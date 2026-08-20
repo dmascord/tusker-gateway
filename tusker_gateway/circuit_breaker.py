@@ -67,7 +67,7 @@ class BreakerPolicy:
 @dataclass
 class BreakerConfig:
     enabled: bool = False
-    path: str = _default_path()
+    path: str = field(default_factory=_default_path)
     policy: BreakerPolicy = field(default_factory=BreakerPolicy)
     # Per-provider overrides keyed by provider name; falls back to `policy`.
     overrides: dict[str, BreakerPolicy] = field(default_factory=dict)

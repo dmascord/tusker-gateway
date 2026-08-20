@@ -56,7 +56,7 @@ class RateLimitPolicy:
 @dataclass
 class RateLimitConfig:
     enabled: bool = False
-    path: str = _default_path()
+    path: str = field(default_factory=_default_path)
     policies: dict[str, RateLimitPolicy] = field(default_factory=dict)
     # Default policy applied to keys without explicit entries.
     default_policy: RateLimitPolicy | None = None

@@ -63,7 +63,7 @@ class BudgetCaps:
 @dataclass
 class BudgetConfig:
     enabled: bool = False
-    path: str = _default_path()
+    path: str = field(default_factory=_default_path)
     # Map of api_key_fingerprint -> caps dict
     caps: dict[str, BudgetCaps] = field(default_factory=dict)
     # Optional global cap (applied to all keys regardless of caps table)

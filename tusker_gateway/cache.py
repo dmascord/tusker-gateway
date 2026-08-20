@@ -81,7 +81,7 @@ def make_cache_key(
 @dataclass
 class CacheConfig:
     enabled: bool = False
-    path: str = _default_path()
+    path: str = field(default_factory=_default_path)
     ttl_secs: int = 300
     max_entries: int = 10_000
 
