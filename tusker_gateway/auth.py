@@ -14,7 +14,6 @@ class AuthMiddleware:
     """Verify Bearer tokens against app["config"]["api_keys"]."""
 
     async def verify(self, request: web.Request) -> None:
-        import os
         auth = request.headers.get("Authorization")
         if not auth or not auth.startswith("Bearer "):
             raise AuthenticationError("Authorization header required")
@@ -23,13 +22,13 @@ class AuthMiddleware:
         if not token:
             raise AuthenticationError("Invalid API key")
 
-        if secrets.compare_digest(token, _DEV_KEY):
+        allowed = set(request.app["config"].get("api_keys", []))
+        # Dev key bypass only when no production keys are configured.
+        # In production, api_keys contains real secrets and the dev key should NOT work.
+        if not allowed and secrets.compare_digest(token, _DEV_KEY):
             return
 
-        allowed = set(request.app["config"].get("api_keys", []))
         if token in allowed:
             return
 
-        # DEBUG: log what was checked
-        print(f"[AUTH-DEBUG] token={token!r} allowed={allowed} len={len(token)}", flush=True)
         raise AuthenticationError("Invalid API key")

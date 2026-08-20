@@ -34,8 +34,11 @@ async def _call_with_pool_fallback(
 
     excluded: set[tuple[str, str]] = set()
     last_error: Exception | None = None
+    # Single shared PoolManager across retries so stickiness / cooldown
+    # state is consistent within a single request.
+    pool_mgr = PoolManager(config)
     while True:
-        selected = PoolManager(config).select(pool_name, excluded=excluded)
+        selected = pool_mgr.select(pool_name, excluded=excluded)
         if not selected:
             if last_error is not None:
                 raise last_error

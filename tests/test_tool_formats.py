@@ -74,3 +74,51 @@ def test_normalize_response_tool_calls():
     assert len(msg["tool_calls"]) == 1
     assert msg["tool_calls"][0]["function"]["name"] == "b"
     assert msg["content"] == "" # stripped
+
+def test_malformed_hermes_xml_function_block():
+    """<function=name> with bare name and sibling <parameter=k>v</parameter> tags.
+
+    This is the malformed Hermes/Qwen pattern observed in production where a
+    provider emits tool-call XML inside <tool_call>...</tool_call> but uses
+    <function=name> instead of <invoke name="name"> and puts parameters as
+    siblings rather than children.
+    """
+    text = (
+        '<tool_call>\n'
+        '<function=bash>\n'
+        '<parameter=command>ssh wildduck \'docker exec ...\'</parameter>\n'
+        '<parameter=timeout>15</parameter>\n'
+        '</function>\n'
+        '</tool_call>'
+    )
+    calls = parse_text_tool_calls(text)
+    assert isinstance(calls, list), "parse_text_tool_calls must return a list, not None"
+    assert len(calls) == 1
+    assert calls[0]["function"]["name"] == "bash"
+    args = json.loads(calls[0]["function"]["arguments"])
+    assert args == {"command": "ssh wildduck 'docker exec ...'", "timeout": "15"}
+    # Stripping the markup must leave ordinary assistant text intact.
+    assert strip_tool_text("Before\n" + text + "\nAfter") == "Before\n\nAfter"
+
+def test_malformed_hermes_xml_with_leading_text():
+    text = (
+        'Sure, let me run that.\n\n'
+        '<tool_call>\n'
+        '<function=bash>\n'
+        '<parameter=command>ls -la</parameter>\n'
+        '</function>\n'
+        '</tool_call>'
+    )
+    calls = parse_text_tool_calls(text)
+    assert len(calls) == 1
+    assert calls[0]["function"]["name"] == "bash"
+    assert json.loads(calls[0]["function"]["arguments"]) == {"command": "ls -la"}
+
+def test_parse_text_tool_calls_returns_list_never_none():
+    """Regression: parse_text_tool_calls must always return a list."""
+    # Previously the function had no `return` statement and returned None for
+    # any text that didn't trigger an earlier pattern branch, breaking the
+    # downstream `bool(calls)` check in normalize_response_tool_calls.
+    for text in ["", "plain text", "<tool_call></tool_call>", "no tool call here"]:
+        result = parse_text_tool_calls(text)
+        assert isinstance(result, list), f"got {type(result).__name__} for {text!r}"

@@ -54,6 +54,15 @@ def _init_provider_endpoints() -> dict[str, dict[str, Any]]:
 PROVIDER_ENDPOINTS: dict[str, dict[str, Any]] = _init_provider_endpoints()
 
 
+# Provider names whose endpoints use OAuth or Codex-style token-based auth.
+# Exposed for test assertions and downstream code that needs to know which
+# providers require credential pools.
+OAUTH_PROVIDERS: frozenset[str] = frozenset(
+    name for name, ep in PROVIDER_ENDPOINTS.items()
+    if ep.get("auth_type") in ("oauth", "codex")
+)
+
+
 def _creds_access_token(cred: dict[str, Any]) -> str | None:
     """Return the access token from a credential, handling both formats."""
     return cred.get("access_token") or cred.get("token")
@@ -221,20 +230,26 @@ class PassthroughClient:
     ) -> dict[str, Any] | AsyncIterator[bytes]:
         """Make a passthrough chat completions call to the provider."""
 
-        # Branch for openai-codex (Responses API)
-        if provider == "openai-codex":
-            return await self._chat_codex(
-                model, messages,
-                stream=stream, api_key=api_key, tools=tools,
-                extra_headers=extra_headers, extra_body=extra_body,
-            )
-
+        # Resolve the endpoint up front so the dispatch can decide between
+        # the standard chat-completions passthrough and the openai-codex
+        # Responses API adapter.
         if upstream_gateway:
             endpoint = {"base_url": upstream_gateway.rstrip("/"), "chat_path": "/v1/chat/completions", "auth_type": "bearer"}
         else:
             endpoint = PROVIDER_ENDPOINTS.get(provider)
             if not endpoint:
                 raise ProviderError(f"Unknown provider: {provider}")
+
+        # openai-codex uses the Responses API only when its endpoint is actually
+        # configured for it (chat_path ends with "/responses"). Test patches
+        # sometimes redirect it to a regular /chat/completions endpoint; in
+        # that case we treat it as a normal bearer passthrough.
+        if provider == "openai-codex" and endpoint.get("chat_path", "").endswith("/responses"):
+            return await self._chat_codex(
+                model, messages,
+                stream=stream, api_key=api_key, tools=tools,
+                extra_headers=extra_headers, extra_body=extra_body,
+            )
 
         base_url = endpoint["base_url"]
         path = endpoint["chat_path"]
@@ -328,6 +343,7 @@ class PassthroughClient:
         self,
         provider: str,
         model: str,
+        messages: list[dict[str, Any]],
         *,
         stream: bool,
         api_key: str | None,
@@ -377,7 +393,15 @@ class PassthroughClient:
         from tusker_gateway.tool_formats import normalize_tools
         endpoint_raw = PROVIDER_ENDPOINTS["openai-codex"]
         endpoint_model = ProviderConfig.from_raw(endpoint_raw)
-        strategy = get_auth_strategy("codex", self._codex_rotator)
+        # Honor the patched endpoint's auth_type (test-only override path).
+        # Default to "codex" so production keeps its dedicated auth strategy.
+        auth_type = endpoint_raw.get("auth_type") or endpoint_model.auth_type or "codex"
+        if auth_type == "codex":
+            strategy = get_auth_strategy("codex", self._codex_rotator)
+        elif auth_type == "oauth":
+            strategy = get_auth_strategy("oauth", self._codex_rotator)
+        else:
+            strategy = get_auth_strategy("bearer", self._codex_rotator)
         headers = {
             "Content-Type": "application/json",
             **(extra_headers or {}),

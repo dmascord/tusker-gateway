@@ -10,14 +10,15 @@ from tusker_gateway.pools import PoolManager
 
 
 def test_pool_selection_logic():
+    # Use real providers from DEFAULT_PROVIDER_REGISTRY (pools require known providers).
     with tempfile.TemporaryDirectory() as tmpdir:
         config = {
             "pools": {
                 "test": PoolConfig(
                     name="test",
                     models=[
-                        {"provider": "p1", "model": "m1"},
-                        {"provider": "p2", "model": "m2"},
+                        {"provider": "groq", "model": "m1"},
+                        {"provider": "openai", "model": "m2"},
                     ],
                 )
             },
@@ -26,16 +27,21 @@ def test_pool_selection_logic():
         }
         mgr = PoolManager(config)
         sel1 = mgr.select("test")
-        assert sel1 in [("p1", "m1"), ("p2", "m2")]
+        assert sel1 in [("groq", "m1"), ("openai", "m2")], f"got {sel1}"
         sel2 = mgr.select("test", session_id="s1")
         sel3 = mgr.select("test", session_id="s1")
-        assert sel2 == sel3
+        assert sel2 == sel3, f"stickiness broken: {sel2} vs {sel3}"
 
 
 def test_cooldown_parsing():
     assert _cooldown_seconds_for_429({"headers": {"Retry-After": "10"}}) == 10
-    assert _cooldown_seconds_for_429({"body": "limit exceeded for this week"}) == 3600
-    assert _cooldown_seconds_for_429({"body": "reached 50/day limit"}) == 3600
+    # "this week" → 7 days = 604800s (rate-limit windows are honored as written)
+    assert _cooldown_seconds_for_429({"body": "limit exceeded for this week"}) == 7 * 86400
+    # "this month" → 30 days
+    assert _cooldown_seconds_for_429({"body": "limit exceeded for this month"}) == 30 * 86400
+    # "50/day" → 86400/50 = 1728s between requests
+    assert _cooldown_seconds_for_429({"body": "reached 50/day limit"}) == 86400 / 50
+    # "rate limited" generic → 60s fallback
     assert _cooldown_seconds_for_429({"body": "rate limited"}) == 60
 
 

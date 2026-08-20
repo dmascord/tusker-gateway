@@ -76,6 +76,8 @@ class FakeProvider:
 def _base_config(quality_path: str) -> dict[str, Any]:
     cfg = load_config()
     cfg["quality_db_path"] = quality_path
+    # Test default: only accept the well-known dev key so chained tests work.
+    cfg["api_keys"] = ["sk-secret-dev"]
     return cfg
 
 

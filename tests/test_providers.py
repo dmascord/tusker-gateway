@@ -29,7 +29,7 @@ ZAI_KEY = os.environ.get("ZAI_API_KEY", "")
 
 
 REQUIRED_KEYS = {"base_url", "chat_path", "auth_type"}
-VALID_AUTH_TYPES = {"oauth", "bearer"}
+VALID_AUTH_TYPES = {"oauth", "bearer", "codex"}
 
 
 def test_provider_endpoints_have_required_shape():
@@ -43,7 +43,7 @@ def test_provider_endpoints_have_required_shape():
 
 
 def test_oauth_providers_match_registry():
-    expected = {p for p, e in PROVIDER_ENDPOINTS.items() if e.get("auth_type") == "oauth"}
+    expected = {p for p, e in PROVIDER_ENDPOINTS.items() if e.get("auth_type") in ("oauth", "codex")}
     assert OAUTH_PROVIDERS == expected
 
 

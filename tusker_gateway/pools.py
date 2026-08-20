@@ -5,13 +5,28 @@ role alias (hermes-code, hermes-privacy, hermes-premium, hermes-swarm).
 """
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from tusker_gateway.config import PoolConfig
+from tusker_gateway.config import DEFAULT_PROVIDER_REGISTRY, PoolConfig
 from tusker_gateway.cooldown import CooldownTracker, global_tracker
 from tusker_gateway.quality import QualityDB
+
+logger = logging.getLogger(__name__)
+
+
+def _validate_providers(specs: list["ModelSpec"]) -> list[str]:
+    """Return warnings for any model whose provider is not in the registry.
+
+    Logging happens once per (provider, model) pair to avoid duplicate spam.
+    """
+    warnings: list[str] = []
+    for s in specs:
+        if s.provider not in DEFAULT_PROVIDER_REGISTRY:
+            warnings.append(f"unknown provider '{s.provider}' for model '{s.model}'")
+    return warnings
 
 
 @dataclass
@@ -57,10 +72,15 @@ class PoolManager:
         self._cooldowns = global_tracker()
         # Build model lists from pool configs
         for name, pool in self.pools.items():
-            self.models[name] = [
+            specs = [
                 ModelSpec.from_dict(m, default_window=pool.context_window, zdr=pool.zdr)
                 for m in pool.models
             ]
+            self.models[name] = specs
+            # Warn about unknown providers once at startup
+            warnings = _validate_providers(specs)
+            for w in warnings:
+                logger.warning("pool '%s': %s — will be skipped during selection", name, w)
 
     def select(
         self,
@@ -100,6 +120,9 @@ class PoolManager:
         candidates: list[ModelSpec] = []
         for s in specs:
             if (s.provider, s.model) in excluded:
+                continue
+            # Skip providers that are not in the registry — avoids ProviderError cascade
+            if s.provider not in DEFAULT_PROVIDER_REGISTRY:
                 continue
             if context_tokens > 0 and s.context_window < context_tokens:
                 continue
@@ -143,11 +166,19 @@ class PoolManager:
         """Return pool status for /status endpoint."""
         result = {}
         for name, specs in self.models.items():
+            valid = [s for s in specs if s.provider in DEFAULT_PROVIDER_REGISTRY]
+            invalid = [s for s in specs if s.provider not in DEFAULT_PROVIDER_REGISTRY]
             result[name] = {
                 "models": len(specs),
+                "valid_candidates": len(valid),
+                "invalid_candidates": len(invalid),
+                "invalid_entries": [
+                    {"provider": s.provider, "model": s.model}
+                    for s in invalid
+                ],
                 "candidates": [
                     {"provider": s.provider, "model": s.model, "context_window": s.context_window}
-                    for s in specs
+                    for s in valid
                 ],
             }
         return result

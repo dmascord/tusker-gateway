@@ -143,11 +143,18 @@ def load_config() -> dict[str, Any]:
     config["codex_credentials"] = _parse_env_json_list("CODEX_CREDENTIALS")
     if not config["codex_credentials"]:
         try:
-            with open(auth_file, encoding="utf-8") as auth_handle:
-                auth_data = json.load(auth_handle)
-            pool = auth_data.get("credential_pool", {})
-            if isinstance(pool, dict):
-                config["codex_credentials"] = list(pool.get("openai-codex", []))
+            from tusker_gateway.copilot_enroll import load_auth_file as _load_auth
+            creds = _load_auth(auth_file)
+            # Filter to openai-codex credentials for the codex pool
+            config["codex_credentials"] = [
+                c for c in creds
+                if c.get("provider", "openai-codex") == "openai-codex"
+            ]
+            # If no provider tag is present, keep all creds (legacy list-format file).
+            if not config["codex_credentials"] and any(
+                "provider" not in c for c in creds
+            ):
+                config["codex_credentials"] = creds
         except (OSError, TypeError, ValueError):
             pass
 

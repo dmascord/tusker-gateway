@@ -1,6 +1,10 @@
 """Shared test fixtures for tusker-gateway tests."""
 from __future__ import annotations
 
+import json
+import os
+from pathlib import Path
+
 import pytest
 import pytest_asyncio
 from aiohttp import web
@@ -13,19 +17,58 @@ from tusker_gateway.endpoints import (
     models_handler,
     responses_handler,
 )
-@pytest.fixture(autouse=True)
-def setup_auth_file(tmp_path):
-    import json
-    from pathlib import Path
-    auth_file = Path.home() / ".hermes" / "auth.json"
-    auth_file.parent.mkdir(parents=True, exist_ok=True)
-    auth_file.write_text(json.dumps([{"access_token": "mock"}]))
 from tusker_gateway.errors import GatewayError, openai_error
 from tusker_gateway.health import health_handler, ready_handler, status_handler
 
 
+@pytest.fixture(autouse=True)
+def setup_auth_file(tmp_path, monkeypatch):
+    """Point TUSKER_AUTH_FILE at an isolated temp file so tests don't pollute
+    the developer's real ~/.hermes/auth.json."""
+    auth_file = tmp_path / "auth.json"
+    auth_file.write_text(json.dumps({"version": 1, "credential_pool": {}}))
+    monkeypatch.setenv("TUSKER_AUTH_FILE", str(auth_file))
+    # Test app expects HEADERS_AUTH = "Bearer sk-secret-dev" to work, so make
+    # that the only accepted key for tests that don't override api_keys.
+    monkeypatch.setenv("API_KEYS", "sk-secret-dev")
+    return auth_file
+
+
+@pytest.fixture(autouse=True)
+def reset_cooldown_tracker():
+    """Clear the global cooldown tracker between tests so a 429 in one test
+    doesn't poison subsequent tests' pool selection."""
+    from tusker_gateway.cooldown import global_tracker
+    tracker = global_tracker()
+    tracker._cooldowns.clear()
+    tracker._provider_default.clear()
+    tracker._recent_failures.clear()
+    tracker._global = None
+    yield
+    tracker._cooldowns.clear()
+    tracker._provider_default.clear()
+    tracker._recent_failures.clear()
+    tracker._global = None
+
+
+@pytest.fixture(autouse=True)
+def restore_provider_endpoints():
+    """Snapshot PROVIDER_ENDPOINTS so test patches can be restored even if a
+    test fails before its finally clause runs."""
+    from tusker_gateway.passthrough import PROVIDER_ENDPOINTS
+    snapshot = {k: dict(v) for k, v in PROVIDER_ENDPOINTS.items()}
+    yield
+    PROVIDER_ENDPOINTS.clear()
+    PROVIDER_ENDPOINTS.update(snapshot)
+
+
 def _create_test_app(config=None):
     cfg = config or load_config()
+    # Default test config: only accept the well-known dev key so the test
+    # client fixtures (HEADERS_AUTH) work without per-test setup. Tests that
+    # need a different auth scheme override cfg["api_keys"] explicitly.
+    if not cfg.get("api_keys"):
+        cfg["api_keys"] = ["sk-secret-dev"]
     app = web.Application(client_max_size=10 * 1024 * 1024)
     app["config"] = cfg
     app["http_session"] = None

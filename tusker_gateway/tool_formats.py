@@ -190,6 +190,39 @@ def parse_text_tool_calls(text: Any) -> list[dict[str, Any]]:
         except json.JSONDecodeError:
             args_obj = {"raw": args}
         calls.append({"name": match.group(1), "arguments": args_obj})
+
+    # 6. Malformed Hermes/Qwen-style XML: <function=name>...<parameter=k>v</parameter>...</function>
+    # The opening/closing tags for <function> may be bare or quoted; parameters are siblings, not nested.
+    # Example:
+    #   <tool_call>
+    #   <function=bash>
+    #   <parameter=command>ssh ...</parameter>
+    #   <parameter=timeout>15</parameter>
+    #   </function>
+    #   </tool_call>
+    for match in re.finditer(
+        r"<\s*function\s*=\s*[\"']?([^\s\"'<>]+)[\"']?\s*>(.*?)<\s*/\s*function\s*>",
+        text, re.I | re.S,
+    ):
+        name = match.group(1).strip()
+        inner = match.group(2)
+        args: dict[str, Any] = {}
+        # Match each <parameter=name>value</parameter> sibling.
+        for param in re.finditer(
+            r"<\s*parameter\s*=\s*[\"']?([^\s\"'<>]*)[\"']?\s*>(.*?)<\s*/\s*parameter\s*>",
+            inner, re.I | re.S,
+        ):
+            key = (param.group(1) or "value").strip()
+            args[key] = param.group(2).strip()
+        # Also handle bare <parameter>value</parameter> with no name attr.
+        if not args:
+            for param in re.finditer(
+                r"<\s*parameter\s*>(.*?)<\s*/\s*parameter\s*>",
+                inner, re.I | re.S,
+            ):
+                args[f"arg_{len(args)}"] = param.group(1).strip()
+        calls.append({"name": name, "arguments": args})
+
     return normalize_tool_calls(calls)
 
 
@@ -199,6 +232,13 @@ def strip_tool_text(text: Any) -> Any:
         return text
     cleaned = re.sub(r"TOOL_CALL:.*$", "", text, flags=re.I | re.M)
     cleaned = re.sub(r"<(?:tool_call|function_call|tool_calls|function_calls|tool_use|tool_invocation|dsml:invoke|ds:function)\b[^>]*>.*?</(?:tool_call|function_call|tool_calls|function_calls|tool_use|tool_invocation|dsml:invoke|ds:function)>", "", cleaned, flags=re.I | re.S)
+    # Strip well-formed <function=name>...</function> blocks (multi-line, possibly nested params).
+    cleaned = re.sub(
+        r"<\s*function\s*=\s*[\"']?[^\s\"'<>]+[\"']?\s*>.*?<\s*/\s*function\s*>",
+        "", cleaned, flags=re.I | re.S,
+    )
+    # Strip malformed <function=name</parameter>...</function> blocks (legacy fallback).
+    cleaned = re.sub(r"<function=[^\s<>]+</parameter>.*?</function>", "", cleaned, flags=re.I | re.S)
     cleaned = re.sub(r"<tool_invocation[^>]*/>", "", cleaned, flags=re.I)
     cleaned = re.sub(r"<(?:(?:MiMoML|DSML)[|｜]?|[|｜](?:MiMoML|DSML)[|｜]?)\s*[^>]*>", "", cleaned, flags=re.I)
     return re.sub(r"\n{3,}", "\n\n", cleaned).strip()

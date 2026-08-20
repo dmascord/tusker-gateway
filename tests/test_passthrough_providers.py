@@ -282,9 +282,9 @@ def test_endpoint_has_required_fields(provider):
     ep = PROVIDER_ENDPOINTS[provider]
     assert "base_url" in ep, f"{provider} missing base_url"
     assert "chat_path" in ep, f"{provider} missing chat_path"
-    assert ep["auth_type"] in ("oauth", "bearer"), f"{provider} has unexpected auth_type: {ep['auth_type']}"
-    if ep["auth_type"] == "oauth":
-        assert "model_header" in ep, f"{provider} (oauth) missing model_header"
+    assert ep["auth_type"] in ("oauth", "bearer", "codex"), f"{provider} has unexpected auth_type: {ep['auth_type']}"
+    if ep["auth_type"] in ("oauth", "codex"):
+        assert "model_header" in ep, f"{provider} ({ep['auth_type']}) missing model_header"
 
 
 # ---------------------------------------------------------------------------
@@ -308,13 +308,17 @@ async def test_oauth_no_credentials_no_auth(mock_http, quality_db, provider):
     config = _base_config(codex_credentials=[])
     client = PassthroughClient(config, quality_db, mock_http)
     endpoint = PROVIDER_ENDPOINTS[provider]
+    # Note: openai-codex uses the codex auth strategy (raw JWT, not exchange).
+    # Both oauth and codex strategies leave Authorization unset when no creds exist.
     headers, body = await client._build_request(
         provider, "model", [{"role": "user", "content": "hi"}],
         stream=False, api_key=None,
         extra_headers=None, extra_body=None,
         endpoint=endpoint,
     )
-    assert "Authorization" not in headers
+    assert "Authorization" not in headers, (
+        f"{provider} leaked Authorization when no creds: {headers}"
+    )
     model_header = endpoint["model_header"]
     assert headers[model_header] == "model"
 
