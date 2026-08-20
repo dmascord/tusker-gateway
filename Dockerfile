@@ -17,6 +17,8 @@ COPY tusker_gateway/ ./tusker_gateway/
 RUN find /opt/tusker-gateway -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 COPY README.md ./
 
+# Install PyTorch CPU-only first to avoid pulling CUDA (5+ GB).
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
 RUN pip install --no-cache-dir --upgrade pip \
  && pip install --no-cache-dir ".[semantic-cache]"
 
