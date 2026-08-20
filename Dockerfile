@@ -16,7 +16,7 @@ RUN find /opt/tusker-gateway -type d -name __pycache__ -exec rm -rf {} + 2>/dev/
 COPY README.md ./
 
 RUN pip install --no-cache-dir --upgrade pip \
- && pip install --no-cache-dir .
+ && pip install --no-cache-dir ".[semantic-cache]"
 
 # Persistent data (quality DB, cooldowns, OAuth pool)
 RUN mkdir -p /home/tusker/.hermes && chown -R nobody:nogroup /home/tusker
