@@ -1,6 +1,9 @@
 """Endpoint handlers: /models, /chat/completions, /responses."""
 from __future__ import annotations
 
+import asyncio
+import logging
+import os
 import time
 import uuid
 from typing import Any
@@ -17,8 +20,30 @@ from tusker_gateway.pools import PoolManager
 from tusker_gateway.quality import QualityDB
 from tusker_gateway.rate_limit import RateLimiter
 from tusker_gateway.routing import resolve_route
-from tusker_gateway.sse import sse_done
+from tusker_gateway.sse import (
+    format_openai_chunk,
+    sse_done,
+    sse_frame,
+    sse_heartbeat_loop,
+)
 from tusker_gateway.tracing import Tracer
+
+logger = logging.getLogger(__name__)
+
+
+# Heartbeat interval for client-facing SSE streams. Must be comfortably below
+# the idle-connection timeouts of common intermediaries:
+#   - Traefik default `Transport.RespondingTimeouts.IdleTimeout` = 60s
+#   - nginx `proxy_read_timeout` (commonly)               = 60s
+#   - Cloudflare free tier                                 = 100s
+#   - CloudFront                                          = 5m (safe)
+# 15s gives us at least 4 heartbeats before any of these fire.
+#
+# Read at request time (not import time) so tests can monkeypatch the
+# env var without re-importing the module, and operators can flip the
+# knob in production via the deployment manifest without a redeploy.
+def _sse_heartbeat_secs() -> float:
+    return float(os.environ.get("TUSKER_SSE_HEARTBEAT_SECS", "15"))
 
 
 def _pool_name(body: dict[str, Any]) -> str | None:
@@ -195,6 +220,16 @@ async def metrics_handler(request: web.Request) -> web.Response:
         s = ratelimit.stats_snapshot()
         metrics.budget_blocks._values[("ratelimit_allowed",)] = float(s["allowed"])  # noqa: SLF001
         metrics.budget_blocks._values[("ratelimit_blocked",)] = float(s["blocked"])  # noqa: SLF001
+    sem_cache = request.app.get("semantic_cache")
+    if sem_cache is not None and sem_cache.enabled:
+        s = sem_cache.stats_snapshot()
+        for kind, value in (
+            ("hits", s["hits"]),
+            ("misses", s["misses"]),
+            ("writes", s["writes"]),
+            ("evictions", s["evictions"]),
+        ):
+            metrics.budget_blocks._values[(f"semantic_{kind}",)] = float(value)  # noqa: SLF001
     body = metrics.render()
     return web.Response(
         status=200,
@@ -207,6 +242,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
     """POST /v1/chat/completions."""
     metrics: MetricsRegistry | None = request.app.get("metrics")
     cache: ResponseCache | None = request.app.get("cache")
+    sem_cache = request.app.get("semantic_cache")
     budget: BudgetTracker | None = request.app.get("budget")
     breaker: CircuitBreaker | None = request.app.get("breaker")
     ratelimit: RateLimiter | None = request.app.get("ratelimit")
@@ -243,6 +279,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
     with span_cm as root_span:
         try:
             body = _validate_chat_body(await request.json())
+            logger.info('chat request model=%s pool=%s stream=%s', body.get("model"), pool_name, body.get("stream"))
             if tracer is not None and tracer.enabled and root_span is not None:
                 root_span.attributes["tusker.model"] = str(body.get("model") or "")
             config = request.app["config"]
@@ -281,12 +318,34 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                 )
                 hit = cache.get(cache_key)
                 if hit is not None:
+                    logger.debug('cache hit key=%s', cache_key[:16])
                     if metrics is not None:
                         metrics.requests_total.inc(
                             {"pool": pool_name, "provider": "cache", "model": str(body.get("model") or ""), "status": "cache_hit"}
                         )
                         metrics.request_duration.observe(time.monotonic() - started, {"pool": pool_name, "provider": "cache", "model": str(body.get("model") or "")})
                     return web.json_response(hit)
+
+            # Semantic cache lookup (after exact-match miss).
+            sem_hit: dict[str, Any] | None = None
+            if (
+                sem_cache is not None
+                and sem_cache.enabled
+                and not body.get("stream", False)
+                and not bypass_cache
+            ):
+                sem_hit = await sem_cache.query(body["messages"])
+                if sem_hit is not None:
+                    logger.info('semantic cache hit model=%s', body.get("model"))
+                    if metrics is not None:
+                        metrics.requests_total.inc(
+                            {"pool": pool_name, "provider": "semantic_cache", "model": str(body.get("model") or ""), "status": "cache_hit"}
+                        )
+                        metrics.request_duration.observe(time.monotonic() - started, {"pool": pool_name, "provider": "semantic_cache", "model": str(body.get("model") or "")})
+                    # Also store in exact-match cache for faster subsequent lookups.
+                    if cache is not None and cache_key is not None:
+                        cache.put(cache_key, sem_hit)
+                    return web.json_response(sem_hit)
 
             # Budget pre-flight
             if budget is not None and api_key:
@@ -305,6 +364,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                     )
 
             provider, target_model, result = await _call_with_pool_fallback(config, body, client, tools, breaker=breaker)
+            logger.debug('selected %s/%s for pool %s', provider, target_model, pool_name)
 
             if budget is not None and api_key and isinstance(result, dict):
                 usage = result.get("usage") or {}
@@ -319,13 +379,92 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                 and cache_key is not None
             ):
                 cache.put(cache_key, result)
+                logger.debug('cache stored key=%s', cache_key[:16])
+
+            # Store in semantic cache (non-streaming dict responses only).
+            if (
+                sem_cache is not None
+                and sem_cache.enabled
+                and not bypass_cache
+                and not body.get("stream", False)
+                and isinstance(result, dict)
+            ):
+                await sem_cache.store(body["messages"], result)
+                logger.debug('semantic cache stored model=%s', body.get("model"))
 
             if body.get("stream", False):
-                resp = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive"})
+                resp = web.StreamResponse(
+                    status=200,
+                    headers={
+                        "Content-Type": "text/event-stream",
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                        # Disable nginx-style response buffering so SSE events
+                        # flush immediately. Traefik honors this too.
+                        "X-Accel-Buffering": "no",
+                    },
+                )
                 await resp.prepare(request)
-                async for chunk in result:
-                    await resp.write(chunk)
-                await resp.write(sse_done())
+
+                # Send the role chunk *before* the first upstream byte. This
+                # (a) gives the client a parseable first event immediately, and
+                # (b) forces the first bytes through any proxy buffer so
+                # subsequent heartbeats aren't held back. OpenAI's reference
+                # streaming behavior starts with `delta: {role: "assistant"}`.
+                await resp.write(sse_frame(format_openai_chunk(role="assistant")))
+
+                stop = asyncio.Event()
+                hb_interval = _sse_heartbeat_secs()
+                hb_task = asyncio.create_task(
+                    sse_heartbeat_loop(
+                        resp.write,
+                        stop,
+                        interval_secs=hb_interval,
+                        comment="keepalive",
+                    ),
+                    name="sse-heartbeat",
+                )
+                stream_ok = True
+                try:
+                    async for chunk in result:
+                        await resp.write(chunk)
+                except (ConnectionResetError, ConnectionError, BrokenPipeError) as exc:
+                    stream_ok = False
+                    logger.info(
+                        "stream client disconnected mid-flight provider=%s model=%s err=%s",
+                        provider, target_model, exc,
+                    )
+                    if budget is not None and api_key and body is not None:
+                        budget.refund(api_key, pool_name, _estimated_tokens(body["messages"]))
+                except asyncio.CancelledError:
+                    stream_ok = False
+                    logger.info(
+                        "stream cancelled provider=%s model=%s", provider, target_model,
+                    )
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    stream_ok = False
+                    logger.warning(
+                        "stream pump failed provider=%s model=%s err=%s",
+                        provider, target_model, exc,
+                        exc_info=True,
+                    )
+                    if budget is not None and api_key and body is not None:
+                        budget.refund(api_key, pool_name, _estimated_tokens(body["messages"]))
+                else:
+                    # Best-effort: if the client is gone, [DONE] write will
+                    # raise — swallow so we still record metrics.
+                    try:
+                        await resp.write(sse_done())
+                    except (ConnectionResetError, ConnectionError, BrokenPipeError):
+                        stream_ok = False
+                finally:
+                    stop.set()
+                    try:
+                        await asyncio.wait_for(hb_task, timeout=hb_interval + 1.0)
+                    except asyncio.TimeoutError:
+                        hb_task.cancel()
+                status = "ok" if stream_ok else status
                 _emit(status)
                 return resp
 
@@ -342,6 +481,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
             _emit(status)
             return web.json_response(openai_error(exc.message, code=exc.code, error_type=exc.error_type), status=exc.status)
         except Exception as exc:
+            logger.warning('chat request failed: %s', exc)
             status = "provider_error"
             _emit(status)
             if budget is not None and api_key and body is not None:
@@ -352,6 +492,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
 async def responses_handler(request: web.Request) -> web.Response | web.StreamResponse:
     try:
         body = await request.json()
+        logger.info('responses request model=%s', body.get("model") if isinstance(body, dict) else None)
         if not isinstance(body, dict):
             raise BadRequestError("Request body must be a JSON object", code="invalid_request")
         input_value = body.get("input")

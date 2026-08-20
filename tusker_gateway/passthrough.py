@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import os
 import time
 from typing import Any, AsyncIterator
 
@@ -19,6 +21,18 @@ from tusker_gateway.errors import (
     RateLimitError,
 )
 from tusker_gateway.quality import QualityDB
+
+logger = logging.getLogger(__name__)
+
+
+# Per-read timeout for upstream SSE streams. The `total` budget below is the
+# hard cap on the whole request; `sock_read` caps the *gap* between bytes so a
+# stalled provider surfaces as a clean timeout instead of hanging silently
+# until `total` expires (which is what causes the "socket connection was
+# closed unexpectedly" symptom on the client).
+_UPSTREAM_STREAM_SOCK_READ_SECS = float(
+    os.environ.get("TUSKER_UPSTREAM_SOCK_READ_SECS", "90")
+)
 
 # Build per-provider endpoints dict from the normalized registry in config.py
 # Falls back to legacy hard-coded mapping if the registry is unavailable.
@@ -229,6 +243,7 @@ class PassthroughClient:
         upstream_gateway: str | None = None,
     ) -> dict[str, Any] | AsyncIterator[bytes]:
         """Make a passthrough chat completions call to the provider."""
+        logger.info('passthrough %s/%s stream=%s', provider, model, stream)
 
         # Resolve the endpoint up front so the dispatch can decide between
         # the standard chat-completions passthrough and the openai-codex
@@ -266,7 +281,18 @@ class PassthroughClient:
         if stream:
             resp = await self._http.request(
                 "POST", url, headers=headers, json=body,
-                timeout=aiohttp.ClientTimeout(total=120),
+                timeout=aiohttp.ClientTimeout(
+                    total=120,
+                    # Cap the *gap* between SSE bytes. If the provider goes
+                    # silent for this long, aiohttp raises a clean asyncio
+                    # TimeoutError instead of letting the socket hang until
+                    # the 120s `total` fires. The error then surfaces to the
+                    # caller as a normal exception (which the endpoint layer
+                    # already logs + refunds) — never as the opaque
+                    # "socket connection was closed unexpectedly" that
+                    # appears when the underlying TCP gets reaped first.
+                    sock_read=_UPSTREAM_STREAM_SOCK_READ_SECS,
+                ),
             )
             try:
                 await self._check_response(resp)
@@ -275,6 +301,7 @@ class PassthroughClient:
                 tracker = global_tracker()
                 body_text = exc.body or "429 rate limit"
                 seconds = _cooldown_seconds_for_429({"body": body_text, "headers": dict(resp.headers)})
+                logger.warning('429 from %s/%s, cooldown=%.0fs', provider, model, seconds)
                 tracker.cooldown(provider, model, seconds)
                 try:
                     from tusker_gateway.persistent_cooldown import PersistentCooldownStore
@@ -295,7 +322,7 @@ class PassthroughClient:
                 global_tracker().clear_failures(provider)
             except Exception:
                 pass
-            return self._stream_events(resp)
+            return self._stream_events(resp, provider=provider, model=model)
         try:
             async with self._http.request(
                 "POST", url, headers=headers, json=body,
@@ -307,6 +334,7 @@ class PassthroughClient:
                 result = normalize_response_tool_calls(result)
                 latency_ms = (time.monotonic() - start) * 1000
                 await self._record_quality(provider, model, True, latency_ms)
+                logger.debug('quality recorded %s/%s success=True', provider, model)
                 global_tracker().clear_failures(provider)
                 return result
         except RateLimitError as exc:
@@ -314,6 +342,7 @@ class PassthroughClient:
             tracker = global_tracker()
             body_text = exc.body or "429 rate limit"
             seconds = _cooldown_seconds_for_429({"body": body_text, "headers": exc.headers})
+            logger.warning('429 from %s/%s, cooldown=%.0fs', provider, model, seconds)
             tracker.cooldown(provider, model, seconds)
             try:
                 from tusker_gateway.persistent_cooldown import PersistentCooldownStore
@@ -327,6 +356,7 @@ class PassthroughClient:
         except Exception as exc:
             latency_ms = (time.monotonic() - start) * 1000
             await self._record_quality(provider, model, False, latency_ms)
+            logger.debug('quality recorded %s/%s success=False', provider, model)
             tracker = global_tracker()
             if tracker.record_failure(provider):
                 tracker.cooldown(provider, "", 300.0) # Provider-level cooldown
@@ -338,6 +368,7 @@ class PassthroughClient:
                     store.record_provider(provider, 300.0)
                 except Exception:
                     pass
+            logger.warning('provider error %s/%s: %s', provider, model, exc)
             raise ProviderError(str(exc)) from exc
     async def _build_request(
         self,
@@ -588,6 +619,7 @@ class PassthroughClient:
     async def _check_response(resp: aiohttp.ClientResponse) -> None:
         if resp.status == 200:
             return
+        logger.warning('provider returned %d', resp.status)
         body = await resp.text()
         if resp.status == 401:
             raise ProviderError("Provider authentication failed", code="auth_error")
@@ -600,12 +632,56 @@ class PassthroughClient:
         if resp.status != 200:
             raise ProviderError(f"Provider returned {resp.status}: {body[:200]}", code="provider_error")
 
-    async def _stream_events(self, resp: aiohttp.ClientResponse) -> AsyncIterator[bytes]:
+    async def _stream_events(
+        self,
+        resp: aiohttp.ClientResponse,
+        *,
+        provider: str | None = None,
+        model: str | None = None,
+    ) -> AsyncIterator[bytes]:
+        """Pump an upstream SSE response byte-for-byte to the gateway caller.
+
+        `aiohttp.ClientConnectionError` historically meant "the gateway's
+        caller (aiohttp client connecting to us) went away", so it was
+        silent. With this gateway now sitting behind Traefik+Cloudflare and
+        the upstream provider behind their own stack, *upstream-side*
+        disconnects also surface as connection errors. We log both cases
+        at INFO level with the upstream URL + status (when available) so
+        operators can correlate with what the caller saw (Bun's opaque
+        "socket connection was closed unexpectedly" on the OMP side, or a
+        502 from the load balancer).
+        """
+        upstream = getattr(resp, "url", None)
+        upstream_str = str(upstream) if upstream is not None else (provider or "?")
+        status = getattr(resp, "status", None)
         try:
             async for chunk in resp.content.iter_any():
                 yield chunk
-        except aiohttp.ClientConnectionError:
-            pass  # client disconnect during streaming
+        except aiohttp.ServerDisconnectedError as exc:
+            logger.info(
+                "upstream server disconnected mid-stream provider=%s model=%s "
+                "url=%s status=%s err=%s",
+                provider, model, upstream_str, status, exc,
+            )
+        except aiohttp.ClientConnectionError as exc:
+            logger.info(
+                "upstream connection error mid-stream provider=%s model=%s "
+                "url=%s status=%s err=%s",
+                provider, model, upstream_str, status, exc,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "upstream SSE read timeout (>%ss idle) provider=%s model=%s "
+                "url=%s status=%s",
+                _UPSTREAM_STREAM_SOCK_READ_SECS, provider, model, upstream_str, status,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "upstream SSE read failed provider=%s model=%s "
+                "url=%s status=%s err=%s",
+                provider, model, upstream_str, status, exc,
+                exc_info=True,
+            )
         finally:
             resp.release()
 

@@ -38,6 +38,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 def _default_path() -> str:
     home = os.environ.get("HOME", "")
@@ -100,10 +104,7 @@ class RateLimiter:
             Path(config.path).parent.mkdir(parents=True, exist_ok=True)
             self._ensure_db()
         except (PermissionError, OSError) as exc:
-            import logging
-            logging.getLogger(__name__).warning(
-                "rate limit disabled: cannot create %s: %s", config.path, exc
-            )
+            logger.warning("rate limit disabled: cannot create %s: %s", config.path, exc)
             self._config.enabled = False
 
     def _ensure_db(self) -> None:
@@ -173,6 +174,7 @@ class RateLimiter:
                 )
                 conn.commit()
             self.stats.allowed += 1
+            logger.debug('rate limit check key=%s allowed=True', fp[:8])
             return RateLimitDecision(allowed=True, remaining=tokens)
         else:
             # Persist the refilled amount so we don't lose refill progress.
@@ -191,6 +193,7 @@ class RateLimiter:
             deficit = cost - tokens
             retry = deficit / policy.rate_per_sec if policy.rate_per_sec > 0 else 60.0
             self.stats.blocked += 1
+            logger.warning('rate limit blocked key=%s (remaining=%.1f)', fp[:8], tokens)
             return RateLimitDecision(
                 allowed=False,
                 remaining=tokens,

@@ -40,6 +40,10 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 def _default_path() -> str:
     home = os.environ.get("HOME", "")
@@ -110,10 +114,7 @@ class CircuitBreaker:
             Path(config.path).parent.mkdir(parents=True, exist_ok=True)
             self._ensure_db()
         except (PermissionError, OSError) as exc:
-            import logging
-            logging.getLogger(__name__).warning(
-                "circuit breaker disabled: cannot create %s: %s", config.path, exc
-            )
+            logger.warning("circuit breaker disabled: cannot create %s: %s", config.path, exc)
             self._config.enabled = False
 
     def _ensure_db(self) -> None:
@@ -162,12 +163,14 @@ class CircuitBreaker:
                              state=BreakerState.HALF_OPEN.value,
                              half_open_probe_inflight=1)
                 self.stats.half_open_probes += 1
+                logger.info('breaker %s/%s -> HALF_OPEN (probe)', provider, model)
                 return BreakerDecision(
                     allowed=True,
                     state=BreakerState.HALF_OPEN,
                     reason="half_open_probe",
                 )
             self.stats.short_circuits += 1
+            logger.debug('breaker %s/%s OPEN, short-circuiting', provider, model)
             remaining = max(0.0, cooldown - (now - (opened_at or now)))
             return BreakerDecision(
                 allowed=False,
@@ -203,6 +206,7 @@ class CircuitBreaker:
         policy = self._policy_for(provider)
         if state == BreakerState.HALF_OPEN:
             self.stats.half_open_successes += 1
+            logger.info('breaker %s/%s -> CLOSED (probe succeeded)', provider, model)
             # Probe succeeded — back to CLOSED.
             self._update(
                 provider, model,
@@ -264,6 +268,7 @@ class CircuitBreaker:
 
         if should_trip:
             self.stats.trips += 1
+            logger.warning('breaker %s/%s TRIPPED (consecutive=%d)', provider, model, consecutive)
 
         if row is None:
             # First failure — upsert (creates the row).

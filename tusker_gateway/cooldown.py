@@ -10,6 +10,10 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 MAX_COOLDOWN_SECS = 30 * 86400.0 # 30 days
 
@@ -60,22 +64,28 @@ class CooldownTracker:
         self._cooldowns[(provider, model)] = Cooldown(until=until)
         # Also track at provider level
         self._provider_default[provider] = Cooldown(until=until)
+        logger.info('cooldown set %s/%s for %.0fs', provider, model, seconds)
     def is_cooldown(self, provider: str, model: str) -> bool:
         """Return True if (provider, model) is in cooldown."""
         if self._global is not None and self._global.is_active():
+            logger.debug('cooldown check %s/%s: active (global)', provider, model)
             return True
         key = (provider, model)
         if key in self._cooldowns and self._cooldowns[key].is_active():
+            logger.debug('cooldown check %s/%s: active', provider, model)
             return True
         if provider in self._provider_default:
             co = self._provider_default[provider]
             if co.is_active():
+                logger.debug('cooldown check %s/%s: active (provider default)', provider, model)
                 return True
+        logger.debug('cooldown check %s/%s: clear', provider, model)
         return False
 
     def clear(self, provider: str, model: str) -> None:
         """Clear cooldown for (provider, model)."""
         self._cooldowns.pop((provider, model), None)
+        logger.debug('cooldown cleared %s/%s', provider, model)
         # Don't clear provider-default; keep it for batch eviction
 
 
@@ -141,8 +151,11 @@ def _cooldown_seconds_for_429(exc: dict[str, Any]) -> float:
     if "hour" in body_lower: return 3600.0
     m = re.search(r"(\d+)\s*/\s*day", body_lower)
     if m: return 86400.0 / float(m.group(1))
-    if "429" in body_lower or "rate limit" in body_lower: return 60.0
+    if "429" in body_lower or "rate limit" in body_lower:
+        logger.info('429 cooldown: 60.0s for %s', 'unknown')
+        return 60.0
 
+    logger.info('429 cooldown: 60.0s for %s', 'unknown')
     return 60.0
 
 

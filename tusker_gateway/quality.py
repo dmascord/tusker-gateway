@@ -11,6 +11,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class ModelQuality:
@@ -67,6 +71,7 @@ class QualityDB:
     def record(self, provider: str, model: str, success: bool, latency_ms: float) -> None:
         """Record a call outcome and update quality score."""
         now = time.time()
+        logger.debug('record %s/%s success=%s latency=%.1fms', provider, model, success, latency_ms)
         with sqlite3.connect(self._path) as conn:
             conn.execute(
                 """
@@ -147,6 +152,7 @@ class QualityDB:
             """,
             (score, provider, model),
         )
+        logger.debug('recomputed score for %s/%s: %.2f', provider, model, score)
 
     def get_quality(self, provider: str, model: str) -> float | None:
         """Return quality score for (provider, model), or None if no data."""
@@ -191,6 +197,7 @@ class QualityDB:
         # Replace placeholders with floor
         result = [(p, m, s if s >= 0 else floor) for p, m, s in scored]
         result.sort(key=lambda x: x[2], reverse=True)
+        logger.debug('ranked %d candidates', len(result))
         return result
 
     def status(self) -> dict[str, Any]:

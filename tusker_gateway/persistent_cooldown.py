@@ -12,6 +12,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 from tusker_gateway.cooldown import Cooldown, CooldownTracker, MAX_COOLDOWN_SECS
 
 
@@ -65,6 +69,7 @@ class PersistentCooldownStore:
                 (provider, model, until_epoch, time.time()),
             )
             conn.commit()
+        logger.debug('persisted cooldown %s/%s for %.0fs', provider, model, seconds)
 
     def record_provider(self, provider: str, seconds: float) -> None:
         """Persist a provider cooldown until `seconds` from now."""
@@ -109,6 +114,7 @@ class PersistentCooldownStore:
                     continue
                 tracker.cooldown(provider, "", remaining) # model='' sentinel
                 loaded += 1
+        logger.info('hydrated %d provider cooldowns from store', loaded)
         return loaded
     def is_active(self, provider: str, model: str) -> bool:
         """Return True if (provider, model) cooldown is still active in storage."""
@@ -128,7 +134,9 @@ class PersistentCooldownStore:
                 "DELETE FROM cooldowns WHERE until_epoch <= ?", (time.time(),)
             )
             conn.commit()
-        return cur.rowcount
+        count = cur.rowcount
+        logger.info('purged %d expired cooldowns', count)
+        return count
 
     def hydrate(self, tracker: CooldownTracker) -> int:
         """Load active cooldowns into an in-memory `CooldownTracker`.
@@ -148,6 +156,7 @@ class PersistentCooldownStore:
                 # Use monotonic remaining time in the in-memory tracker
                 tracker.cooldown(provider, model, remaining)
                 loaded += 1
+        logger.info('hydrated %d cooldowns from store', loaded)
         return loaded
 
     def clear(self, provider: str, model: str) -> None:

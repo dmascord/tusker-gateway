@@ -1,5 +1,6 @@
 """Application factory: assemble aiohttp app from modules."""
 
+import logging
 import os
 
 import aiohttp
@@ -34,6 +35,15 @@ from tusker_gateway.tracing import Tracer, load_tracer_config_from_env
 
 def create_app() -> web.Application:
     """Build and return the aiohttp Application."""
+    # Configure structured logging for the gateway.
+    log_level = os.environ.get("TUSKER_LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(
+        level=getattr(logging, log_level, logging.INFO),
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
+    )
+    log = logging.getLogger("tusker_gateway.app")
+
     app = web.Application(client_max_size=10 * 1024 * 1024)
     app["config"] = load_config()
 
@@ -60,11 +70,26 @@ def create_app() -> web.Application:
     tracer_cfg = load_tracer_config_from_env()
     app["tracer"] = Tracer(tracer_cfg)
 
+    # Release 3: semantic cache (optional, default-disabled).
+    try:
+        from tusker_gateway.semantic_cache import SemanticCache, load_semantic_cache_config_from_env
+        sem_cache_cfg = load_semantic_cache_config_from_env()
+        app["semantic_cache"] = SemanticCache(sem_cache_cfg)
+        if sem_cache_cfg.enabled:
+            log.info("semantic cache enabled (similarity=%.2f, model=%s)", sem_cache_cfg.similarity_threshold, sem_cache_cfg.model_name)
+        else:
+            log.info("semantic cache disabled")
+    except ImportError:
+        log.info("semantic cache unavailable (missing deps: chromadb, sentence-transformers)")
+        app["semantic_cache"] = None
+
     async def on_startup(app):
+        startup_log = logging.getLogger("tusker_gateway.startup")
         config = app["config"]
         app["http_session"] = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=120),
         )
+        startup_log.info("HTTP session created")
         # Hydrate persistent cooldowns into the in-memory tracker
         try:
             from pathlib import Path as _P
@@ -72,20 +97,30 @@ def create_app() -> web.Application:
             from tusker_gateway.persistent_cooldown import PersistentCooldownStore
             db_dir = _P(config.get("quality_db_path", "data/quality.db")).parent
             store = PersistentCooldownStore(db_path=db_dir / "cooldowns.db")
-            store.hydrate(global_tracker())
-            store.hydrate_providers(global_tracker())
-            store.purge_expired()
-        except Exception:
-            pass  # best-effort
+            loaded_models = store.hydrate(global_tracker())
+            loaded_providers = store.hydrate_providers(global_tracker())
+            purged = store.purge_expired()
+            startup_log.info("cooldowns hydrated: %d model, %d provider cooldowns loaded, %d expired purged", loaded_models, loaded_providers, purged)
+        except Exception as exc:
+            startup_log.warning("cooldown hydration failed: %s", exc)
         # Start OTLP trace flusher.
         tracer = app.get("tracer")
         if tracer is not None and getattr(tracer, "enabled", False):
             await tracer.start()
+            startup_log.info("OTLP tracer started (endpoint=%s)", tracer._config.endpoint)
+        # Initialize semantic cache embedding model.
+        sem_cache = app.get("semantic_cache")
+        if sem_cache is not None and sem_cache.enabled:
+            await sem_cache.initialize()
+            startup_log.info("semantic cache initialized")
 
     async def on_cleanup(app):
         tracer = app.get("tracer")
         if tracer is not None and getattr(tracer, "enabled", False):
             await tracer.stop()
+        sem_cache = app.get("semantic_cache")
+        if sem_cache is not None and sem_cache.enabled:
+            await sem_cache.close()
         if "http_session" in app:
             await app["http_session"].close()
 

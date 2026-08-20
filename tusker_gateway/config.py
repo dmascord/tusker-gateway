@@ -8,6 +8,10 @@ from typing import Any
 from dataclasses import dataclass
 from typing import Literal
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class ProviderConfig:
@@ -161,6 +165,7 @@ def load_config() -> dict[str, Any]:
     from pathlib import Path as _Path
     default_db = "/home/tusker/.hermes/model_quality.db" if _Path("/home/tusker").exists() else "/tmp/tusker-quality.db"
     config["quality_db_path"] = os.environ.get("QUALITY_DB_PATH", default_db)
+    logger.info('config loaded: %d providers, %d pools, quality_db=%s', len(config.get("providers", {})), len(config.get("pools", {})), config["quality_db_path"])
     return config
 
 

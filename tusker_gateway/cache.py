@@ -37,6 +37,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 def _default_path() -> str:
     """Return the default cache DB path, preferring the persistent HOME volume."""
@@ -118,10 +122,7 @@ class ResponseCache:
             self._ensure_db()
         except (PermissionError, OSError) as exc:
             # Read-only filesystem or similar: silently disable this instance.
-            import logging
-            logging.getLogger(__name__).warning(
-                "cache disabled: cannot create %s: %s", config.path, exc
-            )
+            logger.warning("cache disabled: cannot create %s: %s", config.path, exc)
             self._config.enabled = False
 
     # -- schema ---------------------------------------------------------
@@ -157,6 +158,7 @@ class ResponseCache:
             ).fetchone()
         if row is None:
             self.stats.misses += 1
+            logger.debug('cache miss key=%s', key[:16])
             return None
         body_json, expires_at = row
         if expires_at <= now:
@@ -174,6 +176,7 @@ class ResponseCache:
             )
             conn.commit()
         self.stats.hits += 1
+        logger.debug('cache hit key=%s', key[:16])
         try:
             return json.loads(body_json)
         except json.JSONDecodeError:
@@ -203,6 +206,7 @@ class ResponseCache:
         # Enforce size cap.
         self._enforce_size_cap()
         self.stats.writes += 1
+        logger.debug('cache store key=%s', key[:16])
 
     def invalidate(self, key: str) -> None:
         """Remove a single entry (e.g. on tool-call response)."""
@@ -211,6 +215,7 @@ class ResponseCache:
         with sqlite3.connect(self._config.path) as conn:
             conn.execute("DELETE FROM entries WHERE key = ?", (key,))
             conn.commit()
+        logger.debug('cache invalidate key=%s', key[:16])
 
     def stats_snapshot(self) -> dict[str, int]:
         return self.stats.snapshot()

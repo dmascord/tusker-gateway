@@ -11,6 +11,7 @@ logger = logging.getLogger(__name__)
 
 def health_handler(request: web.Request) -> web.Response:
     """GET /health — liveness probe."""
+    logger.debug('health check')
     return web.json_response({"status": "ok", "version": "0.1.0"})
 
 
@@ -23,11 +24,14 @@ def ready_handler(request: web.Request) -> web.Response:
 
     Returns 200 with pool health summary otherwise.
     """
+    logger.debug('ready check')
     if "config" not in request.app:
+        logger.warning('readiness failed: config not loaded')
         return web.json_response({"status": "error", "reason": "config not loaded"}, status=503)
     cfg = request.app["config"]
     pools = cfg.get("pools", {})
     if not pools:
+        logger.warning('readiness failed: no pools configured')
         return web.json_response({"status": "error", "reason": "no pools configured"}, status=503)
 
     # Validate that every pool has at least one candidate whose provider is known.
@@ -60,6 +64,7 @@ def ready_handler(request: web.Request) -> web.Response:
             empty_pools.append(name)
 
     if empty_pools:
+        logger.warning('readiness failed: pools with no valid candidates: %s', empty_pools)
         return web.json_response(
             {
                 "status": "error",

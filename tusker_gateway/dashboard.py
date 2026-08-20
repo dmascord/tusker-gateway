@@ -117,6 +117,7 @@ async def dashboard_handler(request: web.Request) -> web.Response:
 async def dashboard_meta(request: web.Request) -> web.Response:
     metrics = request.app.get("metrics")
     cache: ResponseCache | None = request.app.get("cache")
+    sem_cache = request.app.get("semantic_cache")
     budget: BudgetTracker | None = request.app.get("budget")
     breaker: CircuitBreaker | None = request.app.get("breaker")
     ratelimit: RateLimiter | None = request.app.get("ratelimit")
@@ -127,13 +128,15 @@ async def dashboard_meta(request: web.Request) -> web.Response:
     if cache is not None:
         s = cache.stats_snapshot()
         parts.append(f"cache: {s['hits']}h/{s['misses']}m")
+    if sem_cache is not None and sem_cache.enabled:
+        s = sem_cache.stats_snapshot()
+        parts.append(f"semantic: {s['hits']}h/{s['misses']}m")
     if breaker is not None:
         s = breaker.stats_snapshot()
         parts.append(f"breaker trips: {s['trips']}")
     if ratelimit is not None:
         s = ratelimit.stats_snapshot()
         parts.append(f"rate: {s['allowed']} ok / {s['blocked']} blocked")
-
     return web.Response(
         status=200,
         text=" · ".join(parts),
@@ -235,6 +238,7 @@ async def dashboard_cooldowns(request: web.Request) -> web.Response:
 
 async def dashboard_quota(request: web.Request) -> web.Response:
     cache: ResponseCache | None = request.app.get("cache")
+    sem_cache = request.app.get("semantic_cache")
     budget: BudgetTracker | None = request.app.get("budget")
     ratelimit: RateLimiter | None = request.app.get("ratelimit")
     out = []
@@ -244,17 +248,11 @@ async def dashboard_quota(request: web.Request) -> web.Response:
             f"<div><span class='meta'>cache</span><div class='num'>{s['hits']}/{s['misses']}</div>"
             f"<span class='meta'>hit/miss · {s['writes']} writes · {s['evictions']} evictions</span></div>"
         )
-    if budget is not None:
-        s = budget.stats_snapshot()
+    if sem_cache is not None and sem_cache.enabled:
+        s = sem_cache.stats_snapshot()
         out.append(
-            f"<div><span class='meta'>budget blocks</span><div class='num'>{s['blocks_daily'] + s['blocks_monthly'] + s['blocks_pool']}</div>"
-            f"<span class='meta'>daily {s['blocks_daily']} · monthly {s['blocks_monthly']} · pool {s['blocks_pool']}</span></div>"
-        )
-    if ratelimit is not None:
-        s = ratelimit.stats_snapshot()
-        out.append(
-            f"<div><span class='meta'>rate limit</span><div class='num'>{s['allowed']}</div>"
-            f"<span class='meta'>allowed · {s['blocked']} blocked</span></div>"
+            f"<div><span class='meta'>semantic cache</span><div class='num'>{s['hits']}/{s['misses']}</div>"
+            f"<span class='meta'>hit/miss · {s['writes']} writes · {s['evictions']} evictions</span></div>"
         )
     if not out:
         return web.Response(

@@ -44,6 +44,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 def _default_path() -> str:
     home = os.environ.get("HOME", "")
@@ -119,10 +123,7 @@ class BudgetTracker:
             Path(config.path).parent.mkdir(parents=True, exist_ok=True)
             self._ensure_db()
         except (PermissionError, OSError) as exc:
-            import logging
-            logging.getLogger(__name__).warning(
-                "budget disabled: cannot create %s: %s", config.path, exc
-            )
+            logger.warning("budget disabled: cannot create %s: %s", config.path, exc)
             self._config.enabled = False
 
     def _ensure_db(self) -> None:
@@ -161,6 +162,7 @@ class BudgetTracker:
             used = self._sum(fp, "daily", now, self.DAILY_WINDOW)
             if used + tokens > self._config.global_daily_tokens:
                 self.stats.blocks_global += 1
+                logger.warning('budget blocked key=%s reason=global daily cap exceeded', fp[:8])
                 return BudgetDecision(
                     allowed=False,
                     reason=f"global daily cap exceeded ({used}/{self._config.global_daily_tokens})",
@@ -176,6 +178,7 @@ class BudgetTracker:
             used = self._sum(fp, "daily", now, self.DAILY_WINDOW)
             if used + tokens > caps.daily_tokens:
                 self.stats.blocks_daily += 1
+                logger.warning('budget blocked key=%s reason=daily cap exceeded', fp[:8])
                 return BudgetDecision(
                     allowed=False,
                     reason=f"daily cap exceeded ({used}/{caps.daily_tokens})",
@@ -188,6 +191,7 @@ class BudgetTracker:
             used = self._sum(fp, "monthly", now, self.MONTHLY_WINDOW)
             if used + tokens > caps.monthly_tokens:
                 self.stats.blocks_monthly += 1
+                logger.warning('budget blocked key=%s reason=monthly cap exceeded', fp[:8])
                 return BudgetDecision(
                     allowed=False,
                     reason=f"monthly cap exceeded ({used}/{caps.monthly_tokens})",
@@ -202,6 +206,7 @@ class BudgetTracker:
             used = self._sum(fp, period_key, now, self.DAILY_WINDOW)
             if used + tokens > cap:
                 self.stats.blocks_pool += 1
+                logger.warning('budget blocked key=%s reason=per-pool cap exceeded', fp[:8])
                 return BudgetDecision(
                     allowed=False,
                     reason=f"per-pool cap exceeded ({used}/{cap}) for pool={pool_name}",
@@ -228,6 +233,7 @@ class BudgetTracker:
                 self._bump(conn, fp, f"pool:{pool_name}", now, self.DAILY_WINDOW, tokens)
             conn.commit()
         self.stats.records += 1
+        logger.debug('budget record key=%s tokens=%d pool=%s', fp[:8], tokens, pool_name)
 
     def refund(self, api_key: str, pool_name: str | None, tokens: int) -> None:
         """Subtract `tokens` (for failed provider calls)."""
@@ -242,6 +248,7 @@ class BudgetTracker:
                 self._bump(conn, fp, f"pool:{pool_name}", now, self.DAILY_WINDOW, -tokens)
             conn.commit()
         self.stats.refunds += 1
+        logger.info('budget refund key=%s tokens=%d', fp[:8], tokens)
 
     def stats_snapshot(self) -> dict[str, int]:
         return self.stats.snapshot()
