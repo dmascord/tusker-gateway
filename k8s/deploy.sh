@@ -15,7 +15,7 @@ set -euo pipefail
 NAMESPACE=hermes
 DEPLOY=tusker-gateway
 REGISTRY=registry.tusker.net.au:5000
-SRC_DIR=/srv/opencode/tusker-ai-gateway
+SRC_DIR=/srv/opencode/tusker-gateway
 TAG=${1:-$(date +%Y%m%d%H%M%S)}
 IMAGE="${REGISTRY}/tusker-gateway:swarm-alpine-${TAG}"
 
