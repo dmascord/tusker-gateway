@@ -1,12 +1,14 @@
-FROM python:3.11-alpine
+FROM python:3.11-slim
 
 LABEL org.opencontainers.image.title="tusker-gateway" \
-      org.opencontainers.image.description="Tusker OpenAI-compatible gateway" \
-      org.opencontainers.image.source="https://github.com/dmascord/tusker-gateway"
+       org.opencontainers.image.description="Tusker OpenAI-compatible gateway" \
+       org.opencontainers.image.source="https://github.com/dmascord/tusker-gateway"
 
 WORKDIR /opt/tusker-gateway
 
-RUN apk add --no-cache build-base libffi-dev openssl-dev
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential libffi-dev libssl-dev curl \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml ./
 COPY tusker_gateway/ ./tusker_gateway/
@@ -26,9 +28,7 @@ ENV HOME=/home/tusker \
 
 USER nobody
 
-EXPOSE 8642
-
 HEALTHCHECK --interval=10s --timeout=3s --start-period=15s --retries=3 \
-    CMD wget -qO- http://127.0.0.1:8642/health || exit 1
+    CMD curl -f http://127.0.0.1:8642/health || exit 1
 
 ENTRYPOINT ["python", "-m", "tusker_gateway"]
