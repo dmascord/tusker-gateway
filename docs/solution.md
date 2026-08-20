@@ -42,6 +42,8 @@ registers:
 - `GET /health`: liveness response.
 - `GET /ready`: readiness response; currently requires at least one credential.
 - `GET /status`: pool and quality status.
+- `GET /metrics`: Prometheus text exposition (Release 1; optional auth via
+  `TUSKER_METRICS_TOKEN`).
 - `GET /v1/models`: exposed model catalog.
 - `POST /v1/chat/completions`: OpenAI chat completion proxy.
 - `POST /v1/responses`: Responses-compatible endpoint.
@@ -170,12 +172,25 @@ than a readiness request side effect.
 1. Keep `auth.json`, API keys, and quality/cooldown databases outside images.
 2. Mount persistent storage for auth and SQLite state in Kubernetes.
 3. Configure a deployment secret or environment for provider keys.
-4. Expose `/health` for liveness and `/ready` for readiness.
+4. Expose `/health` for liveness and `/ready` for readiness. Expose `/metrics`
+   for Prometheus scraping (optionally gated by `TUSKER_METRICS_TOKEN`).
 5. Use `/status` and quality database inspection for routing diagnosis.
 6. Run deterministic tests before deployment and a real provider smoke test
    after rollout.
 7. Treat privacy/ZDR policy as a source-code/configuration invariant and review
    every new provider/model entry.
+
+## Release 1 capabilities (opt-in)
+
+All three modules below default to disabled. Enable per-deployment via env:
+
+- `TUSKER_CACHE_ENABLED=true` + `TUSKER_CACHE_PATH` + `TUSKER_CACHE_TTL_SECS`
+  + `TUSKER_CACHE_MAX_ENTRIES` to turn on the exact-match response cache.
+  Per-request bypass via `X-Tusker-Cache: bypass` header.
+- `TUSKER_BUDGETS_ENABLED=true` + `TUSKER_BUDGETS_JSON` (fingerprint-keyed
+  caps) + optional `TUSKER_GLOBAL_DAILY_TOKENS` for per-key token budgets.
+- `/metrics` is always registered; if `TUSKER_METRICS_TOKEN` is set, callers
+  must send `X-Tusker-Metrics-Token: <token>` to scrape.
 
 ## Extension rules
 

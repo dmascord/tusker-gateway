@@ -1,25 +1,41 @@
 """Application factory: assemble aiohttp app from modules."""
 
-from __future__ import annotations
+import os
 
 import aiohttp
 from aiohttp import web
 
 from tusker_gateway.auth import AuthMiddleware
+from tusker_gateway.budget import BudgetTracker, load_budget_config_from_env
+from tusker_gateway.cache import ResponseCache, load_cache_config_from_env
 from tusker_gateway.config import load_config
 from tusker_gateway.endpoints import (
     chat_completions_handler,
+    metrics_handler,
     models_handler,
     responses_handler,
 )
 from tusker_gateway.errors import GatewayError, openai_error
 from tusker_gateway.health import health_handler, ready_handler, status_handler
+from tusker_gateway.metrics import MetricsRegistry
 
 
 def create_app() -> web.Application:
     """Build and return the aiohttp Application."""
     app = web.Application(client_max_size=10 * 1024 * 1024)
     app["config"] = load_config()
+
+    # Release 1 capabilities: cache, budget, metrics. All default-disabled
+    # via env so existing deployments are unaffected.
+    metrics = MetricsRegistry()
+    metrics.add_meta("version", "0.1.0")
+    app["metrics"] = metrics
+
+    cache_cfg = load_cache_config_from_env()
+    app["cache"] = ResponseCache(cache_cfg)
+
+    budget_cfg = load_budget_config_from_env()
+    app["budget"] = BudgetTracker(budget_cfg)
 
     async def on_startup(app):
         config = app["config"]
@@ -40,10 +56,21 @@ def create_app() -> web.Application:
             pass  # best-effort
 
     auth = AuthMiddleware()
+    metrics_token = os.environ.get("TUSKER_METRICS_TOKEN", "").strip()
 
     @web.middleware
     async def auth_middleware(request, handler):
         if request.path in ("/health", "/ready"):
+            return await handler(request)
+        # /metrics is opt-in authenticated.
+        if request.path == "/metrics":
+            if metrics_token:
+                token = request.headers.get("X-Tusker-Metrics-Token", "").strip()
+                if not _secrets_compare(token, metrics_token):
+                    return web.json_response(
+                        openai_error("metrics token required", code="invalid_api_key", error_type="invalid_request_error"),
+                        status=401,
+                    )
             return await handler(request)
         try:
             await auth.verify(request)
@@ -59,6 +86,7 @@ def create_app() -> web.Application:
     app.router.add_get("/health", health_handler)
     app.router.add_get("/ready", ready_handler)
     app.router.add_get("/status", status_handler)
+    app.router.add_get("/metrics", metrics_handler)
     app.router.add_get("/v1/models", models_handler)
     app.router.add_post("/v1/chat/completions", chat_completions_handler)
     app.router.add_post("/v1/responses", responses_handler)
@@ -70,6 +98,13 @@ def create_app() -> web.Application:
     app.on_cleanup.append(on_cleanup)
     app.on_startup.append(on_startup)
     return app
+
+
+def _secrets_compare(a: str, b: str) -> bool:
+    import secrets
+    if not a or not b:
+        return False
+    return secrets.compare_digest(a, b)
 
 
 def main() -> None:

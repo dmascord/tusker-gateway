@@ -7,7 +7,10 @@ from typing import Any
 
 from aiohttp import web
 
+from tusker_gateway.cache import ResponseCache, make_cache_key
+from tusker_gateway.budget import BudgetTracker
 from tusker_gateway.errors import BadRequestError, openai_error
+from tusker_gateway.metrics import MetricsRegistry
 from tusker_gateway.passthrough import PassthroughClient
 from tusker_gateway.pools import PoolManager
 from tusker_gateway.quality import QualityDB
@@ -18,6 +21,35 @@ from tusker_gateway.sse import sse_done
 def _pool_name(body: dict[str, Any]) -> str | None:
     route = resolve_route(body.get("model"), body)
     return route.pool_name or "code" if route.kind in {"pool", "code"} else None
+
+
+def _resolve_api_key(request: web.Request) -> str:
+    """Return the raw bearer token used by the caller (for budget keying)."""
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        return auth[len("Bearer "):].strip()
+    return ""
+
+
+def _estimated_tokens(messages: list[dict[str, Any]]) -> int:
+    """Rough prompt-token estimate for budget pre-flight.
+
+    We don't have tiktoken in this image, so we use a coarse char-based
+    estimate (1 token ~= 4 chars). The pre-flight is intentionally
+    conservative — over-budgeting a request by a few hundred tokens is
+    fine, under-budgeting causes a 429 after the provider call which is
+    worse.
+    """
+    chars = 0
+    for m in messages:
+        content = m.get("content", "")
+        if isinstance(content, str):
+            chars += len(content)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict):
+                    chars += len(str(part.get("text", "")))
+    return max(1, chars // 4)
 
 
 async def _call_with_pool_fallback(
@@ -90,25 +122,149 @@ async def models_handler(request: web.Request) -> web.Response:
     return web.json_response({"object": "list", "data": data})
 
 
+async def metrics_handler(request: web.Request) -> web.Response:
+    """GET /metrics — Prometheus text exposition."""
+    metrics: MetricsRegistry | None = request.app.get("metrics")
+    if metrics is None:
+        return web.Response(status=404, text="metrics not enabled\n")
+    # Refresh gauges from live state.
+    cache: ResponseCache | None = request.app.get("cache")
+    if cache is not None:
+        s = cache.stats_snapshot()
+        metrics.cache_hits._values[()] = float(s["hits"])  # noqa: SLF001
+        metrics.cache_misses._values[()] = float(s["misses"])
+        metrics.cache_writes._values[()] = float(s["writes"])
+        metrics.cache_evictions._values[()] = float(s["evictions"])
+    budget: BudgetTracker | None = request.app.get("budget")
+    if budget is not None:
+        s = budget.stats_snapshot()
+        for kind, value in (
+            ("daily", s["blocks_daily"]),
+            ("monthly", s["blocks_monthly"]),
+            ("pool", s["blocks_pool"]),
+            ("global_daily", s["blocks_global"]),
+        ):
+            metrics.budget_blocks._values[(kind,)] = float(value)  # noqa: SLF001
+        metrics.budget_records._values[()] = float(s["records"])
+        metrics.budget_refunds._values[()] = float(s["refunds"])
+    body = metrics.render()
+    return web.Response(
+        status=200,
+        body=body,
+        headers={"Content-Type": MetricsRegistry.CONTENT_TYPE},
+    )
+
+
 async def chat_completions_handler(request: web.Request) -> web.Response | web.StreamResponse:
     """POST /v1/chat/completions."""
+    metrics: MetricsRegistry | None = request.app.get("metrics")
+    cache: ResponseCache | None = request.app.get("cache")
+    budget: BudgetTracker | None = request.app.get("budget")
+
+    started = time.monotonic()
+    pool_name = "passthrough"  # overwritten for pool-routed requests
+    provider = "unknown"
+    target_model = "unknown"
+    status = "ok"
+    body: dict[str, Any] | None = None
+    api_key = _resolve_api_key(request)
+
     try:
         body = _validate_chat_body(await request.json())
         config = request.app["config"]
         client = PassthroughClient(config, QualityDB(config["quality_db_path"]), request.app["http_session"])
         tools = body.get("tools") if isinstance(body.get("tools"), list) else None
+        pool_name = _pool_name(body) or "passthrough"
+        bypass_cache = request.headers.get("X-Tusker-Cache", "").strip().lower() == "bypass"
+
+        # Cache lookup (only for non-streaming requests; streaming caching
+        # adds complexity that's better handled in Release 3 by streaming-aware
+        # dedup, not exact-match reuse).
+        cache_key: str | None = None
+        if cache is not None and not body.get("stream", False) and not bypass_cache:
+            cache_key = make_cache_key(
+                pool_name=pool_name,
+                model=body.get("model"),
+                messages=body["messages"],
+                tools=tools,
+                extra_body=body.get("extra_body"),
+            )
+            hit = cache.get(cache_key)
+            if hit is not None:
+                if metrics is not None:
+                    metrics.requests_total.inc(
+                        {"pool": pool_name, "provider": "cache", "model": str(body.get("model") or ""), "status": "cache_hit"}
+                    )
+                    metrics.request_duration.observe(time.monotonic() - started, {"pool": pool_name, "provider": "cache", "model": str(body.get("model") or "")})
+                return web.json_response(hit)
+
+        # Budget pre-flight
+        if budget is not None and api_key:
+            est = _estimated_tokens(body["messages"])
+            decision = budget.check(api_key, pool_name, est)
+            if not decision.allowed:
+                status = "budget_blocked"
+                if metrics is not None:
+                    metrics.budget_blocks.inc({"kind": decision.cap_name or "unknown"})
+                    metrics.requests_total.inc({"pool": pool_name, "provider": provider, "model": target_model, "status": status})
+                headers = {"X-Tusker-Budget-Reason": decision.reason or "budget exceeded"}
+                return web.json_response(
+                    openai_error(decision.reason or "budget exceeded", code="budget_exceeded", error_type="rate_limit_error"),
+                    status=429,
+                    headers=headers,
+                )
+
         provider, target_model, result = await _call_with_pool_fallback(config, body, client, tools)
+
+        # Record budget on success
+        if budget is not None and api_key and isinstance(result, dict):
+            usage = result.get("usage") or {}
+            used = int(usage.get("total_tokens") or _estimated_tokens(body["messages"]))
+            budget.record(api_key, pool_name, used)
+
+        # Cache write (non-streaming, JSON responses only).
+        if (
+            cache is not None
+            and not bypass_cache
+            and not body.get("stream", False)
+            and isinstance(result, dict)
+            and cache_key is not None
+        ):
+            cache.put(cache_key, result)
+
         if body.get("stream", False):
             resp = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive"})
             await resp.prepare(request)
             async for chunk in result:
                 await resp.write(chunk)
             await resp.write(sse_done())
+            if metrics is not None:
+                metrics.requests_total.inc({"pool": pool_name, "provider": provider, "model": target_model, "status": status})
+                metrics.request_duration.observe(time.monotonic() - started, {"pool": pool_name, "provider": provider, "model": target_model})
             return resp
+        if metrics is not None:
+            metrics.requests_total.inc({"pool": pool_name, "provider": provider, "model": target_model, "status": status})
+            metrics.request_duration.observe(time.monotonic() - started, {"pool": pool_name, "provider": provider, "model": target_model})
+            usage = (result or {}).get("usage") or {} if isinstance(result, dict) else {}
+            for direction, key in (("prompt", "prompt_tokens"), ("completion", "completion_tokens")):
+                n = int(usage.get(key) or 0)
+                if n:
+                    metrics.tokens_total.inc({"pool": pool_name, "provider": provider, "model": target_model, "direction": direction}, n)
         return web.json_response(result)
     except BadRequestError as exc:
+        status = exc.code or "bad_request"
+        if metrics is not None:
+            metrics.requests_total.inc({"pool": pool_name, "provider": provider, "model": target_model, "status": status})
+            metrics.request_duration.observe(time.monotonic() - started, {"pool": pool_name, "provider": provider, "model": target_model})
         return web.json_response(openai_error(exc.message, code=exc.code, error_type=exc.error_type), status=exc.status)
     except Exception as exc:
+        status = "provider_error"
+        if metrics is not None:
+            metrics.requests_total.inc({"pool": pool_name, "provider": provider, "model": target_model, "status": status})
+            metrics.request_duration.observe(time.monotonic() - started, {"pool": pool_name, "provider": provider, "model": target_model})
+        # Refund budget on provider failure so flaky providers don't burn caps.
+        if budget is not None and api_key and body is not None:
+            budget.refund(api_key, pool_name, _estimated_tokens(body["messages"]))
         return web.json_response(openai_error(str(exc), code="provider_error", error_type="provider_error"), status=502)
 
 

@@ -33,27 +33,27 @@ The columns are ordered roughly from "specialized" (Tusker) to "broad"
 | **Auth & credentials** |
 | OAuth device-code flow | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | Token exchange & refresh | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| Multi-credential rotation | ✅ | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ❌ | ⚠️ | ⚠️ |
+| Multi-credential rotation | ✅ | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ❌ | �️ | ✅ |
 | Hermes auth.json interop | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | **Reliability** |
 | Persistent cooldowns | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | Circuit breaker | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Quality DB routing | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ |
 | **Observability** |
-| Prometheus metrics | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Prometheus metrics | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | OpenTelemetry traces | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Dashboard UI | ❌ | ✅ | ✅ | ✅ | ⚠️ | ✅ | ❌ | ✅ |
 | **Caching** |
-| Exact-match cache | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ⚠️ | ✅ |
-| Semantic cache | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ |
+| Exact-match cache | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ⚠️ | ✅ |
+| Semantic cache | � | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ |
 | **Governance** |
 | Per-key rate limits | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Cost budgets | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ⚠️ | ✅ |
+| Cost budgets | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ⚠️ | ✅ |
 | Guardrails/PII | ❌ | ✅ | ✅ | ✅ | ✅ | ⚠️ | ✅ | ✅ |
 | **Agentic** |
 | MCP proxy | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| A2A gateway | ❌ | ❌ | ⚠️ | ⚠️ | ⚠️ | ❌ | ⚠️ | ❌ |
-| Tool routing | ❌ | ⚠️ | ✅ | ⚠️ | ✅ | ❌ | ✅ | ✅ |
+| A2A gateway | ❌ | ❌ | ⚠️ | ⚠️ | ✅ | ❌ | ⚠️ | ❌ |
+| Tool routing | ❌ | �️ | ✅ | ⚠️ | ✅ | ❌ | ✅ | ✅ |
 
 ## Where Tusker leads
 
@@ -94,15 +94,20 @@ The matrix exposes real gaps:
 The plan is grouped into four releases. Each release is small enough to ship
 behind a feature flag and roll back safely.
 
-### Release 1 — Caching & cost basics (target: 2-3 weeks)
+### Release 1 — Caching & cost basics ✅ (shipped 2026-08-20)
 - **Exact-match cache** (`/v1/chat/completions`) backed by SQLite.
-  - Key: SHA-256 of model + messages + extra_body.
-  - TTL: configurable (default 5 min).
+  - Key: SHA-256 of `pool_name | model | canonical(messages) | canonical(tools) | extra_body_hash`.
+  - TTL: configurable via `TUSKER_CACHE_TTL_SECS` (default 300s).
   - Bypass header: `X-Tusker-Cache: bypass`.
-- **Cost/budget tracking** — `BudgetStore` with daily/weekly caps per virtual
-  API key. Return `429` with `X-Tusker-Budget-Reason` when exceeded.
-- **Prometheus `/metrics`** — counters for requests, tokens, latency;
-  gauges for pool size, cooldown count.
+  - LRU size cap via `TUSKER_CACHE_MAX_ENTRIES` (default 10000).
+  - Lazy eviction on read.
+- **Cost/budget tracking** — `BudgetTracker` with daily + monthly + per-pool caps per
+  virtual API key. Returns `429` with `X-Tusker-Budget-Reason` when exceeded.
+  Refunds on provider failure so flaky providers don't burn caps.
+  Configured via `TUSKER_BUDGETS_JSON` (fingerprint-keyed).
+- **Prometheus `/metrics`** — counters for requests/tokens/cache/budget,
+  histogram for latency, gauges for pool candidates and active cooldowns.
+  Optional `TUSKER_METRICS_TOKEN` for auth on the endpoint.
 
 ### Release 2 — Observability & governance (target: 3-4 weeks)
 - **OpenTelemetry traces** — span for inbound request → auth → pool select →
