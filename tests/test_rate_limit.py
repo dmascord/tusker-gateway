@@ -141,6 +141,37 @@ def test_load_config_with_default_only():
     assert cfg.default_policy.burst == 10
 
 
+def test_load_config_default_in_json():
+    """Regression: 'default' key inside TUSKER_RATELIMIT_JSON must populate
+    default_policy (not be silently dropped by an outer scope reassignment)."""
+    import json
+    raw = json.dumps({
+        "default": {"rate_per_sec": 2, "burst": 3},
+        "vip_fp": {"rate_per_sec": 100, "burst": 200},
+    })
+    cfg = load_rate_limit_config_from_env(env={
+        "TUSKER_RATELIMIT_ENABLED": "true",
+        "TUSKER_RATELIMIT_JSON": raw,
+    })
+    assert cfg.default_policy is not None, "default policy should not be None"
+    assert cfg.default_policy.rate_per_sec == 2
+    assert cfg.default_policy.burst == 3
+    assert "vip_fp" in cfg.policies
+
+
+def test_load_config_default_with_both_json_and_env():
+    """Env-var default overrides JSON 'default'."""
+    import json
+    raw = json.dumps({"default": {"rate_per_sec": 1, "burst": 1}})
+    cfg = load_rate_limit_config_from_env(env={
+        "TUSKER_RATELIMIT_JSON": raw,
+        "TUSKER_RATELIMIT_DEFAULT_RATE": "5",
+        "TUSKER_RATELIMIT_DEFAULT_BURST": "50",
+    })
+    assert cfg.default_policy.rate_per_sec == 5
+    assert cfg.default_policy.burst == 50
+
+
 def test_key_fingerprint_deterministic():
     assert _key_fingerprint("k1") == _key_fingerprint("k1")
     assert _key_fingerprint("k1") != _key_fingerprint("k2")

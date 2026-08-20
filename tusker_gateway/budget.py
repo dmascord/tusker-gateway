@@ -45,6 +45,13 @@ from pathlib import Path
 from typing import Any
 
 
+def _default_path() -> str:
+    home = os.environ.get("HOME", "")
+    if home:
+        return os.path.join(home, ".hermes", "budget.db")
+    return "cache/budget.db"
+
+
 @dataclass
 class BudgetCaps:
     """Caps for a single virtual API key."""
@@ -56,7 +63,7 @@ class BudgetCaps:
 @dataclass
 class BudgetConfig:
     enabled: bool = False
-    path: str = "cache/budget.db"
+    path: str = _default_path()
     # Map of api_key_fingerprint -> caps dict
     caps: dict[str, BudgetCaps] = field(default_factory=dict)
     # Optional global cap (applied to all keys regardless of caps table)
@@ -108,8 +115,15 @@ class BudgetTracker:
         self.stats = BudgetStats()
         if not config.enabled:
             return
-        Path(config.path).parent.mkdir(parents=True, exist_ok=True)
-        self._ensure_db()
+        try:
+            Path(config.path).parent.mkdir(parents=True, exist_ok=True)
+            self._ensure_db()
+        except (PermissionError, OSError) as exc:
+            import logging
+            logging.getLogger(__name__).warning(
+                "budget disabled: cannot create %s: %s", config.path, exc
+            )
+            self._config.enabled = False
 
     def _ensure_db(self) -> None:
         with sqlite3.connect(self._config.path) as conn:

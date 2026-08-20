@@ -41,6 +41,13 @@ from pathlib import Path
 from typing import Any
 
 
+def _default_path() -> str:
+    home = os.environ.get("HOME", "")
+    if home:
+        return os.path.join(home, ".hermes", "circuit.db")
+    return "cache/circuit.db"
+
+
 class BreakerState(str, Enum):
     CLOSED = "closed"
     OPEN = "open"
@@ -60,7 +67,7 @@ class BreakerPolicy:
 @dataclass
 class BreakerConfig:
     enabled: bool = False
-    path: str = "cache/circuit.db"
+    path: str = _default_path()
     policy: BreakerPolicy = field(default_factory=BreakerPolicy)
     # Per-provider overrides keyed by provider name; falls back to `policy`.
     overrides: dict[str, BreakerPolicy] = field(default_factory=dict)
@@ -99,8 +106,15 @@ class CircuitBreaker:
         self.stats = BreakerStats()
         if not config.enabled:
             return
-        Path(config.path).parent.mkdir(parents=True, exist_ok=True)
-        self._ensure_db()
+        try:
+            Path(config.path).parent.mkdir(parents=True, exist_ok=True)
+            self._ensure_db()
+        except (PermissionError, OSError) as exc:
+            import logging
+            logging.getLogger(__name__).warning(
+                "circuit breaker disabled: cannot create %s: %s", config.path, exc
+            )
+            self._config.enabled = False
 
     def _ensure_db(self) -> None:
         with sqlite3.connect(self._config.path) as conn:

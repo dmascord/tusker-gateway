@@ -11,11 +11,10 @@ Key composition (all parts canonicalised, then concatenated and SHA-256'd):
     pool_name | model | canonical(messages) | canonical(tools) | extra_body_hash
 
 Storage:
-    SQLite at the configured path (default `cache/cache.db`).
-    Schema is intentionally minimal — a single `entries` table keyed by hash
-    with `expires_at` and a JSON `body` blob. We don't try to be clever with
-    partial responses; the whole assistant message (or the assembled
-    streaming payload) is cached as one record.
+    SQLite at the configured path (default `$HOME/.hermes/cache.db` so the
+    container's persistent volume works without extra config). The directory
+    is created lazily; if creation fails (read-only filesystem), the cache
+    silently disables itself for this process and behaves as a no-op.
 
 Eviction:
     Lazy: `get()` rejects expired rows and deletes them on access.
@@ -31,11 +30,20 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+
+def _default_path() -> str:
+    """Return the default cache DB path, preferring the persistent HOME volume."""
+    home = os.environ.get("HOME", "")
+    if home:
+        return os.path.join(home, ".hermes", "cache.db")
+    return "cache/cache.db"
 
 
 def canonical_json(obj: Any) -> str:
@@ -73,7 +81,7 @@ def make_cache_key(
 @dataclass
 class CacheConfig:
     enabled: bool = False
-    path: str = "cache/cache.db"
+    path: str = _default_path()
     ttl_secs: int = 300
     max_entries: int = 10_000
 
@@ -105,8 +113,16 @@ class ResponseCache:
         self.stats = CacheStats()
         if not config.enabled:
             return
-        Path(config.path).parent.mkdir(parents=True, exist_ok=True)
-        self._ensure_db()
+        try:
+            Path(config.path).parent.mkdir(parents=True, exist_ok=True)
+            self._ensure_db()
+        except (PermissionError, OSError) as exc:
+            # Read-only filesystem or similar: silently disable this instance.
+            import logging
+            logging.getLogger(__name__).warning(
+                "cache disabled: cannot create %s: %s", config.path, exc
+            )
+            self._config.enabled = False
 
     # -- schema ---------------------------------------------------------
 

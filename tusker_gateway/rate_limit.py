@@ -39,6 +39,13 @@ from pathlib import Path
 from typing import Any
 
 
+def _default_path() -> str:
+    home = os.environ.get("HOME", "")
+    if home:
+        return os.path.join(home, ".hermes", "ratelimit.db")
+    return "cache/ratelimit.db"
+
+
 @dataclass
 class RateLimitPolicy:
     rate_per_sec: float = 10.0
@@ -49,7 +56,7 @@ class RateLimitPolicy:
 @dataclass
 class RateLimitConfig:
     enabled: bool = False
-    path: str = "cache/ratelimit.db"
+    path: str = _default_path()
     policies: dict[str, RateLimitPolicy] = field(default_factory=dict)
     # Default policy applied to keys without explicit entries.
     default_policy: RateLimitPolicy | None = None
@@ -89,8 +96,15 @@ class RateLimiter:
         self.stats = RateLimitStats()
         if not config.enabled:
             return
-        Path(config.path).parent.mkdir(parents=True, exist_ok=True)
-        self._ensure_db()
+        try:
+            Path(config.path).parent.mkdir(parents=True, exist_ok=True)
+            self._ensure_db()
+        except (PermissionError, OSError) as exc:
+            import logging
+            logging.getLogger(__name__).warning(
+                "rate limit disabled: cannot create %s: %s", config.path, exc
+            )
+            self._config.enabled = False
 
     def _ensure_db(self) -> None:
         with sqlite3.connect(self._config.path) as conn:
@@ -207,6 +221,7 @@ def load_rate_limit_config_from_env(env: dict[str, str] | None = None) -> RateLi
         "1", "true", "yes", "on"
     )
     policies: dict[str, RateLimitPolicy] = {}
+    default: RateLimitPolicy | None = None
     raw = env.get("TUSKER_RATELIMIT_JSON", "").strip()
     if raw:
         import json
@@ -225,16 +240,13 @@ def load_rate_limit_config_from_env(env: dict[str, str] | None = None) -> RateLi
                         cost_per_request=float(v.get("cost_per_request", 1.0)),
                     )
                     if k == "default":
-                        # applied as default below
                         default = policy
                         continue
                     policies[k] = policy
         except json.JSONDecodeError:
             pass
-    else:
-        default = None
-    # Top-level default (if specified without a JSON block).
-    default = None
+
+    # Top-level default (overrides JSON "default" if both are set).
     if env.get("TUSKER_RATELIMIT_DEFAULT_RATE"):
         default = RateLimitPolicy(
             rate_per_sec=float(env["TUSKER_RATELIMIT_DEFAULT_RATE"]),
