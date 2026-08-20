@@ -39,6 +39,13 @@ spec:
           value: '1'
         - name: API_KEYS
           value: d36fa730d29ed2e8749708ffc7ff7453d5c68a84b9b17360f15bffa9fb0a6a6d,1669ed9f11c615b5cb60fdfa60d23b4373c503de306eaa90039a20790427aef0,4f9736e8bfa246e74ffc11279cf59d2fe4b381cc70159255a9f78e26932bbb1f,e6507e72971c8e015b2958930497e3baaf75607e2dc178ae44f1db671bd49e0d
+        # Semantic cache (Release 3)
+        - name: TUSKER_SEMANTIC_CACHE_ENABLED
+          value: 'true'
+        - name: TUSKER_SEMANTIC_CACHE_THRESHOLD
+          value: '0.85'
+        - name: TUSKER_SEMANTIC_CACHE_TTL
+          value: '3600'
         # Clean pool config — no unknown providers (xiaomi, ollama, etc.)
         - name: TUSKER_POOL_CODE
           value: '{"models":[{"provider":"ollama-cloud","model":"deepseek-v4-flash"},{"provider":"minimax","model":"MiniMax-M3"},{"provider":"synthetic","model":"hf:zai-org/GLM-5.2"},{"provider":"opencode-go","model":"deepseek-v4-flash"},{"provider":"synthetic","model":"syn:large:text"},{"provider":"opencode-go","model":"mimo-v2.5"},{"provider":"opencode-zen","model":"north-mini-code-free"},{"provider":"opencode-go","model":"qwen3.6-plus"},{"provider":"ollama-cloud","model":"minimax-m3"},{"provider":"minimax","model":"MiniMax-2.5"},{"provider":"minimax","model":"MiniMax-2.7"},{"provider":"google","model":"gemini-3.1-flash-lite-preview"},{"provider":"cerebras","model":"gpt-oss-120b"},{"provider":"github-copilot-enterprise","model":"gpt-5.5"},{"provider":"ollama-cloud","model":"mistral-large-3:675b"},{"provider":"openrouter","model":"poolside/laguna-m.1:free"},{"provider":"opencode-go","model":"deepseek-v4-pro"},{"provider":"ollama-cloud","model":"kimi-k2.7-code"},{"provider":"ollama-cloud","model":"deepseek-v4-pro"},{"provider":"ollama-cloud","model":"qwen3.5:397b"},{"provider":"github-copilot-enterprise","model":"gpt-5.4"},{"provider":"ollama-cloud","model":"glm-5.2"},{"provider":"ollama-cloud","model":"gpt-oss:120b"},{"provider":"opencode-zen","model":"big-pickle"},{"provider":"ollama-cloud","model":"ollama/qwen3-coder-next"},{"provider":"github-copilot-enterprise","model":"gpt-5.4-mini"},{"provider":"openrouter","model":"kimi-k2.6:free"},{"provider":"google","model":"gemini-2.5-flash"},{"provider":"openrouter","model":"qwen/qwen3-next-80b-a3b-instruct:free"},{"provider":"openrouter","model":"poolside/laguna-xs-2.1:free"},{"provider":"openrouter","model":"tencent/hy3:free"},{"provider":"openrouter","model":"openai/gpt-oss-20b:free"}],"context_window":128000}'
