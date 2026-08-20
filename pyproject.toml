@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+[project]
+name = "tusker-gateway"
+version = "0.1.0"
+description = "Lightweight OpenAI-compatible API gateway with model pools, quality scoring, and provider rotation."
+requires-python = ">=3.11"
+dependencies = [
+    "aiohttp>=3.9,<4",
+]
+[project.scripts]
+tusker-gateway = "tusker_gateway.__main__:main"
+tusker-gateway-auth = "tusker_gateway.cli:main"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"

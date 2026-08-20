@@ -1,0 +1,77 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tusker-gateway
+  namespace: hermes
+  labels:
+    app: tusker-gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tusker-gateway
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: tusker-gateway
+    spec:
+      containers:
+      - name: tusker-gateway
+        image: registry.tusker.net.au:5000/tusker-gateway:swarm-alpine-20260820
+        imagePullPolicy: Always
+        envFrom:
+        - secretRef:
+            name: hermes-env-vault
+        env:
+        - name: MODEL_NAME
+          value: tusker-gateway
+        - name: HOME
+          value: /home/tusker
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: PYTHONDONTWRITEBYTECODE
+          value: "1"
+        ports:
+        - containerPort: 8642
+          name: http
+          protocol: TCP
+        volumeMounts:
+        - mountPath: /home/tusker/.hermes
+          name: tusker-home
+        - mountPath: /home/tusker/.claude
+          name: tusker-home
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 8642
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 60
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8642
+          periodSeconds: 5
+          timeoutSeconds: 2
+          failureThreshold: 3
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8642
+          periodSeconds: 30
+          timeoutSeconds: 3
+          failureThreshold: 3
+        lifecycle:
+          preStop:
+            exec:
+              command: ["sleep", "5"]
+      volumes:
+      - name: tusker-home
+        persistentVolumeClaim:
+          claimName: tusker-home
+      terminationGracePeriodSeconds: 60

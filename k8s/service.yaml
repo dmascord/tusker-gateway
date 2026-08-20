@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: tusker-gateway
+  namespace: hermes
+  labels:
+    app: tusker-gateway
+spec:
+  type: ClusterIP
+  ports:
+  - port: 8642
+    targetPort: 8642
+    protocol: TCP
+    name: http
+  selector:
+    app: tusker-gateway
