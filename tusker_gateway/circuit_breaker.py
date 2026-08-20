@@ -396,7 +396,7 @@ def load_circuit_config_from_env(env: dict[str, str] | None = None) -> BreakerCo
     )
     return BreakerConfig(
         enabled=enabled,
-        path=env.get("TUSKER_CIRCUIT_PATH", "cache/circuit.db"),
+        path=env.get("TUSKER_CIRCUIT_PATH") or _default_path(),
         policy=BreakerPolicy(
             consecutive_failures=int(env.get("TUSKER_CIRCUIT_CONSECUTIVE", "5")),
             window_size=int(env.get("TUSKER_CIRCUIT_WINDOW", "20")),

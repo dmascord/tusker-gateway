@@ -254,7 +254,7 @@ def load_rate_limit_config_from_env(env: dict[str, str] | None = None) -> RateLi
         )
     return RateLimitConfig(
         enabled=enabled,
-        path=env.get("TUSKER_RATELIMIT_PATH", "cache/ratelimit.db"),
+        path=env.get("TUSKER_RATELIMIT_PATH") or _default_path(),
         policies=policies,
         default_policy=default,
     )

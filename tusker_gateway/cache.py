@@ -247,7 +247,7 @@ def load_cache_config_from_env(env: dict[str, str] | None = None) -> CacheConfig
     enabled = enabled_raw in ("1", "true", "yes", "on")
     return CacheConfig(
         enabled=enabled,
-        path=env.get("TUSKER_CACHE_PATH", "cache/cache.db"),
+        path=env.get("TUSKER_CACHE_PATH") or _default_path(),
         ttl_secs=int(env.get("TUSKER_CACHE_TTL_SECS", "300")),
         max_entries=int(env.get("TUSKER_CACHE_MAX_ENTRIES", "10000")),
     )

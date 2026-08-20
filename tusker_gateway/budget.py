@@ -335,7 +335,7 @@ def load_budget_config_from_env(env: dict[str, str] | None = None) -> BudgetConf
             pass
     return BudgetConfig(
         enabled=enabled,
-        path=env.get("TUSKER_BUDGETS_PATH", "cache/budget.db"),
+        path=env.get("TUSKER_BUDGETS_PATH") or _default_path(),
         caps=caps,
         global_daily_tokens=int(env["TUSKER_GLOBAL_DAILY_TOKENS"]) if env.get("TUSKER_GLOBAL_DAILY_TOKENS") else None,
     )
