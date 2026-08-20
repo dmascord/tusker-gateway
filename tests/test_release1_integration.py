@@ -89,6 +89,7 @@ async def test_metrics_requires_token_when_configured(client):
     app = cl.server.app
     # Set the token on the live app via the closure used by create_app.
     # Simpler: re-instantiate with token set.
+    prev = os.environ.get("TUSKER_METRICS_TOKEN")
     os.environ["TUSKER_METRICS_TOKEN"] = "secret-token"
     # Re-create app to pick up the env var.
     new_app = create_app()
@@ -108,3 +109,7 @@ async def test_metrics_requires_token_when_configured(client):
         assert resp.status == 200
     finally:
         await new_client.close()
+        if prev is None:
+            os.environ.pop("TUSKER_METRICS_TOKEN", None)
+        else:
+            os.environ["TUSKER_METRICS_TOKEN"] = prev

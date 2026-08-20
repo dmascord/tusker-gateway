@@ -27,33 +27,33 @@ The columns are ordered roughly from "specialized" (Tusker) to "broad"
 | Responses API | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ⚠️ | ✅ |
 | **Routing** |
 | Pool/role aliasing | ✅ | ✅ | ✅ | ✅ | ✅ | ⚠️ | ✅ | ✅ |
-| Session stickiness | ✅ | ✅ | ✅ | ✅ | ⚠️ | ❌ | ⚠️ | ✅ |
+| Session stickiness | ✅ | ✅ | ✅ | ✅ | ⚠️ | � | ⚠️ | ✅ |
 | Quality-aware select | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ⚠️ | ✅ |
 | Weighted/load-balance | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | **Auth & credentials** |
-| OAuth device-code flow | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| Token exchange & refresh | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| Multi-credential rotation | ✅ | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ❌ | �️ | ✅ |
-| Hermes auth.json interop | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| OAuth device-code flow | ✅ | ❌ | ❌ | ❌ | ❌ | � | ❌ | ❌ |
+| Token exchange & refresh | ✅ | ❌ | � | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Multi-credential rotation | ✅ | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ❌ | ⚠️ | ✅ |
+| Hermes auth.json interop | ✅ | � | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | **Reliability** |
 | Persistent cooldowns | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| Circuit breaker | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Circuit breaker | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Quality DB routing | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ |
 | **Observability** |
 | Prometheus metrics | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| OpenTelemetry traces | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Dashboard UI | ❌ | ✅ | ✅ | ✅ | ⚠️ | ✅ | ❌ | ✅ |
+| OpenTelemetry traces | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Dashboard UI | ✅ | ✅ | ✅ | ✅ | ⚠️ | ✅ | ❌ | ✅ |
 | **Caching** |
 | Exact-match cache | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ⚠️ | ✅ |
-| Semantic cache | � | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ |
+| Semantic cache | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ |
 | **Governance** |
-| Per-key rate limits | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Per-key rate limits | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Cost budgets | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ⚠️ | ✅ |
 | Guardrails/PII | ❌ | ✅ | ✅ | ✅ | ✅ | ⚠️ | ✅ | ✅ |
 | **Agentic** |
 | MCP proxy | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | A2A gateway | ❌ | ❌ | ⚠️ | ⚠️ | ✅ | ❌ | ⚠️ | ❌ |
-| Tool routing | ❌ | �️ | ✅ | ⚠️ | ✅ | ❌ | ✅ | ✅ |
+| Tool routing | ❌ | ⚠️ | ✅ | ⚠️ | ✅ | ❌ | ✅ | ✅ |
 
 ## Where Tusker leads
 
@@ -109,13 +109,23 @@ behind a feature flag and roll back safely.
   histogram for latency, gauges for pool candidates and active cooldowns.
   Optional `TUSKER_METRICS_TOKEN` for auth on the endpoint.
 
-### Release 2 — Observability & governance (target: 3-4 weeks)
-- **OpenTelemetry traces** — span for inbound request → auth → pool select →
-  provider call; export via OTLP.
-- **Circuit breaker** — per-provider rolling window of failures; trip after N
-  consecutive or M-of-N failures; half-open probe after cooldown.
-- **Per-key rate limits** — token bucket per virtual key, with refill rate.
-- **Status dashboard** — minimal `React` or `htmx` page consuming `/status`.
+### Release 2 — Observability & governance ✅ (shipped 2026-08-20)
+- **OpenTelemetry traces** — span for inbound request; export via OTLP/HTTP-JSON
+  to any collector (Tempo, Jaeger, Honeycomb, OTLP receiver). No external deps;
+  we hand-rolled the protobuf-free JSON exporter. Background flush task
+  batches spans (default 100/batch every 5s). Set `TUSKER_OTLP_ENDPOINT` to enable.
+- **Circuit breaker** — per-(provider, model) breaker with CLOSED/OPEN/HALF_OPEN
+  state machine. Trips on consecutive failures OR rolling-window failure ratio
+  (default 5 consecutive, 50% over 20 calls, 60s cooldown). One probe at a time
+  in HALF_OPEN. SQLite-backed state survives restarts. Per-provider overrides.
+- **Per-key rate limits** — token bucket per virtual API key, configurable
+  rate/burst/cost via `TUSKER_RATELIMIT_JSON`. Optional `default` policy for
+  unknown keys. SQLite-backed bucket state. Returns 429 with `Retry-After`
+  and `X-Tusker-RateLimit-Reason` headers.
+- **Status dashboard** — server-rendered HTML using HTMX for partial
+  refreshes. Routes: `/dashboard`, `/dashboard/partials/{pools,breakers,
+  cooldowns,quota,quality,meta}`. Auto-refresh every 5s. Auth: same
+  `TUSKER_METRICS_TOKEN` as `/metrics`.
 
 ### Release 3 — Semantic caching & intelligence (target: 4-6 weeks)
 - **Semantic cache** — embed incoming prompt (local `sentence-transformers`

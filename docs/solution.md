@@ -44,6 +44,8 @@ registers:
 - `GET /status`: pool and quality status.
 - `GET /metrics`: Prometheus text exposition (Release 1; optional auth via
   `TUSKER_METRICS_TOKEN`).
+- `GET /dashboard` + `/dashboard/partials/*`: server-rendered status dashboard
+  with HTMX auto-refresh (Release 2).
 - `GET /v1/models`: exposed model catalog.
 - `POST /v1/chat/completions`: OpenAI chat completion proxy.
 - `POST /v1/responses`: Responses-compatible endpoint.
@@ -191,6 +193,17 @@ All three modules below default to disabled. Enable per-deployment via env:
   caps) + optional `TUSKER_GLOBAL_DAILY_TOKENS` for per-key token budgets.
 - `/metrics` is always registered; if `TUSKER_METRICS_TOKEN` is set, callers
   must send `X-Tusker-Metrics-Token: <token>` to scrape.
+
+## Release 2 capabilities (opt-in)
+
+- `TUSKER_CIRCUIT_ENABLED=true` to enable per-(provider, model) circuit
+  breakers. Knobs: `TUSKER_CIRCUIT_{CONSECUTIVE,WINDOW,RATIO,COOLDOWN}`.
+- `TUSKER_RATELIMIT_ENABLED=true` + `TUSKER_RATELIMIT_JSON` (fingerprint-keyed
+  policies, plus optional `default` key) for per-key token-bucket rate limits.
+- `TUSKER_OTLP_ENDPOINT=http://collector:4318` to enable OTLP/HTTP-JSON
+  tracing export. Optional `TUSKER_OTLP_HEADERS` (JSON dict) for auth headers.
+- `/dashboard` is always registered; auth via `TUSKER_METRICS_TOKEN` (same
+  as `/metrics`).
 
 ## Extension rules
 

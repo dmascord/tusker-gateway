@@ -9,13 +9,16 @@ from aiohttp import web
 
 from tusker_gateway.cache import ResponseCache, make_cache_key
 from tusker_gateway.budget import BudgetTracker
+from tusker_gateway.circuit_breaker import CircuitBreaker, BreakerDecision
 from tusker_gateway.errors import BadRequestError, openai_error
 from tusker_gateway.metrics import MetricsRegistry
 from tusker_gateway.passthrough import PassthroughClient
 from tusker_gateway.pools import PoolManager
 from tusker_gateway.quality import QualityDB
+from tusker_gateway.rate_limit import RateLimiter
 from tusker_gateway.routing import resolve_route
 from tusker_gateway.sse import sse_done
+from tusker_gateway.tracing import Tracer
 
 
 def _pool_name(body: dict[str, Any]) -> str | None:
@@ -57,12 +60,32 @@ async def _call_with_pool_fallback(
     body: dict[str, Any],
     client: PassthroughClient,
     tools: list[dict[str, Any]] | None = None,
+    breaker: CircuitBreaker | None = None,
 ) -> tuple[str, str, Any]:
-    """Call a pool candidate, trying the next candidate after provider failure."""
+    """Call a pool candidate, trying the next candidate after provider failure.
+
+    If `breaker` is set, candidates whose breaker is OPEN are skipped before
+    the call is attempted. Successful calls record success; failures (other
+    than 429 rate-limit, which uses the cooldown path) record failure.
+    """
     pool_name = _pool_name(body)
     if pool_name is None:
         provider, model = _route_target(config, body)
-        return provider, model, await client.chat(provider, model, body["messages"], stream=bool(body.get("stream")), tools=tools)
+        decision = breaker.check(provider, model) if breaker else BreakerDecision(allowed=True, state=None)
+        if not decision.allowed:
+            raise BadRequestError(
+                f"circuit open for {provider}/{model}: {decision.reason}",
+                code="circuit_open",
+            )
+        try:
+            result = await client.chat(provider, model, body["messages"], stream=bool(body.get("stream")), tools=tools)
+            if breaker is not None:
+                breaker.record_success(provider, model)
+            return provider, model, result
+        except Exception:
+            if breaker is not None:
+                breaker.record_failure(provider, model)
+            raise
 
     excluded: set[tuple[str, str]] = set()
     last_error: Exception | None = None
@@ -70,7 +93,16 @@ async def _call_with_pool_fallback(
     # state is consistent within a single request.
     pool_mgr = PoolManager(config)
     while True:
+        # Pool select() already filters out cooldown-blocked candidates;
+        # additionally filter out breaker-open candidates here.
         selected = pool_mgr.select(pool_name, excluded=excluded)
+        if breaker is not None and selected is not None:
+            while selected is not None:
+                decision = breaker.check(selected[0], selected[1])
+                if decision.allowed:
+                    break
+                excluded.add(selected)
+                selected = pool_mgr.select(pool_name, excluded=excluded)
         if not selected:
             if last_error is not None:
                 raise last_error
@@ -78,8 +110,12 @@ async def _call_with_pool_fallback(
         provider, model = selected
         try:
             result = await client.chat(provider, model, body["messages"], stream=bool(body.get("stream")), tools=tools)
+            if breaker is not None:
+                breaker.record_success(provider, model)
             return provider, model, result
         except Exception as exc:
+            if breaker is not None:
+                breaker.record_failure(provider, model)
             last_error = exc
             excluded.add(selected)
 
@@ -147,6 +183,18 @@ async def metrics_handler(request: web.Request) -> web.Response:
             metrics.budget_blocks._values[(kind,)] = float(value)  # noqa: SLF001
         metrics.budget_records._values[()] = float(s["records"])
         metrics.budget_refunds._values[()] = float(s["refunds"])
+    breaker: CircuitBreaker | None = request.app.get("breaker")
+    if breaker is not None:
+        s = breaker.stats_snapshot()
+        # Surface breaker stats via existing budget_blocks counter family so
+        # we don't grow the metric catalogue. Reuse 'breaker' kind label.
+        for kind in ("trips", "short_circuits", "half_open_probes", "half_open_successes", "half_open_failures"):
+            metrics.budget_blocks._values[(f"breaker_{kind}",)] = float(s[kind])  # noqa: SLF001
+    ratelimit: RateLimiter | None = request.app.get("ratelimit")
+    if ratelimit is not None:
+        s = ratelimit.stats_snapshot()
+        metrics.budget_blocks._values[("ratelimit_allowed",)] = float(s["allowed"])  # noqa: SLF001
+        metrics.budget_blocks._values[("ratelimit_blocked",)] = float(s["blocked"])  # noqa: SLF001
     body = metrics.render()
     return web.Response(
         status=200,
@@ -160,6 +208,9 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
     metrics: MetricsRegistry | None = request.app.get("metrics")
     cache: ResponseCache | None = request.app.get("cache")
     budget: BudgetTracker | None = request.app.get("budget")
+    breaker: CircuitBreaker | None = request.app.get("breaker")
+    ratelimit: RateLimiter | None = request.app.get("ratelimit")
+    tracer: Tracer | None = request.app.get("tracer")
 
     started = time.monotonic()
     pool_name = "passthrough"  # overwritten for pool-routed requests
@@ -169,103 +220,133 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
     body: dict[str, Any] | None = None
     api_key = _resolve_api_key(request)
 
-    try:
-        body = _validate_chat_body(await request.json())
-        config = request.app["config"]
-        client = PassthroughClient(config, QualityDB(config["quality_db_path"]), request.app["http_session"])
-        tools = body.get("tools") if isinstance(body.get("tools"), list) else None
-        pool_name = _pool_name(body) or "passthrough"
-        bypass_cache = request.headers.get("X-Tusker-Cache", "").strip().lower() == "bypass"
+    def _emit(status_label: str, provider_label: str | None = None,
+              model_label: str | None = None) -> None:
+        if metrics is None:
+            return
+        pl = provider_label if provider_label is not None else provider
+        ml = model_label if model_label is not None else target_model
+        metrics.requests_total.inc({"pool": pool_name, "provider": pl, "model": ml, "status": status_label})
+        metrics.request_duration.observe(time.monotonic() - started, {"pool": pool_name, "provider": pl, "model": ml})
 
-        # Cache lookup (only for non-streaming requests; streaming caching
-        # adds complexity that's better handled in Release 3 by streaming-aware
-        # dedup, not exact-match reuse).
-        cache_key: str | None = None
-        if cache is not None and not body.get("stream", False) and not bypass_cache:
-            cache_key = make_cache_key(
-                pool_name=pool_name,
-                model=body.get("model"),
-                messages=body["messages"],
-                tools=tools,
-                extra_body=body.get("extra_body"),
-            )
-            hit = cache.get(cache_key)
-            if hit is not None:
-                if metrics is not None:
-                    metrics.requests_total.inc(
-                        {"pool": pool_name, "provider": "cache", "model": str(body.get("model") or ""), "status": "cache_hit"}
+    # Top-level span (synchronous context).
+    span_cm = (
+        tracer.span("chat_completion", attributes={
+            "http.method": request.method,
+            "http.path": "/v1/chat/completions",
+            "tusker.api_key_fingerprint": _resolve_api_key(request)[:16],
+        })
+        if tracer is not None and tracer.enabled
+        else _noop_cm()
+    )
+
+    with span_cm as root_span:
+        try:
+            body = _validate_chat_body(await request.json())
+            if tracer is not None and tracer.enabled and root_span is not None:
+                root_span.attributes["tusker.model"] = str(body.get("model") or "")
+            config = request.app["config"]
+            client = PassthroughClient(config, QualityDB(config["quality_db_path"]), request.app["http_session"])
+            tools = body.get("tools") if isinstance(body.get("tools"), list) else None
+            pool_name = _pool_name(body) or "passthrough"
+            bypass_cache = request.headers.get("X-Tusker-Cache", "").strip().lower() == "bypass"
+
+            # Rate-limit pre-flight (cheapest check, runs first).
+            if ratelimit is not None and api_key:
+                rl = ratelimit.check(api_key)
+                if not rl.allowed:
+                    status = "ratelimit_blocked"
+                    if metrics is not None:
+                        metrics.budget_blocks.inc({"kind": "ratelimit_blocked"})
+                    _emit(status)
+                    headers = {
+                        "Retry-After": str(int(rl.retry_after) + 1),
+                        "X-Tusker-RateLimit-Reason": rl.reason or "rate limit exceeded",
+                    }
+                    return web.json_response(
+                        openai_error(rl.reason or "rate limit exceeded", code="rate_limit_error", error_type="rate_limit_error"),
+                        status=429,
+                        headers=headers,
                     )
-                    metrics.request_duration.observe(time.monotonic() - started, {"pool": pool_name, "provider": "cache", "model": str(body.get("model") or "")})
-                return web.json_response(hit)
 
-        # Budget pre-flight
-        if budget is not None and api_key:
-            est = _estimated_tokens(body["messages"])
-            decision = budget.check(api_key, pool_name, est)
-            if not decision.allowed:
-                status = "budget_blocked"
-                if metrics is not None:
-                    metrics.budget_blocks.inc({"kind": decision.cap_name or "unknown"})
-                    metrics.requests_total.inc({"pool": pool_name, "provider": provider, "model": target_model, "status": status})
-                headers = {"X-Tusker-Budget-Reason": decision.reason or "budget exceeded"}
-                return web.json_response(
-                    openai_error(decision.reason or "budget exceeded", code="budget_exceeded", error_type="rate_limit_error"),
-                    status=429,
-                    headers=headers,
+            # Cache lookup
+            cache_key: str | None = None
+            if cache is not None and not body.get("stream", False) and not bypass_cache:
+                cache_key = make_cache_key(
+                    pool_name=pool_name,
+                    model=body.get("model"),
+                    messages=body["messages"],
+                    tools=tools,
+                    extra_body=body.get("extra_body"),
                 )
+                hit = cache.get(cache_key)
+                if hit is not None:
+                    if metrics is not None:
+                        metrics.requests_total.inc(
+                            {"pool": pool_name, "provider": "cache", "model": str(body.get("model") or ""), "status": "cache_hit"}
+                        )
+                        metrics.request_duration.observe(time.monotonic() - started, {"pool": pool_name, "provider": "cache", "model": str(body.get("model") or "")})
+                    return web.json_response(hit)
 
-        provider, target_model, result = await _call_with_pool_fallback(config, body, client, tools)
+            # Budget pre-flight
+            if budget is not None and api_key:
+                est = _estimated_tokens(body["messages"])
+                decision = budget.check(api_key, pool_name, est)
+                if not decision.allowed:
+                    status = "budget_blocked"
+                    if metrics is not None:
+                        metrics.budget_blocks.inc({"kind": decision.cap_name or "unknown"})
+                    _emit(status)
+                    headers = {"X-Tusker-Budget-Reason": decision.reason or "budget exceeded"}
+                    return web.json_response(
+                        openai_error(decision.reason or "budget exceeded", code="budget_exceeded", error_type="rate_limit_error"),
+                        status=429,
+                        headers=headers,
+                    )
 
-        # Record budget on success
-        if budget is not None and api_key and isinstance(result, dict):
-            usage = result.get("usage") or {}
-            used = int(usage.get("total_tokens") or _estimated_tokens(body["messages"]))
-            budget.record(api_key, pool_name, used)
+            provider, target_model, result = await _call_with_pool_fallback(config, body, client, tools, breaker=breaker)
 
-        # Cache write (non-streaming, JSON responses only).
-        if (
-            cache is not None
-            and not bypass_cache
-            and not body.get("stream", False)
-            and isinstance(result, dict)
-            and cache_key is not None
-        ):
-            cache.put(cache_key, result)
+            if budget is not None and api_key and isinstance(result, dict):
+                usage = result.get("usage") or {}
+                used = int(usage.get("total_tokens") or _estimated_tokens(body["messages"]))
+                budget.record(api_key, pool_name, used)
 
-        if body.get("stream", False):
-            resp = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive"})
-            await resp.prepare(request)
-            async for chunk in result:
-                await resp.write(chunk)
-            await resp.write(sse_done())
+            if (
+                cache is not None
+                and not bypass_cache
+                and not body.get("stream", False)
+                and isinstance(result, dict)
+                and cache_key is not None
+            ):
+                cache.put(cache_key, result)
+
+            if body.get("stream", False):
+                resp = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive"})
+                await resp.prepare(request)
+                async for chunk in result:
+                    await resp.write(chunk)
+                await resp.write(sse_done())
+                _emit(status)
+                return resp
+
+            _emit(status)
             if metrics is not None:
-                metrics.requests_total.inc({"pool": pool_name, "provider": provider, "model": target_model, "status": status})
-                metrics.request_duration.observe(time.monotonic() - started, {"pool": pool_name, "provider": provider, "model": target_model})
-            return resp
-        if metrics is not None:
-            metrics.requests_total.inc({"pool": pool_name, "provider": provider, "model": target_model, "status": status})
-            metrics.request_duration.observe(time.monotonic() - started, {"pool": pool_name, "provider": provider, "model": target_model})
-            usage = (result or {}).get("usage") or {} if isinstance(result, dict) else {}
-            for direction, key in (("prompt", "prompt_tokens"), ("completion", "completion_tokens")):
-                n = int(usage.get(key) or 0)
-                if n:
-                    metrics.tokens_total.inc({"pool": pool_name, "provider": provider, "model": target_model, "direction": direction}, n)
-        return web.json_response(result)
-    except BadRequestError as exc:
-        status = exc.code or "bad_request"
-        if metrics is not None:
-            metrics.requests_total.inc({"pool": pool_name, "provider": provider, "model": target_model, "status": status})
-            metrics.request_duration.observe(time.monotonic() - started, {"pool": pool_name, "provider": provider, "model": target_model})
-        return web.json_response(openai_error(exc.message, code=exc.code, error_type=exc.error_type), status=exc.status)
-    except Exception as exc:
-        status = "provider_error"
-        if metrics is not None:
-            metrics.requests_total.inc({"pool": pool_name, "provider": provider, "model": target_model, "status": status})
-            metrics.request_duration.observe(time.monotonic() - started, {"pool": pool_name, "provider": provider, "model": target_model})
-        # Refund budget on provider failure so flaky providers don't burn caps.
-        if budget is not None and api_key and body is not None:
-            budget.refund(api_key, pool_name, _estimated_tokens(body["messages"]))
-        return web.json_response(openai_error(str(exc), code="provider_error", error_type="provider_error"), status=502)
+                usage = (result or {}).get("usage") or {} if isinstance(result, dict) else {}
+                for direction, key in (("prompt", "prompt_tokens"), ("completion", "completion_tokens")):
+                    n = int(usage.get(key) or 0)
+                    if n:
+                        metrics.tokens_total.inc({"pool": pool_name, "provider": provider, "model": target_model, "direction": direction}, n)
+            return web.json_response(result)
+        except BadRequestError as exc:
+            status = exc.code or "bad_request"
+            _emit(status)
+            return web.json_response(openai_error(exc.message, code=exc.code, error_type=exc.error_type), status=exc.status)
+        except Exception as exc:
+            status = "provider_error"
+            _emit(status)
+            if budget is not None and api_key and body is not None:
+                budget.refund(api_key, pool_name, _estimated_tokens(body["messages"]))
+            return web.json_response(openai_error(str(exc), code="provider_error", error_type="provider_error"), status=502)
 
 
 async def responses_handler(request: web.Request) -> web.Response | web.StreamResponse:
@@ -294,3 +375,17 @@ async def responses_handler(request: web.Request) -> web.Response | web.StreamRe
         return web.json_response(openai_error(exc.message, code=exc.code, error_type=exc.error_type), status=exc.status)
     except Exception as exc:
         return web.json_response(openai_error(str(exc), code="provider_error", error_type="provider_error"), status=502)
+
+
+class _NoOpCM:
+    """Null context manager that yields None — used when tracing is disabled."""
+
+    def __enter__(self):
+        return None
+
+    def __exit__(self, *args):
+        return False
+
+
+def _noop_cm():
+    return _NoOpCM()

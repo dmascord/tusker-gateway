@@ -8,7 +8,17 @@ from aiohttp import web
 from tusker_gateway.auth import AuthMiddleware
 from tusker_gateway.budget import BudgetTracker, load_budget_config_from_env
 from tusker_gateway.cache import ResponseCache, load_cache_config_from_env
+from tusker_gateway.circuit_breaker import CircuitBreaker, load_circuit_config_from_env
 from tusker_gateway.config import load_config
+from tusker_gateway.dashboard import (
+    dashboard_breakers,
+    dashboard_cooldowns,
+    dashboard_handler,
+    dashboard_meta,
+    dashboard_pools,
+    dashboard_quality,
+    dashboard_quota,
+)
 from tusker_gateway.endpoints import (
     chat_completions_handler,
     metrics_handler,
@@ -18,6 +28,8 @@ from tusker_gateway.endpoints import (
 from tusker_gateway.errors import GatewayError, openai_error
 from tusker_gateway.health import health_handler, ready_handler, status_handler
 from tusker_gateway.metrics import MetricsRegistry
+from tusker_gateway.rate_limit import RateLimiter, load_rate_limit_config_from_env
+from tusker_gateway.tracing import Tracer, load_tracer_config_from_env
 
 
 def create_app() -> web.Application:
@@ -37,6 +49,17 @@ def create_app() -> web.Application:
     budget_cfg = load_budget_config_from_env()
     app["budget"] = BudgetTracker(budget_cfg)
 
+    # Release 2 capabilities: circuit breaker, rate limiter, OTLP tracing,
+    # dashboard. All default-disabled via env.
+    breaker_cfg = load_circuit_config_from_env()
+    app["breaker"] = CircuitBreaker(breaker_cfg)
+
+    ratelimit_cfg = load_rate_limit_config_from_env()
+    app["ratelimit"] = RateLimiter(ratelimit_cfg)
+
+    tracer_cfg = load_tracer_config_from_env()
+    app["tracer"] = Tracer(tracer_cfg)
+
     async def on_startup(app):
         config = app["config"]
         app["http_session"] = aiohttp.ClientSession(
@@ -54,6 +77,17 @@ def create_app() -> web.Application:
             store.purge_expired()
         except Exception:
             pass  # best-effort
+        # Start OTLP trace flusher.
+        tracer = app.get("tracer")
+        if tracer is not None and getattr(tracer, "enabled", False):
+            await tracer.start()
+
+    async def on_cleanup(app):
+        tracer = app.get("tracer")
+        if tracer is not None and getattr(tracer, "enabled", False):
+            await tracer.stop()
+        if "http_session" in app:
+            await app["http_session"].close()
 
     auth = AuthMiddleware()
     metrics_token = os.environ.get("TUSKER_METRICS_TOKEN", "").strip()
@@ -62,8 +96,8 @@ def create_app() -> web.Application:
     async def auth_middleware(request, handler):
         if request.path in ("/health", "/ready"):
             return await handler(request)
-        # /metrics is opt-in authenticated.
-        if request.path == "/metrics":
+        # /metrics + /dashboard are opt-in authenticated.
+        if request.path in ("/metrics", "/dashboard") or request.path.startswith("/dashboard/"):
             if metrics_token:
                 token = request.headers.get("X-Tusker-Metrics-Token", "").strip()
                 if not _secrets_compare(token, metrics_token):
@@ -87,13 +121,16 @@ def create_app() -> web.Application:
     app.router.add_get("/ready", ready_handler)
     app.router.add_get("/status", status_handler)
     app.router.add_get("/metrics", metrics_handler)
+    app.router.add_get("/dashboard", dashboard_handler)
+    app.router.add_get("/dashboard/partials/meta", dashboard_meta)
+    app.router.add_get("/dashboard/partials/pools", dashboard_pools)
+    app.router.add_get("/dashboard/partials/breakers", dashboard_breakers)
+    app.router.add_get("/dashboard/partials/cooldowns", dashboard_cooldowns)
+    app.router.add_get("/dashboard/partials/quota", dashboard_quota)
+    app.router.add_get("/dashboard/partials/quality", dashboard_quality)
     app.router.add_get("/v1/models", models_handler)
     app.router.add_post("/v1/chat/completions", chat_completions_handler)
     app.router.add_post("/v1/responses", responses_handler)
-
-    async def on_cleanup(app):
-        if "http_session" in app:
-            await app["http_session"].close()
 
     app.on_cleanup.append(on_cleanup)
     app.on_startup.append(on_startup)
