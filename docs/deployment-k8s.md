@@ -6,24 +6,36 @@ Tusker Gateway runs alongside Hermes in the `hermes` namespace on the `visor` cl
 
 | Where | Path |
 |---|---|
-| Source on visor | `/srv/opencode/tusker-gateway/` (not yet set up — see below) |
+| Local checkout | `~/dev/tusker-ai-gateway/` |
+| Source on visor | `/srv/opencode/tusker-ai-gateway/` |
 | Image registry | `registry.tusker.net.au:5000/tusker-gateway` |
-| Manifests | `tusker-gateway/k8s/` |
+| Manifests | `tusker-ai-gateway/k8s/` |
 
-## 1. Push source to visor
+## 1. Sync source to visor
 
-Tusker Gateway is a standalone repo, not yet tracked in git. Push it to `dmascord/tusker-gateway` before the first build.
+The build host is `visor`. The repo lives at `~/dev/tusker-ai-gateway/` locally and must be mirrored to `/srv/opencode/tusker-ai-gateway/` on `visor` before building.
+
+```bash
+# from Mac
+rsync -a --delete --exclude='.venv' --exclude='__pycache__' --exclude='.pytest_cache' \
+  ~/dev/tusker-ai-gateway/ visor:/srv/opencode/tusker-ai-gateway/
+```
 
 ## 2. Build and deploy
 
-From Mac:
+The convenience script `k8s/deploy.sh` does all of this in one shot:
+
 ```bash
 ssh visor
+cd /srv/opencode/tusker-ai-gateway
+./k8s/deploy.sh                # optional: ./k8s/deploy.sh 20260820180000
 ```
 
-On visor:
+Manual equivalent:
+
 ```bash
-cd /srv/opencode/tusker-gateway
+ssh visor
+cd /srv/opencode/tusker-ai-gateway
 
 # Build
 TAG=swarm-alpine-$(date +%Y%m%d%H%M%S)
@@ -31,43 +43,58 @@ IMAGE=registry.tusker.net.au:5000/tusker-gateway:$TAG
 buildah bud -f Dockerfile -t "$IMAGE" .
 buildah push "$IMAGE"
 
-# Apply manifests
+# Apply manifests (config.yaml carries TUSKER_POOL_* env vars)
 kubectl -n hermes apply -f k8s/pvc.yaml
+kubectl -n hermes apply -f k8s/config.yaml
 kubectl -n hermes apply -f k8s/service.yaml
 kubectl -n hermes apply -f k8s/ingressroute.yaml
 
 # Deploy
 kubectl -n hermes set image deployment/tusker-gateway tusker-gateway="$IMAGE"
-kubectl -n hermes rollout status deployment/tusker-gateway --timeout=120s
+kubectl -n hermes rollout status deployment/tusker-gateway --timeout=180s
 ```
 
 ## 3. Smoke test
 
-```bash
-# In-cluster
-kubectl -n hermes get pods -o wide | grep tusker-gateway
-curl -sS https://ai.tusker.net.au/health && echo
-curl -sS https://ai.tusker.net.au/ready && echo
+The gateway is fronted by `hermes.tusker.net.au` (same edge as Hermes):
 
-# Public edge
-curl -sS -o /dev/null -w 'http=%{http_code} time=%{time_total}s\n' https://ai.tusker.net.au/health
-curl -sS https://ai.tusker.net.au/ready && echo
+```bash
+# Pod health
+kubectl -n hermes get pods -o wide | grep tusker-gateway
+
+# HTTP health
+curl -sS -o /dev/null -w 'health http=%{http_code} time=%{time_total}s\n' \
+  https://hermes.tusker.net.au/health
+curl -sS -o /dev/null -w 'ready  http=%{http_code} time=%{time_total}s\n' \
+  https://hermes.tusker.net.au/ready
+curl -sS https://hermes.tusker.net.au/ready && echo
 ```
 
 ## 4. DNS
 
-Point `ai.tusker.net.au` → `103.68.121.242` (public LB IP).
+`hermes.tusker.net.au` already points at the cluster LB. The gateway shares the
+edge with Hermes — no DNS work needed for it.
 
 ## 5. Configuration
 
-Tusker Gateway uses the **same `hermes-env-vault` secret** as Hermes. All provider keys, pool definitions, and model fallbacks are inherited automatically.
+Tusker Gateway uses the **same `hermes-env-vault` secret** as Hermes. All
+provider keys are inherited automatically. Pool definitions are loaded from
+`k8s/config.yaml` (mounted as env vars `TUSKER_POOL_CODE`, `TUSKER_POOL_PRIVACY`,
+`TUSKER_POOL_PREMIUM`, `TUSKER_POOL_SWARM`).
 
-The gateway reads:
-- `OPENROUTER_API_KEY` — live key from vault
-- `HERMES_CODE_FALLBACK_*` / `HERMES_PRIVACY_FALLBACK_*` — pool definitions
-- All other provider keys (GitHub Copilot, Gemini, Groq, etc.)
+The gateway reads provider keys for every provider named in those pools:
+- `OPENROUTER_API_KEY`
+- `MINIMAX_API_KEY` (and similar for `minimax` typo alias, if any)
+- `OLLAMA_API_KEY` / `OLLAMA_MAC_API_KEY` (for `ollama-cloud`)
+- `OPENCODE_GO_API_KEY`
+- `GITHUB_COPILOT_*` (token file paths)
+- `CEREBRAS_API_KEY`
+- `GOOGLE_API_KEY`
+- `SYNTHETIC_API_KEY`
 
-No separate secret is required.
+Always verify pool providers exist in `tusker_gateway/config.py:DEFAULT_PROVIDER_REGISTRY`
+before adding them — unknown providers raise `ProviderError("Unknown provider: ...")`
+which becomes HTTP 502 and exhausts the agent retry budget.
 
 ## 6. Rollback
 

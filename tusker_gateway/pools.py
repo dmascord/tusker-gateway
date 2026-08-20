@@ -70,16 +70,13 @@ class PoolManager:
         session_id: str | None = None,
         preferred: str | None = None,
         heavyweight_ok: bool = False,
+        excluded: set[tuple[str, str]] | None = None,
     ) -> tuple[str, str] | None:
         """Select the best (provider, model) from a pool.
 
-        Selection order:
-        1. Session stickiness: if previous selection is still valid, reuse it
-        2. Preferred provider/model: if specified, use it (skip cooldown check for passthrough)
-        3. Quality-ranked selection: highest score first, skip cooldowned/unhealthy
-
-        Returns (provider, model) or None if no candidate available.
+        Failed candidates can be excluded for request-level fallback.
         """
+        excluded = excluded or set()
         specs = self.models.get(pool_name, [])
         if not specs:
             return None
@@ -91,15 +88,19 @@ class PoolManager:
                 prev = self._stickiness[key]
                 for s in specs:
                     if (s.provider, s.model) == prev:
+                        if (s.provider, s.model) in excluded:
+                            self._stickiness.pop(key, None)
+                            break
                         if context_tokens > 0 and s.context_window < context_tokens:
                             # Context doesn't fit; clear stickiness
                             self._stickiness.pop(key, None)
                             break
                         return prev
-
-        # 2. Filter candidates by context window and cooldown
+        # 2. Filter candidates by context window, cooldown, and request-level exclusions
         candidates: list[ModelSpec] = []
         for s in specs:
+            if (s.provider, s.model) in excluded:
+                continue
             if context_tokens > 0 and s.context_window < context_tokens:
                 continue
             if not heavyweight_ok and s.heavyweight:
@@ -109,8 +110,7 @@ class PoolManager:
             # ZDR: exclude providers in exclusion list
             pool_config = self.pools.get(pool_name)
             if pool_config and pool_config.zdr:
-                excluded = self.config.get("excluded_providers", [])
-                if s.provider in excluded:
+                if s.provider in self.config.get("excluded_providers", []):
                     continue
             candidates.append(s)
 

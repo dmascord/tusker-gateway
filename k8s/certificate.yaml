@@ -1,0 +1,12 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: tusker-gateway-tls
+  namespace: hermes
+spec:
+  secretName: tusker-gateway-tls
+  issuerRef:
+    name: letsencrypt-cloudflare
+    kind: ClusterIssuer
+  dnsNames:
+  - ai.tusker.net.au

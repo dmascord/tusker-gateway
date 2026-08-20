@@ -33,6 +33,15 @@ class PersistentCooldownStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS provider_cooldowns (
+                    provider TEXT PRIMARY KEY,
+                    until_epoch REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                )
+                """
+            )
             conn.commit()
 
     def _connect(self) -> sqlite3.Connection:
@@ -57,6 +66,50 @@ class PersistentCooldownStore:
             )
             conn.commit()
 
+    def record_provider(self, provider: str, seconds: float) -> None:
+        """Persist a provider cooldown until `seconds` from now."""
+        if seconds <= 0:
+            return
+        seconds = min(seconds, MAX_COOLDOWN_SECS)
+        until_epoch = time.time() + seconds
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO provider_cooldowns (provider, until_epoch, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(provider) DO UPDATE SET
+                    until_epoch = excluded.until_epoch,
+                    updated_at = excluded.updated_at
+                """,
+                (provider, until_epoch, time.time()),
+            )
+            conn.commit()
+
+    def is_provider_active(self, provider: str) -> bool:
+        """Return True if provider cooldown is still active."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT until_epoch FROM provider_cooldowns WHERE provider = ?",
+                (provider,),
+            ).fetchone()
+        if not row:
+            return False
+        return row[0] > time.time()
+
+    def hydrate_providers(self, tracker: CooldownTracker) -> int:
+        """Load active provider cooldowns into an in-memory `CooldownTracker`."""
+        now_wall = time.time()
+        loaded = 0
+        with self._connect() as conn:
+            for provider, until_epoch, _updated in conn.execute(
+                "SELECT provider, until_epoch, updated_at FROM provider_cooldowns"
+            ):
+                remaining = until_epoch - now_wall
+                if remaining <= 0:
+                    continue
+                tracker.cooldown(provider, "", remaining) # model='' sentinel
+                loaded += 1
+        return loaded
     def is_active(self, provider: str, model: str) -> bool:
         """Return True if (provider, model) cooldown is still active in storage."""
         with self._connect() as conn:

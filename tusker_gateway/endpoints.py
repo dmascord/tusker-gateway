@@ -15,6 +15,40 @@ from tusker_gateway.routing import resolve_route
 from tusker_gateway.sse import sse_done
 
 
+def _pool_name(body: dict[str, Any]) -> str | None:
+    route = resolve_route(body.get("model"), body)
+    return route.pool_name or "code" if route.kind in {"pool", "code"} else None
+
+
+async def _call_with_pool_fallback(
+    config: dict[str, Any],
+    body: dict[str, Any],
+    client: PassthroughClient,
+    tools: list[dict[str, Any]] | None = None,
+) -> tuple[str, str, Any]:
+    """Call a pool candidate, trying the next candidate after provider failure."""
+    pool_name = _pool_name(body)
+    if pool_name is None:
+        provider, model = _route_target(config, body)
+        return provider, model, await client.chat(provider, model, body["messages"], stream=bool(body.get("stream")), tools=tools)
+
+    excluded: set[tuple[str, str]] = set()
+    last_error: Exception | None = None
+    while True:
+        selected = PoolManager(config).select(pool_name, excluded=excluded)
+        if not selected:
+            if last_error is not None:
+                raise last_error
+            raise BadRequestError("No healthy models in pool", code="no_healthy_models")
+        provider, model = selected
+        try:
+            result = await client.chat(provider, model, body["messages"], stream=bool(body.get("stream")), tools=tools)
+            return provider, model, result
+        except Exception as exc:
+            last_error = exc
+            excluded.add(selected)
+
+
 def _validate_chat_body(body: Any) -> dict[str, Any]:
     if not isinstance(body, dict):
         raise BadRequestError("Request body must be a JSON object", code="invalid_request")
@@ -58,18 +92,16 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
     try:
         body = _validate_chat_body(await request.json())
         config = request.app["config"]
-        provider, target_model = _route_target(config, body)
         client = PassthroughClient(config, QualityDB(config["quality_db_path"]), request.app["http_session"])
-        upstream = config.get("upstream_gateway_url")
         tools = body.get("tools") if isinstance(body.get("tools"), list) else None
+        provider, target_model, result = await _call_with_pool_fallback(config, body, client, tools)
         if body.get("stream", False):
             resp = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive"})
             await resp.prepare(request)
-            async for chunk in await client.chat(provider, target_model, body["messages"], stream=True, tools=tools, upstream_gateway=upstream):
+            async for chunk in result:
                 await resp.write(chunk)
             await resp.write(sse_done())
             return resp
-        result = await client.chat(provider, target_model, body["messages"], tools=tools, upstream_gateway=upstream)
         return web.json_response(result)
     except BadRequestError as exc:
         return web.json_response(openai_error(exc.message, code=exc.code, error_type=exc.error_type), status=exc.status)
@@ -78,7 +110,6 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
 
 
 async def responses_handler(request: web.Request) -> web.Response | web.StreamResponse:
-    """POST /v1/responses — normalize Responses input to chat upstream."""
     try:
         body = await request.json()
         if not isinstance(body, dict):
@@ -91,12 +122,9 @@ async def responses_handler(request: web.Request) -> web.Response | web.StreamRe
         else:
             raise BadRequestError("input must be a string or array", code="invalid_input")
         chat_body = {"model": body.get("model"), "messages": messages, "stream": bool(body.get("stream", False))}
-        _validate_chat_body(chat_body)
         config = request.app["config"]
-        provider, target_model = _route_target(config, chat_body)
         client = PassthroughClient(config, QualityDB(config["quality_db_path"]), request.app["http_session"])
-        upstream = config.get("upstream_gateway_url")
-        result = await client.chat(provider, target_model, messages, upstream_gateway=upstream)
+        _, _, result = await _call_with_pool_fallback(config, chat_body, client)
         if isinstance(result, dict) and "choices" in result:
             text = result.get("choices", [{}])[0].get("message", {}).get("content", "")
         else:

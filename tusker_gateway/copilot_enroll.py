@@ -23,21 +23,17 @@ import aiohttp
 from tusker_gateway.copilot_constants import (
     _ACCESS_TOKEN_URL,
     COPILOT_OAUTH_CLIENT_ID,
-    DEVICE_CODE_URL,
+    _DEVICE_CODE_URL,
     EDITOR_VERSION as _DEFAULT_EDITOR_VERSION,
     EXCHANGE_USER_AGENT as _EXCHANGE_USER_AGENT,
     JWT_REFRESH_MARGIN_SECONDS,
-    POLL_INTERVAL as _POLL_INTERVAL,
-    POLL_SAFETY as _POLL_SAFETY,
-    TIMEOUT as _TIMEOUT,
+    _POLL_INTERVAL,
+    _POLL_SAFETY,
+    _TIMEOUT,
 )
 
 logger = logging.getLogger(__name__)
 
-# Re-exported for backward compatibility (existing tests import these names)
-_DEVICE_CODE_URL = DEVICE_CODE_URL
-_ACCESS_TOKEN_URL = ACCESS_TOKEN_URL
-_JWT_REFRESH_MARGIN_SECONDS = JWT_REFRESH_MARGIN_SECONDS  # noqa: F841
 
 
 def _token_fingerprint(raw: str) -> str:

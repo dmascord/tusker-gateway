@@ -13,4 +13,4 @@ spec:
     - name: tusker-gateway
       port: 8642
   tls:
-    certResolver: letsencrypt
+    secretName: tusker-gateway-tls

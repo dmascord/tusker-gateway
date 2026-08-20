@@ -1,0 +1,24 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: tusker-gateway
+  namespace: hermes
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-cloudflare
+spec:
+  ingressClassName: traefik
+  rules:
+  - host: ai.tusker.net.au
+    http:
+      paths:
+      - backend:
+          service:
+            name: tusker-gateway
+            port:
+              number: 8642
+        path: /
+        pathType: Prefix
+  tls:
+  - hosts:
+    - ai.tusker.net.au
+    secretName: tusker-gateway-tls

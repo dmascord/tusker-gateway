@@ -159,17 +159,39 @@ class QualityDB:
             ).fetchone()
             return row[0] if row else None
 
-    def rank(self, candidates: list[tuple[str, str]], *, default_score: float = 50.0) -> list[tuple[str, str, float]]:
+    def rank(
+        self,
+        candidates: list[tuple[str, str]],
+        *,
+        default_score: float | None = None,
+    ) -> list[tuple[str, str, float]]:
         """Sort (provider, model) candidates by quality score (highest first).
 
-        Candidates with no recorded data use default_score.
+        Candidates with no recorded data use an adaptive floor computed
+        from the median score of the pool, clamped to a minimum of 20.0.
         """
-        scored = []
+        scored: list[tuple[str, str, float]] = []
+        known_scores: list[float] = []
         for provider, model in candidates:
             q = self.get_quality(provider, model)
-            scored.append((provider, model, q if q is not None else default_score))
-        scored.sort(key=lambda x: x[2], reverse=True)
-        return scored
+            if q is not None:
+                known_scores.append(q)
+                scored.append((provider, model, q))
+            else:
+                scored.append((provider, model, -1.0))  # placeholder
+        if known_scores:
+            known_scores.sort()
+            n = len(known_scores)
+            median = known_scores[n // 2] if n % 2 else (known_scores[n // 2 - 1] + known_scores[n // 2]) / 2.0
+            floor = max(20.0, median - 20.0)
+        else:
+            floor = 50.0  # no data at all — keep legacy default
+        if default_score is not None:
+            floor = default_score
+        # Replace placeholders with floor
+        result = [(p, m, s if s >= 0 else floor) for p, m, s in scored]
+        result.sort(key=lambda x: x[2], reverse=True)
+        return result
 
     def status(self) -> dict[str, Any]:
         """Return summary status for /status endpoint."""

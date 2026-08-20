@@ -47,9 +47,10 @@ class RateLimitError(GatewayError):
     status = 429
     error_type = "rate_limit_exceeded"
 
-    def __init__(self, message: str = "Rate limited", *, code: str | None = "rate_limit_exceeded", body: str | None = None):
+    def __init__(self, message: str = "Rate limited", *, code: str | None = "rate_limit_exceeded", body: str | None = None, headers: dict[str, str] | None = None):
         super().__init__(message, code=code)
         self.body = body
+        self.headers = headers or {}
 
 def openai_error(message: str, *, code: str | None, error_type: str) -> dict[str, Any]:
     """Build an OpenAI-style error response body."""

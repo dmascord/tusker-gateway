@@ -11,8 +11,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
-# Maximum cooldown window is 1 hour.
-MAX_COOLDOWN_SECS = 3600.0
+MAX_COOLDOWN_SECS = 30 * 86400.0 # 30 days
+
 
 
 @dataclass
@@ -29,12 +29,22 @@ class Cooldown:
 
 @dataclass
 class CooldownTracker:
-    """Tracks cooldowns for (provider, model) pairs."""
-
-    # Maps (provider, model) → Cooldown
     _cooldowns: dict[tuple[str, str], Cooldown] = field(default_factory=dict)
     _provider_default: dict[str, Cooldown] = field(default_factory=dict)
     _global: Cooldown | None = None
+    _recent_failures: dict[str, int] = field(default_factory=dict)
+
+    def record_failure(self, provider: str) -> bool:
+        """Record failure. Returns True if provider cooldown triggered."""
+        count = self._recent_failures.get(provider, 0) + 1
+        self._recent_failures[provider] = count
+        if count >= 3:
+            self._recent_failures[provider] = 0
+            return True
+        return False
+
+    def clear_failures(self, provider: str) -> None:
+        self._recent_failures.pop(provider, None)
 
     def cooldown(
         self,
@@ -50,7 +60,6 @@ class CooldownTracker:
         self._cooldowns[(provider, model)] = Cooldown(until=until)
         # Also track at provider level
         self._provider_default[provider] = Cooldown(until=until)
-
     def is_cooldown(self, provider: str, model: str) -> bool:
         """Return True if (provider, model) is in cooldown."""
         if self._global is not None and self._global.is_active():
@@ -97,12 +106,11 @@ def _cooldown_seconds_for_429(exc: dict[str, Any]) -> float:
     else:
         body = str(exc)
         headers = {}
-
     # Explicit Retry-After header
     ra = headers.get("Retry-After", "")
     if ra:
         try:
-            return min(float(ra), MAX_COOLDOWN_SECS)
+            return float(ra)
         except ValueError:
             pass
 
@@ -112,24 +120,28 @@ def _cooldown_seconds_for_429(exc: dict[str, Any]) -> float:
     if "retry-after" in body_lower:
         m = re.search(r"retry[- ]after[:\s]+(\d+)", body_lower)
         if m:
-            return min(float(m.group(1)), MAX_COOLDOWN_SECS)
+            return float(m.group(1))
 
-    # Weekly limit
-    if "week" in body_lower:
-        return min(7 * 86400.0, MAX_COOLDOWN_SECS)
-    # Monthly limit
-    if "month" in body_lower:
-        return min(30 * 86400.0, MAX_COOLDOWN_SECS)
-    # Hourly limit
-    if "hour" in body_lower:
-        return min(3600.0, MAX_COOLDOWN_SECS)
-    # Daily limit
-    m = re.search(r"(\d+)\s*/\s*day", body_lower)
+    # Explicit "try again in N seconds/minutes/hours/days"
+    m = re.search(
+        r"(?:try again in|wait|after|cooldown|retry)[^.]*?(\d+)\s*(seconds?|minutes?|hours?|days?|weeks?)",
+        body_lower,
+    )
     if m:
-        return min(float(m.group(1)) * 86400.0, MAX_COOLDOWN_SECS)
-    # Generic 429
-    if "429" in body_lower or "rate limit" in body_lower:
-        return 60.0
+        n, unit = float(m.group(1)), m.group(2)
+        if unit.startswith("second"): return n
+        if unit.startswith("minute"): return n * 60.0
+        if unit.startswith("hour"): return n * 3600.0
+        if unit.startswith("day"): return n * 86400.0
+        if unit.startswith("week"): return n * 7 * 86400.0
+
+    # Generic heuristic fallbacks
+    if "week" in body_lower: return 7 * 86400.0
+    if "month" in body_lower: return 30 * 86400.0
+    if "hour" in body_lower: return 3600.0
+    m = re.search(r"(\d+)\s*/\s*day", body_lower)
+    if m: return 86400.0 / float(m.group(1))
+    if "429" in body_lower or "rate limit" in body_lower: return 60.0
 
     return 60.0
 

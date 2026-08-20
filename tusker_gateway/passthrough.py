@@ -20,55 +20,38 @@ from tusker_gateway.errors import (
 )
 from tusker_gateway.quality import QualityDB
 
-# Known OAuth-based providers that require token rotation.
-OAUTH_PROVIDERS = {"github-copilot", "github-copilot-enterprise", "openai-codex"}
+# Build per-provider endpoints dict from the normalized registry in config.py
+# Falls back to legacy hard-coded mapping if the registry is unavailable.
+def _init_provider_endpoints() -> dict[str, dict[str, Any]]:
+    try:
+        from tusker_gateway.config import DEFAULT_PROVIDER_REGISTRY
+        out: dict[str, dict[str, Any]] = {}
+        for name, pc in DEFAULT_PROVIDER_REGISTRY.items():
+            entry: dict[str, Any] = {
+                "base_url": pc.base_url,
+                "chat_path": pc.chat_path,
+                "auth_type": pc.auth_type or pc.kind,
+            }
+            if pc.model_header:
+                entry["model_header"] = pc.model_header
+            out[name] = entry
+        if out:
+            return out
+    except ImportError:
+        pass
+    return {
+        "github-copilot": {"base_url": "https://api.githubcopilot.com", "chat_path": "/chat/completions", "auth_type": "oauth", "model_header": "x-github-gpt-model"},
+        "github-copilot-enterprise": {"base_url": "https://api.githubcopilot.com", "chat_path": "/chat/completions", "auth_type": "oauth", "model_header": "x-github-gpt-model"},
+        "openai-codex": {"base_url": "https://api.github.com/copilot", "chat_path": "/chat/completions", "auth_type": "oauth", "model_header": "x-openai-gpt-model"},
+        "openai": {"base_url": "https://api.openai.com", "chat_path": "/v1/chat/completions", "auth_type": "bearer"},
+        "openrouter": {"base_url": "https://openrouter.ai/api/v1", "chat_path": "/chat/completions", "auth_type": "bearer"},
+        "groq": {"base_url": "https://api.groq.com/openai", "chat_path": "/v1/chat/completions", "auth_type": "bearer"},
+        "local-llm": {"base_url": "http://localhost:11434", "chat_path": "/v1/chat/completions", "auth_type": "bearer"},
+        "zai": {"base_url": "https://api.z.ai/api/paas", "chat_path": "/v4/chat/completions", "auth_type": "bearer"},
+    }
 
-# Per-provider base URLs and auth patterns.
-PROVIDER_ENDPOINTS: dict[str, dict[str, Any]] = {
-    "github-copilot": {
-        "base_url": "https://api.githubcopilot.com",
-        "chat_path": "/chat/completions",
-        "auth_type": "oauth",
-        "model_header": "x-github-gpt-model",
-    },
-    "github-copilot-enterprise": {
-        "base_url": "https://api.githubcopilot.com",
-        "chat_path": "/chat/completions",
-        "auth_type": "oauth",
-        "model_header": "x-github-gpt-model",
-    },
-    "openai-codex": {
-        "base_url": "https://api.github.com/copilot",
-        "chat_path": "/chat/completions",
-        "auth_type": "oauth",
-        "model_header": "x-openai-gpt-model",
-    },
-    "openai": {
-        "base_url": "https://api.openai.com",
-        "chat_path": "/v1/chat/completions",
-        "auth_type": "bearer",
-    },
-    "openrouter": {
-        "base_url": "https://openrouter.ai/api/v1",
-        "chat_path": "/chat/completions",
-        "auth_type": "bearer",
-    },
-    "groq": {
-        "base_url": "https://api.groq.com/openai",
-        "chat_path": "/v1/chat/completions",
-        "auth_type": "bearer",
-    },
-    "local-llm": {
-        "base_url": "http://localhost:11434",
-        "chat_path": "/v1/chat/completions",
-        "auth_type": "bearer",
-    },
-    "zai": {
-        "base_url": "https://api.z.ai/api/paas",
-        "chat_path": "/v4/chat/completions",
-        "auth_type": "bearer",
-    },
-}
+
+PROVIDER_ENDPOINTS: dict[str, dict[str, Any]] = _init_provider_endpoints()
 
 
 def _creds_access_token(cred: dict[str, Any]) -> str | None:
@@ -207,8 +190,6 @@ class PassthroughClient:
         self._config = config
         self._quality = quality_db
         self._http = http_client
-        codex_creds = config.get("codex_credentials", [])
-        # Determine auth file path
         auth_file = config.get("auth_file")
         if not auth_file:
             import os
@@ -216,6 +197,13 @@ class PassthroughClient:
         if not auth_file:
             from pathlib import Path
             auth_file = str(Path.home() / ".hermes" / "auth.json")
+        codex_creds = config.get("codex_credentials", [])
+        if not codex_creds:
+            try:
+                from tusker_gateway.copilot_enroll import load_auth_file
+                codex_creds = load_auth_file(auth_file)
+            except Exception:
+                codex_creds = []
         self._codex_rotator = CodexTokenRotator(codex_creds, auth_file=auth_file, http_client=http_client)
 
     async def chat(
@@ -232,6 +220,15 @@ class PassthroughClient:
         upstream_gateway: str | None = None,
     ) -> dict[str, Any] | AsyncIterator[bytes]:
         """Make a passthrough chat completions call to the provider."""
+
+        # Branch for openai-codex (Responses API)
+        if provider == "openai-codex":
+            return await self._chat_codex(
+                model, messages,
+                stream=stream, api_key=api_key, tools=tools,
+                extra_headers=extra_headers, extra_body=extra_body,
+            )
+
         if upstream_gateway:
             endpoint = {"base_url": upstream_gateway.rstrip("/"), "chat_path": "/v1/chat/completions", "auth_type": "bearer"}
         else:
@@ -258,9 +255,31 @@ class PassthroughClient:
             )
             try:
                 await self._check_response(resp)
+            except RateLimitError as exc:
+                from tusker_gateway.cooldown import _cooldown_seconds_for_429
+                tracker = global_tracker()
+                body_text = exc.body or "429 rate limit"
+                seconds = _cooldown_seconds_for_429({"body": body_text, "headers": dict(resp.headers)})
+                tracker.cooldown(provider, model, seconds)
+                try:
+                    from tusker_gateway.persistent_cooldown import PersistentCooldownStore
+                    from pathlib import Path
+                    db_path = Path(self._config.get("quality_db_path", "data/quality.db")).parent / "cooldowns.db"
+                    store = PersistentCooldownStore(db_path=db_path)
+                    store.record(provider, model, seconds)
+                except Exception:
+                    pass
+                raise
             except Exception:
                 resp.release()
                 raise
+            # Record quality on streaming success
+            try:
+                latency_ms = (time.monotonic() - start) * 1000
+                await self._record_quality(provider, model, True, latency_ms)
+                global_tracker().clear_failures(provider)
+            except Exception:
+                pass
             return self._stream_events(resp)
         try:
             async with self._http.request(
@@ -273,12 +292,13 @@ class PassthroughClient:
                 result = normalize_response_tool_calls(result)
                 latency_ms = (time.monotonic() - start) * 1000
                 await self._record_quality(provider, model, True, latency_ms)
+                global_tracker().clear_failures(provider)
                 return result
         except RateLimitError as exc:
             from tusker_gateway.cooldown import _cooldown_seconds_for_429
             tracker = global_tracker()
             body_text = exc.body or "429 rate limit"
-            seconds = _cooldown_seconds_for_429({"body": body_text, "headers": {}})
+            seconds = _cooldown_seconds_for_429({"body": body_text, "headers": exc.headers})
             tracker.cooldown(provider, model, seconds)
             try:
                 from tusker_gateway.persistent_cooldown import PersistentCooldownStore
@@ -292,13 +312,22 @@ class PassthroughClient:
         except Exception as exc:
             latency_ms = (time.monotonic() - start) * 1000
             await self._record_quality(provider, model, False, latency_ms)
+            tracker = global_tracker()
+            if tracker.record_failure(provider):
+                tracker.cooldown(provider, "", 300.0) # Provider-level cooldown
+                try:
+                    from tusker_gateway.persistent_cooldown import PersistentCooldownStore
+                    from pathlib import Path
+                    db_path = Path(self._config.get("quality_db_path", "data/quality.db")).parent / "cooldowns.db"
+                    store = PersistentCooldownStore(db_path=db_path)
+                    store.record_provider(provider, 300.0)
+                except Exception:
+                    pass
             raise ProviderError(str(exc)) from exc
-
     async def _build_request(
         self,
         provider: str,
         model: str,
-        messages: list[dict[str, Any]],
         *,
         stream: bool,
         api_key: str | None,
@@ -332,6 +361,204 @@ class PassthroughClient:
         if extra_body:
             body.update(extra_body)
         return headers, body
+    async def _chat_codex(
+        self,
+        model: str,
+        messages: list[dict[str, Any]],
+        *,
+        stream: bool,
+        api_key: str | None,
+        tools: list[dict[str, Any]] | None = None,
+        extra_headers: dict[str, str] | None = None,
+        extra_body: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | AsyncIterator[bytes]:
+        from tusker_gateway.auth_strategies import get_auth_strategy
+        from tusker_gateway.models import ProviderConfig
+        from tusker_gateway.tool_formats import normalize_tools
+        endpoint_raw = PROVIDER_ENDPOINTS["openai-codex"]
+        endpoint_model = ProviderConfig.from_raw(endpoint_raw)
+        strategy = get_auth_strategy("codex", self._codex_rotator)
+        headers = {
+            "Content-Type": "application/json",
+            **(extra_headers or {}),
+            **await strategy.headers(self._config, "openai-codex", model, api_key, endpoint_model),
+        }
+        input_data: list[dict[str, Any]] = []
+        for msg in messages:
+            role = msg.get("role")
+            content = msg.get("content")
+            if role == "system":
+                input_data.append({"role": "system", "content": [{"type": "input_text", "text": content}]})
+            elif role == "user":
+                input_data.append({"role": "user", "content": [{"type": "input_text", "text": content}]})
+            elif role == "assistant":
+                input_data.append({"role": "assistant", "content": [{"type": "output_text", "text": content}]})
+        body: dict[str, Any] = {"model": model, "input": input_data, "stream": True, "store": False}
+        if messages and messages[0].get("role") == "system":
+            sys_text = str(messages[0].get("content") or "").strip()
+            if sys_text:
+                body["instructions"] = sys_text
+        if tools:
+            body["tools"] = [
+                {"type": "function", "name": t["function"]["name"],
+                 "description": t["function"].get("description", ""),
+                 "parameters": t["function"].get("parameters", {"type": "object", "properties": {}})}
+                for t in normalize_tools(tools)
+            ]
+        if extra_body:
+            body.update(extra_body)
+        url = f"{endpoint_raw['base_url']}{endpoint_raw['chat_path']}"
+        start = time.monotonic()
+        resp = await self._http.request("POST", url, headers=headers, json=body, timeout=aiohttp.ClientTimeout(total=120))
+        try:
+            await self._check_response(resp)
+        except RateLimitError as exc:
+            resp.release()
+            from tusker_gateway.cooldown import _cooldown_seconds_for_429
+            tracker = global_tracker()
+            seconds = _cooldown_seconds_for_429({"body": (exc.body or "429"), "headers": {}})
+            tracker.cooldown("openai-codex", model, seconds)
+            try:
+                from tusker_gateway.persistent_cooldown import PersistentCooldownStore
+                from pathlib import Path
+                db_path = Path(self._config.get("quality_db_path", "data/quality.db")).parent / "cooldowns.db"
+                PersistentCooldownStore(db_path=db_path).record("openai-codex", model, seconds)
+            except Exception:
+                pass
+            raise
+        except Exception:
+            resp.release()
+            raise
+        result = await self._parse_codex_sse_async(resp)
+        latency_ms = (time.monotonic() - start) * 1000
+        await self._record_quality("openai-codex", model, True, latency_ms)
+        return result
+    async def _parse_codex_sse_async(self, resp: aiohttp.ClientResponse) -> dict[str, Any]:
+        """Iterate a Codex SSE response and assemble an OpenAI-compatible dict."""
+        content_parts: list[str] = []
+        tool_calls: dict[str, dict[str, Any]] = {}
+        tool_order: list[str] = []
+        usage_obj: dict[str, Any] | None = None
+        async for raw_line in resp.content:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line.startswith("data: "):
+                continue
+            try:
+                evt = json.loads(line[len("data: "):])
+            except json.JSONDecodeError:
+                continue
+            etype = evt.get("type", "")
+            if etype == "response.output_text.delta":
+                delta = evt.get("delta") or ""
+                if delta:
+                    content_parts.append(delta)
+            elif etype == "response.output_item.added":
+                item = evt.get("item") or {}
+                if item.get("type") == "function_call":
+                    call_id = str(item.get("call_id") or f"call_{len(tool_order) + 1}")
+                    tool_calls[call_id] = {"id": call_id, "type": "function", "function": {"name": item.get("name", ""), "arguments": ""}}
+                    tool_order.append(call_id)
+            elif etype == "response.function_call_arguments.delta":
+                call_id = str(evt.get("call_id") or "")
+                if call_id in tool_calls:
+                    tool_calls[call_id]["function"]["arguments"] += evt.get("delta") or ""
+            elif etype == "response.completed":
+                response = evt.get("response") or {}
+                usage_obj = response.get("usage")
+            elif etype == "response.failed":
+                err = evt.get("error") or {}
+                raise ProviderError(f"Codex response failed: {err.get('code','unknown')} {err.get('message','')[:200]}")
+        message: dict[str, Any] = {"role": "assistant", "content": "".join(content_parts)}
+        if tool_order:
+            message["tool_calls"] = [tool_calls[cid] for cid in tool_order]
+        return {
+            "id": f"chatcmpl-codex-{int(time.time() * 1000)}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": "openai-codex",
+            "choices": [{"index": 0, "message": message, "finish_reason": "tool_calls" if tool_order else "stop"}],
+            "usage": usage_obj or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        }
+        latency_ms = (time.monotonic() - start) * 1000
+        await self._record_quality("openai-codex", model, True, latency_ms)
+        return result
+
+
+    async def _stream_codex_events(self, resp: aiohttp.ClientResponse) -> AsyncIterator[bytes]:
+        """Parse Responses-API SSE events and forward OpenAI-compatible chunks."""
+        from tusker_gateway.sse import sse_frame
+        # Accumulate function-call arguments emitted across delta events.
+        fn_name: str | None = None
+        fn_call_id: str | None = None
+        fn_arguments = ""
+        try:
+            async for line in resp.content:
+                if line.startswith(b"data: "):
+                    data_str = line[len(b"data: "):].decode("utf-8").strip()
+                    if data_str == "[DONE]":
+                        yield sse_frame({"choices": [{"delta": {}, "finish_reason": "stop", "index": 0}]})
+                        break
+                    try:
+                        data = json.loads(data_str)
+                        event_type = data.get("type")
+                        delta: dict[str, Any] = {}
+
+                        if event_type == "response.output_text.delta":
+                            delta["content"] = data.get("delta", "")
+                        elif event_type == "response.function_call_arguments.delta":
+                            fn_name = data.get("name", fn_name)
+                            fn_call_id = data.get("call_id", fn_call_id)
+                            chunk = data.get("delta", "")
+                            fn_arguments += chunk
+                            delta["function_call"] = {
+                                "name": fn_name,
+                                "arguments": chunk,
+                            }
+
+                        if delta:
+                            yield sse_frame({"id": "chatcmpl-codex", "choices": [{"delta": delta, "index": 0}]})
+                    except json.JSONDecodeError:
+                        continue
+        finally:
+            resp.release()
+
+    def _parse_codex_response(self, result: dict[str, Any]) -> dict[str, Any]:
+        """Convert a non-stream Responses-API response to an OpenAI dict."""
+        content = ""
+        tool_calls: list[dict[str, Any]] = []
+        output_items = result.get("output", [])
+        for item in output_items:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "message":
+                for part in item.get("content") or []:
+                    if isinstance(part, dict) and part.get("type") == "output_text":
+                        content += part.get("text", "")
+            elif item.get("type") == "function_call":
+                call_id = item.get("call_id") or f"call_{len(tool_calls) + 1}"
+                tool_calls.append({
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": item.get("name", ""),
+                        "arguments": json.dumps(item.get("arguments") or {}),
+                    },
+                })
+
+        finish_reason = "tool_calls" if tool_calls else "stop"
+        return {
+            "id": f"chatcmpl-{int(time.time() * 1000)}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": result.get("model", "tusker-gateway"),
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": content, "tool_calls": tool_calls} if tool_calls
+                           else {"role": "assistant", "content": content},
+                "finish_reason": finish_reason,
+            }],
+            "usage": result.get("usage", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}),
+        }
 
     @staticmethod
     async def _check_response(resp: aiohttp.ClientResponse) -> None:
@@ -343,7 +570,7 @@ class PassthroughClient:
         if resp.status == 403:
             raise ProviderError("Provider access forbidden", code="forbidden")
         if resp.status == 429:
-            raise RateLimitError(body=body)
+            raise RateLimitError(body=body, headers=dict(resp.headers))
         if resp.status >= 500:
             raise ProviderError(f"Provider returned {resp.status}: {body[:200]}", code="provider_error")
         if resp.status != 200:

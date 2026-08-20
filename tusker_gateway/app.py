@@ -19,10 +19,10 @@ from tusker_gateway.health import health_handler, ready_handler, status_handler
 def create_app() -> web.Application:
     """Build and return the aiohttp Application."""
     app = web.Application(client_max_size=10 * 1024 * 1024)
+    app["config"] = load_config()
 
     async def on_startup(app):
-        config = load_config()
-        app["config"] = config
+        config = app["config"]
         app["http_session"] = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=120),
         )
@@ -34,6 +34,7 @@ def create_app() -> web.Application:
             db_dir = _P(config.get("quality_db_path", "data/quality.db")).parent
             store = PersistentCooldownStore(db_path=db_dir / "cooldowns.db")
             store.hydrate(global_tracker())
+            store.hydrate_providers(global_tracker())
             store.purge_expired()
         except Exception:
             pass  # best-effort
@@ -67,6 +68,7 @@ def create_app() -> web.Application:
             await app["http_session"].close()
 
     app.on_cleanup.append(on_cleanup)
+    app.on_startup.append(on_startup)
     return app
 
 

@@ -6,14 +6,25 @@ from typing import Any, Mapping
 
 
 @dataclass(frozen=True)
-class ProviderConfig:
+class ProviderEndpoint:
+    """Per-request endpoint payload resolved from the provider registry."""
     base_url: str
     chat_path: str
     auth_type: str = "bearer"
     model_header: str | None = None
 
     @classmethod
-    def from_raw(cls, raw: Mapping[str, Any]) -> "ProviderConfig":
+    def from_registry(cls, registry: Mapping[str, Any] | None, name: str) -> "ProviderEndpoint":
+        from tusker_gateway.config import DEFAULT_PROVIDER_REGISTRY
+        reg = registry or DEFAULT_PROVIDER_REGISTRY
+        pc = reg.get(name.lower())
+        if pc is None:
+            raise KeyError(f"Unknown provider: {name}")
+        auth = pc.auth_type if pc.auth_type in {"bearer", "oauth", "local", "upstream"} else pc.kind
+        return cls(base_url=pc.base_url, chat_path=pc.chat_path, auth_type=auth, model_header=pc.model_header)
+
+    @classmethod
+    def from_raw(cls, raw: Mapping[str, Any]) -> "ProviderEndpoint":
         return cls(
             base_url=str(raw["base_url"]),
             chat_path=str(raw["chat_path"]),
@@ -30,6 +41,9 @@ class ProviderConfig:
         if self.model_header:
             out["model_header"] = self.model_header
         return out
+
+
+ProviderConfig = ProviderEndpoint
 
 
 @dataclass
@@ -71,4 +85,4 @@ class Credential:
         return out
 
 
-PROVIDER_CONFIGS: dict[str, ProviderConfig] = {}
+PROVIDER_CONFIGS: dict[str, ProviderEndpoint] = {}

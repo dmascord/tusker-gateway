@@ -14,16 +14,15 @@ def health_handler(request: web.Request) -> web.Response:
 def ready_handler(request: web.Request) -> web.Response:
     """GET /ready — readiness probe.
 
-    Readiness means:
-    - config loaded
-    - quality DB reachable
-    - at least one provider pool has a healthy model
+    Readiness means the HTTP server is up and the app finished startup.
+    We avoid re-loading configuration here so readiness reflects live state,
+    not whether environment-only defaults happen to parse a second time.
     """
-    from tusker_gateway.copilot_enroll import load_auth_file
-    creds = load_auth_file()
-    if not creds:
-        return web.json_response({"status": "error", "reason": "no credentials"}, status=503)
-    return web.json_response({"status": "ok", "credential_count": len(creds)})
+    if "config" not in request.app:
+        return web.json_response({"status": "error", "reason": "config not loaded"}, status=503)
+    cfg = request.app["config"]
+    pools = list(cfg.get("pools", {}).keys())
+    return web.json_response({"status": "ok", "pools": pools})
 
 
 def status_handler(request: web.Request) -> web.Response:
@@ -36,10 +35,20 @@ def status_handler(request: web.Request) -> web.Response:
     quality = QualityDB(config["quality_db_path"])
     pools = PoolManager(config)
 
+    try:
+        from tusker_gateway.persistent_cooldown import PersistentCooldownStore
+        from pathlib import Path
+        db_path = Path(config.get("quality_db_path", "data/quality.db")).parent / "cooldowns.db"
+        store = PersistentCooldownStore(db_path=db_path)
+        purged = store.purge_expired()
+    except Exception:
+        purged = 0
+
     status: dict[str, Any] = {
         "status": "ok",
         "version": "0.1.0",
         "pools": pools.status(),
         "quality": quality.status(),
+        "purged_cooldowns": purged,
     }
     return web.json_response(status)
