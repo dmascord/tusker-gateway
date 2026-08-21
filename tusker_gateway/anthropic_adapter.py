@@ -332,11 +332,12 @@ class AnthropicSSEStreamTranslator:
 # ---------------------------------------------------------------------------
 
 def _resolve_api_key(request: web.Request) -> str:
-    """Return the raw bearer token from the Authorization header."""
+    """Return the raw API key from Authorization or x-api-key header."""
     auth = request.headers.get("Authorization", "")
     if auth.startswith("Bearer "):
         return auth[len("Bearer "):].strip()
-    return ""
+    x_api_key = request.headers.get("x-api-key", "")
+    return x_api_key.strip()
 
 
 def _anthropic_error(message: str, *, type: str = "error") -> dict[str, Any]:

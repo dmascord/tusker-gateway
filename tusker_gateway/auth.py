@@ -18,7 +18,16 @@ class AuthMiddleware:
 
     async def verify(self, request: web.Request) -> None:
         auth = request.headers.get("Authorization")
-        if not auth or not auth.startswith("Bearer "):
+        x_api_key = request.headers.get("x-api-key", "")
+
+        # Anthropic clients use x-api-key header instead of Authorization.
+        token = ""
+        if auth and auth.startswith("Bearer "):
+            token = auth[len("Bearer ") :].strip()
+        elif x_api_key:
+            token = x_api_key.strip()
+
+        if not token:
             raise AuthenticationError("Authorization header required")
 
         token = auth[len("Bearer ") :].strip()
