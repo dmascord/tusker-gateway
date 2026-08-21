@@ -77,21 +77,23 @@ async def _normalize_stream(raw_stream: AsyncIterator[bytes]) -> AsyncIterator[b
         choice = choices[0]
         delta = choice.get("delta") or {}
         fr = choice.get("finish_reason")
-        has_content = "content" in delta and delta["content"]
-        has_tools = "tool_calls" in delta
+        has_content = bool(delta.get("content"))
+        tc = delta.get("tool_calls")
+        has_tools = bool(tc) and isinstance(tc, list) and len(tc) > 0
         # Split if chunk has BOTH content/tools AND finish_reason
         if fr and (has_content or has_tools):
-            content_delta = {k: v for k, v in delta.items()
-                           if k not in ("role", "tool_calls")}
-            if content_delta:
+            if has_content:
+                # content-only delta (no finish_reason, no tools)
+                content_delta = {k: v for k, v in delta.items()
+                               if k not in ("role", "tool_calls")}
                 content_obj = {**obj, "choices": [{**choice, "delta": content_delta, "finish_reason": None}]}
                 yield f"data: {json.dumps(content_obj, ensure_ascii=False)}\n\n".encode()
-            # Emit tool_calls delta if present (without finish_reason)
             if has_tools:
-                tools_only = {"role": delta.get("role"), "tool_calls": delta["tool_calls"]}
+                # tools-only delta
+                tools_only = {"role": delta.get("role"), "tool_calls": tc}
                 tools_obj = {**obj, "choices": [{**choice, "delta": tools_only, "finish_reason": None}]}
                 yield f"data: {json.dumps(tools_obj, ensure_ascii=False)}\n\n".encode()
-            # Emit finish_reason-only chunk (no content, no tools)
+            # finish_reason-only chunk (no content, no tools)
             finish_obj = {**obj, "choices": [{**choice, "delta": {}, "finish_reason": fr}]}
             yield f"data: {json.dumps(finish_obj, ensure_ascii=False)}\n\n".encode()
         else:
