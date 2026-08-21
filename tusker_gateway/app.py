@@ -15,6 +15,7 @@ from tusker_gateway.dashboard import (
     dashboard_breakers,
     dashboard_cooldowns,
     dashboard_handler,
+    dashboard_guardrails,
     dashboard_meta,
     dashboard_pools,
     dashboard_quality,
@@ -26,8 +27,10 @@ from tusker_gateway.endpoints import (
     models_handler,
     responses_handler,
 )
+from tusker_gateway.anthropic_adapter import anthropic_messages_handler
 from tusker_gateway.errors import GatewayError, openai_error
 from tusker_gateway.health import health_handler, ready_handler, status_handler
+from tusker_gateway.guardrails import init_guard_pipeline, load_guardrails_config_from_env
 from tusker_gateway.metrics import MetricsRegistry
 from tusker_gateway.rate_limit import RateLimiter, load_rate_limit_config_from_env
 from tusker_gateway.tracing import Tracer, load_tracer_config_from_env
@@ -82,6 +85,14 @@ def create_app() -> web.Application:
     except ImportError:
         log.info("semantic cache unavailable (missing deps: chromadb, sentence-transformers)")
         app["semantic_cache"] = None
+
+    # Guardrails: default-disabled via env.
+    guard_cfg = load_guardrails_config_from_env()
+    app["guard_pipeline"] = init_guard_pipeline(guard_cfg)
+    if guard_cfg.get("enabled", False):
+        log.info("guardrails enabled (max_output=%s)", guard_cfg.get("max_output_tokens"))
+    else:
+        log.info("guardrails disabled")
 
     async def on_startup(app):
         startup_log = logging.getLogger("tusker_gateway.startup")
@@ -163,9 +174,11 @@ def create_app() -> web.Application:
     app.router.add_get("/dashboard/partials/cooldowns", dashboard_cooldowns)
     app.router.add_get("/dashboard/partials/quota", dashboard_quota)
     app.router.add_get("/dashboard/partials/quality", dashboard_quality)
+    app.router.add_get("/dashboard/partials/guardrails", dashboard_guardrails)
     app.router.add_get("/v1/models", models_handler)
     app.router.add_post("/v1/chat/completions", chat_completions_handler)
     app.router.add_post("/v1/responses", responses_handler)
+    app.router.add_post("/v1/messages", anthropic_messages_handler)
 
     app.on_cleanup.append(on_cleanup)
     app.on_startup.append(on_startup)

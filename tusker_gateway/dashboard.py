@@ -302,6 +302,40 @@ async def dashboard_quality(request: web.Request) -> web.Response:
     )
 
 
+async def dashboard_guardrails(request: web.Request) -> web.Response:
+    metrics = request.app.get("metrics")
+    guard_pipeline = request.app.get("guard_pipeline")
+    if guard_pipeline is None or not guard_pipeline.guards:
+        return web.Response(
+            status=200,
+            text="<span class='meta'>guardrails disabled</span>",
+            content_type="text/html",
+            charset="utf-8",
+        )
+    guard_names = [type(g).__name__ for g in guard_pipeline.guards]
+    parts = []
+    parts.append(f"<div><span class='meta'>active guards</span>")
+    parts.append(f"<div class='num'>{', '.join(guard_names)}</div></div>")
+    if metrics is not None:
+        for line in metrics.guardrail_blocks.render():
+            # Parse "tusker_guardrail_blocks_total{kind=\"...\"} N"
+            if line and not line.startswith("#"):
+                parts.append(f"<div><span class='meta'>blocks</span><div class='num'>{_esc(line)}</div></div>")
+    if parts:
+        return web.Response(
+            status=200,
+            text="<div class='grid-2'>" + "".join(parts) + "</div>",
+            content_type="text/html",
+            charset="utf-8",
+        )
+    return web.Response(
+        status=200,
+        text="<span class='meta'>no guardrail data</span>",
+        content_type="text/html",
+        charset="utf-8",
+    )
+
+
 __all__ = [
     "dashboard_handler",
     "dashboard_meta",
@@ -310,4 +344,5 @@ __all__ = [
     "dashboard_cooldowns",
     "dashboard_quota",
     "dashboard_quality",
+    "dashboard_guardrails",
 ]

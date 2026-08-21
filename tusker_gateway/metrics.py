@@ -248,6 +248,11 @@ class MetricsRegistry:
         self.budget_refunds = Counter(
             "tusker_budget_refunds_total", "Token refunds for failed provider calls"
         )
+        self.guardrail_blocks = Counter(
+            "tusker_guardrail_blocks_total",
+            "Requests blocked by guardrail checks",
+            ("kind",),
+        )
         self.pool_candidates = Gauge(
             "tusker_pool_candidates",
             "Current number of candidates per pool, partitioned by validity",
@@ -285,7 +290,7 @@ class MetricsRegistry:
         for m in (
             self.requests_total, self.tokens_total, self.request_duration,
             self.cache_hits, self.cache_misses, self.cache_writes, self.cache_evictions,
-            self.budget_blocks, self.budget_records, self.budget_refunds,
+            self.budget_blocks, self.budget_records, self.budget_refunds, self.guardrail_blocks,
             self.pool_candidates, self.cooldowns_active,
         ):
             for line in m.render():

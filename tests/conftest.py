@@ -17,6 +17,7 @@ from tusker_gateway.endpoints import (
     models_handler,
     responses_handler,
 )
+from tusker_gateway.anthropic_adapter import anthropic_messages_handler
 from tusker_gateway.errors import GatewayError, openai_error
 from tusker_gateway.health import health_handler, ready_handler, status_handler
 
@@ -96,6 +97,7 @@ def _create_test_app(config=None):
     app.router.add_get("/v1/models", models_handler)
     app.router.add_post("/v1/chat/completions", chat_completions_handler)
     app.router.add_post("/v1/responses", responses_handler)
+    app.router.add_post("/v1/messages", anthropic_messages_handler)
     return app
 
 

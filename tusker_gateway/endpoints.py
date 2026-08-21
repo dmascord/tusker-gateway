@@ -288,6 +288,23 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
             pool_name = _pool_name(body) or "passthrough"
             bypass_cache = request.headers.get("X-Tusker-Cache", "").strip().lower() == "bypass"
 
+            # Guard pipeline: input/output guards.
+            guard_pipeline = request.app.get("guard_pipeline")
+            if guard_pipeline is not None:
+                guard_result = await guard_pipeline.run(body)
+                if not guard_result.allowed:
+                    status = "guardrail_blocked"
+                    if metrics is not None:
+                        metrics.guardrail_blocks.inc({"kind": guard_result.message or "blocked"})
+                    _emit(status)
+                    return web.json_response(
+                        openai_error(guard_result.message or "request blocked by guardrail", code="guardrail_blocked", error_type="invalid_request_error"),
+                        status=400,
+                    )
+                if guard_result.modified_body is not None:
+                    body = guard_result.modified_body
+
+
             # Rate-limit pre-flight (cheapest check, runs first).
             if ratelimit is not None and api_key:
                 rl = ratelimit.check(api_key)
