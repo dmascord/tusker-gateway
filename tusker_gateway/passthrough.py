@@ -138,7 +138,10 @@ class CodexTokenRotator:
         if not self._creds:
             return None
         async with self._lock:
-            cred = self._creds[self._index % len(self._creds)]
+            idx = self._index % len(self._creds)
+            cred = self._creds[idx]
+            label = cred.get("label", cred.get("id", f"cred#{idx}"))
+            logger.debug("codex rotator: index=%d/%d label=%s", idx, len(self._creds), label)
             if self._http and self._is_near_expiry(cred):
                 try:
                     cred = await self._refresh_one(cred)
