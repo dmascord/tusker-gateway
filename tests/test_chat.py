@@ -44,15 +44,12 @@ async def test_chat_completions_pool_dispatch(client):
         data = await resp.json()
         assert data["choices"][0]["message"]["content"] == "hello"
 
-        # Verify provider selection. Default `code` pool contains both
-        # openai-codex/{gpt-5.6-luna,gpt-5.4-mini} (kept) and
-        # openrouter/openai/gpt-oss-20b:free (kept). When no quality data
-        # is recorded, rank() uses an adaptive floor and falls back to
-        # the first candidate — which is the openrouter entry because it
-        # comes first in the default pool JSON.
+        # Verify provider selection. Unrated candidates now start at 100.0,
+        # so ranking preserves the first eligible candidate in the default
+        # pool. The first light candidate is openai-codex/gpt-5.6-luna.
         args, kwargs = mock_chat.call_args
-        assert args[0] == "openrouter"
-        assert args[1] == "openai/gpt-oss-20b:free"
+        assert args[0] == "openai-codex"
+        assert args[1] == "gpt-5.6-luna"
 
 
 @pytest.mark.asyncio

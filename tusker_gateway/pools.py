@@ -242,7 +242,7 @@ class PoolManager:
         # 3. Rank by quality and pick top
         quality_list = self._quality.rank(
             [(c.provider, c.model) for c in candidates],
-            default_score=50.0,
+            default_score=100.0,
         )
 
         # Pick top candidate
