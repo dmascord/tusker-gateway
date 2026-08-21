@@ -205,21 +205,21 @@ class SemanticCache:
             results = self._collection.query(
                 query_embeddings=[embedding],
                 n_results=1,
-                include=["documents", "metadatas"],
+                include=["documents", "metadatas", "distances"],
             )
         except Exception as exc:
             logger.warning("semantic cache: query failed: %s", exc)
             return None
 
-        ids = results.get("ids", [[]])[0]
+        ids = (results.get("ids") or [[]])[0]
         if not ids:
             self._misses += 1
             logger.debug("semantic cache: miss (no neighbours)")
             return None
 
         # ChromaDB cosine distance: distance=0 means identical; distance=2 means opposite.
-        distances = results.get("distances", [[]])[0]
-        metadatas = results.get("metadatas", [[]])[0]
+        distances = (results.get("distances") or [[]])[0]
+        metadatas = (results.get("metadatas") or [[]])[0]
         distance = distances[0] if distances else 1.0
         # Convert cosine distance to similarity score (1 - distance).
         similarity = 1.0 - distance
@@ -250,7 +250,7 @@ class SemanticCache:
             return None
 
         # Parse stored document (JSON string of response body).
-        documents = results.get("documents", [[]])[0]
+        documents = (results.get("documents") or [[]])[0]
         stored_doc = documents[0] if documents else None
         if stored_doc is None:
             self._misses += 1

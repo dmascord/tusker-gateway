@@ -481,7 +481,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
             _emit(status)
             return web.json_response(openai_error(exc.message, code=exc.code, error_type=exc.error_type), status=exc.status)
         except Exception as exc:
-            import traceback; logger.warning('chat request failed: %s\n%s', exc, traceback.format_exc())
+            logger.warning('chat request failed: %s', exc)
             status = "provider_error"
             _emit(status)
             if budget is not None and api_key and body is not None:
