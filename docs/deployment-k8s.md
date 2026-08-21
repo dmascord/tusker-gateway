@@ -56,7 +56,7 @@ kubectl -n hermes rollout status deployment/tusker-gateway --timeout=180s
 
 ## 3. Smoke test
 
-The gateway is fronted by `hermes.tusker.net.au` (same edge as Hermes):
+The gateway is fronted by `ai.tusker.net.au` (same edge as Hermes):
 
 ```bash
 # Pod health
@@ -64,15 +64,15 @@ kubectl -n hermes get pods -o wide | grep tusker-gateway
 
 # HTTP health
 curl -sS -o /dev/null -w 'health http=%{http_code} time=%{time_total}s\n' \
-  https://hermes.tusker.net.au/health
+  https://ai.tusker.net.au/health
 curl -sS -o /dev/null -w 'ready  http=%{http_code} time=%{time_total}s\n' \
-  https://hermes.tusker.net.au/ready
-curl -sS https://hermes.tusker.net.au/ready && echo
+  https://ai.tusker.net.au/ready
+curl -sS https://ai.tusker.net.au/ready && echo
 ```
 
 ## 4. DNS
 
-`hermes.tusker.net.au` already points at the cluster LB. The gateway shares the
+`ai.tusker.net.au` already points at the cluster LB. The gateway shares the
 edge with Hermes — no DNS work needed for it.
 
 ## 5. Configuration
@@ -120,3 +120,14 @@ kubectl -n hermes delete pvc tusker-home
 | Host | `hermes.tusker.net.au` | `ai.tusker.net.au` |
 | PVC | `hermes-home` | `tusker-home` |
 | Config | `hermes-env-vault` | `hermes-env-vault` (shared) |
+
+## Migration history
+
+- **2026-08-21** — Migrated the three Codex OAuth credentials (`dmascord@gmail.com`,
+  `damien.01@tusker.net.au`, `damien.02@tusker.net.au`) from
+  `hermes.tusker.net.au` (deployment `hermes`) to `ai.tusker.net.au` (this
+  gateway). The OAuth tokens are stored on the gateway's PVC at
+  `/home/tusker/.hermes/auth.json` and rotated by the `CodexTokenRotator`.
+  Hermes's pool was cleared to prevent refresh-token reuse collisions.
+  `TUSKER_POOL_CODE` and `TUSKER_POOL_PRIVACY` were rebuilt from the live hermes
+  pools, plus all `openai-codex/*` models exposed by the migrated catalog.

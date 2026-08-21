@@ -47,8 +47,8 @@ kubectl -n "${NAMESPACE}" rollout status deployment/"${DEPLOY}" --timeout=180s
 # --- Smoke test ---
 echo "--- Smoke test ---"
 kubectl -n "${NAMESPACE}" get pods -o wide | grep -E 'tusker-gateway|NAME'
-curl -sS -o /dev/null -w "health http=%{http_code} time=%{time_total}s\n" "https://hermes.tusker.net.au/health"
-curl -sS -o /dev/null -w "ready  http=%{http_code} time=%{time_total}s\n" "https://hermes.tusker.net.au/ready"
-curl -sS "https://hermes.tusker.net.au/ready" && echo
+curl -sS -o /dev/null -w "health http=%{http_code} time=%{time_total}s\n" "https://ai.tusker.net.au/health"
+curl -sS -o /dev/null -w "ready  http=%{http_code} time=%{time_total}s\n" "https://ai.tusker.net.au/ready"
+curl -sS "https://ai.tusker.net.au/ready" && echo
 
 echo "=== Done ==="

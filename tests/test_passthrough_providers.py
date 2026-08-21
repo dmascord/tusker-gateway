@@ -352,6 +352,124 @@ async def test_codex_rotator_empty():
     assert await rotator.get_token() is None
 
 
+@pytest.mark.asyncio
+async def test_codex_rotator_advance_moves_to_next():
+    """Advance() should move the rotator to the next credential.
+
+    This is the behaviour relied on by the error path in _chat_codex so
+    that a single sick account doesn't cause the breaker to trip after 5
+    consecutive failures.
+    """
+    from tusker_gateway.passthrough import CodexTokenRotator
+    creds = [{"token": "t1"}, {"token": "t2"}, {"token": "t3"}]
+    rotator = CodexTokenRotator(creds)
+    assert await rotator.get_token() == "t1"
+    await rotator.advance()
+    assert await rotator.get_token() == "t2"
+    await rotator.advance()
+    assert await rotator.get_token() == "t3"
+    await rotator.advance()
+    # Wraps back to the first credential.
+    assert await rotator.get_token() == "t1"
+
+
+@pytest.mark.asyncio
+async def test_codex_rotator_advance_noop_for_single_credential():
+    """Advance() on a single-credential rotator is a no-op (size > 1 guard)."""
+    from tusker_gateway.passthrough import CodexTokenRotator
+    rotator = CodexTokenRotator([{"token": "only"}])
+    await rotator.advance()
+    assert await rotator.get_token() == "only"
+
+
+# ---------------------------------------------------------------------------
+# Codex error path: advance the rotator on non-2xx so a sick account doesn't
+# cause the circuit breaker to trip after 5 consecutive failures. Regression
+# test for the bug where CodexTokenRotator.advance() was defined but never
+# called from anywhere.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_chat_codex_advances_rotator_on_4xx():
+    """_chat_codex must call rotator.advance() on any non-2xx upstream response."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from tusker_gateway.passthrough import CodexTokenRotator, PassthroughClient
+
+    rotator = CodexTokenRotator([
+        {"access_token": "tok-a", "expires_at_ms": 9999999999999},
+        {"access_token": "tok-b", "expires_at_ms": 9999999999999},
+    ])
+    rotator.advance = AsyncMock()  # type: ignore[method-attr]
+
+    client = PassthroughClient.__new__(PassthroughClient)  # bypass __init__
+    client._codex_rotator = rotator
+    client._config = {"quality_db_path": "/tmp/q.db"}
+    client._http = MagicMock()
+
+    # Build a fake 400 response.
+    fake_resp = MagicMock()
+    fake_resp.status = 400
+    fake_resp.text = AsyncMock(return_value='{"detail":"model not supported"}')
+
+    class FakeHTTPRequest:
+        async def __call__(self, *_a, **_kw):
+            return fake_resp
+
+    client._http.request = FakeHTTPRequest()
+
+    with pytest.raises(Exception):
+        await client._chat_codex(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "ok"}],
+            stream=False,
+            api_key=None,
+        )
+    # Advance must have been called because of the 400.
+    assert rotator.advance.await_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_chat_codex_advances_rotator_on_rate_limit():
+    """_chat_codex must call rotator.advance() on RateLimitError (429)."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from tusker_gateway.errors import RateLimitError
+    from tusker_gateway.passthrough import CodexTokenRotator, PassthroughClient
+
+    rotator = CodexTokenRotator([
+        {"access_token": "tok-a", "expires_at_ms": 9999999999999},
+        {"access_token": "tok-b", "expires_at_ms": 9999999999999},
+    ])
+    rotator.advance = AsyncMock()  # type: ignore[method-attr]
+
+    client = PassthroughClient.__new__(PassthroughClient)
+    client._codex_rotator = rotator
+    client._config = {"quality_db_path": "/tmp/q.db"}
+    client._http = MagicMock()
+
+    fake_resp = MagicMock()
+    fake_resp.status = 429
+    fake_resp.headers = {"Retry-After": "60"}
+    fake_resp.text = AsyncMock(return_value="rate limited")
+
+    class FakeHTTPRequest:
+        async def __call__(self, *_a, **_kw):
+            return fake_resp
+
+    client._http.request = FakeHTTPRequest()
+
+    with pytest.raises(RateLimitError):
+        await client._chat_codex(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "ok"}],
+            stream=False,
+            api_key=None,
+        )
+    assert rotator.advance.await_count >= 1
+
+
 # ---------------------------------------------------------------------------
 # LIVE smoke: openrouter (requires OPENROUTER_API_KEY in env)
 # ---------------------------------------------------------------------------

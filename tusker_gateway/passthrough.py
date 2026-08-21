@@ -447,12 +447,28 @@ class PassthroughClient:
             elif role == "user":
                 input_data.append({"role": "user", "content": [{"type": "input_text", "text": content}]})
             elif role == "assistant":
-                input_data.append({"role": "assistant", "content": [{"type": "output_text", "text": content}]})
-        body: dict[str, Any] = {"model": model, "input": input_data, "stream": True, "store": False}
+                # Responses API expects plain content for assistant *input*
+                # items (output_text is for output items only). Hermes-agent
+                # and the Codex CLI both send plain strings here.
+                input_data.append({"role": "assistant", "content": str(content) if content is not None else ""})
+        # Codex backend requires stream=true; force it here regardless of
+        # what the caller asked for (the response parser handles SSE).
+        body: dict[str, Any] = {
+            "model": model,
+            "input": input_data,
+            "stream": True,
+            "store": False,
+        }
+        # Pull the first system message out into `instructions` if present.
+        # Falls back to None so OpenAI can apply its own default.
         if messages and messages[0].get("role") == "system":
             sys_text = str(messages[0].get("content") or "").strip()
             if sys_text:
                 body["instructions"] = sys_text
+        # Default reasoning effort: medium. Codex backend uses native chain-
+        # of-thought; without this the backend may default to a non-thinking
+        # variant or reject the request entirely.
+        body["reasoning"] = {"effort": "medium", "summary": "auto"}
         if tools:
             body["tools"] = [
                 {"type": "function", "name": t["function"]["name"],
@@ -460,6 +476,8 @@ class PassthroughClient:
                  "parameters": t["function"].get("parameters", {"type": "object", "properties": {}})}
                 for t in normalize_tools(tools)
             ]
+            body["tool_choice"] = "auto"
+            body["parallel_tool_calls"] = True
         if extra_body:
             body.update(extra_body)
         url = f"{endpoint_raw['base_url']}{endpoint_raw['chat_path']}"
@@ -480,9 +498,27 @@ class PassthroughClient:
                 PersistentCooldownStore(db_path=db_path).record("openai-codex", model, seconds)
             except Exception:
                 pass
+            # Advance to next credential so the next request doesn't keep
+            # hammering a rate-limited account.
+            if self._codex_rotator and self._codex_rotator.size > 1:
+                await self._codex_rotator.advance()
             raise
-        except Exception:
+        except Exception as exc:
+            # Read & log the body before releasing the response so transient
+            # upstream errors (model unsupported, quota, etc.) show up in logs.
+            try:
+                err_body = await resp.text()
+            except Exception:
+                err_body = "<could not read body>"
+            logger.warning(
+                "codex error %s stream=%s: %s",
+                model, stream, err_body[:300],
+            )
             resp.release()
+            # Advance to next credential on any non-2xx so a sick account
+            # doesn't cause the breaker to trip after 5 consecutive failures.
+            if self._codex_rotator and self._codex_rotator.size > 1:
+                await self._codex_rotator.advance()
             raise
         result = await self._parse_codex_sse_async(resp)
         latency_ms = (time.monotonic() - start) * 1000
@@ -538,82 +574,6 @@ class PassthroughClient:
         await self._record_quality("openai-codex", model, True, latency_ms)
         return result
 
-
-    async def _stream_codex_events(self, resp: aiohttp.ClientResponse) -> AsyncIterator[bytes]:
-        """Parse Responses-API SSE events and forward OpenAI-compatible chunks."""
-        from tusker_gateway.sse import sse_frame
-        # Accumulate function-call arguments emitted across delta events.
-        fn_name: str | None = None
-        fn_call_id: str | None = None
-        fn_arguments = ""
-        try:
-            async for line in resp.content:
-                if line.startswith(b"data: "):
-                    data_str = line[len(b"data: "):].decode("utf-8").strip()
-                    if data_str == "[DONE]":
-                        yield sse_frame({"choices": [{"delta": {}, "finish_reason": "stop", "index": 0}]})
-                        break
-                    try:
-                        data = json.loads(data_str)
-                        event_type = data.get("type")
-                        delta: dict[str, Any] = {}
-
-                        if event_type == "response.output_text.delta":
-                            delta["content"] = data.get("delta", "")
-                        elif event_type == "response.function_call_arguments.delta":
-                            fn_name = data.get("name", fn_name)
-                            fn_call_id = data.get("call_id", fn_call_id)
-                            chunk = data.get("delta", "")
-                            fn_arguments += chunk
-                            delta["function_call"] = {
-                                "name": fn_name,
-                                "arguments": chunk,
-                            }
-
-                        if delta:
-                            yield sse_frame({"id": "chatcmpl-codex", "choices": [{"delta": delta, "index": 0}]})
-                    except json.JSONDecodeError:
-                        continue
-        finally:
-            resp.release()
-
-    def _parse_codex_response(self, result: dict[str, Any]) -> dict[str, Any]:
-        """Convert a non-stream Responses-API response to an OpenAI dict."""
-        content = ""
-        tool_calls: list[dict[str, Any]] = []
-        output_items = result.get("output", [])
-        for item in output_items:
-            if not isinstance(item, dict):
-                continue
-            if item.get("type") == "message":
-                for part in item.get("content") or []:
-                    if isinstance(part, dict) and part.get("type") == "output_text":
-                        content += part.get("text", "")
-            elif item.get("type") == "function_call":
-                call_id = item.get("call_id") or f"call_{len(tool_calls) + 1}"
-                tool_calls.append({
-                    "id": call_id,
-                    "type": "function",
-                    "function": {
-                        "name": item.get("name", ""),
-                        "arguments": json.dumps(item.get("arguments") or {}),
-                    },
-                })
-
-        finish_reason = "tool_calls" if tool_calls else "stop"
-        return {
-            "id": f"chatcmpl-{int(time.time() * 1000)}",
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": result.get("model", "tusker-gateway"),
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": content, "tool_calls": tool_calls} if tool_calls
-                           else {"role": "assistant", "content": content},
-                "finish_reason": finish_reason,
-            }],
-            "usage": result.get("usage", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}),
-        }
 
     @staticmethod
     async def _check_response(resp: aiohttp.ClientResponse) -> None:
