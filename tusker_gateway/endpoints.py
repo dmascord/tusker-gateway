@@ -86,6 +86,7 @@ async def _call_with_pool_fallback(
     client: PassthroughClient,
     tools: list[dict[str, Any]] | None = None,
     breaker: CircuitBreaker | None = None,
+    request: web.Request | None = None,
 ) -> tuple[str, str, Any]:
     """Call a pool candidate, trying the next candidate after provider failure.
 
@@ -114,9 +115,12 @@ async def _call_with_pool_fallback(
 
     excluded: set[tuple[str, str]] = set()
     last_error: Exception | None = None
-    # Single shared PoolManager across retries so stickiness / cooldown
-    # state is consistent within a single request.
-    pool_mgr = PoolManager(config)
+    # Prefer the app-level PoolManager (so catalog refresh + session
+    # stickiness are shared); fall back to a per-request instance.
+    if request is not None:
+        pool_mgr = request.app.get("pool_manager") or PoolManager(config)
+    else:
+        pool_mgr = PoolManager(config)
     while True:
         # Pool select() already filters out cooldown-blocked candidates;
         # additionally filter out breaker-open candidates here.
@@ -380,7 +384,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                         headers=headers,
                     )
 
-            provider, target_model, result = await _call_with_pool_fallback(config, body, client, tools, breaker=breaker)
+            provider, target_model, result = await _call_with_pool_fallback(config, body, client, tools, breaker=breaker, request=request)
             logger.debug('selected %s/%s for pool %s', provider, target_model, pool_name)
 
             if budget is not None and api_key and isinstance(result, dict):
@@ -522,7 +526,7 @@ async def responses_handler(request: web.Request) -> web.Response | web.StreamRe
         chat_body = {"model": body.get("model"), "messages": messages, "stream": bool(body.get("stream", False))}
         config = request.app["config"]
         client = PassthroughClient(config, QualityDB(config["quality_db_path"]), request.app["http_session"])
-        _, _, result = await _call_with_pool_fallback(config, chat_body, client)
+        _, _, result = await _call_with_pool_fallback(config, chat_body, client, request=request)
         if isinstance(result, dict) and "choices" in result:
             text = result.get("choices", [{}])[0].get("message", {}).get("content", "")
         else:

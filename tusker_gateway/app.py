@@ -94,6 +94,11 @@ def create_app() -> web.Application:
     else:
         log.info("guardrails disabled")
 
+    # Shared PoolManager so catalog refresh + session stickiness +
+    # cooldown state are consistent across all request handlers.
+    from tusker_gateway.pools import PoolManager
+    app["pool_manager"] = PoolManager(app["config"])
+
     async def on_startup(app):
         startup_log = logging.getLogger("tusker_gateway.startup")
         config = app["config"]
@@ -124,8 +129,52 @@ def create_app() -> web.Application:
         if sem_cache is not None and sem_cache.enabled:
             await sem_cache.initialize()
             startup_log.info("semantic cache initialized")
+        # Dynamic model catalog refresh (Codex, Copilot, OpenRouter,
+        # models.dev). Initial refresh is synchronous so the pool has
+        # data on the first request; the background loop keeps it fresh.
+        catalog_enabled = os.environ.get("TUSKER_CATALOG_ENABLED", "1").strip().lower()
+        if catalog_enabled not in {"0", "false", "no", "off"}:
+            try:
+                from tusker_gateway.catalog import (
+                    CatalogRegistry,
+                    catalog_refresh_loop,
+                )
+                interval_secs = float(os.environ.get("TUSKER_CATALOG_REFRESH_SECS", "300"))
+                registry = CatalogRegistry.default()
+                # Wire into PoolManager so extend_pools_with_catalog() can read.
+                pool_manager = app.get("pool_manager")
+                if pool_manager is not None:
+                    pool_manager.catalog_registry = registry
+                await registry.refresh_all(app["http_session"])
+                if pool_manager is not None:
+                    pool_manager.extend_pools_with_catalog()
+                    startup_log.info("catalog confirmed %d pool entries", sum(pool_manager.extend_pools_with_catalog().values()))
+                stop_event = asyncio.Event()
+                app["catalog_stop_event"] = stop_event
+                app["catalog_registry"] = registry
+                app["catalog_task"] = asyncio.create_task(
+                    catalog_refresh_loop(registry, app["http_session"], interval_secs, stop_event)
+                )
+                startup_log.info(
+                    "catalog refresh task started (interval=%.0fs, providers=%s)",
+                    interval_secs,
+                    ", ".join(sorted({c.provider for c in registry._clients.values()})),
+                )
+            except Exception as exc:
+                startup_log.warning("catalog refresh failed to start: %s", exc)
 
     async def on_cleanup(app):
+        # Stop the catalog refresh task first so it doesn't try to use
+        # the http_session after it's closed.
+        stop_event = app.get("catalog_stop_event")
+        if stop_event is not None:
+            stop_event.set()
+        task = app.get("catalog_task")
+        if task is not None:
+            try:
+                await asyncio.wait_for(task, timeout=5.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                task.cancel()
         tracer = app.get("tracer")
         if tracer is not None and getattr(tracer, "enabled", False):
             await tracer.stop()

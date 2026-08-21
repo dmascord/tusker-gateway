@@ -75,6 +75,9 @@ class PoolManager:
     models: dict[str, list[ModelSpec]] = field(default_factory=dict)
     _quality: QualityDB | None = None
     _cooldowns: CooldownTracker | None = None
+    # Optional catalog registry — when set, PoolManager.extend_pools_with_catalog()
+    # merges catalog-known models into the allowlist. See catalog.py.
+    catalog_registry: object | None = None
 
     # Session stickiness: (session_id, pool_name) → (provider, model)
     _stickiness: dict[tuple[str, str], tuple[str, str]] = field(default_factory=dict)
@@ -103,6 +106,67 @@ class PoolManager:
         Premium-tier pools (premium, swarm) keep them.
         """
         return pool_name in PREMIUM_POOLS
+
+    def static_allowlist(self, pool_name: str) -> set[tuple[str, str]]:
+        """Return the set of (provider, model) pairs explicitly listed in
+        the static pool config for ``pool_name``.
+
+        Used as the allowlist when merging catalog entries — operators
+        opt in to catalog models by listing them in TUSKER_POOL_*.
+        """
+        pool = self.pools.get(pool_name)
+        if not pool:
+            return set()
+        return {
+            (m.get("provider", ""), m.get("model", ""))
+            for m in pool.models
+        }
+
+    def extend_pools_with_catalog(self) -> dict[str, int]:
+        """Merge catalog-known models into every pool.
+
+        For each (provider, model) in the static allowlist, if the catalog
+        also knows about that (provider, model) pair, ensure the pool has
+        a fresh entry for it. Useful when an upstream model is renamed
+        and the operator updates the static entry but the catalog still
+        has the old slug — the catalog confirms the model is live.
+
+        Returns a mapping of pool_name -> number of catalog-confirmed
+        entries.
+        """
+        if self.catalog_registry is None:
+            return {}
+        confirmed: dict[str, int] = {}
+        for pool_name in self.pools:
+            allowlist = self.static_allowlist(pool_name)
+            count = 0
+            for provider, model in allowlist:
+                if not provider or not model:
+                    continue
+                catalog_models = self.catalog_registry.known_models(provider)
+                if catalog_models is None:
+                    continue  # provider not catalog-covered
+                if model not in catalog_models:
+                    continue  # catalog doesn't have it; static stays
+                count += 1
+            confirmed[pool_name] = count
+        logger.info("catalog confirmed %s pool entries", confirmed)
+        return confirmed
+
+    def reload_all_pools(self) -> None:
+        """Rebuild ModelSpec lists from current pool configs.
+
+        Called after a catalog refresh so the pool reflects any model
+        additions made by the operator in TUSKER_POOL_*. Does NOT add
+        catalog-only models — those still need to be in the static
+        allowlist to be picked up.
+        """
+        for name, pool in self.pools.items():
+            specs = [
+                ModelSpec.from_dict(m, default_window=pool.context_window, zdr=pool.zdr)
+                for m in pool.models
+            ]
+            self.models[name] = specs
 
     def select(
         self,
