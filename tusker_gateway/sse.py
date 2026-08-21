@@ -144,6 +144,7 @@ def format_openai_chunk(
     delta: dict = {}
     if content is not None:
         delta["content"] = content
+        delta["text"] = content
     if role is not None:
         delta["role"] = role
 
