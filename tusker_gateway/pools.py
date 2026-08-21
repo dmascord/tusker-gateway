@@ -12,9 +12,16 @@ from typing import Any
 
 from tusker_gateway.config import DEFAULT_PROVIDER_REGISTRY, PoolConfig
 from tusker_gateway.cooldown import CooldownTracker, global_tracker
+from tusker_gateway.heavyweight import is_heavyweight
 from tusker_gateway.quality import QualityDB
 
 logger = logging.getLogger(__name__)
+
+
+# Pools that are considered "premium" tiers — heavyweight models are
+# kept for these (mirrors hermes-agent's `hermes-premium` semantics).
+# Cheap-tier pools (`hermes-code`, `hermes-privacy`) drop heavyweights.
+PREMIUM_POOLS: frozenset[str] = frozenset({"premium", "swarm"})
 
 
 def _validate_providers(specs: list["ModelSpec"]) -> list[str]:
@@ -42,7 +49,14 @@ class ModelSpec:
         provider = data["provider"]
         model = data["model"]
         ctx = int(data.get("context_window", default_window))
-        hw = bool(data.get("heavyweight", False))
+        # Per-entry `heavyweight` override; fall back to slug-based classifier.
+        # This means operators don't need to keep the pool JSON in sync when
+        # OpenAI/Copilot ship new heavyweight slugs — the slug set catches them.
+        hw = data.get("heavyweight")
+        if hw is None:
+            hw = is_heavyweight(model)
+        else:
+            hw = bool(hw)
         return cls(
             provider=provider,
             model=model,
@@ -82,6 +96,14 @@ class PoolManager:
             for w in warnings:
                 logger.warning("pool '%s': %s — will be skipped during selection", name, w)
 
+    def pool_keeps_heavyweight(self, pool_name: str) -> bool:
+        """Return True if the named pool should keep heavyweight candidates.
+
+        Cheap-tier pools (code, privacy) drop heavyweights.
+        Premium-tier pools (premium, swarm) keep them.
+        """
+        return pool_name in PREMIUM_POOLS
+
     def select(
         self,
         pool_name: str,
@@ -89,17 +111,25 @@ class PoolManager:
         context_tokens: int = 0,
         session_id: str | None = None,
         preferred: str | None = None,
-        heavyweight_ok: bool = False,
+        heavyweight_ok: bool | None = None,
         excluded: set[tuple[str, str]] | None = None,
     ) -> tuple[str, str] | None:
         """Select the best (provider, model) from a pool.
 
         Failed candidates can be excluded for request-level fallback.
+
+        ``heavyweight_ok`` defaults to the pool's tier: cheap-tier pools
+        (code, privacy) drop heavyweights, premium-tier pools (premium,
+        swarm) keep them. Pass an explicit True/False to override.
         """
         excluded = excluded or set()
         specs = self.models.get(pool_name, [])
         if not specs:
             return None
+
+        # Resolve heavyweight gate from pool tier if not explicitly set.
+        if heavyweight_ok is None:
+            heavyweight_ok = self.pool_keeps_heavyweight(pool_name)
 
         # 1. Session stickiness
         if session_id:
@@ -113,6 +143,11 @@ class PoolManager:
                             break
                         if context_tokens > 0 and s.context_window < context_tokens:
                             # Context doesn't fit; clear stickiness
+                            self._stickiness.pop(key, None)
+                            break
+                        # Don't return a sticky heavyweight if the pool
+                        # no longer allows it (config changed mid-session).
+                        if not heavyweight_ok and s.heavyweight:
                             self._stickiness.pop(key, None)
                             break
                         return prev

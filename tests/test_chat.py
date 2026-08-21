@@ -44,9 +44,14 @@ async def test_chat_completions_pool_dispatch(client):
         data = await resp.json()
         assert data["choices"][0]["message"]["content"] == "hello"
 
-        # Verify provider selection (default pool: code -> github-copilot)
+        # Verify provider selection. Default `code` pool contains
+        # github-copilot/{gpt-5.5,claude-sonnet-4.6} (heavyweight, dropped)
+        # and openai-codex/{gpt-5.6-luna,gpt-5.4-mini} (kept). First
+        # survivor is openai-codex/gpt-5.6-luna (no quality data → median
+        # floor used by rank).
         args, kwargs = mock_chat.call_args
-        assert args[0] == "github-copilot"
+        assert args[0] == "openai-codex"
+        assert args[1] == "gpt-5.6-luna"
 
 
 @pytest.mark.asyncio

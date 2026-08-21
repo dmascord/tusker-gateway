@@ -293,8 +293,13 @@ def _load_pools() -> dict[str, PoolConfig]:
         pools["code"] = PoolConfig(
             name="code",
             models=[
+                # Mix of free/cheap models (kept) and heavyweight slugs (dropped
+                # automatically by the heavyweight gate in pools.py).
                 {"provider": "github-copilot", "model": "gpt-5.5"},
                 {"provider": "github-copilot", "model": "claude-sonnet-4.6"},
+                {"provider": "openai-codex", "model": "gpt-5.6-luna"},
+                {"provider": "openai-codex", "model": "gpt-5.4-mini"},
+                {"provider": "openrouter", "model": "openai/gpt-oss-20b:free"},
             ],
         )
     if "privacy" not in pools:
