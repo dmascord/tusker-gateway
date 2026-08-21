@@ -49,6 +49,9 @@ from typing import Any, Iterator
 
 
 logger = logging.getLogger(__name__)
+# OTLP export warnings are noisy and unhelpful for debugging the gateway itself.
+# Set to ERROR so only actual failures (4xx/5xx from the collector) are logged.
+logger.setLevel(logging.ERROR)
 
 
 def _ns_now() -> int:

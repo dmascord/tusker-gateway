@@ -317,6 +317,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
     tracer: Tracer | None = request.app.get("tracer")
 
     started = time.monotonic()
+    request_id = uuid.uuid4().hex[:12]
     pool_name = "passthrough"  # overwritten for pool-routed requests
     provider = "unknown"
     target_model = "unknown"
@@ -347,7 +348,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
     with span_cm as root_span:
         try:
             body = _validate_chat_body(await request.json())
-            logger.info('chat request model=%s pool=%s stream=%s', body.get("model"), pool_name, body.get("stream"))
+            logger.info('chat request rid=%s model=%s pool=%s stream=%s', request_id, body.get("model"), pool_name, body.get("stream"))
             if tracer is not None and tracer.enabled and root_span is not None:
                 root_span.attributes["tusker.model"] = str(body.get("model") or "")
             config = request.app["config"]
@@ -449,7 +450,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                     )
 
             provider, target_model, result = await _call_with_pool_fallback(config, body, client, tools, breaker=breaker, request=request)
-            logger.debug('selected %s/%s for pool %s', provider, target_model, pool_name)
+            logger.debug('selected rid=%s provider=%s model=%s pool=%s', request_id, provider, target_model, pool_name)
 
             if budget is not None and api_key and isinstance(result, dict):
                 usage = result.get("usage") or {}
@@ -544,22 +545,22 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                 except (ConnectionResetError, ConnectionError, BrokenPipeError) as exc:
                     stream_ok = False
                     logger.info(
-                        "stream client disconnected mid-flight provider=%s model=%s err=%s",
-                        provider, target_model, exc,
+                        "stream client disconnected mid-flight rid=%s provider=%s model=%s err=%s",
+                        request_id, provider, target_model, exc,
                     )
                     if budget is not None and api_key and body is not None:
                         budget.refund(api_key, pool_name, _estimated_tokens(body["messages"]))
                 except asyncio.CancelledError:
                     stream_ok = False
                     logger.info(
-                        "stream cancelled provider=%s model=%s", provider, target_model,
+                        "stream cancelled rid=%s provider=%s model=%s", request_id, provider, target_model,
                     )
                     raise
                 except Exception as exc:  # noqa: BLE001
                     stream_ok = False
                     logger.warning(
-                        "stream pump failed provider=%s model=%s err=%s",
-                        provider, target_model, exc,
+                        "stream pump failed rid=%s provider=%s model=%s err=%s",
+                        request_id, provider, target_model, exc,
                         exc_info=True,
                     )
                     if budget is not None and api_key and body is not None:
@@ -594,7 +595,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
             _emit(status)
             return web.json_response(openai_error(exc.message, code=exc.code, error_type=exc.error_type), status=exc.status)
         except Exception as exc:
-            logger.warning('chat request failed: %s', exc)
+            logger.warning('chat request failed rid=%s: %s', request_id, exc)
             status = "provider_error"
             _emit(status)
             if budget is not None and api_key and body is not None:

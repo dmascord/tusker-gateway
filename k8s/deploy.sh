@@ -26,7 +26,9 @@ echo "IMAGE: ${IMAGE}"
 # --- Build ---
 echo "--- Build ---"
 cd "${SRC_DIR}"
-buildah bud -f Dockerfile -t "${IMAGE}" .
+COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)
+echo "COMMIT: ${COMMIT}"
+buildah bud --build-arg "TUSKER_COMMIT=${COMMIT}" -f Dockerfile -t "${IMAGE}" .
 buildah push "${IMAGE}"
 buildah images --format '{{.ID}} {{.Name}}:{{.Tag}}' | grep -q "${IMAGE}" \
   || { echo "ERROR: image push failed"; exit 1; }

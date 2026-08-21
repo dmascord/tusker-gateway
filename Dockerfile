@@ -4,6 +4,8 @@ LABEL org.opencontainers.image.title="tusker-gateway" \
        org.opencontainers.image.description="Tusker OpenAI-compatible gateway" \
        org.opencontainers.image.source="https://github.com/dmascord/tusker-gateway"
 
+ARG TUSKER_COMMIT=unknown
+ENV TUSKER_COMMIT=${TUSKER_COMMIT}
 WORKDIR /opt/tusker-gateway
 
 RUN apt-get update && apt-get install -y --no-install-recommends \

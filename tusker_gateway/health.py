@@ -2,17 +2,24 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 from aiohttp import web
 
 logger = logging.getLogger(__name__)
 
+_GIT_COMMIT = os.environ.get("TUSKER_COMMIT", "unknown").strip()
+
 
 def health_handler(request: web.Request) -> web.Response:
     """GET /health — liveness probe."""
     logger.debug('health check')
-    return web.json_response({"status": "ok", "version": "0.1.0"})
+    return web.json_response({
+        "status": "ok",
+        "version": "0.1.0",
+        "commit": _GIT_COMMIT,
+    })
 
 
 def ready_handler(request: web.Request) -> web.Response:
