@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
 import uuid
-from typing import Any
+from typing import Any, AsyncIterator
 
 from aiohttp import web
 
@@ -44,6 +45,57 @@ logger = logging.getLogger(__name__)
 # knob in production via the deployment manifest without a redeploy.
 def _sse_heartbeat_secs() -> float:
     return float(os.environ.get("TUSKER_SSE_HEARTBEAT_SECS", "15"))
+
+
+async def _normalize_stream(raw_stream: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
+    """Normalize upstream SSE chunks for OMP/client compatibility.
+
+    Some upstream providers bundle `delta.content` and `finish_reason` in the
+    same SSE chunk. OMP (and other strict OpenAI clients) require:
+      - content-only delta chunks with finish_reason: null
+      - a separate final chunk with finish_reason set
+    This generator splits bundled chunks into separate SSE frames.
+    """
+    async for line in raw_stream:
+        # Fast path: pass through non-data lines (blank, comments) as-is
+        if not line.startswith(b"data: "):
+            yield line
+            continue
+        # Pass through [DONE] sentinel as-is
+        if line.strip() == b"data: [DONE]":
+            yield line
+            continue
+        try:
+            obj = json.loads(line[len(b"data: "):])
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            yield line
+            continue
+        choices = obj.get("choices")
+        if not isinstance(choices, list) or not choices:
+            yield line
+            continue
+        choice = choices[0]
+        delta = choice.get("delta") or {}
+        fr = choice.get("finish_reason")
+        has_content = "content" in delta and delta["content"]
+        has_tools = "tool_calls" in delta
+        # Split if chunk has BOTH content/tools AND finish_reason
+        if fr and (has_content or has_tools):
+            content_delta = {k: v for k, v in delta.items()
+                           if k not in ("role", "tool_calls")}
+            if content_delta:
+                content_obj = {**obj, "choices": [{**choice, "delta": content_delta, "finish_reason": None}]}
+                yield f"data: {json.dumps(content_obj, ensure_ascii=False)}\n\n".encode()
+            # Emit tool_calls delta if present (without finish_reason)
+            if has_tools:
+                tools_only = {"role": delta.get("role"), "tool_calls": delta["tool_calls"]}
+                tools_obj = {**obj, "choices": [{**choice, "delta": tools_only, "finish_reason": None}]}
+                yield f"data: {json.dumps(tools_obj, ensure_ascii=False)}\n\n".encode()
+            # Emit finish_reason-only chunk (no content, no tools)
+            finish_obj = {**obj, "choices": [{**choice, "delta": {}, "finish_reason": fr}]}
+            yield f"data: {json.dumps(finish_obj, ensure_ascii=False)}\n\n".encode()
+        else:
+            yield line
 
 
 def _pool_name(body: dict[str, Any]) -> str | None:
@@ -470,12 +522,12 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                                 tc_id = tc.get("id", "")
                                 fn = tc.get("function", {})
                                 tc_delta = {"role": "assistant", "tool_calls": [{"index": 0, "id": tc_id, "type": "function", "function": {"name": fn.get("name", ""), "arguments": fn.get("arguments", "")}}]}
-                                await resp.write(sse_frame({"id": result.get("id", "chatcmpl-tusker"), "choices": [{"index": 0, "delta": tc_delta}], "model": result.get("model", "tusker-gateway")}))
+                                await resp.write(sse_frame({"id": result.get("id", "chatcmpl-tusker"), "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": tc_delta}], "model": result.get("model", "tusker-gateway")}))
                         
-                        # Emit finish_reason chunk
+                        # Emit finish_reason chunk (distinct from content to satisfy OMP)
                         await resp.write(sse_frame(format_openai_chunk(finish_reason=finish_reason)))
                     else:
-                        async for chunk in result:
+                        async for chunk in _normalize_stream(result):
                             await resp.write(chunk)
                 except (ConnectionResetError, ConnectionError, BrokenPipeError) as exc:
                     stream_ok = False

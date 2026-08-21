@@ -139,7 +139,7 @@ def format_openai_chunk(
     model: str | None = None,
 ) -> dict:
     """Build an OpenAI chat completion chunk dict."""
-    chunk: dict = {"id": f"chatcmpl-{_rand_id()}", "choices": [], "model": model or "tusker-gateway"}
+    chunk: dict = {"id": f"chatcmpl-{_rand_id()}", "object": "chat.completion.chunk", "choices": [], "model": model or "tusker-gateway"}
 
     delta: dict = {}
     if content is not None:
