@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from typing import Any, AsyncIterator
@@ -47,6 +48,104 @@ def _sse_heartbeat_secs() -> float:
     return float(os.environ.get("TUSKER_SSE_HEARTBEAT_SECS", "15"))
 
 
+_TOOL_CALL_XML_RE = re.compile(
+    r"<\|?\s*/?\s*tool_call\s*\|?>|<function=[\s\S]*?</function>",
+    re.IGNORECASE,
+)
+
+# Opening tokens that mark the start of a tool-call block. When the tail of
+# the accumulated buffer matches one of these prefixes, we hold it back until
+# the full block has arrived (a block may span several streamed chunks).
+_TOOL_OPENERS = (
+    "<tool_call>",
+    "<tool_call",
+    "<|tool_call|>",
+    "<|tool_call",
+    "<|start_header|>",
+    "<function=",
+    "<|begin_of_",
+)
+
+
+class _ToolCallStripper:
+    """Stateful stripper that removes XML/Markdown tool_call markup from a
+    streamed text sequence, tolerating block boundaries that split across
+    network chunks.
+
+    Holds a ``_carry`` tail that may be an incomplete opening token; when a
+    complete block is seen it is dropped, otherwise carried text is emitted.
+    """
+
+    def __init__(self) -> None:
+        self._carry = ""
+
+    def _looks_like_opener(self, text: str) -> bool:
+        """Return True if `text` is a prefix of a known tool-call opener."""
+        if not text:
+            return False
+        lower = text.lower()
+        for opener in _TOOL_OPENERS:
+            if opener.startswith(lower):
+                return True
+        return False
+
+    def feed(self, chunk: str) -> str:
+        """Process a content chunk, returning the clean (emit-able) text."""
+        if not chunk:
+            return ""
+        text = self._carry + chunk
+        self._carry = ""
+        out: list[str] = []
+
+        # Repeatedly remove complete tool-call blocks.
+        while True:
+            m = _TOOL_CALL_XML_RE.search(text)
+            if not m:
+                break
+            out.append(text[: m.start()])
+            text = text[m.end():]
+
+        # Now `text` contains no complete tool block. Check whether its
+        # trailing suffix is an incomplete opener prefix that may continue
+        # into the next chunk; carry it if so, otherwise emit it.
+        if text:
+            emit_end = len(text)
+            carry = ""
+            for i in range(len(text)):
+                tail = text[i:]
+                if self._looks_like_opener(tail):
+                    emit_end = i
+                    carry = tail
+                    break
+            out.append(text[:emit_end])
+            self._carry = carry
+        return "".join(out)
+
+    def flush(self) -> str:
+        """Drop any remaining carried content (partial opener that never
+        completed). Returns the clean emitted text, usually empty."""
+        carry, self._carry = self._carry, ""
+        return ""
+
+
+def _strip_xml_tool_calls(content: str) -> str:
+    """Strip XML/Markdown-style tool_call markup from assistant content.
+
+    Some open-source models (e.g. DeepSeek, Qwen) emit tool-call markup
+    as raw text in the content stream even when tools are provided via
+    the structured `tool_calls` API field. This causes clients like
+    OMP to see duplicate tool-call artifacts ("text tool calls leaking
+    through"). We strip both the wrapper tags and the inner function
+    payloads so the content stream only carries the prose.
+
+    We only strip when the markup contains tool-call-shaped tags so normal
+    text mentioning "tool_call" is preserved.
+    """
+    if not content or "<" not in content:
+        return content
+    return _TOOL_CALL_XML_RE.sub("", content)
+
+
 async def _normalize_stream(raw_stream: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
     """Normalize upstream SSE chunks for OMP/client compatibility.
 
@@ -56,11 +155,19 @@ async def _normalize_stream(raw_stream: AsyncIterator[bytes]) -> AsyncIterator[b
       - a separate final chunk with finish_reason set
     This generator splits bundled chunks into separate SSE frames.
 
+    Additionally, some open-source models emit XML/Markdown-style
+    ``<tool_call>...<function=...>...</function></tool_call>`` markup in
+    the content stream alongside structured ``tool_calls`` deltas. This
+    shows up in OMP as raw text tool calls "leaking through". We strip
+    that markup from content deltas so OMP sees only the structured
+    tool_calls and the surrounding prose.
+
     The upstream yields arbitrary byte chunks from `resp.content.iter_any()`,
     which may contain multiple SSE events. We split on ``\\n\\n`` boundaries,
     process each ``data:`` event individually, and re-emit them.
     """
     buffer = b""
+    tool_stripper = _ToolCallStripper()
     async for chunk in raw_stream:
         buffer += chunk
         while b"\n\n" in buffer:
@@ -73,6 +180,7 @@ async def _normalize_stream(raw_stream: AsyncIterator[bytes]) -> AsyncIterator[b
                 continue
             # Pass through [DONE] sentinel as-is
             if stripped == b"data: [DONE]":
+                tool_stripper.flush()
                 yield frame
                 continue
             try:
@@ -87,24 +195,37 @@ async def _normalize_stream(raw_stream: AsyncIterator[bytes]) -> AsyncIterator[b
             choice = choices[0]
             delta = choice.get("delta") or {}
             fr = choice.get("finish_reason")
-            has_content = bool(delta.get("content"))
+            raw_content = delta.get("content")
+            has_content = isinstance(raw_content, str) and bool(raw_content)
             tc = delta.get("tool_calls")
             has_tools = bool(tc) and isinstance(tc, list) and len(tc) > 0
+            # Strip XML/Markdown tool-call markup from content deltas using
+            # a stateful stripper so markup spanning multiple streamed chunks
+            # is still recognized and dropped.
+            if has_content and "<" in raw_content:
+                cleaned = tool_stripper.feed(raw_content)
+                if not cleaned and has_tools:
+                    delta = {k: v for k, v in delta.items() if k != "content"}
+                else:
+                    delta = {**delta, "content": cleaned}
+            # Replace delta in choice and obj for downstream re-emission.
+            new_choice = {**choice, "delta": delta}
+            new_obj = {**obj, "choices": [new_choice, *choices[1:]]}
             # Split if chunk has BOTH content/tools AND finish_reason
-            if fr and (has_content or has_tools):
-                if has_content:
+            if fr and (bool(delta.get("content")) or has_tools):
+                if bool(delta.get("content")):
                     content_delta = {k: v for k, v in delta.items()
                                    if k not in ("role", "tool_calls")}
-                    content_obj = {**obj, "choices": [{**choice, "delta": content_delta, "finish_reason": None}]}
+                    content_obj = {**new_obj, "choices": [{**new_choice, "delta": content_delta, "finish_reason": None}]}
                     yield f"data: {json.dumps(content_obj, ensure_ascii=False)}\n\n".encode()
                 if has_tools:
                     tools_only = {"role": delta.get("role"), "tool_calls": tc}
-                    tools_obj = {**obj, "choices": [{**choice, "delta": tools_only, "finish_reason": None}]}
+                    tools_obj = {**new_obj, "choices": [{**new_choice, "delta": tools_only, "finish_reason": None}]}
                     yield f"data: {json.dumps(tools_obj, ensure_ascii=False)}\n\n".encode()
-                finish_obj = {**obj, "choices": [{**choice, "delta": {}, "finish_reason": fr}]}
+                finish_obj = {**new_obj, "choices": [{**new_choice, "delta": {}, "finish_reason": fr}]}
                 yield f"data: {json.dumps(finish_obj, ensure_ascii=False)}\n\n".encode()
             else:
-                yield frame
+                yield f"data: {json.dumps(new_obj, ensure_ascii=False)}\n\n".encode()
     # Flush any remaining partial frame in the buffer
     if buffer.strip():
         yield buffer
