@@ -140,6 +140,11 @@ spec:
             secretKeyRef:
               name: hermes-env-vault
               key: OPENCODE_ZEN_API_KEY
+        # Override the secret's 2 req/s burst 3 — that's too tight for OMP.
+        - name: TUSKER_RATELIMIT_DEFAULT_RATE
+          value: "10"
+        - name: TUSKER_RATELIMIT_DEFAULT_BURST
+          value: "20"
         ports:
         - containerPort: 8642
           name: http
