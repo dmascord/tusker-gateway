@@ -570,9 +570,6 @@ class PassthroughClient:
             "choices": [{"index": 0, "message": message, "finish_reason": "tool_calls" if tool_order else "stop"}],
             "usage": usage_obj or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         }
-        latency_ms = (time.monotonic() - start) * 1000
-        await self._record_quality("openai-codex", model, True, latency_ms)
-        return result
 
 
     @staticmethod

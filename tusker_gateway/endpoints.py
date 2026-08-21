@@ -447,8 +447,36 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                 )
                 stream_ok = True
                 try:
-                    async for chunk in result:
-                        await resp.write(chunk)
+                    if isinstance(result, dict):
+                        # Convert complete response to SSE chunks.
+                        # Codex parses the full response from its SSE stream;
+                        # the gateway receives it as a single dict and must
+                        # emit it as proper OpenAI streaming chunks so the
+                        # client (e.g. OMP) can consume them as text deltas.
+                        choices = result.get("choices", [{}])
+                        choice = choices[0]
+                        message = choice.get("message", {})
+                        content = message.get("content", "")
+                        finish_reason = choice.get("finish_reason", "stop")
+                        
+                        # Emit content chunk if there's text
+                        if content:
+                            await resp.write(sse_frame(format_openai_chunk(content=content)))
+                        
+                        # Emit tool_calls as individual deltas if present
+                        tool_calls = message.get("tool_calls")
+                        if tool_calls:
+                            for tc in tool_calls:
+                                tc_id = tc.get("id", "")
+                                fn = tc.get("function", {})
+                                tc_delta = {"role": "assistant", "tool_calls": [{"index": 0, "id": tc_id, "type": "function", "function": {"name": fn.get("name", ""), "arguments": fn.get("arguments", "")}}]}
+                                await resp.write(sse_frame({"id": result.get("id", "chatcmpl-tusker"), "choices": [{"index": 0, "delta": tc_delta}], "model": result.get("model", "tusker-gateway")}))
+                        
+                        # Emit finish_reason chunk
+                        await resp.write(sse_frame(format_openai_chunk(finish_reason=finish_reason)))
+                    else:
+                        async for chunk in result:
+                            await resp.write(chunk)
                 except (ConnectionResetError, ConnectionError, BrokenPipeError) as exc:
                     stream_ok = False
                     logger.info(
