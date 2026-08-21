@@ -55,49 +55,59 @@ async def _normalize_stream(raw_stream: AsyncIterator[bytes]) -> AsyncIterator[b
       - content-only delta chunks with finish_reason: null
       - a separate final chunk with finish_reason set
     This generator splits bundled chunks into separate SSE frames.
+
+    The upstream yields arbitrary byte chunks from `resp.content.iter_any()`,
+    which may contain multiple SSE events. We split on ``\\n\\n`` boundaries,
+    process each ``data:`` event individually, and re-emit them.
     """
-    async for line in raw_stream:
-        # Fast path: pass through non-data lines (blank, comments) as-is
-        if not line.startswith(b"data: "):
-            yield line
-            continue
-        # Pass through [DONE] sentinel as-is
-        if line.strip() == b"data: [DONE]":
-            yield line
-            continue
-        try:
-            obj = json.loads(line[len(b"data: "):])
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            yield line
-            continue
-        choices = obj.get("choices")
-        if not isinstance(choices, list) or not choices:
-            yield line
-            continue
-        choice = choices[0]
-        delta = choice.get("delta") or {}
-        fr = choice.get("finish_reason")
-        has_content = bool(delta.get("content"))
-        tc = delta.get("tool_calls")
-        has_tools = bool(tc) and isinstance(tc, list) and len(tc) > 0
-        # Split if chunk has BOTH content/tools AND finish_reason
-        if fr and (has_content or has_tools):
-            if has_content:
-                # content-only delta (no finish_reason, no tools)
-                content_delta = {k: v for k, v in delta.items()
-                               if k not in ("role", "tool_calls")}
-                content_obj = {**obj, "choices": [{**choice, "delta": content_delta, "finish_reason": None}]}
-                yield f"data: {json.dumps(content_obj, ensure_ascii=False)}\n\n".encode()
-            if has_tools:
-                # tools-only delta
-                tools_only = {"role": delta.get("role"), "tool_calls": tc}
-                tools_obj = {**obj, "choices": [{**choice, "delta": tools_only, "finish_reason": None}]}
-                yield f"data: {json.dumps(tools_obj, ensure_ascii=False)}\n\n".encode()
-            # finish_reason-only chunk (no content, no tools)
-            finish_obj = {**obj, "choices": [{**choice, "delta": {}, "finish_reason": fr}]}
-            yield f"data: {json.dumps(finish_obj, ensure_ascii=False)}\n\n".encode()
-        else:
-            yield line
+    buffer = b""
+    async for chunk in raw_stream:
+        buffer += chunk
+        while b"\n\n" in buffer:
+            frame, buffer = buffer.split(b"\n\n", 1)
+            frame += b"\n\n"  # preserve terminator for yield
+            stripped = frame.strip()
+            # Pass through non-data frames as-is (comments, empty)
+            if not stripped.startswith(b"data: "):
+                yield frame
+                continue
+            # Pass through [DONE] sentinel as-is
+            if stripped == b"data: [DONE]":
+                yield frame
+                continue
+            try:
+                obj = json.loads(stripped[len(b"data: "):])
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                yield frame
+                continue
+            choices = obj.get("choices")
+            if not isinstance(choices, list) or not choices:
+                yield frame
+                continue
+            choice = choices[0]
+            delta = choice.get("delta") or {}
+            fr = choice.get("finish_reason")
+            has_content = bool(delta.get("content"))
+            tc = delta.get("tool_calls")
+            has_tools = bool(tc) and isinstance(tc, list) and len(tc) > 0
+            # Split if chunk has BOTH content/tools AND finish_reason
+            if fr and (has_content or has_tools):
+                if has_content:
+                    content_delta = {k: v for k, v in delta.items()
+                                   if k not in ("role", "tool_calls")}
+                    content_obj = {**obj, "choices": [{**choice, "delta": content_delta, "finish_reason": None}]}
+                    yield f"data: {json.dumps(content_obj, ensure_ascii=False)}\n\n".encode()
+                if has_tools:
+                    tools_only = {"role": delta.get("role"), "tool_calls": tc}
+                    tools_obj = {**obj, "choices": [{**choice, "delta": tools_only, "finish_reason": None}]}
+                    yield f"data: {json.dumps(tools_obj, ensure_ascii=False)}\n\n".encode()
+                finish_obj = {**obj, "choices": [{**choice, "delta": {}, "finish_reason": fr}]}
+                yield f"data: {json.dumps(finish_obj, ensure_ascii=False)}\n\n".encode()
+            else:
+                yield frame
+    # Flush any remaining partial frame in the buffer
+    if buffer.strip():
+        yield buffer
 
 
 def _pool_name(body: dict[str, Any]) -> str | None:
