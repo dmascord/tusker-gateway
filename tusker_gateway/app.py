@@ -26,6 +26,7 @@ from tusker_gateway.endpoints import (
     metrics_handler,
     models_handler,
     responses_handler,
+    images_handler,
 )
 from tusker_gateway.anthropic_adapter import anthropic_messages_handler
 from tusker_gateway.errors import GatewayError, openai_error
@@ -228,6 +229,9 @@ def create_app() -> web.Application:
     app.router.add_post("/v1/chat/completions", chat_completions_handler)
     app.router.add_post("/v1/responses", responses_handler)
     app.router.add_post("/v1/messages", anthropic_messages_handler)
+    app.router.add_post("/v1/images/generations", images_handler)
+    app.router.add_post("/v1/images/edits", images_handler)
+    app.router.add_post("/v1/images/variations", images_handler)
 
     app.on_cleanup.append(on_cleanup)
     app.on_startup.append(on_startup)

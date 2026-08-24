@@ -38,6 +38,7 @@ echo "Image pushed: ${IMAGE}"
 echo "--- Apply manifests ---"
 kubectl -n "${NAMESPACE}" apply -f k8s/pvc.yaml
 kubectl -n "${NAMESPACE}" apply -f k8s/config.yaml
+kubectl -n "${NAMESPACE}" apply -f k8s/deployment.yaml
 kubectl -n "${NAMESPACE}" apply -f k8s/service.yaml
 kubectl -n "${NAMESPACE}" apply -f k8s/ingressroute.yaml
 
