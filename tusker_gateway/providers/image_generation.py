@@ -33,13 +33,15 @@ IMAGE_GEN_MODELS = {
 def _map_model_to_codex(model: str) -> str:
     """Translate an OpenAI image model id to the Codex image generation model slug.
 
-    Codex currently serves GPT Image models via the ``image_generation`` tool;
-    the model slug for the most capable variant is ``gpt-image-1``. Older
-    DALL-E names pass through unchanged so any custom slugs still work.
+    Codex/ChatGPT currently only serves image generation through ``gpt-image-2``
+    when authenticated with a ChatGPT account; ``gpt-image-1`` returns
+    "model not supported when using Codex with a ChatGPT account".
+    Older DALL-E names also route to ``gpt-image-2`` since that's the
+    available slug.
     """
     lower = (model or "").lower()
     if "gpt-image" in lower or "dall-e" in lower or lower in {"", "auto"}:
-        return "gpt-image-1"
+        return "gpt-image-2"
     return model
 
 

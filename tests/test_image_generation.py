@@ -28,15 +28,18 @@ def _make_config():
     }
 
 
+
 def test_map_model_to_codex_gpt_image():
-    assert _map_model_to_codex("gpt-image-1") == "gpt-image-1"
-    assert _map_model_to_codex("gpt-image-2") == "gpt-image-1"
-    assert _map_model_to_codex("GPT-IMAGE-MINI") == "gpt-image-1"
+    # Codex/ChatGPT currently only supports gpt-image-2.
+    assert _map_model_to_codex("gpt-image-1") == "gpt-image-2"
+    assert _map_model_to_codex("gpt-image-2") == "gpt-image-2"
+    assert _map_model_to_codex("GPT-IMAGE-MINI") == "gpt-image-2"
 
 
 def test_map_model_to_codex_dall_e():
-    assert _map_model_to_codex("dall-e-3") == "gpt-image-1"
-    assert _map_model_to_codex("dall-e-2") == "gpt-image-1"
+    # DALL-E names route to gpt-image-2 since that's the only Codex slug.
+    assert _map_model_to_codex("dall-e-3") == "gpt-image-2"
+    assert _map_model_to_codex("dall-e-2") == "gpt-image-2"
 
 
 def test_map_model_to_codex_passthrough():
@@ -44,8 +47,9 @@ def test_map_model_to_codex_passthrough():
 
 
 def test_map_model_to_codex_empty_and_auto():
-    assert _map_model_to_codex("") == "gpt-image-1"
-    assert _map_model_to_codex("auto") == "gpt-image-1"
+    assert _map_model_to_codex("") == "gpt-image-2"
+    assert _map_model_to_codex("auto") == "gpt-image-2"
+
 
 
 def test_get_provider_for_image_request_openai():
