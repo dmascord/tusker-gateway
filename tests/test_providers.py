@@ -157,6 +157,32 @@ async def test_openrouter_request_shape():
 
 
 @pytest.mark.asyncio
+async def test_build_request_forwards_extra_body_max_tokens():
+    """max_tokens in extra_body must land in the upstream request body.
+
+    Without this, upstream providers fall back to their own default
+    max_tokens (often 256-1024) and silently truncate the model mid-task.
+    """
+    client = _make_client({"openai": "sk-test"})
+    try:
+        headers, body = await client._build_request(  # noqa: SLF001
+            provider="openai",
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": "hi"}],
+            stream=False,
+            api_key=None,
+            extra_headers=None,
+            extra_body={"max_tokens": 16384, "temperature": 0.7, "top_p": 0.9},
+            endpoint=PROVIDER_ENDPOINTS["openai"],
+        )
+        assert body["max_tokens"] == 16384
+        assert body["temperature"] == 0.7
+        assert body["top_p"] == 0.9
+    finally:
+        await client._http.close()  # noqa: SLF001
+
+
+@pytest.mark.asyncio
 async def test_provider_api_key_fallback_to_config():
     client = _make_client({"openai": "sk-config-key"})
     try:

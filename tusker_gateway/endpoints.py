@@ -294,6 +294,28 @@ def _estimated_tokens(messages: list[dict[str, Any]]) -> int:
     return max(1, chars // 4)
 
 
+# Request fields handled separately by the gateway. Everything else from
+# the request body is forwarded upstream as-is so callers can pass
+# max_tokens / temperature / top_p / stop / seed / response_format / etc.
+# without us needing to maintain a whitelist. Without this passthrough,
+# upstream providers fall back to their own tiny defaults (often 256-512
+# tokens) and the model silently truncates mid-task with a StopReason
+# of 'length' that OMP then interprets as 'finished'.
+_GATEWAY_HANDLED_FIELDS = frozenset({
+    "model", "messages", "stream", "tools", "tool_choice",
+})
+
+
+def _build_extra_body(body: dict[str, Any]) -> dict[str, Any]:
+    """Extract passthrough fields from a request body.
+
+    Returns a dict of fields that should be forwarded to the upstream
+    provider as `extra_body`, excluding fields the gateway already
+    handles (model/messages/stream/tools/tool_choice).
+    """
+    return {k: v for k, v in body.items() if k not in _GATEWAY_HANDLED_FIELDS}
+
+
 async def _call_with_pool_fallback(
     config: dict[str, Any],
     body: dict[str, Any],
@@ -308,6 +330,7 @@ async def _call_with_pool_fallback(
     the call is attempted. Successful calls record success; failures (other
     than 429 rate-limit, which uses the cooldown path) record failure.
     """
+    extra_body = _build_extra_body(body)
     pool_name = _pool_name(body)
     if pool_name is None:
         provider, model = _route_target(config, body)
@@ -318,7 +341,12 @@ async def _call_with_pool_fallback(
                 code="circuit_open",
             )
         try:
-            result = await client.chat(provider, model, body["messages"], stream=bool(body.get("stream")), tools=tools)
+            result = await client.chat(
+                provider, model, body["messages"],
+                stream=bool(body.get("stream")),
+                tools=tools,
+                extra_body=extra_body or None,
+            )
             if breaker is not None:
                 breaker.record_success(provider, model)
             return provider, model, result
@@ -352,7 +380,12 @@ async def _call_with_pool_fallback(
             raise BadRequestError("No healthy models in pool", code="no_healthy_models")
         provider, model = selected
         try:
-            result = await client.chat(provider, model, body["messages"], stream=bool(body.get("stream")), tools=tools)
+            result = await client.chat(
+                provider, model, body["messages"],
+                stream=bool(body.get("stream")),
+                tools=tools,
+                extra_body=extra_body or None,
+            )
             if breaker is not None:
                 breaker.record_success(provider, model)
             return provider, model, result

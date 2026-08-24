@@ -113,3 +113,31 @@ async def test_streaming_dict_response_long_content(client):
 
     assert long_text.encode() in content
     assert b"data: [DONE]" in content
+
+
+def test_build_extra_body_filters_gateway_fields():
+    """_build_extra_body must strip fields handled by the gateway."""
+    from tusker_gateway.endpoints import _build_extra_body
+    body = {
+        "model": "hermes-code",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": True,
+        "tools": [{"type": "function"}],
+        "tool_choice": "auto",
+        "max_tokens": 16384,
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "stop": ["\n"],
+    }
+    extra = _build_extra_body(body)
+    # Gateway fields must be stripped.
+    assert "model" not in extra
+    assert "messages" not in extra
+    assert "stream" not in extra
+    assert "tools" not in extra
+    assert "tool_choice" not in extra
+    # Hyperparameters must be preserved.
+    assert extra["max_tokens"] == 16384
+    assert extra["temperature"] == 0.7
+    assert extra["top_p"] == 0.9
+    assert extra["stop"] == ["\n"]
