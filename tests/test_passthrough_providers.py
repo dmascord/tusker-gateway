@@ -81,7 +81,8 @@ def oauth_client(mock_http, quality_db):
     ("openrouter::openai/gpt-4o-mini", "openrouter", "openai/gpt-4o-mini"),
     ("xiaomi::mimo-v2.5-pro", "xiaomi", "mimo-v2.5-pro"),
     ("zai::glm-5.2", "zai", "glm-5.2"),
-     # provider/model
+    ("arliai::Fastest", "arliai", "Fastest"),
+    # provider/model
     ("github-copilot/claude-sonnet-4.6", "github-copilot", "claude-sonnet-4.6"),
     ("openai/gpt-4o", "openai", "gpt-4o"),
     ("openrouter/openai/gpt-4o-mini", "openrouter", "openai/gpt-4o-mini"),
