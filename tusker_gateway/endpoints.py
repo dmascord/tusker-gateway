@@ -874,3 +874,79 @@ async def images_handler(request: web.Request) -> web.Response:
             openai_error(str(exc), code="image_generation_error", error_type="provider_error"),
             status=502,
         )
+
+
+async def tts_handler(request: web.Request) -> web.Response:
+    """POST /v1/audio/speech.
+
+    Text-to-speech endpoint. Returns binary audio (mp3/pcm/opus/...) with the
+    upstream's Content-Type. Dispatches to OpenAI when an OPENAI_API_KEY is
+    configured, otherwise to OpenRouter.
+    """
+    try:
+        body = await request.json()
+        model = body.get("model", "tts-1")
+        tts = request.app.get("tts_handler")
+        if tts is None:
+            return web.json_response(
+                openai_error("tts handler not initialised", code="internal_error", error_type="internal"),
+                status=503,
+            )
+        config = request.app["config"]
+        provider_keys = config.get("provider_api_keys", {})
+        provider = tts.get_provider_for_tts_request(model)
+        api_key = provider_keys.get(provider)
+        audio_bytes, content_type = await tts.handle_request(
+            model=model,
+            body=body,
+            api_key=api_key,
+        )
+        return web.Response(body=audio_bytes, content_type=content_type)
+    except Exception as exc:
+        logger.warning("TTS request failed: %s", exc)
+        return web.json_response(
+            openai_error(str(exc), code="tts_error", error_type="provider_error"),
+            status=502,
+        )
+
+
+async def video_handler(request: web.Request) -> web.Response:
+    """POST /v1/videos.
+
+    Video generation endpoint. Returns a JSON job object. When wait=true
+    (default) the gateway polls the upstream until the job completes and
+    includes the rendered MP4 as base64 under b64_json. Set wait=false to
+    get the initial job object immediately.
+    """
+    try:
+        body = await request.json()
+        model = body.get("model", "sora-2")
+        wait = _truthy(request.query.get("wait", "true"))
+        video = request.app.get("video_handler")
+        if video is None:
+            return web.json_response(
+                openai_error("video handler not initialised", code="internal_error", error_type="internal"),
+                status=503,
+            )
+        config = request.app["config"]
+        provider_keys = config.get("provider_api_keys", {})
+        provider = video.get_provider_for_video_request(model)
+        api_key = provider_keys.get(provider)
+        result = await video.handle_request(
+            model=model,
+            body=body,
+            api_key=api_key,
+            wait=wait,
+        )
+        return web.json_response(result)
+    except Exception as exc:
+        logger.warning("Video request failed: %s", exc)
+        return web.json_response(
+            openai_error(str(exc), code="video_error", error_type="provider_error"),
+            status=502,
+        )
+
+
+def _truthy(value: str) -> bool:
+    """Parse a query-string bool. False for anything other than 1/true/yes/on."""
+    return value.lower() in ("1", "true", "yes", "on")
