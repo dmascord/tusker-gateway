@@ -175,3 +175,42 @@ async def test_stream_normalizer_promotes_reasoning_content(client):
     assert '"content": " for a moment."' in text
     # content must never be null in the promoted deltas.
     assert '"content": null' not in text
+
+
+@pytest.mark.asyncio
+async def test_stream_normalizer_injects_finish_when_upstream_omits_it(client):
+    """If the upstream stream ends without a finish_reason chunk, the gateway
+    must synthesize one so OMP doesn't report
+    'stream closed before a finish_reason was received'.
+    """
+    async def no_finish_stream(*args, **kwargs):
+        # Upstream emits content but never sends finish_reason — simulates
+        # a provider that drops the connection after content.
+        yield (
+            b'data: {"choices":[{"index":0,"delta":{"role":"assistant",'
+            b'"content":"Hello world"}}]}\n\n'
+        )
+        # Stream ends here — no finish_reason chunk, no [DONE].
+
+    with patch("tusker_gateway.endpoints.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
+        mock_chat.return_value = no_finish_stream()
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-code",
+                "messages": [{"role": "user", "content": "say hi"}],
+                "stream": True,
+            },
+            headers=HEADERS_AUTH,
+        )
+        assert resp.status == 200
+        body = await resp.read()
+
+    text = body.decode("utf-8", errors="replace")
+    # Content must be present.
+    assert '"content": "Hello world"' in text
+    # A finish_reason: "stop" chunk must be present even though the
+    # upstream never sent one.
+    assert '"finish_reason": "stop"' in text
+    # [DONE] sentinel must still be present.
+    assert b"data: [DONE]" in body

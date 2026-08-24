@@ -29,7 +29,6 @@ from tusker_gateway.sse import (
     sse_heartbeat_loop,
 )
 from tusker_gateway.tracing import Tracer
-from tusker_gateway.providers.image_generation import ImageGenerationHandler
 
 logger = logging.getLogger(__name__)
 
@@ -169,6 +168,12 @@ async def _normalize_stream(raw_stream: AsyncIterator[bytes]) -> AsyncIterator[b
     """
     buffer = b""
     tool_stripper = _ToolCallStripper()
+    saw_finish_reason = False
+    saw_done = False
+
+    def _finish_frame() -> bytes:
+        return sse_frame(format_openai_chunk(finish_reason="stop"))
+
     async for chunk in raw_stream:
         buffer += chunk
         while b"\n\n" in buffer:
@@ -182,6 +187,7 @@ async def _normalize_stream(raw_stream: AsyncIterator[bytes]) -> AsyncIterator[b
             # Pass through [DONE] sentinel as-is
             if stripped == b"data: [DONE]":
                 tool_stripper.flush()
+                saw_done = True
                 yield frame
                 continue
             try:
@@ -196,6 +202,8 @@ async def _normalize_stream(raw_stream: AsyncIterator[bytes]) -> AsyncIterator[b
             choice = choices[0]
             delta = choice.get("delta") or {}
             fr = choice.get("finish_reason")
+            if fr:
+                saw_finish_reason = True
             raw_content = delta.get("content")
             reasoning_content = delta.get("reasoning_content")
             # Some reasoning models (qwen, etc.) emit reasoning/thinking in
@@ -243,6 +251,13 @@ async def _normalize_stream(raw_stream: AsyncIterator[bytes]) -> AsyncIterator[b
     # Flush any remaining partial frame in the buffer
     if buffer.strip():
         yield buffer
+    # If the upstream ended without ever emitting a finish_reason, OMP
+    # surfaces this as "stream closed before a finish_reason was received".
+    # Synthesize a stop chunk so the client always has a clean termination.
+    # Skip if the upstream already sent its own [DONE] (which implies it
+    # terminated cleanly) to avoid emitting a chunk after the sentinel.
+    if not saw_finish_reason and not saw_done:
+        yield _finish_frame()
 
 
 def _pool_name(body: dict[str, Any]) -> str | None:
