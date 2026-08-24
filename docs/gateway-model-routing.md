@@ -86,6 +86,46 @@ present even if upstream renames or moves the slug.
 
 This is the feature being implemented alongside the heavyweight gate.
 
+## Auto-free catalog merge
+
+Pools can opt in to **automatic free-tier discovery** by setting
+`auto_free: true` in their `TUSKER_POOL_<name>` JSON env var:
+
+```json
+TUSKER_POOL_CODE='{"models": [], "auto_free": true}'
+```
+
+When enabled, every catalog refresh (initial + 5-minute background loop)
+walks the registered catalogs and merges any model currently available for
+free into the pool's allowlist. Discovery differs per upstream:
+
+| Upstream | Free-tier signal |
+|---|---|
+| `openrouter` | `pricing.prompt == "0" AND pricing.completion == "0"` |
+| `opencode-zen` | All entries returned by `/zen/v1/models` (the upstream key-filters paid models) |
+| `opencode-go` | All entries returned by `/zen/go/v1/models` (same key-filter) |
+
+**Idempotence across refreshes**: entries we auto-added are tracked
+separately in `PoolManager.auto_added`. When an entry stops being free on
+a subsequent refresh (e.g. `stealth/ox-alpha` flips from pricing 0/0 to
+3e-6/1.5e-5) it's pruned without disturbing operator-curated entries.
+
+**Pruning proof** (`tests/test_catalog.py::test_poolmanager_auto_free_drops_models_that_stop_being_free`):
+
+```text
+pass 1: stealth/ox-alpha is free
+        pool.models = [{openrouter, stealth/ox-alpha}]
+        auto_added[code] = {(openrouter, stealth/ox-alpha)}
+pass 2: stealth/ox-alpha is now paid
+        pool.models = []
+        auto_added[code] = set()  # pruned
+```
+
+The original static config (from the operator's `TUSKER_POOL_*` JSON) is
+frozen at `PoolManager.__post_init__` time so this pruning can never touch
+operator-curated entries.
+
+
 ## Migration history
 
 - **2026-08-21**: Codex OAuth credentials migrated from `hermes.tusker.net.au`
