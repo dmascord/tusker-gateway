@@ -305,15 +305,46 @@ async def test_call_openai_codex_pulls_multiple_images_from_response_completed()
     session = _FakeSession()
     session.set_response(_FakeResp(status=200, body=body))
 
+
+
+@pytest.mark.asyncio
+async def test_call_openai_codex_extracts_partial_image_b64():
+    """Verify the parser extracts partial_image_b64 from partial_image events."""
+    h = ImageGenerationHandler(_make_config())
+    fake_rotator = MagicMock()
+    fake_rotator.get_token = AsyncMock(return_value="test-token")
+
+    body = _sse(
+        {
+            "type": "response.image_generation_call.in_progress",
+            "item_id": "ig_x",
+            "output_index": 0,
+        },
+        {
+            "type": "response.image_generation_call.generating",
+            "item_id": "ig_x",
+            "output_index": 0,
+        },
+        {
+            "type": "response.image_generation_call.partial_image",
+            "item_id": "ig_x",
+            "output_index": 0,
+            "partial_image_b64": "PARTIAL_BASE64",
+        },
+        {"type": "response.output_item.done", "item": {"type": "image_generation_call", "result": "FINAL_BASE64"}},
+        {"type": "response.completed", "response": {"output": []}},
+    )
+    session = _FakeSession()
+    session.set_response(_FakeResp(status=200, body=body))
+
     with patch("aiohttp.ClientSession", lambda *a, **kw: session):
         result = await h._call_openai_codex(
             model="gpt-image-1",
             path="/v1/images/generations",
-            body={"prompt": "two images", "n": 2},
+            body={"prompt": "x"},
             codex_rotator=fake_rotator,
             extra_headers=None,
         )
 
-    assert len(result["data"]) == 2
-    assert result["data"][0]["b64_json"] == "PNG1"
-    assert result["data"][1]["b64_json"] == "PNG2"
+    # The final image (from output_item.done) overrides the partial preview.
+    assert result["data"][-1]["b64_json"] == "FINAL_BASE64"

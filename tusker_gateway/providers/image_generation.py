@@ -200,7 +200,6 @@ class ImageGenerationHandler:
         codex_model = "gpt-5.5"
         prompt = body.get("prompt", "")
         size = body.get("size", "1024x1024")
-        n = int(body.get("n", 1))
         # Translate OpenAI image request -> Responses API image_generation tool call.
         # The tool produces base64 PNG output via image_generation_call items.
         # The image_generation tool doesn't accept n; for n>1 callers get a single
@@ -247,13 +246,29 @@ class ImageGenerationHandler:
                                 continue
                             item_type = event.get("type", "")
                             if ".image_generation_call" in item_type or item_type == "image_generation_call":
+                                # partial_image events carry intermediate previews in
+                                # partial_image_b64; some Codex surfaces also emit a final
+                                # result here on the last partial or a completed variant.
                                 payload_obj = event.get("image_generation_call") or event.get("item") or event
                                 result = payload_obj.get("result") if isinstance(payload_obj, dict) else None
                                 if isinstance(result, str) and result:
                                     b64_images.append(result)
+                                partial = payload_obj.get("partial_image_b64") if isinstance(payload_obj, dict) else None
+                                if isinstance(partial, str) and partial and not b64_images:
+                                    # No final result yet; remember the latest partial.
+                                    b64_images.append(partial)
                                 revised = payload_obj.get("revised_prompt") if isinstance(payload_obj, dict) else None
                                 if revised and not revised_prompt:
                                     revised_prompt = revised
+                            elif item_type == "response.output_item.done":
+                                item = event.get("item") or {}
+                                if item.get("type") == "image_generation_call":
+                                    result = item.get("result")
+                                    if isinstance(result, str) and result:
+                                        b64_images.append(result)
+                                    rp = item.get("revised_prompt")
+                                    if rp and not revised_prompt:
+                                        revised_prompt = rp
                             elif item_type == "response.completed":
                                 response_obj = event.get("response") or {}
                                 for out_item in response_obj.get("output", []):
@@ -279,6 +294,7 @@ class ImageGenerationHandler:
             "created": int(time.time()),
             "data": data,
         }
+
 
     async def _call_openrouter(
         self,
