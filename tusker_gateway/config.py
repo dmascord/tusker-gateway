@@ -39,12 +39,14 @@ class PoolConfig:
         context_window: int = 128_000,
         zdr: bool = False,
         provider_warmup_secs: int = 300,
+        auto_free: bool = False,
     ):
         self.name = name
         self.models = models
         self.context_window = context_window
         self.zdr = zdr
         self.provider_warmup_secs = provider_warmup_secs
+        self.auto_free = auto_free
 
     def __repr__(self) -> str:
         return f"PoolConfig(name={self.name!r}, models={len(self.models)})"
@@ -288,6 +290,7 @@ def _load_pools() -> dict[str, PoolConfig]:
                 models=models,
                 context_window=data.get("context_window", 128_000),
                 zdr=data.get("zdr", False),
+                auto_free=bool(data.get("auto_free", False)),
             )
         except (json.JSONDecodeError, TypeError):
             continue

@@ -166,6 +166,12 @@ def create_app() -> web.Application:
                 )
                 interval_secs = float(os.environ.get("TUSKER_CATALOG_REFRESH_SECS", "300"))
                 registry = CatalogRegistry.default()
+                # Wire API keys into catalog clients that need them.
+                provider_keys = config.get("provider_api_keys", {})
+                for prov in ("openrouter", "opencode-zen", "opencode-go"):
+                    client = registry.get_client(prov)
+                    if client is not None:
+                        client.set_api_key(provider_keys.get(prov))
                 # Wire into PoolManager so extend_pools_with_catalog() can read.
                 pool_manager = app.get("pool_manager")
                 if pool_manager is not None:
@@ -173,12 +179,24 @@ def create_app() -> web.Application:
                 await registry.refresh_all(app["http_session"])
                 if pool_manager is not None:
                     pool_manager.extend_pools_with_catalog()
-                    startup_log.info("catalog confirmed %d pool entries", sum(pool_manager.extend_pools_with_catalog().values()))
-                stop_event = asyncio.Event()
-                app["catalog_stop_event"] = stop_event
-                app["catalog_registry"] = registry
+                    auto_free = pool_manager.extend_pools_with_free_catalog()
+                    startup_log.info(
+                        "catalog confirmed %d pool entries; auto_free pools: %s",
+                        sum(pool_manager.extend_pools_with_catalog().values()),
+                        {k: len(v) for k, v in auto_free.items() if any("openrouter/" in s or "opencode-" in s.split("/")[0] for s in v)},
+                    )
                 app["catalog_task"] = asyncio.create_task(
-                    catalog_refresh_loop(registry, app["http_session"], interval_secs, stop_event)
+                    catalog_refresh_loop(
+                        registry,
+                        app["http_session"],
+                        interval_secs,
+                        stop_event,
+                        on_refresh=(
+                            pool_manager.extend_pools_with_free_catalog
+                            if pool_manager is not None
+                            else None
+                        ),
+                    )
                 )
                 startup_log.info(
                     "catalog refresh task started (interval=%.0fs, providers=%s)",

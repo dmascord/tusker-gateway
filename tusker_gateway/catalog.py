@@ -37,7 +37,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import aiohttp
 
@@ -51,6 +51,8 @@ DEFAULT_TTLS: dict[str, float] = {
     "github-copilot": 300.0,       # Copilot: 5 min
     "github-copilot-enterprise": 300.0,
     "openrouter": 3600.0,          # OpenRouter: 60 min
+    "opencode-zen": 3600.0,       # OpenCode: 60 min (key-filtered)
+    "opencode-go": 3600.0,
     "models.dev": 3600.0,          # models.dev: 60 min
 }
 
@@ -97,6 +99,25 @@ class CatalogClient:
         self._fetched_at: float = 0.0
         self._last_error: str | None = None
         self._lock = asyncio.Lock()
+        # Subclasses can set ``api_key`` or ``api_key_env`` to inject
+        # an Authorization: Bearer header into fetch requests. Set
+        # explicitly via ``client.set_api_key(...)`` when wiring up
+        # a registry — env-var lookup is the caller's responsibility.
+        self._api_key: str | None = None
+
+    def set_api_key(self, api_key: str | None) -> None:
+        """Inject an API key for catalog fetches. Pass None to clear."""
+        self._api_key = api_key.strip() if isinstance(api_key, str) and api_key.strip() else None
+
+    def _auth_headers(self, base: dict[str, str] | None = None) -> dict[str, str]:
+        """Return headers dict including Authorization if an API key is set.
+        Subclasses pass their default UA/accept dict; the Authorization
+        header is layered on top when ``_api_key`` is configured.
+        """
+        h = dict(base) if base else {}
+        if self._api_key:
+            h["Authorization"] = f"Bearer {self._api_key}"
+        return h
 
     async def get(self, session: aiohttp.ClientSession) -> list[CatalogEntry]:
         """Return cached entries, refreshing if expired."""
@@ -242,10 +263,10 @@ class OpenRouterCatalog(CatalogClient):
     ENDPOINT = "https://openrouter.ai/api/v1/models"
 
     async def fetch(self, session: aiohttp.ClientSession) -> list[CatalogEntry]:
-        headers = {
+        headers = self._auth_headers({
             "User-Agent": "tusker-gateway/1.0 (catalog-refresh)",
             "accept": "application/json",
-        }
+        })
         async with session.get(self.ENDPOINT, headers=headers) as resp:
             if resp.status != 200:
                 raise CatalogError(f"openrouter models HTTP {resp.status}")
@@ -258,12 +279,76 @@ class OpenRouterCatalog(CatalogClient):
             slug = m.get("id") or m.get("name")
             if not isinstance(slug, str) or not slug.strip():
                 continue
-            out.append(CatalogEntry(provider="openrouter", model=slug.strip(), raw=m))
+            prompt_cost, completion_cost = _extract_openrouter_pricing(m)
+            out.append(CatalogEntry(
+                provider="openrouter",
+                model=slug.strip(),
+                raw=m,
+                cost_input=prompt_cost,
+                cost_output=completion_cost,
+            ))
         return out
 
 
 # ---------------------------------------------------------------------------
-# models.dev (pricing DB)
+class OpenCodeCatalog(CatalogClient):
+    """OpenCode Zen / Go catalog from opencode.ai/zen/v1/models and /go/v1/models.
+
+    ``/v1/models`` is key-filtered: the response only contains models
+    the configured API key can access. For the gateway's free-tier
+    key, that's the full "free for this key" set, and every entry is
+    treated as auto-free-eligible (no per-model pricing field).
+
+    Subclasses set ``provider`` ("opencode-zen" or "opencode-go")
+    and ``ENDPOINT``. The catalog refresh relies on
+    ``set_api_key()`` being called with the matching env-derived
+    Bearer token; without auth the endpoint returns a different
+    (paid) model list and the auto-free merge would be wrong.
+    """
+
+    provider = "opencode-zen"
+    ttl_secs = DEFAULT_TTLS["opencode-zen"]
+
+    ENDPOINT = "https://opencode.ai/zen/v1/models"
+
+    async def fetch(self, session: aiohttp.ClientSession) -> list[CatalogEntry]:
+        headers = self._auth_headers({
+            "User-Agent": "tusker-gateway/1.0 (catalog-refresh)",
+            "accept": "application/json",
+        })
+        async with session.get(self.ENDPOINT, headers=headers) as resp:
+            if resp.status != 200:
+                raise CatalogError(f"opencode {self.provider} HTTP {resp.status}")
+            data = await resp.json()
+        models = data.get("data", []) if isinstance(data, dict) else data
+        out: list[CatalogEntry] = []
+        for m in models:
+            if not isinstance(m, dict):
+                continue
+            slug = m.get("id") or m.get("name")
+            if not isinstance(slug, str) or not slug.strip():
+                continue
+            out.append(CatalogEntry(
+                provider=self.provider,
+                model=slug.strip(),
+                raw=m,
+            ))
+        return out
+
+
+class OpenCodeGoCatalog(OpenCodeCatalog):
+    """OpenCode Go (zen/go) backend — same auth/response shape as Zen
+    but a different model list and endpoint."""
+
+    provider = "opencode-go"
+    ttl_secs = DEFAULT_TTLS["opencode-go"]
+
+    ENDPOINT = "https://opencode.ai/zen/go/v1/models"
+
+
+ # ---------------------------------------------------------------------------
+ # models.dev (pricing DB)
+ # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 
 
@@ -327,6 +412,20 @@ def _extract_pricing(model_info: dict[str, Any]) -> tuple[float | None, float | 
         _parse_cost_field(cost.get("output")),
     )
 
+def _extract_openrouter_pricing(model_info: dict[str, Any]) -> tuple[float | None, float | None]:
+    """Extract (cost_input, cost_output) per 1M tokens from an OpenRouter entry.
+
+    OpenRouter schema: ``{"pricing": {"prompt": "0", "completion": "0"}}``
+    where the values are per-token dollar strings (e.g. "0.000003" ==
+    $3 per 1M tokens). ``"0"`` is the explicit free-tier signal.
+    """
+    pricing = model_info.get("pricing")
+    if not isinstance(pricing, dict):
+        return None, None
+    return (
+        _parse_cost_field(pricing.get("prompt")),
+        _parse_cost_field(pricing.get("completion")),
+    )
 
 def _parse_cost_field(value: Any) -> float | None:
     """Parse a models.dev cost field like '0.5 / 1M tokens' or 0.5."""
@@ -410,15 +509,30 @@ class CatalogRegistry:
             return None
         return {e.model for e in client._entries}
 
+    def entries_for(self, provider: str) -> list[CatalogEntry] | None:
+        """Return the cached CatalogEntry list for ``provider``.
+
+        Like ``known_models`` but returns the full entries (with
+        cost_input/cost_output populated). Returns None when the
+        provider has no catalog client, so callers can distinguish
+        "unknown provider" from "empty catalog".
+        """
+        client = self._clients.get(provider)
+        if client is None:
+            return None
+        return list(client._entries)
+
     @classmethod
     def default(cls) -> "CatalogRegistry":
         """Build the default registry covering Codex, Copilot, OpenRouter,
-        and models.dev."""
+        OpenCode Zen/Go, and models.dev."""
         reg = cls()
         reg.register("openai-codex", CodexCatalog())
         reg.register("github-copilot", CopilotCatalog())
         reg.register("github-copilot-enterprise", CopilotCatalog())
         reg.register("openrouter", OpenRouterCatalog())
+        reg.register("opencode-zen", OpenCodeCatalog())
+        reg.register("opencode-go", OpenCodeGoCatalog())
         reg.register("models.dev", ModelsDevCatalog())
         return reg
 
@@ -433,6 +547,7 @@ async def catalog_refresh_loop(
     session: aiohttp.ClientSession,
     interval_secs: float,
     stop_event: asyncio.Event,
+    on_refresh: Callable[[], None] | None = None,
 ) -> None:
     """Background loop: refresh all catalogs every ``interval_secs``.
 
@@ -440,11 +555,22 @@ async def catalog_refresh_loop(
     request), then every ``interval_secs``. Returns when ``stop_event``
     is set. Exceptions are logged and swallowed so a transient upstream
     failure doesn't kill the loop.
+
+    ``on_refresh`` is an optional zero-arg callback invoked after every
+    successful refresh_all(); the pool manager uses it to merge
+    auto-free catalog entries into the runtime pool, so newly free
+    upstreams (e.g. ``stealth/ox-alpha``) enter rotation without a
+    gateway restart.
     """
     try:
         await registry.refresh_all(session)
     except Exception as exc:
         logger.warning("initial catalog refresh failed: %s", exc)
+    if on_refresh is not None:
+        try:
+            on_refresh()
+        except Exception as exc:
+            logger.warning("post-refresh hook failed: %s", exc)
     while not stop_event.is_set():
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=interval_secs)
@@ -453,5 +579,7 @@ async def catalog_refresh_loop(
             pass
         try:
             await registry.refresh_all(session)
+            if on_refresh is not None:
+                on_refresh()
         except Exception as exc:
             logger.warning("scheduled catalog refresh failed: %s", exc)

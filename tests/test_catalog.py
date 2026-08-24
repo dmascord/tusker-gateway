@@ -21,6 +21,8 @@ from tusker_gateway.catalog import (
     CodexCatalog,
     CopilotCatalog,
     ModelsDevCatalog,
+    OpenCodeCatalog,
+    OpenCodeGoCatalog,
     OpenRouterCatalog,
     _parse_cost_field,
     catalog_refresh_loop,
@@ -170,11 +172,65 @@ async def test_openrouter_catalog_parses_models():
         "google/gemma-4-31b-it:free",
     }
     assert all(e.provider == "openrouter" for e in entries)
+    # Default test body has no pricing fields — cost_* should be None.
+    for e in entries:
+        assert e.cost_input is None
+        assert e.cost_output is None
+
+
+@pytest.mark.asyncio
+async def test_openrouter_catalog_extracts_pricing():
+    """Free-tier entries (pricing.prompt == "0") get cost_input == 0;
+    paid entries get the parsed dollar value."""
+    body = {
+        "data": [
+            {"id": "stealth/ox-alpha", "pricing": {"prompt": "0", "completion": "0"}},
+            {"id": "anthropic/claude-sonnet-4.6", "pricing": {"prompt": "0.000003", "completion": "0.000015"}},
+        ]
+    }
+    session = FakeSession({"default": FakeResponse(200, body)})
+    entries = await OpenRouterCatalog().fetch(session)
+    by_model = {e.model: e for e in entries}
+    assert by_model["stealth/ox-alpha"].cost_input == 0.0
+    assert by_model["stealth/ox-alpha"].cost_output == 0.0
+    assert by_model["anthropic/claude-sonnet-4.6"].cost_output == pytest.approx(1.5e-5)
+
+@pytest.mark.asyncio
+async def test_opencode_zen_catalog_parses_models():
+    body = {"data": [{"id": "muse-spark-1.2"}, {"id": "big-pickle"}]}
+    session = FakeSession({"default": FakeResponse(200, body)})
+    entries = await OpenCodeCatalog().fetch(session)
+    assert {e.model for e in entries} == {"muse-spark-1.2", "big-pickle"}
+    assert all(e.provider == "opencode-zen" for e in entries)
+
+
+@pytest.mark.asyncio
+async def test_opencode_go_catalog_parses_models():
+    body = {"data": [{"id": "minimax-m3"}, {"id": "kimi-k2.6"}]}
+    session = FakeSession({"default": FakeResponse(200, body)})
+    entries = await OpenCodeGoCatalog().fetch(session)
+    assert {e.model for e in entries} == {"minimax-m3", "kimi-k2.6"}
+    assert all(e.provider == "opencode-go" for e in entries)
+    # Go subclass should hit /go/v1/models, not /v1/models.
+    assert OpenCodeGoCatalog.ENDPOINT.endswith("/go/v1/models")
+
+
+def test_catalog_client_set_api_key_injects_auth():
+    """set_api_key enables Authorization header via _auth_headers."""
+    client = CatalogClient()
+    assert "Authorization" not in client._auth_headers({})
+    client.set_api_key("sk-test-1234")
+    headers = client._auth_headers({"User-Agent": "test"})
+    assert headers["Authorization"] == "Bearer sk-test-1234"
+    assert headers["User-Agent"] == "test"
+    client.set_api_key(None)
+    assert "Authorization" not in client._auth_headers({})
 
 
 # ---------------------------------------------------------------------------
 # ModelsDevCatalog.fetch (pricing parsing)
 # ---------------------------------------------------------------------------
+
 
 
 @pytest.mark.asyncio
@@ -454,3 +510,147 @@ def test_poolmanager_extend_pools_without_registry():
     pm = PoolManager(cfg)
     pm.catalog_registry = None
     assert pm.extend_pools_with_catalog() == {}
+
+
+
+def test_poolmanager_auto_free_adds_openrouter_zero_pricing():
+    """auto_free pulls OpenRouter entries with prompt=0, completion=0
+    into the pool's runtime model list."""
+    from tusker_gateway.config import PoolConfig
+    from tusker_gateway.pools import PoolManager
+    cfg = {
+        "pools": {
+            "code": PoolConfig(
+                name="code",
+                models=[{"provider": "openai-codex", "model": "gpt-5.6-luna"}],
+                auto_free=True,
+            ),
+        },
+        "excluded_providers": [],
+        "quality_db_path": "/tmp/_unused.db",
+    }
+    pm = PoolManager(cfg)
+
+    reg = CatalogRegistry()
+    orr = OpenRouterCatalog()
+    orr._entries = [
+        # Free entry — should be added.
+        CatalogEntry(provider="openrouter", model="stealth/ox-alpha",
+                     cost_input=0.0, cost_output=0.0),
+        # Paid entry — should NOT be added.
+        CatalogEntry(provider="openrouter", model="anthropic/claude-sonnet-4.6",
+                     cost_input=3e-6, cost_output=1.5e-5),
+        # Already-static entry — should stay put, not be re-added.
+        CatalogEntry(provider="openai-codex", model="gpt-5.6-luna"),
+    ]
+    reg.register("openrouter", orr)
+    pm.catalog_registry = reg
+
+    pm.extend_pools_with_free_catalog()
+
+    pool_models = {(m["provider"], m["model"]) for m in pm.pools["code"].models}
+    assert ("openai-codex", "gpt-5.6-luna") in pool_models  # static kept
+    assert ("openrouter", "stealth/ox-alpha") in pool_models  # free added
+    assert ("openrouter", "anthropic/claude-sonnet-4.6") not in pool_models  # paid excluded
+
+    # The runtime model list (self.models) must also reflect the addition
+    # so PoolManager.select() can pick it.
+    runtime = {(s.provider, s.model) for s in pm.models["code"]}
+    assert ("openrouter", "stealth/ox-alpha") in runtime
+
+
+def test_poolmanager_auto_free_includes_opencode_zen_and_go():
+    """auto_free treats the entire OpenCode Zen/Go catalog as free-for-key,
+    since /v1/models is key-filtered (no per-model pricing field)."""
+    from tusker_gateway.config import PoolConfig
+    from tusker_gateway.pools import PoolManager
+    cfg = {
+        "pools": {
+            "code": PoolConfig(name="code", models=[], auto_free=True),
+        },
+        "excluded_providers": [],
+        "quality_db_path": "/tmp/_unused.db",
+    }
+    pm = PoolManager(cfg)
+
+    reg = CatalogRegistry()
+    zen = OpenCodeCatalog()
+    zen._entries = [
+        CatalogEntry(provider="opencode-zen", model="muse-spark-1.2"),
+        CatalogEntry(provider="opencode-zen", model="big-pickle"),
+    ]
+    reg.register("opencode-zen", zen)
+    go = OpenCodeGoCatalog()
+    go._entries = [
+        CatalogEntry(provider="opencode-go", model="minimax-m3"),
+        CatalogEntry(provider="opencode-go", model="kimi-k2.6"),
+    ]
+    reg.register("opencode-go", go)
+    pm.catalog_registry = reg
+
+    pm.extend_pools_with_free_catalog()
+
+    pool_models = {(m["provider"], m["model"]) for m in pm.pools["code"].models}
+    assert ("opencode-zen", "muse-spark-1.2") in pool_models
+    assert ("opencode-zen", "big-pickle") in pool_models
+    assert ("opencode-go", "minimax-m3") in pool_models
+    assert ("opencode-go", "kimi-k2.6") in pool_models
+
+
+def test_poolmanager_auto_free_drops_models_that_stop_being_free():
+    """Idempotency: when a model goes paid, it must be removed from
+    the pool on the next auto_free pass."""
+    from tusker_gateway.config import PoolConfig
+    from tusker_gateway.pools import PoolManager
+    cfg = {
+        "pools": {
+            "code": PoolConfig(name="code", models=[], auto_free=True),
+        },
+        "excluded_providers": [],
+        "quality_db_path": "/tmp/_unused.db",
+    }
+    pm = PoolManager(cfg)
+
+    # First pass: stealth/ox-alpha is free, gets added.
+    reg1 = CatalogRegistry()
+    orr1 = OpenRouterCatalog()
+    orr1._entries = [CatalogEntry(provider="openrouter", model="stealth/ox-alpha",
+                                  cost_input=0.0, cost_output=0.0)]
+    reg1.register("openrouter", orr1)
+    pm.catalog_registry = reg1
+    pm.extend_pools_with_free_catalog()
+    assert ("openrouter", "stealth/ox-alpha") in {(m["provider"], m["model"]) for m in pm.pools["code"].models}
+
+    # Second pass: stealth/ox-alpha is now paid (cost > 0).
+    reg2 = CatalogRegistry()
+    orr2 = OpenRouterCatalog()
+    orr2._entries = [CatalogEntry(provider="openrouter", model="stealth/ox-alpha",
+                                  cost_input=3e-6, cost_output=1.5e-5)]
+    reg2.register("openrouter", orr2)
+    pm.catalog_registry = reg2
+    pm.extend_pools_with_free_catalog()
+    assert ("openrouter", "stealth/ox-alpha") not in {(m["provider"], m["model"]) for m in pm.pools["code"].models}
+
+
+def test_poolmanager_auto_free_disabled_is_noop():
+    """auto_free=False (default) means the catalog is ignored entirely."""
+    from tusker_gateway.config import PoolConfig
+    from tusker_gateway.pools import PoolManager
+    cfg = {
+        "pools": {
+            "code": PoolConfig(name="code", models=[], auto_free=False),
+        },
+        "excluded_providers": [],
+        "quality_db_path": "/tmp/_unused.db",
+    }
+    pm = PoolManager(cfg)
+
+    reg = CatalogRegistry()
+    orr = OpenRouterCatalog()
+    orr._entries = [CatalogEntry(provider="openrouter", model="stealth/ox-alpha",
+                                 cost_input=0.0, cost_output=0.0)]
+    reg.register("openrouter", orr)
+    pm.catalog_registry = reg
+
+    pm.extend_pools_with_free_catalog()
+    assert pm.pools["code"].models == []

@@ -78,17 +78,32 @@ class PoolManager:
     # Optional catalog registry — when set, PoolManager.extend_pools_with_catalog()
     # merges catalog-known models into the allowlist. See catalog.py.
     catalog_registry: object | None = None
-
-    # Session stickiness: (session_id, pool_name) → (provider, model)
+    # pool_name -> set of (provider, model) pairs auto-added by
+    # extend_pools_with_free_catalog(). Tracked separately from
+    # static allowlist so we can prune auto-added entries when
+    # they stop being free (e.g. stealth/ox-alpha goes paid),
+    # while keeping operator-curated entries untouched.
+    auto_added: dict[str, set[tuple[str, str]]] = field(default_factory=dict)
+    # pool_name -> set of (provider, model) pairs from the original
+    # TUSKER_POOL_* config, snapshotted at startup. Used by
+    # extend_pools_with_free_catalog() to distinguish operator-curated
+    # entries (never pruned) from auto-added ones (pruned when they
+    # stop being free).
+    _original_static: dict[str, frozenset[tuple[str, str]]] = field(default_factory=dict)
     _stickiness: dict[tuple[str, str], tuple[str, str]] = field(default_factory=dict)
     STICKINESS_TTL = 3600.0  # 1 hour
-
     def __post_init__(self):
         self.pools = dict(self.config.get("pools", {}))
         self._quality = QualityDB(self.config["quality_db_path"])
         self._cooldowns = global_tracker()
         # Build model lists from pool configs
         for name, pool in self.pools.items():
+            # Snapshot the operator-curated entries BEFORE any catalog
+            # merge so auto_free can distinguish static from auto-added.
+            self._original_static[name] = frozenset(
+                (m.get("provider", ""), m.get("model", ""))
+                for m in pool.models
+            )
             specs = [
                 ModelSpec.from_dict(m, default_window=pool.context_window, zdr=pool.zdr)
                 for m in pool.models
@@ -98,7 +113,6 @@ class PoolManager:
             warnings = _validate_providers(specs)
             for w in warnings:
                 logger.warning("pool '%s': %s — will be skipped during selection", name, w)
-
     def pool_keeps_heavyweight(self, pool_name: str) -> bool:
         """Return True if the named pool should keep heavyweight candidates.
 
@@ -152,6 +166,96 @@ class PoolManager:
             confirmed[pool_name] = count
         logger.info("catalog confirmed %s pool entries", confirmed)
         return confirmed
+    def extend_pools_with_free_catalog(self) -> dict[str, list[str]]:
+        """Auto-promote free upstream models into pools marked auto_free=True.
+
+        For each pool whose ``PoolConfig.auto_free`` is set, scan the
+        catalog for ``(provider, model)`` pairs whose upstream tier is
+        free for the configured API key. These are merged into the
+        pool's static ``models`` list, and ``self.models[name]`` is
+        rebuilt via ``reload_all_pools()`` so the new candidates
+        participate in selection immediately.
+
+        Free-model discovery differs per upstream:
+        - openrouter: ``pricing.prompt == "0" and pricing.completion == "0"``
+          (their explicit free-tier signal).
+        - opencode-zen / opencode-go: ``/v1/models`` is already
+          key-filtered (the response omits paid models the key can't
+          access), so the entire catalog is treated as free-for-this-key.
+
+        The merge is idempotent across catalog refreshes:
+        - Free models newly appearing on the upstream are added.
+        - Free models that have since gone paid are removed from the
+          pool (tracked in ``self.auto_added`` so we don't conflate
+          with operator-curated entries).
+        - Models already in the static allowlist stay where they are.
+
+        Returns a mapping of pool_name -> the list of (provider, model)
+        slugs currently held by the pool after the merge (post-reload).
+        """
+        if self.catalog_registry is None:
+            return {}
+        changed = False
+        for pool_name, pool in self.pools.items():
+            if not pool.auto_free:
+                continue
+            # Static = entries from TUSKER_POOL_* that the operator set
+            # at startup. Frozen at __post_init__ time so we can tell
+            # "operator put it here" apart from "auto_free put it here".
+            static_pairs: set[tuple[str, str]] = set(
+                self._original_static.get(pool_name, frozenset())
+            )
+            # Auto-added = entries we promoted on a previous pass.
+            previously_auto = self.auto_added.get(pool_name, set())
+
+            free_pairs: set[tuple[str, str]] = set()
+            for prov, mode in (
+                ("openrouter", "pricing"),
+                ("opencode-zen", "all"),
+                ("opencode-go", "all"),
+            ):
+                entries = self.catalog_registry.entries_for(prov)
+                if not entries:
+                    continue
+                for e in entries:
+                    if mode == "pricing":
+                        if e.cost_input is None or e.cost_input > 0:
+                            continue
+                        if e.cost_output is None or e.cost_output > 0:
+                            continue
+                    free_pairs.add((e.provider, e.model))
+
+            # Final set = static entries + (auto-added entries that are
+            # still free). When a previously-auto entry disappears from
+            # the free set, it's pruned here. When a new free entry
+            # appears, it's added.
+            desired_auto = previously_auto & free_pairs
+            new_auto = free_pairs - static_pairs
+            desired = static_pairs | desired_auto | new_auto
+            current = static_pairs | previously_auto
+            if desired == current:
+                # Still idempotent: refresh tracked set without touching pool.
+                self.auto_added[pool_name] = (previously_auto & free_pairs) | new_auto
+                continue
+
+            new_models = [
+                m for m in pool.models
+                if (m.get("provider", ""), m.get("model", "")) in static_pairs
+            ]
+            # Re-add auto entries that are still free, then any newly free.
+            surviving_auto = sorted(previously_auto & free_pairs)
+            new_auto_sorted = sorted(new_auto)
+            new_models.extend({"provider": p, "model": m} for (p, m) in surviving_auto)
+            new_models.extend({"provider": p, "model": m} for (p, m) in new_auto_sorted)
+            pool.models = new_models
+            self.auto_added[pool_name] = (previously_auto & free_pairs) | new_auto
+            changed = True
+            logger.info(
+                "auto_free pool '%s': %d free catalog entries (was %d auto)",
+                pool_name, len(free_pairs), len(previously_auto),
+            )
+        if changed:
+            self.reload_all_pools()
 
     def reload_all_pools(self) -> None:
         """Rebuild ModelSpec lists from current pool configs.
