@@ -347,3 +347,152 @@ async def test_video_openai_already_completed_on_first_poll():
         )
     assert result["status"] == "completed"
     assert "b64_json" in result
+
+
+@pytest.mark.asyncio
+async def test_video_zai_dispatches_cogvideox_and_vidu():
+    """cogvideox-* / vidu* model slugs route to zai provider."""
+    h = VideoHandler({})
+    assert h.get_provider_for_video_request("cogvideox-3") == "zai"
+    assert h.get_provider_for_video_request("viduq1-text") == "zai"
+    # Sanity: openrouter slash-model still wins.
+    assert h.get_provider_for_video_request("cogvideox-3/openrouter") == "openrouter"
+
+
+@pytest.mark.asyncio
+async def test_video_zai_requires_api_key():
+    h = VideoHandler({})
+    with pytest.raises(GatewayError) as ei:
+        await h._call_zai(
+            model="cogvideox-3",
+            body={"prompt": "A wave"},
+            api_key=None,
+            extra_headers=None,
+            wait=True,
+            poll_interval=0.001,
+            max_wait=5.0,
+        )
+    assert ei.value.code == "missing_api_key"
+
+
+@pytest.mark.asyncio
+async def test_video_zai_create_polls_until_success_and_inlines_b64():
+    """Create → poll → fetch MP4 from signed URL → base64 inlined under b64_json."""
+    h = VideoHandler({})
+    session = _FakeSession()
+    session.add(_FakeResp(200, json.dumps({"id": "vid-1"}).encode()))
+    # Polls return PROCESSING twice, then SUCCESS with a video URL.
+    session.add(_FakeResp(200, json.dumps({"task_status": "PROCESSING"}).encode()))
+    session.add(_FakeResp(200, json.dumps({"task_status": "PROCESSING"}).encode()))
+    session.add(
+        _FakeResp(
+            200,
+            json.dumps(
+                {
+                    "task_status": "SUCCESS",
+                    "video_result": [{"url": "https://signed.test/out.mp4"}],
+                }
+            ).encode(),
+        )
+    )
+    # Final content fetch from the signed URL.
+    session.add(_FakeResp(200, b"MP4DATA"))
+
+    captured: dict = {}
+    real_post = session.post
+    real_get = session.get
+
+    def post(url, headers=None, json=None, **kw):
+        captured["create_url"] = url
+        captured["create_headers"] = headers
+        captured["create_body"] = json
+        return real_post(url, headers=headers, json=json, **kw)
+
+    def get(url, headers=None, **kw):
+        captured.setdefault("gets", []).append((url, headers))
+        return real_get(url, headers=headers, **kw)
+
+    session.post = post
+    session.get = get
+
+    with patch("aiohttp.ClientSession", lambda *a, **kw: session):
+        result = await h._call_zai(
+            model="cogvideox-3",
+            body={"prompt": "A wave", "size": "1280x720"},
+            api_key="zai-key",
+            extra_headers=None,
+            wait=True,
+            poll_interval=0.001,
+            max_wait=5.0,
+        )
+
+    assert captured["create_url"] == "https://api.z.ai/api/paas/v4/videos/generations"
+    assert captured["create_headers"]["Authorization"] == "Bearer zai-key"
+    assert captured["create_body"]["model"] == "cogvideox-3"
+    assert captured["create_body"]["prompt"] == "A wave"
+    assert captured["create_body"]["size"] == "1280x720"
+    # Two PROCESSING polls + SUCCESS poll + final content fetch
+    urls = [u for (u, _) in captured["gets"]]
+    assert urls[0] == "https://api.z.ai/api/paas/v4/async-result/vid-1"
+    assert urls[1] == "https://api.z.ai/api/paas/v4/async-result/vid-1"
+    assert urls[2] == "https://api.z.ai/api/paas/v4/async-result/vid-1"
+    assert urls[3] == "https://signed.test/out.mp4"
+    # SUCCESS poll carries the Authorization header.
+    for u, h_ in captured["gets"][:3]:
+        assert h_["Authorization"] == "Bearer zai-key"
+    # b64_json should be the base64 of MP4DATA.
+    import base64
+    assert base64.b64decode(result["b64_json"]) == b"MP4DATA"
+
+
+@pytest.mark.asyncio
+async def test_video_zai_no_wait_returns_initial_job():
+    """wait=false → return the create response immediately, no polling."""
+    h = VideoHandler({})
+    session = _FakeSession()
+    initial = {"id": "vid-2", "task_status": "PROCESSING"}
+    session.add(_FakeResp(200, json.dumps(initial).encode()))
+
+    with patch("aiohttp.ClientSession", lambda *a, **kw: session):
+        result = await h._call_zai(
+            model="viduq1-text",
+            body={"prompt": "A flower blooms"},
+            api_key="zai-key",
+            extra_headers=None,
+            wait=False,
+            poll_interval=0.001,
+            max_wait=5.0,
+        )
+
+    assert result["id"] == "vid-2"
+    assert result["task_status"] == "PROCESSING"
+
+
+@pytest.mark.asyncio
+async def test_video_zai_poll_fail_status_raises():
+    """FAIL status from the async-result endpoint surfaces as upstream_error."""
+    h = VideoHandler({})
+    session = _FakeSession()
+    session.add(_FakeResp(200, json.dumps({"id": "vid-3"}).encode()))
+    session.add(
+        _FakeResp(
+            200,
+            json.dumps({"task_status": "FAIL", "error": "bad prompt"}).encode(),
+        )
+    )
+
+    with patch("aiohttp.ClientSession", lambda *a, **kw: session):
+        with pytest.raises(GatewayError) as ei:
+            await h._call_zai(
+                model="cogvideox-3",
+                body={"prompt": "A wave"},
+                api_key="zai-key",
+                extra_headers=None,
+                wait=True,
+                poll_interval=0.001,
+                max_wait=5.0,
+            )
+
+    assert ei.value.code == "upstream_error"
+    assert "FAIL" in str(ei.value) or "bad prompt" in str(ei.value)
+

@@ -1,6 +1,7 @@
 """Tests for image generation provider routing and Codex OAuth pathway."""
 from __future__ import annotations
 
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -74,6 +75,108 @@ def test_get_provider_for_image_request_anthropic():
     h = ImageGenerationHandler({})
     assert h.get_provider_for_image_request("claude-sonnet-4", "/v1/images/generations") == "anthropic"
 
+
+def test_get_provider_for_image_request_zai():
+    """Z.ai's CogView and GLM-Image models route to the zai provider."""
+    h = ImageGenerationHandler({})
+    assert h.get_provider_for_image_request("cogview-4-250304", "/v1/images/generations") == "zai"
+    assert h.get_provider_for_image_request("glm-image", "/v1/images/generations") == "zai"
+
+
+def test_is_image_generation_request_recognises_zai_models():
+    """Model slug alone (cogview-*, glm-image) is enough to flag as image gen."""
+    h = ImageGenerationHandler({})
+    assert h.is_image_generation_request("POST", "/v1/images/generations", "cogview-4-250304")
+    assert h.is_image_generation_request("POST", "/v1/images/generations", "glm-image")
+
+
+@pytest.mark.asyncio
+async def test_zai_dispatches_to_call_zai():
+    """handle_request routes cogview-* / glm-image to _call_zai."""
+    h = ImageGenerationHandler({})
+    captured = {}
+
+    async def fake_call_zai(self, model, path, body, api_key, extra_headers):
+        captured["model"] = model
+        captured["api_key"] = api_key
+        return {"created": 99, "data": [{"url": "https://example.test/x.png"}]}
+
+    with patch.object(ImageGenerationHandler, "_call_zai", new=fake_call_zai):
+        result = await h.handle_request(
+            model="cogview-4-250304",
+            path="/v1/images/generations",
+            body={"model": "cogview-4-250304", "prompt": "a dragon"},
+            api_key="zai-key-abc",
+        )
+
+    assert result["data"][0]["url"] == "https://example.test/x.png"
+    assert captured["model"] == "cogview-4-250304"
+    assert captured["api_key"] == "zai-key-abc"
+
+
+@pytest.mark.asyncio
+async def test_zai_call_zai_raises_without_api_key():
+    h = ImageGenerationHandler({})
+    with pytest.raises(GatewayError) as excinfo:
+        await h._call_zai(
+            model="glm-image",
+            path="/v1/images/generations",
+            body={"prompt": "x"},
+            api_key=None,
+            extra_headers=None,
+        )
+    assert excinfo.value.code == "missing_api_key"
+
+
+@pytest.mark.asyncio
+async def test_zai_call_zai_posts_to_paas_endpoint():
+    """Verify the upstream URL, headers, and request payload shape."""
+    captured: dict = {}
+
+    class _FakeResp:
+        status = 200
+
+        async def text(self):
+            return json.dumps({"created": 1, "data": [{"url": "https://up.test/img.png"}]})
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class _FakeSession:
+        def post(self, url, headers=None, json=None, timeout=None):
+            captured["url"] = url
+            captured["headers"] = headers
+            captured["body"] = json
+            return _FakeResp()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    h = ImageGenerationHandler({})
+    with patch(
+        "tusker_gateway.providers.image_generation.aiohttp.ClientSession",
+        return_value=_FakeSession(),
+    ):
+        result = await h._call_zai(
+            model="cogview-4-250304",
+            path="/v1/images/generations",
+            body={"prompt": "a dragon", "size": "1024x1024"},
+            api_key="zai-key",
+            extra_headers=None,
+        )
+
+    assert captured["url"] == "https://api.z.ai/api/paas/v4/images/generations"
+    assert captured["headers"]["Authorization"] == "Bearer zai-key"
+    assert captured["body"]["model"] == "cogview-4-250304"
+    assert captured["body"]["prompt"] == "a dragon"
+    assert captured["body"]["size"] == "1024x1024"
+    assert result["data"][0]["url"] == "https://up.test/img.png"
 
 @pytest.mark.asyncio
 async def test_openai_falls_back_to_codex_when_no_api_key():

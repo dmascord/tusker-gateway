@@ -27,6 +27,11 @@ IMAGE_GEN_MODELS = {
     "gpt-image-1-mini": {"cost_per_1k_tokens": 0.005, "context_window": 8000},
     "dall-e-3": {"cost_per_1k_tokens": 0.04, "context_window": 4096},
     "dall-e-2": {"cost_per_1k_tokens": 0.02, "context_window": 4096},
+    # Z.ai PaaS image models. Cost values are per-image (not per-token)
+    # so we don't expose them through the cost-per-1k-tokens budget.
+    # Listed for catalog discovery only.
+    "cogview-4-250304": {"cost_per_image": 0.0, "context_window": 1024},
+    "glm-image": {"cost_per_image": 0.0, "context_window": 1024},
 }
 
 # Map common OpenAI image model names to the slugs the Codex backend accepts.
@@ -68,7 +73,7 @@ class ImageGenerationHandler:
             return True
         if model and any(
             tag in model.lower()
-            for tag in ("gpt-image", "dall-e", "imagen", "stable-image")
+            for tag in ("gpt-image", "dall-e", "imagen", "stable-image", "cogview-", "glm-image")
         ):
             return path.startswith("/v1/images/")
         return False
@@ -88,6 +93,11 @@ class ImageGenerationHandler:
             return "google"
         if "claude" in model_lower or "anthropic" in model_lower:
             return "anthropic"
+        # Z.ai's own image models (CogView, GLM-Image). The slug is the
+        # unambiguous signal — these never appear on any other upstream
+        # the gateway talks to.
+        if any(tag in model_lower for tag in ("cogview-", "glm-image")):
+            return "zai"
         return "openai"
 
     async def handle_request(
@@ -109,6 +119,8 @@ class ImageGenerationHandler:
             return await self._call_openrouter(model, path, body, api_key, extra_headers)
         if provider == "anthropic":
             return await self._call_anthropic(model, path, body, api_key, extra_headers)
+        if provider == "zai":
+            return await self._call_zai(model, path, body, api_key, extra_headers)
         return {
             "created": int(time.time()),
             "provider": provider,
@@ -406,6 +418,64 @@ class ImageGenerationHandler:
                     logger.warning("Anthropic image gen failed: %s %s", resp.status, text[:200])
                     raise GatewayError(
                         f"Anthropic error {resp.status}: {text[:200]}",
+                        code="upstream_error",
+                    )
+                if not text:
+                    return {"status": "ok"}
+                return json.loads(text)
+
+    async def _call_zai(
+        self,
+        model: str,
+        path: str,
+        body: Dict[str, Any],
+        api_key: Optional[str],
+        extra_headers: Optional[Dict[str, str]],
+    ) -> Dict[str, Any]:
+        """Call Z.AI image generation API for CogView-4 and GLM-Image models.
+
+        Endpoint: POST https://api.z.ai/api/paas/v4/images/generations
+        Models: cogview-4-250304, glm-image
+        Auth: Bearer (ZAI_API_KEY / GLM_API_KEY)
+
+        Synchronous: returns a JSON object with `data[].url` for the
+        generated image. Same response shape as OpenAI /v1/images/generations.
+        """
+        if not api_key:
+            raise GatewayError("Z.AI API key required", code="missing_api_key")
+
+        url = "https://api.z.ai/api/paas/v4/images/generations"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        if extra_headers:
+            headers.update(extra_headers)
+
+        payload: Dict[str, Any] = {
+            "model": model,
+            "prompt": body.get("prompt", ""),
+            "quality": body.get("quality", "hd"),
+            "size": body.get("size", "1280x1280"),
+        }
+        if body.get("user_id"):
+            payload["user_id"] = body["user_id"]
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=120),
+            ) as resp:
+                text = await resp.text()
+                if resp.status >= 400:
+                    logger.warning(
+                        "Z.AI image gen failed: %s %s", resp.status, text[:200]
+                    )
+                    raise GatewayError(
+                        f"Z.AI error {resp.status}: {text[:200]}",
                         code="upstream_error",
                     )
                 if not text:
