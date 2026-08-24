@@ -11,15 +11,9 @@ spec:
     matchLabels:
       app: tusker-gateway
   strategy:
-    # RollingUpdate with maxUnavailable=0 keeps the current pod serving
-    # in-flight SSE streams until the new pod's readiness probe passes.
-    # Recreate would SIGTERM the only pod immediately, dropping every
-    # active /v1/chat/completions stream mid-flight (OMP shows
-    # "stream closed before a finish_reason was received").
-    type: RollingUpdate
-    rollingUpdate:
-      maxUnavailable: 0
-      maxSurge: 1
+    # Recreate is required because the PVC is ReadWriteOnce, which prevents
+    # concurrent mounts by multiple pods during a rolling update.
+    type: Recreate
   template:
     metadata:
       labels:
