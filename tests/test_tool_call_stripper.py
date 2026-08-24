@@ -133,3 +133,45 @@ async def test_stream_normalizer_strips_inline_tool_call_text(client):
     assert not leaked_present, f"tool_call markup leaked into stream: {text!r}"
     assert prose_present, f"expected prose to survive: {text!r}"
     assert b"data: [DONE]" in body
+
+
+@pytest.mark.asyncio
+async def test_stream_normalizer_promotes_reasoning_content(client):
+    """reasoning-only models must not produce empty-text turns for OMP.
+
+    Some upstream reasoning models (e.g. qwen) emit their thinking in
+    `reasoning_content` while leaving `content` null. OMP treats a turn with
+    content=null as "no text" and ends early. The normalizer must promote
+    `reasoning_content` into `content` so the client sees real text.
+    """
+    async def reasoning_stream(*args, **kwargs):
+        yield (
+            b'data: {"choices":[{"index":0,"delta":{"role":"assistant",'
+            b'"content":null,"reasoning_content":"Let me think about this"}}]}\n\n'
+        )
+        yield (
+            b'data: {"choices":[{"index":0,"delta":{'
+            b'"content":null,"reasoning_content":" for a moment."},"finish_reason":"stop"}]}\n\n'
+        )
+
+    with patch("tusker_gateway.endpoints.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
+        mock_chat.return_value = reasoning_stream()
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-code",
+                "messages": [{"role": "user", "content": "say hi"}],
+                "stream": True,
+            },
+            headers=HEADERS_AUTH,
+        )
+        assert resp.status == 200
+        body = await resp.read()
+
+    text = body.decode("utf-8", errors="replace")
+    # The reasoning text must be promoted into content so the client (OMP)
+    # sees real text instead of an empty turn that finishes early.
+    assert '"content": "Let me think about this"' in text
+    assert '"content": " for a moment."' in text
+    # content must never be null in the promoted deltas.
+    assert '"content": null' not in text

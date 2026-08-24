@@ -29,6 +29,7 @@ from tusker_gateway.sse import (
     sse_heartbeat_loop,
 )
 from tusker_gateway.tracing import Tracer
+from tusker_gateway.providers.image_generation import ImageGenerationHandler
 
 logger = logging.getLogger(__name__)
 
@@ -196,6 +197,19 @@ async def _normalize_stream(raw_stream: AsyncIterator[bytes]) -> AsyncIterator[b
             delta = choice.get("delta") or {}
             fr = choice.get("finish_reason")
             raw_content = delta.get("content")
+            reasoning_content = delta.get("reasoning_content")
+            # Some reasoning models (qwen, etc.) emit reasoning/thinking in
+            # `reasoning_content` while leaving `content` null or empty.
+            # OMP treats content=null as "no text" and ends the turn early.
+            # Promote reasoning_content to content when content is absent so
+            # clients see real text and keep the conversation alive.
+            if raw_content is None and reasoning_content is not None:
+                raw_content = reasoning_content
+                delta["content"] = reasoning_content
+                # OMP client compatibility: sometimes reasoning models omit "content"
+                # when "reasoning_content" is present.
+                if "reasoning_content" in delta:
+                    del delta["reasoning_content"]
             has_content = isinstance(raw_content, str) and bool(raw_content)
             tc = delta.get("tool_calls")
             has_tools = bool(tc) and isinstance(tc, list) and len(tc) > 0
@@ -765,3 +779,52 @@ class _NoOpCM:
 
 def _noop_cm():
     return _NoOpCM()
+
+
+async def images_handler(request: web.Request) -> web.Response:
+    """POST /v1/images/generations, /v1/images/edits, /v1/images/variations.
+
+    Image generation endpoint for OpenAI GPT Image models and other providers.
+    Delegates to the ImageGenerationHandler for routing and processing.
+    """
+    try:
+        body = await request.json()
+        model = body.get("model", "gpt-image-2")
+
+        # Determine provider from model name
+        provider = "openai"
+        if "gpt-image" in model.lower() or "dall-e" in model.lower():
+            provider = "openai"
+        elif "gemini" in model.lower() or "google" in model.lower():
+            provider = "google"
+        elif "claude" in model.lower() or "anthropic" in model.lower():
+            provider = "anthropic"
+
+        # Check if the image handler is configured in the app
+        image_handler = request.app.get("image_handler")
+        if image_handler:
+            api_key = _resolve_api_key(request)
+            result = await image_handler.handle_request(
+                model=model,
+                path=request.path,
+                body=body,
+                api_key=api_key,
+            )
+            return web.json_response(result)
+
+        # Fallback: return structured response indicating the request path
+        return web.json_response({
+            "created": int(time.time()),
+            "provider": provider,
+            "model": model,
+            "path": request.path,
+            "status": "provider_not_configured",
+            "message": f"Image generation via {provider} not configured — set provider API keys",
+        })
+
+    except Exception as exc:
+        logger.warning("Image generation request failed: %s", exc)
+        return web.json_response(
+            openai_error(str(exc), code="image_generation_error", error_type="provider_error"),
+            status=502,
+        )
