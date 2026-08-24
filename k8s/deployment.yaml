@@ -183,6 +183,13 @@ spec:
           requests:
             memory: 256Mi
             cpu: 100m
+            ephemeral-storage: 1Gi
+          limits:
+            # The cluster admission policy expects resources.limits to exist;
+            # ephemeral-storage caps stay well within the 2Gi/4Gi defaults
+            # (see ValidatingAdmissionPolicy 'ephemeral-storage-limit').
+            ephemeral-storage: 4Gi
+            memory: 512Mi
       volumes:
       - name: tusker-home
         persistentVolumeClaim:
