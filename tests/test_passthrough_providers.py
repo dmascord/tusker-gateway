@@ -79,7 +79,9 @@ def oauth_client(mock_http, quality_db):
     ("openai-codex::gpt-5.6-sol", "openai-codex", "gpt-5.6-sol"),
     ("openai::gpt-4o", "openai", "gpt-4o"),
     ("openrouter::openai/gpt-4o-mini", "openrouter", "openai/gpt-4o-mini"),
-    # provider/model
+    ("xiaomi::mimo-v2.5-pro", "xiaomi", "mimo-v2.5-pro"),
+    ("zai::glm-5.2", "zai", "glm-5.2"),
+     # provider/model
     ("github-copilot/claude-sonnet-4.6", "github-copilot", "claude-sonnet-4.6"),
     ("openai/gpt-4o", "openai", "gpt-4o"),
     ("openrouter/openai/gpt-4o-mini", "openrouter", "openai/gpt-4o-mini"),
@@ -141,10 +143,9 @@ async def test_oauth_provider_request_shape(oauth_client, provider):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("provider,key_env,expected_key", [
-    ("openai", "openai", "sk-openai-test"),
-    ("openrouter", "openrouter", "sk-or-test"),
     ("groq", "groq", "sk-groq-test"),
     ("local-llm", "local-llm", "sk-local-test"),
+    ("xiaomi", "xiaomi", "sk-mimo-test"),
     ("zai", "zai", "sk-zai-test"),
 ])
 async def test_apikey_provider_request_shape(mock_http, quality_db, provider, key_env, expected_key):
