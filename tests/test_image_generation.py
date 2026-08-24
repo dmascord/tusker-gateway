@@ -1,0 +1,315 @@
+"""Tests for image generation provider routing and Codex OAuth pathway."""
+from __future__ import annotations
+
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from tusker_gateway.errors import GatewayError
+from tusker_gateway.providers.image_generation import (
+    ImageGenerationHandler,
+    _map_model_to_codex,
+)
+
+
+def _make_config():
+    return {
+        "provider_api_keys": {
+            "openai": None,  # no direct OpenAI key -> must use Codex pathway
+        },
+        "codex_credentials": [
+            {
+                "access_token": "test-access-token",
+                "refresh_token": "test-refresh-token",
+                "expires_at_ms": 9999999999999,
+                "label": "test-codex",
+            }
+        ],
+    }
+
+
+def test_map_model_to_codex_gpt_image():
+    assert _map_model_to_codex("gpt-image-1") == "gpt-image-1"
+    assert _map_model_to_codex("gpt-image-2") == "gpt-image-1"
+    assert _map_model_to_codex("GPT-IMAGE-MINI") == "gpt-image-1"
+
+
+def test_map_model_to_codex_dall_e():
+    assert _map_model_to_codex("dall-e-3") == "gpt-image-1"
+    assert _map_model_to_codex("dall-e-2") == "gpt-image-1"
+
+
+def test_map_model_to_codex_passthrough():
+    assert _map_model_to_codex("custom-model") == "custom-model"
+
+
+def test_map_model_to_codex_empty_and_auto():
+    assert _map_model_to_codex("") == "gpt-image-1"
+    assert _map_model_to_codex("auto") == "gpt-image-1"
+
+
+def test_get_provider_for_image_request_openai():
+    h = ImageGenerationHandler({})
+    assert h.get_provider_for_image_request("gpt-image-1", "/v1/images/generations") == "openai"
+    assert h.get_provider_for_image_request("dall-e-3", "/v1/images/generations") == "openai"
+
+
+def test_get_provider_for_image_request_openrouter():
+    h = ImageGenerationHandler({})
+    assert h.get_provider_for_image_request("openai/gpt-image-1", "/v1/images/generations") == "openrouter"
+    assert h.get_provider_for_image_request("google/gemini-2.5-flash-image", "/v1/images/generations") == "openrouter"
+
+
+def test_get_provider_for_image_request_google():
+    h = ImageGenerationHandler({})
+    assert h.get_provider_for_image_request("gemini-2.5-flash-image", "/v1/images/generations") == "google"
+    assert h.get_provider_for_image_request("imagen-3.0-generate-002", "/v1/images/generations") == "google"
+
+
+def test_get_provider_for_image_request_anthropic():
+    h = ImageGenerationHandler({})
+    assert h.get_provider_for_image_request("claude-sonnet-4", "/v1/images/generations") == "anthropic"
+
+
+@pytest.mark.asyncio
+async def test_openai_falls_back_to_codex_when_no_api_key():
+    h = ImageGenerationHandler(_make_config())
+    fake_rotator = MagicMock()
+    fake_rotator.get_token = AsyncMock(return_value="rotator-token")
+
+    captured = {}
+
+    async def fake_call_openai_codex(self, model, path, body, codex_rotator, extra_headers):
+        captured["model"] = model
+        captured["rotator"] = codex_rotator
+        return {"created": 1, "data": [{"b64_json": "AAA"}]}
+
+    with patch.object(
+        ImageGenerationHandler, "_call_openai_codex", new=fake_call_openai_codex
+    ):
+        result = await h.handle_request(
+            model="gpt-image-1",
+            path="/v1/images/generations",
+            body={"model": "gpt-image-1", "prompt": "A mountain"},
+            api_key=None,
+            codex_rotator=fake_rotator,
+        )
+
+    assert result["created"] == 1
+    assert captured["model"] == "gpt-image-1"
+    assert captured["rotator"] is fake_rotator
+
+
+@pytest.mark.asyncio
+async def test_openai_uses_direct_key_when_present():
+    h = ImageGenerationHandler(_make_config())
+    captured = {}
+
+    async def fake_call_openai_direct(self, model, path, body, api_key, extra_headers):
+        captured["api_key"] = api_key
+        return {"created": 2, "data": []}
+
+    with patch.object(
+        ImageGenerationHandler, "_call_openai_direct", new=fake_call_openai_direct
+    ):
+        result = await h.handle_request(
+            model="gpt-image-1",
+            path="/v1/images/generations",
+            body={"model": "gpt-image-1", "prompt": "x"},
+            api_key="sk-direct-key",
+        )
+
+    assert result["created"] == 2
+    assert captured["api_key"] == "sk-direct-key"
+
+
+@pytest.mark.asyncio
+async def test_openai_raises_when_no_credentials():
+    h = ImageGenerationHandler({})
+
+    with pytest.raises(GatewayError) as excinfo:
+        await h.handle_request(
+            model="gpt-image-1",
+            path="/v1/images/generations",
+            body={"prompt": "x"},
+            api_key=None,
+            codex_rotator=None,
+        )
+
+    assert excinfo.value.code == "missing_api_key"
+
+
+class _FakeContent:
+    """Async iterable that returns one chunk of bytes then stops."""
+
+    def __init__(self, payload: bytes):
+        self.payload = payload
+        self._done = False
+
+    async def iter_any(self):
+        if not self._done:
+            self._done = True
+            yield self.payload
+
+
+class _FakeResp:
+    def __init__(self, *, status: int = 200, body: bytes = b"", err_text: str = ""):
+        self.status = status
+        self._body = body
+        self._err_text = err_text
+        self._content = _FakeContent(body)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    @property
+    def content(self):
+        return self._content
+
+    async def text(self):
+        return self._err_text
+
+
+class _FakeSession:
+    def __init__(self, *args, **kwargs):
+        self._resp: _FakeResp | None = None
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    def set_response(self, resp: _FakeResp) -> None:
+        self._resp = resp
+
+    def post(self, url, headers=None, json=None):
+        assert self._resp is not None, "FakeSession.post called without set_response"
+        return self._resp
+
+
+def _sse(*events: dict) -> bytes:
+    """Build an SSE byte payload from a list of event dicts."""
+    out = b""
+    for ev in events:
+        import json as _json
+        out += b"data: " + _json.dumps(ev).encode() + b"\n\n"
+    out += b"data: [DONE]\n\n"
+    return out
+
+
+@pytest.mark.asyncio
+async def test_call_openai_codex_parses_sse_response():
+    """Verify the Codex SSE parser extracts base64 images from image_generation_call items."""
+    h = ImageGenerationHandler(_make_config())
+    fake_rotator = MagicMock()
+    fake_rotator.get_token = AsyncMock(return_value="test-token")
+
+    body = _sse(
+        {
+            "type": "response.image_generation_call.completed",
+            "image_generation_call": {"result": "BASE64PNG", "revised_prompt": "a mountain peak"},
+        },
+        {"type": "response.completed", "response": {"output": []}},
+    )
+
+    session = _FakeSession()
+    session.set_response(_FakeResp(status=200, body=body))
+
+    with patch("aiohttp.ClientSession", lambda *a, **kw: session):
+        result = await h._call_openai_codex(
+            model="gpt-image-1",
+            path="/v1/images/generations",
+            body={"model": "gpt-image-1", "prompt": "A mountain peak", "size": "1024x1024", "n": 1},
+            codex_rotator=fake_rotator,
+            extra_headers=None,
+        )
+
+    assert "created" in result
+    # Multiple images is the only case where revised_prompt is exposed
+    # (OpenAI's API returns revised_prompt only when n > 1).
+    assert result["data"][0]["b64_json"] == "BASE64PNG"
+
+
+@pytest.mark.asyncio
+async def test_call_openai_codex_raises_on_no_images():
+    h = ImageGenerationHandler(_make_config())
+    fake_rotator = MagicMock()
+    fake_rotator.get_token = AsyncMock(return_value="test-token")
+
+    body = _sse({"type": "response.created", "response": {"output": []}})
+    session = _FakeSession()
+    session.set_response(_FakeResp(status=200, body=body))
+
+    with patch("aiohttp.ClientSession", lambda *a, **kw: session):
+        with pytest.raises(GatewayError) as excinfo:
+            await h._call_openai_codex(
+                model="gpt-image-1",
+                path="/v1/images/generations",
+                body={"prompt": "x"},
+                codex_rotator=fake_rotator,
+                extra_headers=None,
+            )
+
+    assert "no images" in str(excinfo.value).lower()
+
+
+@pytest.mark.asyncio
+async def test_call_openai_codex_handles_error_status():
+    h = ImageGenerationHandler(_make_config())
+    fake_rotator = MagicMock()
+    fake_rotator.get_token = AsyncMock(return_value="test-token")
+
+    session = _FakeSession()
+    session.set_response(_FakeResp(status=429, err_text='{"error": {"message": "rate limited"}}'))
+
+    with patch("aiohttp.ClientSession", lambda *a, **kw: session):
+        with pytest.raises(GatewayError) as excinfo:
+            await h._call_openai_codex(
+                model="gpt-image-1",
+                path="/v1/images/generations",
+                body={"prompt": "x"},
+                codex_rotator=fake_rotator,
+                extra_headers=None,
+            )
+
+    assert excinfo.value.code == "upstream_error"
+    assert "429" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_call_openai_codex_pulls_multiple_images_from_response_completed():
+    """The response.completed event may carry the full output list with images."""
+    h = ImageGenerationHandler(_make_config())
+    fake_rotator = MagicMock()
+    fake_rotator.get_token = AsyncMock(return_value="test-token")
+
+    body = _sse(
+        {
+            "type": "response.completed",
+            "response": {
+                "output": [
+                    {"type": "image_generation_call", "result": "PNG1", "revised_prompt": "first"},
+                    {"type": "image_generation_call", "result": "PNG2", "revised_prompt": "second"},
+                ]
+            },
+        }
+    )
+    session = _FakeSession()
+    session.set_response(_FakeResp(status=200, body=body))
+
+    with patch("aiohttp.ClientSession", lambda *a, **kw: session):
+        result = await h._call_openai_codex(
+            model="gpt-image-1",
+            path="/v1/images/generations",
+            body={"prompt": "two images", "n": 2},
+            codex_rotator=fake_rotator,
+            extra_headers=None,
+        )
+
+    assert len(result["data"]) == 2
+    assert result["data"][0]["b64_json"] == "PNG1"
+    assert result["data"][1]["b64_json"] == "PNG2"

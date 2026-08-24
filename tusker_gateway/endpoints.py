@@ -858,11 +858,13 @@ async def images_handler(request: web.Request) -> web.Response:
         provider_keys = config.get("provider_api_keys", {})
         api_key = provider_keys.get(provider)
 
+        codex_rotator = request.app.get("codex_rotator")
         result = await image_handler.handle_request(
             model=model,
             path=request.path,
             body=body,
             api_key=api_key,
+            codex_rotator=codex_rotator,
         )
         return web.json_response(result)
 

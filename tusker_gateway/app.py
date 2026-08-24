@@ -103,6 +103,16 @@ def create_app() -> web.Application:
 
     # Image generation handler (Phase: image/video generation support).
     from tusker_gateway.providers.image_generation import ImageGenerationHandler
+    # Build a Codex token rotator so the image handler can use Codex OAuth
+    # credentials for image generation when no OPENAI_API_KEY is configured.
+    from pathlib import Path as _AuthPath
+    from tusker_gateway.passthrough import CodexTokenRotator
+    codex_creds = app["config"].get("codex_credentials") or []
+    codex_rotator = CodexTokenRotator(
+        codex_creds,
+        auth_file=app["config"].get("auth_file"),
+    )
+    app["codex_rotator"] = codex_rotator
     app["image_handler"] = ImageGenerationHandler(app["config"])
 
     async def on_startup(app):

@@ -7,6 +7,8 @@ generation requests.
 
 from __future__ import annotations
 
+
+import base64
 import json
 import logging
 import time
@@ -14,11 +16,11 @@ from typing import Any, Dict, Optional
 
 import aiohttp
 
+from tusker_gateway.auth_strategies import get_auth_strategy
 from tusker_gateway.copilot_constants import is_likely_vision_model
 from tusker_gateway.errors import GatewayError
 
 logger = logging.getLogger(__name__)
-
 IMAGE_GEN_MODELS = {
     "gpt-image-2": {"cost_per_1k_tokens": 0.005, "context_window": 8000},
     "gpt-image-1": {"cost_per_1k_tokens": 0.02, "context_window": 8000},
@@ -26,6 +28,19 @@ IMAGE_GEN_MODELS = {
     "dall-e-3": {"cost_per_1k_tokens": 0.04, "context_window": 4096},
     "dall-e-2": {"cost_per_1k_tokens": 0.02, "context_window": 4096},
 }
+
+# Map common OpenAI image model names to the slugs the Codex backend accepts.
+def _map_model_to_codex(model: str) -> str:
+    """Translate an OpenAI image model id to the Codex image generation model slug.
+
+    Codex currently serves GPT Image models via the ``image_generation`` tool;
+    the model slug for the most capable variant is ``gpt-image-1``. Older
+    DALL-E names pass through unchanged so any custom slugs still work.
+    """
+    lower = (model or "").lower()
+    if "gpt-image" in lower or "dall-e" in lower or lower in {"", "auto"}:
+        return "gpt-image-1"
+    return model
 
 
 class ImageGenerationHandler:
@@ -80,11 +95,12 @@ class ImageGenerationHandler:
         body: Dict[str, Any],
         api_key: Optional[str] = None,
         extra_headers: Optional[Dict[str, str]] = None,
+        codex_rotator: Any = None,
     ) -> Dict[str, Any]:
         """Handle an image generation request by dispatching to the right provider."""
         provider = self.get_provider_for_image_request(model, path)
         if provider == "openai":
-            return await self._call_openai(model, path, body, api_key, extra_headers)
+            return await self._call_openai(model, path, body, api_key, extra_headers, codex_rotator)
         if provider == "google":
             return await self._call_google(model, path, body, api_key, extra_headers)
         if provider == "openrouter":
@@ -99,7 +115,6 @@ class ImageGenerationHandler:
             "status": "provider_not_configured",
             "message": f"Image generation via {provider} not configured",
         }
-
     async def _call_openai(
         self,
         model: str,
@@ -107,10 +122,27 @@ class ImageGenerationHandler:
         body: Dict[str, Any],
         api_key: Optional[str],
         extra_headers: Optional[Dict[str, str]],
+        codex_rotator: Any = None,
     ) -> Dict[str, Any]:
-        """Call OpenAI image generation API."""
-        if not api_key:
-            raise GatewayError("OpenAI API key required", code="missing_api_key")
+        """Call OpenAI image generation API; falls back to Codex OAuth pathway."""
+        if api_key:
+            return await self._call_openai_direct(model, path, body, api_key, extra_headers)
+        if codex_rotator:
+            return await self._call_openai_codex(model, path, body, codex_rotator, extra_headers)
+        raise GatewayError(
+            "OpenAI image generation requires either OPENAI_API_KEY or Codex OAuth credentials",
+            code="missing_api_key",
+        )
+
+    async def _call_openai_direct(
+        self,
+        model: str,
+        path: str,
+        body: Dict[str, Any],
+        api_key: Optional[str],
+        extra_headers: Optional[Dict[str, str]],
+    ) -> Dict[str, Any]:
+        """Call api.openai.com /v1/images/* directly with an OpenAI API key."""
         url = "https://api.openai.com" + path
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         if extra_headers:
@@ -129,6 +161,117 @@ class ImageGenerationHandler:
                 if not text:
                     return {"status": "ok"}
                 return json.loads(text)
+
+    async def _call_openai_codex(
+        self,
+        model: str,
+        path: str,
+        body: Dict[str, Any],
+        codex_rotator: Any,
+        extra_headers: Optional[Dict[str, str]],
+    ) -> Dict[str, Any]:
+        """Generate images via Codex OAuth (chatgpt.com/backend-api/codex/responses).
+
+        Used when no OPENAI_API_KEY is available but Codex OAuth credentials are.
+        Sends a Responses API request with the native ``image_generation`` tool,
+        which is what Codex / ChatGPT currently exposes for GPT Image models.
+        """
+        from tusker_gateway.models import ProviderConfig
+        endpoint = ProviderConfig.from_raw({
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "chat_path": "/responses",
+            "auth_type": "codex",
+            "model_header": "x-openai-gpt-model",
+        })
+        strategy = get_auth_strategy("codex", codex_rotator)
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+            **(extra_headers or {}),
+            **await strategy.headers(self.config, "openai-codex", model, None, endpoint),
+        }
+        # Codex backend currently accepts the model slug directly (e.g.
+        # "gpt-image-1"); the Responses API with image_generation tool handles
+        # the rest.
+        codex_model = _map_model_to_codex(model)
+        prompt = body.get("prompt", "")
+        size = body.get("size", "1024x1024")
+        n = int(body.get("n", 1))
+        # Translate OpenAI image request -> Responses API image_generation tool call.
+        # The tool produces base64 PNG output via image_generation_call items.
+        payload: Dict[str, Any] = {
+            "model": codex_model,
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": prompt}]}],
+            "tools": [{"type": "image_generation", "size": size, "n": n}],
+            "tool_choice": {"type": "image_generation"},
+            "stream": True,
+            "store": False,
+            "reasoning": {"effort": "low", "summary": "auto"},
+        }
+        url = "https://chatgpt.com/backend-api/codex/responses"
+        timeout = aiohttp.ClientTimeout(total=300)
+        b64_images: list[str] = []
+        revised_prompt: Optional[str] = None
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, headers=headers, json=payload) as resp:
+                if resp.status >= 400:
+                    err_text = (await resp.text())[:300]
+                    logger.warning("Codex image gen failed: %s %s", resp.status, err_text)
+                    raise GatewayError(
+                        f"Codex image gen error {resp.status}: {err_text}",
+                        code="upstream_error",
+                    )
+                # Stream SSE and harvest image_generation_call output items.
+                buffer = b""
+                async for chunk in resp.content.iter_any():
+                    buffer += chunk
+                    while b"\n\n" in buffer:
+                        frame, buffer = buffer.split(b"\n\n", 1)
+                        for line in frame.splitlines():
+                            line = line.strip()
+                            if not line.startswith(b"data: "):
+                                continue
+                            data = line[len(b"data: "):]
+                            if data == b"[DONE]":
+                                continue
+                            try:
+                                event = json.loads(data)
+                            except (json.JSONDecodeError, UnicodeDecodeError):
+                                continue
+                            item_type = event.get("type", "")
+                            if ".image_generation_call" in item_type or item_type == "image_generation_call":
+                                payload_obj = event.get("image_generation_call") or event.get("item") or event
+                                result = payload_obj.get("result") if isinstance(payload_obj, dict) else None
+                                if isinstance(result, str) and result:
+                                    b64_images.append(result)
+                                revised = payload_obj.get("revised_prompt") if isinstance(payload_obj, dict) else None
+                                if revised and not revised_prompt:
+                                    revised_prompt = revised
+                            elif item_type == "response.completed":
+                                response_obj = event.get("response") or {}
+                                for out_item in response_obj.get("output", []):
+                                    if out_item.get("type") == "image_generation_call":
+                                        result = out_item.get("result")
+                                        if isinstance(result, str) and result:
+                                            b64_images.append(result)
+                                        rp = out_item.get("revised_prompt")
+                                        if rp and not revised_prompt:
+                                            revised_prompt = rp
+        if not b64_images:
+            raise GatewayError(
+                "Codex image gen returned no images",
+                code="upstream_error",
+            )
+        data = [
+            {"b64_json": b64, "revised_prompt": revised_prompt}
+            for b64 in b64_images
+        ]
+        if len(data) == 1:
+            data[0].pop("revised_prompt", None)
+        return {
+            "created": int(time.time()),
+            "data": data,
+        }
 
     async def _call_openrouter(
         self,
