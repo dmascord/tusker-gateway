@@ -203,11 +203,13 @@ class ImageGenerationHandler:
         n = int(body.get("n", 1))
         # Translate OpenAI image request -> Responses API image_generation tool call.
         # The tool produces base64 PNG output via image_generation_call items.
+        # The image_generation tool doesn't accept n; for n>1 callers get a single
+        # image, which matches the de-facto Codex surface.
         image_model = _map_model_to_codex(model)  # for the tool's model field
         payload: Dict[str, Any] = {
             "model": codex_model,
             "input": [{"role": "user", "content": [{"type": "input_text", "text": prompt}]}],
-            "tools": [{"type": "image_generation", "model": image_model, "size": size, "n": n}],
+            "tools": [{"type": "image_generation", "model": image_model, "size": size}],
             "tool_choice": {"type": "image_generation"},
             "stream": True,
             "store": False,
