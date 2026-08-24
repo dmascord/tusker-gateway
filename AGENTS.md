@@ -17,6 +17,7 @@ Read in order when picking up the repo:
 | `docs/feature-matrix-and-plan.md` | Roadmap vs. peer gateways. |
 | `docs/cleanup-2026-08-19.md` | Earlier cleanup pass — context for current code shape. |
 | `docs/migrations/2026-08-21-codex-migration/` | Codex OAuth endpoint move + token-rotation tooling. |
+| `docs/zero-downtime-deploys.md` | Why `strategy: Recreate` and the planned RWX migration. |
 
 Topic-specific:
 
