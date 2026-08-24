@@ -312,8 +312,15 @@ def _build_extra_body(body: dict[str, Any]) -> dict[str, Any]:
     Returns a dict of fields that should be forwarded to the upstream
     provider as `extra_body`, excluding fields the gateway already
     handles (model/messages/stream/tools/tool_choice).
+
+    Modern OpenAI clients send `max_completion_tokens` while older
+    providers and the codex Responses API only support `max_tokens`.
+    Map the newer name to the older one so requests don't get rejected.
     """
-    return {k: v for k, v in body.items() if k not in _GATEWAY_HANDLED_FIELDS}
+    extra = {k: v for k, v in body.items() if k not in _GATEWAY_HANDLED_FIELDS}
+    if "max_completion_tokens" in extra and "max_tokens" not in extra:
+        extra["max_tokens"] = extra.pop("max_completion_tokens")
+    return extra
 
 
 async def _call_with_pool_fallback(
@@ -839,36 +846,25 @@ async def images_handler(request: web.Request) -> web.Response:
         body = await request.json()
         model = body.get("model", "gpt-image-2")
 
-        # Determine provider from model name
-        provider = "openai"
-        if "gpt-image" in model.lower() or "dall-e" in model.lower():
-            provider = "openai"
-        elif "gemini" in model.lower() or "google" in model.lower():
-            provider = "google"
-        elif "claude" in model.lower() or "anthropic" in model.lower():
-            provider = "anthropic"
-
-        # Check if the image handler is configured in the app
         image_handler = request.app.get("image_handler")
-        if image_handler:
-            api_key = _resolve_api_key(request)
-            result = await image_handler.handle_request(
-                model=model,
-                path=request.path,
-                body=body,
-                api_key=api_key,
+        if image_handler is None:
+            return web.json_response(
+                openai_error("image handler not initialised", code="internal_error", error_type="internal"),
+                status=503,
             )
-            return web.json_response(result)
 
-        # Fallback: return structured response indicating the request path
-        return web.json_response({
-            "created": int(time.time()),
-            "provider": provider,
-            "model": model,
-            "path": request.path,
-            "status": "provider_not_configured",
-            "message": f"Image generation via {provider} not configured — set provider API keys",
-        })
+        provider = image_handler.get_provider_for_image_request(model, request.path)
+        config = request.app["config"]
+        provider_keys = config.get("provider_api_keys", {})
+        api_key = provider_keys.get(provider)
+
+        result = await image_handler.handle_request(
+            model=model,
+            path=request.path,
+            body=body,
+            api_key=api_key,
+        )
+        return web.json_response(result)
 
     except Exception as exc:
         logger.warning("Image generation request failed: %s", exc)

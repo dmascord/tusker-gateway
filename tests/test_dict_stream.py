@@ -141,3 +141,14 @@ def test_build_extra_body_filters_gateway_fields():
     assert extra["temperature"] == 0.7
     assert extra["top_p"] == 0.9
     assert extra["stop"] == ["\n"]
+
+
+def test_build_extra_body_maps_max_completion_tokens():
+    """_build_extra_body must map max_completion_tokens -> max_tokens."""
+    from tusker_gateway.endpoints import _build_extra_body
+    body = {
+        "max_completion_tokens": 1000,
+    }
+    extra = _build_extra_body(body)
+    assert extra["max_tokens"] == 1000
+    assert "max_completion_tokens" not in extra

@@ -482,7 +482,17 @@ class PassthroughClient:
             body["tool_choice"] = "auto"
             body["parallel_tool_calls"] = True
         if extra_body:
-            body.update(extra_body)
+            # The codex Responses API uses `max_output_tokens`, not the
+            # chat-completions `max_tokens` / `max_completion_tokens`. Map
+            # them so the provider doesn't reject the request with
+            # "Unsupported parameter: max_completion_tokens".
+            mapped = dict(extra_body)
+            if "max_output_tokens" not in mapped:
+                mapped["max_output_tokens"] = mapped.pop("max_tokens", mapped.pop("max_completion_tokens", None))
+            # Drop chat-completions-only params the Responses API rejects.
+            for k in ("max_tokens", "max_completion_tokens"):
+                mapped.pop(k, None)
+            body.update(mapped)
         url = f"{endpoint_raw['base_url']}{endpoint_raw['chat_path']}"
         start = time.monotonic()
         resp = await self._http.request("POST", url, headers=headers, json=body, timeout=aiohttp.ClientTimeout(total=120))

@@ -1,5 +1,6 @@
 """Application factory: assemble aiohttp app from modules."""
 
+import asyncio
 import logging
 import os
 
@@ -99,6 +100,10 @@ def create_app() -> web.Application:
     # cooldown state are consistent across all request handlers.
     from tusker_gateway.pools import PoolManager
     app["pool_manager"] = PoolManager(app["config"])
+
+    # Image generation handler (Phase: image/video generation support).
+    from tusker_gateway.providers.image_generation import ImageGenerationHandler
+    app["image_handler"] = ImageGenerationHandler(app["config"])
 
     async def on_startup(app):
         startup_log = logging.getLogger("tusker_gateway.startup")
