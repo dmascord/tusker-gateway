@@ -192,19 +192,22 @@ class ImageGenerationHandler:
             **(extra_headers or {}),
             **await strategy.headers(self.config, "openai-codex", model, None, endpoint),
         }
-        # Codex backend currently accepts the model slug directly (e.g.
-        # "gpt-image-1"); the Responses API with image_generation tool handles
-        # the rest.
-        codex_model = _map_model_to_codex(model)
+        # Codex/ChatGPT backend uses model "gpt-5.5" as the Responses engine,
+        # and the actual image model slug (e.g. "gpt-image-2") is carried inside
+        # the hosted image_generation tool, NOT in the request model field.
+        # Sending gpt-image-* as the request model returns "model not supported
+        # when using Codex with a ChatGPT account".
+        codex_model = "gpt-5.5"
         prompt = body.get("prompt", "")
         size = body.get("size", "1024x1024")
         n = int(body.get("n", 1))
         # Translate OpenAI image request -> Responses API image_generation tool call.
         # The tool produces base64 PNG output via image_generation_call items.
+        image_model = _map_model_to_codex(model)  # for the tool's model field
         payload: Dict[str, Any] = {
             "model": codex_model,
             "input": [{"role": "user", "content": [{"type": "input_text", "text": prompt}]}],
-            "tools": [{"type": "image_generation", "size": size, "n": n}],
+            "tools": [{"type": "image_generation", "model": image_model, "size": size, "n": n}],
             "tool_choice": {"type": "image_generation"},
             "stream": True,
             "store": False,
