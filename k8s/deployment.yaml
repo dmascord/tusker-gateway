@@ -23,7 +23,7 @@ spec:
       terminationGracePeriodSeconds: 90
       containers:
       - name: tusker-gateway
-        image: registry.tusker.net.au:5000/tusker-gateway:swarm-alpine-20260820200250
+        image: registry.tusker.net.au:5000/tusker-gateway:swarm-alpine-20260825090000
         imagePullPolicy: Always
         envFrom:
         - secretRef:
@@ -188,8 +188,11 @@ spec:
             # The cluster admission policy expects resources.limits to exist;
             # ephemeral-storage caps stay well within the 2Gi/4Gi defaults
             # (see ValidatingAdmissionPolicy 'ephemeral-storage-limit').
+            # Memory has no upper bound here because the semantic-cache
+            # embedding model (all-MiniLM-L6-v2) blows past 512Mi during
+            # init and OOMKills the container — revisit once a lighter
+            # model is in use.
             ephemeral-storage: 4Gi
-            memory: 512Mi
       volumes:
       - name: tusker-home
         persistentVolumeClaim:
