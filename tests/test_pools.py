@@ -24,6 +24,8 @@ def test_pool_selection_logic():
             },
             "quality_db_path": os.path.join(tmpdir, "quality.db"),
             "excluded_providers": [],
+            # Bearer-kind providers are dropped from pools without keys.
+            "provider_api_keys": {"groq": "k-groq", "openai": "k-openai"},
         }
         mgr = PoolManager(config)
         sel1 = mgr.select("test")
@@ -31,6 +33,40 @@ def test_pool_selection_logic():
         sel2 = mgr.select("test", session_id="s1")
         sel3 = mgr.select("test", session_id="s1")
         assert sel2 == sel3, f"stickiness broken: {sel2} vs {sel3}"
+
+
+def test_unkeyed_bearer_provider_soft_fails():
+    """A bearer-kind provider with no API key is dropped from the pool at
+    build time instead of preventing startup — the pod stays up, the
+    provider just doesn't participate in selection."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config = {
+            "pools": {
+                "test": PoolConfig(
+                    name="test",
+                    models=[
+                        {"provider": "groq", "model": "m1"},          # bearer, no key → dropped
+                        {"provider": "openai-codex", "model": "m2"},  # codex kind → exempt
+                        {"provider": "local-llm", "model": "m3"},     # local kind → exempt
+                        {"provider": "openai", "model": "m4"},        # bearer, has key → kept
+                    ],
+                )
+            },
+            "quality_db_path": os.path.join(tmpdir, "quality.db"),
+            "excluded_providers": [],
+            "provider_api_keys": {"openai": "k-openai"},
+        }
+        mgr = PoolManager(config)
+
+        selected = {(s.provider, s.model) for s in mgr.models["test"]}
+        assert ("groq", "m1") not in selected
+        assert ("openai-codex", "m2") in selected
+        assert ("local-llm", "m3") in selected
+        assert ("openai", "m4") in selected
+
+        # Dropped entries stay visible via status for diagnosis.
+        unkeyed = {(e["provider"], e["model"]) for e in mgr.status()["test"]["unkeyed_entries"]}
+        assert ("groq", "m1") in unkeyed
 
 
 def test_cooldown_parsing():

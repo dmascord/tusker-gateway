@@ -36,6 +36,32 @@ def _validate_providers(specs: list["ModelSpec"]) -> list[str]:
     return warnings
 
 
+def _split_unkeyed(
+    specs: list[ModelSpec],
+    provider_keys: dict[str, str],
+) -> tuple[list[ModelSpec], list[tuple[ModelSpec, str]]]:
+    """Soft-fail models whose provider has no usable credential.
+
+    Bearer-kind providers need an entry in ``provider_api_keys``; without
+    one every request to them would 500 at auth time, so we drop those
+    candidates at pool-build time instead of preventing startup. OAuth,
+    codex, and local providers are exempt — they fall back to token
+    rotators or need no key at all.
+
+    Returns ``(usable, skipped)`` where each skipped item is paired with
+    a human-readable reason.
+    """
+    usable: list[ModelSpec] = []
+    skipped: list[tuple[ModelSpec, str]] = []
+    for s in specs:
+        endpoint = DEFAULT_PROVIDER_REGISTRY.get(s.provider)
+        if endpoint is not None and endpoint.kind == "bearer" and not provider_keys.get(s.provider.lower()):
+            skipped.append((s, f"no API key configured for provider '{s.provider}'"))
+            continue
+        usable.append(s)
+    return usable, skipped
+
+
 @dataclass
 class ModelSpec:
     provider: str
@@ -73,6 +99,9 @@ class PoolManager:
     config: dict[str, Any]
     pools: dict[str, PoolConfig] = field(default_factory=dict)
     models: dict[str, list[ModelSpec]] = field(default_factory=dict)
+    # pool_name -> specs dropped because their provider has no API key.
+    # Kept for /status visibility; never eligible for selection.
+    unkeyed: dict[str, list[tuple[ModelSpec, str]]] = field(default_factory=dict)
     _quality: QualityDB | None = None
     _cooldowns: CooldownTracker | None = None
     # Optional catalog registry — when set, PoolManager.extend_pools_with_catalog()
@@ -108,10 +137,16 @@ class PoolManager:
                 ModelSpec.from_dict(m, default_window=pool.context_window, zdr=pool.zdr)
                 for m in pool.models
             ]
-            self.models[name] = specs
+            usable, unkeyed = _split_unkeyed(specs, self.config.get("provider_api_keys", {}))
+            for s, reason in unkeyed:
+                logger.warning(
+                    "pool '%s': dropping %s '%s' — %s (add the key to the provider secret to enable)",
+                    name, s.provider, s.model, reason,
+                )
+            self.unkeyed[name] = unkeyed
+            self.models[name] = usable
             # Warn about unknown providers once at startup
-            warnings = _validate_providers(specs)
-            for w in warnings:
+            for w in _validate_providers(specs):
                 logger.warning("pool '%s': %s — will be skipped during selection", name, w)
     def pool_keeps_heavyweight(self, pool_name: str) -> bool:
         """Return True if the named pool should keep heavyweight candidates.
@@ -270,7 +305,14 @@ class PoolManager:
                 ModelSpec.from_dict(m, default_window=pool.context_window, zdr=pool.zdr)
                 for m in pool.models
             ]
-            self.models[name] = specs
+            usable, unkeyed = _split_unkeyed(specs, self.config.get("provider_api_keys", {}))
+            for s, reason in unkeyed:
+                logger.warning(
+                    "pool '%s': dropping %s '%s' — %s (add the key to the provider secret to enable)",
+                    name, s.provider, s.model, reason,
+                )
+            self.unkeyed[name] = unkeyed
+            self.models[name] = usable
 
     def select(
         self,
@@ -378,6 +420,10 @@ class PoolManager:
                 "invalid_entries": [
                     {"provider": s.provider, "model": s.model}
                     for s in invalid
+                ],
+                "unkeyed_entries": [
+                    {"provider": s.provider, "model": s.model, "reason": reason}
+                    for s, reason in self.unkeyed.get(name, [])
                 ],
                 "candidates": [
                     {"provider": s.provider, "model": s.model, "context_window": s.context_window}

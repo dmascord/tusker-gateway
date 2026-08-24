@@ -452,6 +452,12 @@ def test_poolmanager_static_allowlist():
             ]),
         },
         "excluded_providers": [],
+        # Bearer-kind providers are dropped from pools without keys.
+        "provider_api_keys": {
+            "openrouter": "k-openrouter",
+            "opencode-zen": "k-zen",
+            "opencode-go": "k-go",
+        },
         "quality_db_path": "/tmp/_unused.db",
     }
     pm = PoolManager(cfg)
@@ -473,6 +479,12 @@ def test_poolmanager_extend_pools_with_catalog():
             ]),
         },
         "excluded_providers": [],
+        # Bearer-kind providers are dropped from pools without keys.
+        "provider_api_keys": {
+            "openrouter": "k-openrouter",
+            "opencode-zen": "k-zen",
+            "opencode-go": "k-go",
+        },
         "quality_db_path": "/tmp/_unused.db",
     }
     pm = PoolManager(cfg)
@@ -505,6 +517,12 @@ def test_poolmanager_extend_pools_without_registry():
             ]),
         },
         "excluded_providers": [],
+        # Bearer-kind providers are dropped from pools without keys.
+        "provider_api_keys": {
+            "openrouter": "k-openrouter",
+            "opencode-zen": "k-zen",
+            "opencode-go": "k-go",
+        },
         "quality_db_path": "/tmp/_unused.db",
     }
     pm = PoolManager(cfg)
@@ -527,6 +545,12 @@ def test_poolmanager_auto_free_adds_openrouter_zero_pricing():
             ),
         },
         "excluded_providers": [],
+        # Bearer-kind providers are dropped from pools without keys.
+        "provider_api_keys": {
+            "openrouter": "k-openrouter",
+            "opencode-zen": "k-zen",
+            "opencode-go": "k-go",
+        },
         "quality_db_path": "/tmp/_unused.db",
     }
     pm = PoolManager(cfg)
@@ -569,6 +593,12 @@ def test_poolmanager_auto_free_includes_opencode_zen_and_go():
             "code": PoolConfig(name="code", models=[], auto_free=True),
         },
         "excluded_providers": [],
+        # Bearer-kind providers are dropped from pools without keys.
+        "provider_api_keys": {
+            "openrouter": "k-openrouter",
+            "opencode-zen": "k-zen",
+            "opencode-go": "k-go",
+        },
         "quality_db_path": "/tmp/_unused.db",
     }
     pm = PoolManager(cfg)
@@ -607,6 +637,12 @@ def test_poolmanager_auto_free_drops_models_that_stop_being_free():
             "code": PoolConfig(name="code", models=[], auto_free=True),
         },
         "excluded_providers": [],
+        # Bearer-kind providers are dropped from pools without keys.
+        "provider_api_keys": {
+            "openrouter": "k-openrouter",
+            "opencode-zen": "k-zen",
+            "opencode-go": "k-go",
+        },
         "quality_db_path": "/tmp/_unused.db",
     }
     pm = PoolManager(cfg)
@@ -641,6 +677,12 @@ def test_poolmanager_auto_free_disabled_is_noop():
             "code": PoolConfig(name="code", models=[], auto_free=False),
         },
         "excluded_providers": [],
+        # Bearer-kind providers are dropped from pools without keys.
+        "provider_api_keys": {
+            "openrouter": "k-openrouter",
+            "opencode-zen": "k-zen",
+            "opencode-go": "k-go",
+        },
         "quality_db_path": "/tmp/_unused.db",
     }
     pm = PoolManager(cfg)

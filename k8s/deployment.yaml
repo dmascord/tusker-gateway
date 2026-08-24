@@ -58,71 +58,85 @@ spec:
         - name: PROVIDER_GITHUB_COPILOT_API_KEY
           valueFrom:
             secretKeyRef:
+              optional: true
               name: tusker-env-vault
               key: COPILOT_GITHUB_TOKEN
         - name: PROVIDER_GITHUB_COPILOT_ENTERPRISE_API_KEY
           valueFrom:
             secretKeyRef:
+              optional: true
               name: tusker-env-vault
               key: COPILOT_GITHUB_TOKEN
         - name: PROVIDER_OPENAI_CODEX_API_KEY
           valueFrom:
             secretKeyRef:
+              optional: true
               name: tusker-env-vault
               key: COPILOT_GITHUB_TOKEN
         - name: PROVIDER_OPENROUTER_API_KEY
           valueFrom:
             secretKeyRef:
+              optional: true
               name: tusker-env-vault
               key: OPENROUTER_API_KEY
         - name: PROVIDER_GROQ_API_KEY
           valueFrom:
             secretKeyRef:
+              optional: true
               name: tusker-env-vault
               key: GROQ_API_KEY
         - name: PROVIDER_ZAI_API_KEY
           valueFrom:
             secretKeyRef:
+              optional: true
               name: tusker-env-vault
               key: GLM_API_KEY
         - name: PROVIDER_GEMINI_API_KEY
           valueFrom:
             secretKeyRef:
+              optional: true
               name: tusker-env-vault
               key: GEMINI_API_KEY
         - name: PROVIDER_CEREBRAS_API_KEY
           valueFrom:
             secretKeyRef:
+              optional: true
               name: tusker-env-vault
               key: CEREBRAS_API_KEY
         - name: PROVIDER_COHERE_API_KEY
           valueFrom:
             secretKeyRef:
+              optional: true
               name: tusker-env-vault
               key: COHERE_API_KEY
         - name: PROVIDER_MINIMAX_API_KEY
           valueFrom:
             secretKeyRef:
+              optional: true
               name: tusker-env-vault
               key: MINIMAX_API_KEY
         - name: PROVIDER_SYNTHETIC_API_KEY
           valueFrom:
             secretKeyRef:
+              optional: true
               name: tusker-env-vault
               key: SYNTHETIC_API_KEY
         - name: PROVIDER_OLLAMA_API_KEY
           valueFrom:
             secretKeyRef:
+              optional: true
               name: tusker-env-vault
               key: OLLAMA_API_KEY
         - name: PROVIDER_OPENCODE_GO_API_KEY
           valueFrom:
             secretKeyRef:
+              optional: true
               name: tusker-env-vault
               key: OPENCODE_GO_API_KEY
         - name: PROVIDER_OPENCODE_ZEN_API_KEY
           valueFrom:
             secretKeyRef:
+              optional: true
               name: tusker-env-vault
               key: OPENCODE_ZEN_API_KEY
         - name: TUSKER_RATELIMIT_DEFAULT_RATE
