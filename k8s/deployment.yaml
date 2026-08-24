@@ -11,8 +11,6 @@ spec:
     matchLabels:
       app: tusker-gateway
   strategy:
-    # Recreate is required because the PVC is ReadWriteOnce, which prevents
-    # concurrent mounts by multiple pods during a rolling update.
     type: Recreate
   template:
     metadata:
@@ -29,7 +27,7 @@ spec:
         imagePullPolicy: Always
         envFrom:
         - secretRef:
-            name: hermes-env-vault
+            name: tusker-env-vault
         env:
         - name: MODEL_NAME
           value: tusker-gateway
@@ -41,7 +39,6 @@ spec:
           value: '1'
         - name: API_KEYS
           value: d36fa730d29ed2e8749708ffc7ff7453d5c68a84b9b17360f15bffa9fb0a6a6d,1669ed9f11c615b5cb60fdfa60d23b4373c503de306eaa90039a20790427aef0,4f9736e8bfa246e74ffc11279cf59d2fe4b381cc70159255a9f78e26932bbb1f,e6507e72971c8e015b2958930497e3baaf75607e2dc178ae44f1db671bd49e0d
-        # Semantic cache (Release 3)
         - name: TUSKER_SEMANTIC_CACHE_ENABLED
           value: 'true'
         - name: TUSKER_SEMANTIC_CACHE_THRESHOLD
@@ -49,104 +46,89 @@ spec:
         - name: TUSKER_SEMANTIC_CACHE_TTL
           value: '3600'
         - name: TUSKER_SEMANTIC_CACHE_PATH
-          value: '/home/tusker/.hermes/semantic_cache'
+          value: /home/tusker/.hermes/semantic_cache
         - name: TUSKER_POOL_CODE
-          # Cheap-tier pool: heavyweight models (gpt-5.6-sol/terra, gpt-5.4/5.5,
-          # gpt-5.5 GHE, claude-opus/sonnet) are dropped at runtime by the
-          # heavyweight gate in pools.py. The slug override set lives in
-          # tusker_gateway/heavyweight.py.
-          #
-          # Curated by the migration from hermes-agent (2026-08-21), augmented
-          # with free-tier OpenRouter models for tracking without rewriting
-          # the config. See docs/gateway-model-routing.md.
-          value: '{"models":[{"provider":"minimax","model":"MiniMax-M3"},{"provider":"opencode-go","model":"deepseek-v4-flash"},{"provider":"synthetic","model":"syn:large:text"},{"provider":"opencode-go","model":"mimo-v2.5"},{"provider":"opencode-zen","model":"north-mini-code-free"},{"provider":"opencode-go","model":"qwen3.6-plus"},{"provider":"google","model":"gemini-3.1-flash-lite-preview"},{"provider":"cerebras","model":"gpt-oss-120b"},{"provider":"opencode-go","model":"deepseek-v4-pro"},{"provider":"opencode-zen","model":"big-pickle"},{"provider":"openrouter","model":"poolside/laguna-xs-2.1:free"},{"provider":"openrouter","model":"openai/gpt-oss-20b:free"},{"provider":"opencode-go","model":"minimax-m3"},{"provider":"opencode-go","model":"minimax-m2.7"},{"provider":"opencode-go","model":"qwen3.5-plus"},{"provider":"opencode-go","model":"mimo-v2.5-pro"},{"provider":"ollama-cloud","model":"glm-5.1"},{"provider":"ollama-cloud","model":"deepseek-v4-flash:preview"},{"provider":"ollama-cloud","model":"kimi-k2.6"},{"provider":"ollama-cloud","model":"gpt-oss:20b"},{"provider":"ollama-cloud","model":"minimax-m2.7"},{"provider":"opencode-zen","model":"deepseek-v4-flash-free"},{"provider":"opencode-zen","model":"mimo-v2.5-free"},{"provider":"opencode-zen","model":"hy3-free"},{"provider":"opencode-zen","model":"nemotron-3-ultra-free"},{"provider":"opencode-zen","model":"nemotron-3.5-lightning-free"},{"provider":"opencode-zen","model":"laguna-s-2.1-free"},{"provider":"opencode-zen","model":"gemini-3-flash"},{"provider":"opencode-zen","model":"minimax-m2.7"},{"provider":"opencode-zen","model":"minimax-m2.5-free"},{"provider":"openrouter","model":"nvidia/nemotron-3-ultra-550b-a55b:free"},{"provider":"openrouter","model":"nvidia/nemotron-3.5-lightning:free"},{"provider":"openrouter","model":"dots-studio/dots-3-note-preview:free"},{"provider":"openrouter","model":"google/gemma-4-31b-it:free"},{"provider":"openrouter","model":"google/gemma-4-26b-a4b-it:free"},{"provider":"openrouter","model":"cohere/north-mini-code:free"},{"provider":"openrouter","model":"openrouter/free"},{"provider":"minimax","model":"MiniMax-M2.7-highspeed"},{"provider":"zai","model":"glm-4.7"},{"provider":"cohere","model":"north-mini-code-1-0"},{"provider":"openai-codex","model":"gpt-5.6-luna"},{"provider":"openai-codex","model":"gpt-5.4-mini"}],"context_window":128000,"zdr":false}'
+          value: '{"models":[{"provider":"minimax","model":"MiniMax-M3"},{"provider":"opencode-go","model":"deepseek-v4-flash"},{"provider":"synthetic","model":"syn:large:text"},{"provider":"opencode-go","model":"mimo-v2.5"},{"provider":"opencode-zen","model":"north-mini-code-free"},{"provider":"opencode-go","model":"qwen3.6-plus"},{"provider":"google","model":"gemini-3.1-flash-lite-preview"},{"provider":"cerebras","model":"gpt-oss-120b"},{"provider":"opencode-go","model":"deepseek-v4-pro"},{"provider":"opencode-zen","model":"big-pickle"},{"provider":"openrouter","model":"poolside/laguna-xs-2.1:free"},{"provider":"openrouter","model":"openai/gpt-oss-20b:free"},{"provider":"opencode-go","model":"minimax-m3"},{"provider":"opencode-go","model":"minimax-m2.7"},{"provider":"opencode-go","model":"qwen3.5-plus"},{"provider":"opencode-go","model":"mimo-v2.5-pro"},{"provider":"ollama-cloud","model":"glm-5.1"},{"provider":"ollama-cloud","model":"deepseek-v4-flash:preview"},{"provider":"ollama-cloud","model":"kimi-k2.6"},{"provider":"ollama-cloud","model":"gpt-oss:20b"},{"provider":"ollama-cloud","model":"minimax-m2.7"},{"provider":"opencode-zen","model":"deepseek-v4-flash-free"},{"provider":"opencode-zen","model":"mimo-v2.5-free"},{"provider":"opencode-zen","model":"hy3-free"},{"provider":"opencode-zen","model":"nemotron-3-ultra-free"},{"provider":"opencode-zen","model":"nemotron-3.5-lightning-free"},{"provider":"opencode-zen","model":"laguna-s-2.1-free"},{"provider":"opencode-zen","model":"gemini-3-flash"},{"provider":"opencode-zen","model":"minimax-m2.7"},{"provider":"opencode-zen","model":"minimax-m2.5-free"},{"provider":"openrouter","model":"nvidia/nemotron-3-ultra-550b-a55b:free"},{"provider":"openrouter","model":"nvidia/nemotron-3.5-lightning:free"},{"provider":"openrouter","model":"dots-studio/dots-3-note-preview:free"},{"provider":"openrouter","model":"google/gemma-4-31b-it:free"},{"provider":"openrouter","model":"google/gemma-4-26b-a4b-it:free"},{"provider":"openrouter","model":"cohere/north-mini-code:free"},{"provider":"openrouter","model":"openrouter/free"},{"provider":"minimax","model":"MiniMax-M2.7-highspeed"},{"provider":"zai","model":"glm-4.7"},{"provider":"cohere","model":"north-mini-code-1-0"},{"provider":"openai-codex","model":"gpt-5.6-luna"},{"provider":"openai-codex","model":"gpt-5.4-mini"}],"context_window":128000,"zdr":false,"auto_free":true}'
         - name: TUSKER_POOL_PRIVACY
-          # ZDR / privacy pool. Heavyweight models dropped by the heavyweight
-          # gate; light codex slugs (gpt-5.6-luna, gpt-5.4-mini) and GHE
-          # cheap-tier (gpt-5-mini, gpt-4o-mini) are the Codex/GHE entries.
-          value: '{"models":[{"provider":"github-copilot-enterprise","model":"gpt-5-mini"},{"provider":"github-copilot-enterprise","model":"gpt-4o-mini"},{"provider":"ollama-cloud","model":"ollama/deepseek-v4-flash"},{"provider":"opencode-go","model":"minimax-m3"},{"provider":"opencode-go","model":"minimax-m2.7"},{"provider":"opencode-go","model":"qwen3.6-plus"},{"provider":"opencode-go","model":"qwen3.5-plus"},{"provider":"opencode-go","model":"deepseek-v4-flash"},{"provider":"opencode-go","model":"mimo-v2.5-pro"},{"provider":"ollama-cloud","model":"glm-5.1"},{"provider":"ollama-cloud","model":"deepseek-v4-flash:preview"},{"provider":"ollama-cloud","model":"kimi-k2.6"},{"provider":"ollama-cloud","model":"gpt-oss:20b"},{"provider":"ollama-cloud","model":"minimax-m2.7"},{"provider":"openai-codex","model":"gpt-5.6-luna"},{"provider":"openai-codex","model":"gpt-5.4-mini"}],"context_window":128000,"zdr":true}'
+          value: '{"models":[{"provider":"github-copilot-enterprise","model":"gpt-5-mini"},{"provider":"github-copilot-enterprise","model":"gpt-4o-mini"},{"provider":"ollama-cloud","model":"ollama/deepseek-v4-flash"},{"provider":"opencode-go","model":"minimax-m3"},{"provider":"opencode-go","model":"minimax-m2.7"},{"provider":"opencode-go","model":"qwen3.6-plus"},{"provider":"opencode-go","model":"qwen3.5-plus"},{"provider":"opencode-go","model":"deepseek-v4-flash"},{"provider":"opencode-go","model":"mimo-v2.5-pro"},{"provider":"ollama-cloud","model":"glm-5.1"},{"provider":"ollama-cloud","model":"deepseek-v4-flash:preview"},{"provider":"ollama-cloud","model":"kimi-k2.6"},{"provider":"ollama-cloud","model":"gpt-oss:20b"},{"provider":"ollama-cloud","model":"minimax-m2.7"},{"provider":"openai-codex","model":"gpt-5.6-luna"},{"provider":"openai-codex","model":"gpt-5.4-mini"}],"context_window":128000,"zdr":true,"auto_free":true}'
         - name: TUSKER_POOL_PREMIUM
-          # Paid-tier pool: heavyweight models are KEPT here. This is where
-          # gpt-5.6-sol/terra, gpt-5.4/5.5 codex slugs, and Claude Opus/Sonnet
-          # land so OMP / curl can reach them via the hermes-premium alias.
           value: '{"models":[{"provider":"github-copilot-enterprise","model":"claude-sonnet-4.6"},{"provider":"github-copilot-enterprise","model":"claude-opus-4.6"},{"provider":"openai-codex","model":"gpt-5.6-sol"},{"provider":"openai-codex","model":"gpt-5.6-terra"},{"provider":"openai-codex","model":"gpt-5.5"},{"provider":"openai-codex","model":"gpt-5.4"},{"provider":"github-copilot-enterprise","model":"gpt-5.5"},{"provider":"github-copilot-enterprise","model":"gpt-5.4"},{"provider":"opencode-go","model":"deepseek-v4-pro"},{"provider":"cerebras","model":"gpt-oss-120b"},{"provider":"synthetic","model":"syn:large:text"},{"provider":"minimax","model":"MiniMax-M2.7-highspeed"}],"context_window":128000}'
         - name: TUSKER_POOL_SWARM
           value: '{"models":[{"provider":"opencode-go","model":"deepseek-v4-flash"},{"provider":"opencode-go","model":"mimo-v2.5"}],"context_window":128000}'
         - name: PROVIDER_GITHUB_COPILOT_API_KEY
           valueFrom:
             secretKeyRef:
-              name: hermes-env-vault
+              name: tusker-env-vault
               key: COPILOT_GITHUB_TOKEN
         - name: PROVIDER_GITHUB_COPILOT_ENTERPRISE_API_KEY
           valueFrom:
             secretKeyRef:
-              name: hermes-env-vault
+              name: tusker-env-vault
               key: COPILOT_GITHUB_TOKEN
         - name: PROVIDER_OPENAI_CODEX_API_KEY
           valueFrom:
             secretKeyRef:
-              name: hermes-env-vault
+              name: tusker-env-vault
               key: COPILOT_GITHUB_TOKEN
         - name: PROVIDER_OPENROUTER_API_KEY
           valueFrom:
             secretKeyRef:
-              name: hermes-env-vault
+              name: tusker-env-vault
               key: OPENROUTER_API_KEY
         - name: PROVIDER_GROQ_API_KEY
           valueFrom:
             secretKeyRef:
-              name: hermes-env-vault
+              name: tusker-env-vault
               key: GROQ_API_KEY
         - name: PROVIDER_ZAI_API_KEY
           valueFrom:
             secretKeyRef:
-              name: hermes-env-vault
+              name: tusker-env-vault
               key: GLM_API_KEY
         - name: PROVIDER_GEMINI_API_KEY
           valueFrom:
             secretKeyRef:
-              name: hermes-env-vault
+              name: tusker-env-vault
               key: GEMINI_API_KEY
         - name: PROVIDER_CEREBRAS_API_KEY
           valueFrom:
             secretKeyRef:
-              name: hermes-env-vault
+              name: tusker-env-vault
               key: CEREBRAS_API_KEY
         - name: PROVIDER_COHERE_API_KEY
           valueFrom:
             secretKeyRef:
-              name: hermes-env-vault
+              name: tusker-env-vault
               key: COHERE_API_KEY
         - name: PROVIDER_MINIMAX_API_KEY
           valueFrom:
             secretKeyRef:
-              name: hermes-env-vault
+              name: tusker-env-vault
               key: MINIMAX_API_KEY
         - name: PROVIDER_SYNTHETIC_API_KEY
           valueFrom:
             secretKeyRef:
-              name: hermes-env-vault
+              name: tusker-env-vault
               key: SYNTHETIC_API_KEY
         - name: PROVIDER_OLLAMA_API_KEY
           valueFrom:
             secretKeyRef:
-              name: hermes-env-vault
+              name: tusker-env-vault
               key: OLLAMA_API_KEY
         - name: PROVIDER_OPENCODE_GO_API_KEY
           valueFrom:
             secretKeyRef:
-              name: hermes-env-vault
+              name: tusker-env-vault
               key: OPENCODE_GO_API_KEY
         - name: PROVIDER_OPENCODE_ZEN_API_KEY
           valueFrom:
             secretKeyRef:
-              name: hermes-env-vault
+              name: tusker-env-vault
               key: OPENCODE_ZEN_API_KEY
-        # Override the secret's 2 req/s burst 3 — that's too tight for OMP.
         - name: TUSKER_RATELIMIT_DEFAULT_RATE
-          value: "10"
+          value: '10'
         - name: TUSKER_RATELIMIT_DEFAULT_BURST
-          value: "20"
+          value: '20'
         ports:
         - containerPort: 8642
           name: http
@@ -185,8 +167,8 @@ spec:
               - '10'
         resources:
           requests:
-            memory: "256Mi"
-            cpu: "100m"
+            memory: 256Mi
+            cpu: 100m
       volumes:
       - name: tusker-home
         persistentVolumeClaim:
