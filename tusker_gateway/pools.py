@@ -247,11 +247,10 @@ class PoolManager:
                     continue
 
                 for entry in entries:
-                    if mode == "pricing":
-                        if entry.cost_input is None or entry.cost_input > 0:
-                            continue
-                        if entry.cost_output is None or entry.cost_output > 0:
-                            continue
+                    if mode == "pricing" and not (
+                        entry.cost_input == 0.0 and entry.cost_output == 0.0
+                    ):
+                        continue
 
                     heavyweight = is_heavyweight(
                         entry.model,

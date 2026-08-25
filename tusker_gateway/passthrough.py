@@ -55,7 +55,7 @@ def _init_provider_endpoints() -> dict[str, dict[str, Any]]:
         pass
     return {
         "github-copilot": {"base_url": "https://api.githubcopilot.com", "chat_path": "/chat/completions", "auth_type": "oauth", "model_header": "x-github-gpt-model"},
-        "github-copilot-enterprise": {"base_url": "https://api.githubcopilot.com", "chat_path": "/chat/completions", "auth_type": "oauth", "model_header": "x-github-gpt-model"},
+        "github-copilot-enterprise": {"base_url": "https://copilot-api.sita.ghe.com", "chat_path": "/chat/completions", "auth_type": "oauth", "model_header": "x-github-gpt-model"},
         "openai-codex": {"base_url": "https://api.github.com/copilot", "chat_path": "/chat/completions", "auth_type": "oauth", "model_header": "x-openai-gpt-model"},
         "openai": {"base_url": "https://api.openai.com", "chat_path": "/v1/chat/completions", "auth_type": "bearer"},
         "openrouter": {"base_url": "https://openrouter.ai/api/v1", "chat_path": "/chat/completions", "auth_type": "bearer"},
@@ -260,10 +260,12 @@ class PassthroughClient:
         config: dict[str, Any],
         quality_db: QualityDB,
         http_client: aiohttp.ClientSession,
+        catalog_registry: Any | None = None,
     ):
         self._config = config
         self._quality = quality_db
         self._http = http_client
+        self._catalog_registry = catalog_registry
         auth_file = config.get("auth_file")
         if not auth_file:
             import os
@@ -306,15 +308,44 @@ class PassthroughClient:
             if not endpoint:
                 raise ProviderError(f"Unknown provider: {provider}")
 
-        # openai-codex uses the Responses API only when its endpoint is actually
-        # configured for it (chat_path ends with "/responses"). Test patches
-        # sometimes redirect it to a regular /chat/completions endpoint; in
-        # that case we treat it as a normal bearer passthrough.
-        if provider == "openai-codex" and endpoint.get("chat_path", "").endswith("/responses"):
+        # Determine whether this model must go through the Responses API
+        # adapter (rather than the plain chat-completions passthrough).
+        #
+        # Precedence:
+        #   1. The endpoint's chat_path is already "/responses"
+        #      (openai-codex, or a test patch pointing a provider at
+        #      the Responses adapter).
+        #   2. The catalog says the model's supported_endpoints include
+        #      "/responses". GitHub Copilot serves its GPT-5.x codex-
+        #      family models (gpt-5.6-luna, gpt-5.5, ...) via the
+        #      Responses API even though the provider's default chat
+        #      path is /chat/completions; the catalog is the source of
+        #      truth for which endpoint a model accepts.
+        use_responses = endpoint.get("chat_path", "").endswith("/responses")
+        if not use_responses and self._catalog_registry is not None:
+            entries = self._catalog_registry.entries_for(provider)
+            if entries:
+                for entry in entries:
+                    if entry.model == model and "/responses" in entry.raw.get(
+                        "supported_endpoints", []
+                    ):
+                        use_responses = True
+                        # Copilot models expose "/responses" but not
+                        # "/chat/completions"; override the path so the
+                        # base_url is preserved and the adapter posts to
+                        # the Responses endpoint.
+                        endpoint = {
+                            **endpoint,
+                            "chat_path": "/responses",
+                        }
+                        break
+
+        if use_responses:
             return await self._chat_codex(
-                model, messages,
+                provider, model, messages,
                 stream=stream, api_key=api_key, tools=tools,
                 extra_headers=extra_headers, extra_body=extra_body,
+                endpoint=endpoint,
             )
 
         base_url = endpoint["base_url"]
@@ -461,6 +492,7 @@ class PassthroughClient:
         return headers, body
     async def _chat_codex(
         self,
+        provider: str,
         model: str,
         messages: list[dict[str, Any]],
         *,
@@ -469,11 +501,12 @@ class PassthroughClient:
         tools: list[dict[str, Any]] | None = None,
         extra_headers: dict[str, str] | None = None,
         extra_body: dict[str, Any] | None = None,
+        endpoint: dict[str, Any] | None = None,
     ) -> dict[str, Any] | AsyncIterator[bytes]:
         from tusker_gateway.auth_strategies import get_auth_strategy
         from tusker_gateway.models import ProviderConfig
         from tusker_gateway.tool_formats import normalize_tools
-        endpoint_raw = PROVIDER_ENDPOINTS["openai-codex"]
+        endpoint_raw = endpoint or PROVIDER_ENDPOINTS["openai-codex"]
         endpoint_model = ProviderConfig.from_raw(endpoint_raw)
         # Honor the patched endpoint's auth_type (test-only override path).
         # Default to "codex" so production keeps its dedicated auth strategy.
@@ -487,7 +520,7 @@ class PassthroughClient:
         headers = {
             "Content-Type": "application/json",
             **(extra_headers or {}),
-            **await strategy.headers(self._config, "openai-codex", model, api_key, endpoint_model),
+            **await strategy.headers(self._config, provider, model, api_key, endpoint_model),
         }
         input_data: list[dict[str, Any]] = []
         for msg in messages:
@@ -535,16 +568,34 @@ class PassthroughClient:
             body["tool_choice"] = "auto"
             body["parallel_tool_calls"] = True
         if extra_body:
-            # The codex Responses API uses `max_output_tokens`, not the
-            # chat-completions `max_tokens` / `max_completion_tokens`. Map
-            # them so the provider doesn't reject the request with
-            # "Unsupported parameter: max_completion_tokens".
+            # Forward everything from extra_body upstream except the
+            # chat-completions-only params the Codex Responses API rejects.
+            # The Codex backend for some privacy-pool models
+            # (gpt-5.4-mini, gpt-5.6-luna) rejects max-tokens and
+            # stream_options; it applies its own defaults when omitted,
+            # so silently dropping is safer than guessing.
             mapped = dict(extra_body)
-            if "max_output_tokens" not in mapped:
-                mapped["max_output_tokens"] = mapped.pop("max_tokens", mapped.pop("max_completion_tokens", None))
-            # Drop chat-completions-only params the Responses API rejects.
-            for k in ("max_tokens", "max_completion_tokens"):
+            for k in (
+                "max_tokens",
+                "max_completion_tokens",
+                "max_output_tokens",
+                # Codex Responses streams usage via `response.completed`
+                # events rather than chat-completions' stream_options;
+                # some Codex model deployments reject the latter as an
+                # unknown parameter.
+                "stream_options",
+            ):
                 mapped.pop(k, None)
+            # The Codex Responses API accepts reasoning as a nested object
+            # ({effort, summary}) — not the flat chat-completions
+            # `reasoning_effort` top-level field. Fold the client's value
+            # into the nested object so the request isn't rejected with
+            # "Unsupported parameter: reasoning_effort".
+            reffort = mapped.pop("reasoning_effort", None)
+            if reffort is not None:
+                if not isinstance(body.get("reasoning"), dict):
+                    body["reasoning"] = {}
+                body["reasoning"]["effort"] = reffort
             body.update(mapped)
         url = f"{endpoint_raw['base_url']}{endpoint_raw['chat_path']}"
         start = time.monotonic()
@@ -556,12 +607,12 @@ class PassthroughClient:
             from tusker_gateway.cooldown import _cooldown_seconds_for_429
             tracker = global_tracker()
             seconds = _cooldown_seconds_for_429({"body": (exc.body or "429"), "headers": {}})
-            tracker.cooldown("openai-codex", model, seconds)
+            tracker.cooldown(provider, model, seconds)
             try:
                 from tusker_gateway.persistent_cooldown import PersistentCooldownStore
                 from pathlib import Path
                 db_path = Path(self._config.get("quality_db_path", "data/quality.db")).parent / "cooldowns.db"
-                PersistentCooldownStore(db_path=db_path).record("openai-codex", model, seconds)
+                PersistentCooldownStore(db_path=db_path).record(provider, model, seconds)
             except Exception:
                 pass
             # Advance to next credential so the next request doesn't keep
@@ -588,7 +639,7 @@ class PassthroughClient:
             raise
         result = await self._parse_codex_sse_async(resp)
         latency_ms = (time.monotonic() - start) * 1000
-        await self._record_quality("openai-codex", model, True, latency_ms)
+        await self._record_quality(provider, model, True, latency_ms)
         return result
     async def _parse_codex_sse_async(self, resp: aiohttp.ClientResponse) -> dict[str, Any]:
         """Iterate a Codex SSE response and assemble an OpenAI-compatible dict."""

@@ -135,7 +135,7 @@ async def test_codex_catalog_skips_invalid_entries():
 
 
 @pytest.mark.asyncio
-async def test_copilot_catalog_emits_dual_provider_entries():
+async def test_copilot_catalog_emits_single_provider_entries():
     body = {
         "data": [
             {"id": "gpt-5.5"},
@@ -143,13 +143,106 @@ async def test_copilot_catalog_emits_dual_provider_entries():
         ]
     }
     session = FakeSession({"default": FakeResponse(200, body)})
-    cat = CopilotCatalog()
+    cat = CopilotCatalog(provider="github-copilot")
     entries = await cat.fetch(session)
     providers = {(e.provider, e.model) for e in entries}
     assert ("github-copilot", "gpt-5.5") in providers
-    assert ("github-copilot-enterprise", "gpt-5.5") in providers
     assert ("github-copilot", "claude-sonnet-4.6") in providers
-    assert ("github-copilot-enterprise", "claude-sonnet-4.6") in providers
+    assert all(e.provider == "github-copilot" for e in entries)
+
+class _CapturingSession:
+    """Minimal aiohttp-like session that records the headers of each GET."""
+
+    def __init__(self, response):
+        self._response = response
+        self.captured: dict[str, Any] = {}
+
+    def get(self, url, **kw):
+        self.captured["url"] = url
+        self.captured["headers"] = kw.get("headers", {})
+        return self._response
+
+
+@pytest.mark.asyncio
+async def test_codex_catalog_uses_token_source_auth_headers():
+    """With a token_source configured, CodexCatalog.fetch must send the
+    Codex Responses API auth header set (Bearer + Cloudflare bypass +
+    ChatGPT-Account-ID from the JWT) so the endpoint stops returning
+    HTTP 401.
+    """
+    # Build a fake JWT with a chatgpt_account_id claim so the helper
+    # populates ChatGPT-Account-ID. Three parts: header.payload.sig.
+    import base64
+    import json
+    payload = base64.urlsafe_b64encode(
+        json.dumps({"chatgpt_account_id": "acct-fake-123"}).encode()
+    ).rstrip(b"=").decode()
+    fake_jwt = f"header.{payload}.signature"
+
+    session = _CapturingSession(FakeResponse(200, {"models": []}))
+    cat = CodexCatalog()
+    cat.set_token_source(lambda: _coro(fake_jwt))
+    await cat.fetch(session)
+
+    headers = session.captured["headers"]
+    assert headers["Authorization"] == f"Bearer {fake_jwt}"
+    assert headers["originator"] == "codex_cli_rs"
+    assert headers["User-Agent"] == "codex_cli_rs/0.0.0 (Tusker Gateway)"
+    assert headers["ChatGPT-Account-ID"] == "acct-fake-123"
+    assert headers["accept"] == "application/json"
+
+
+@pytest.mark.asyncio
+async def test_codex_catalog_without_token_omits_authorization():
+    """Without a token_source or static key, the request must not
+    include an Authorization header (so callers see the upstream 401
+    rather than a malformed request).
+    """
+    session = _CapturingSession(FakeResponse(401, {"error": "unauth"}))
+    cat = CodexCatalog()
+    with pytest.raises(CatalogError):
+        await cat.fetch(session)
+    headers = session.captured["headers"]
+    assert "Authorization" not in headers
+    assert headers["accept"] == "application/json"
+
+
+@pytest.mark.asyncio
+async def test_copilot_catalog_exchanges_token_and_sends_copilot_headers(monkeypatch):
+    """CopilotCatalog.fetch must exchange the raw GitHub token via the
+    Copilot token-exchange endpoint and emit the canonical Copilot
+    request header set (Editor-Version, Copilot-Integration-Id, etc.)
+    so the catalog endpoint stops returning HTTP 400.
+    """
+    exchanged = "exch-token"
+    raw = "gho_test"
+
+    async def fake_exchange(raw_token, **kw):
+        assert raw_token == raw
+        return exchanged, 9_999_999_999.0
+
+    # Patch at the source module so the catalog fetch (which imports it
+ # inside fetch) sees the mock.
+    monkeypatch.setattr(
+        "tusker_gateway.copilot_exchange.exchange_copilot_token", fake_exchange
+    )
+    # copilot_request_headers reads an env override; ensure clean state.
+    monkeypatch.delenv("GITHUB_COPILOT_INTEGRATION_ID", raising=False)
+
+    session = _CapturingSession(FakeResponse(200, {"data": []}))
+    cat = CopilotCatalog(provider="github-copilot")
+    cat.set_token_source(lambda: _coro(raw))
+    await cat.fetch(session)
+
+    headers = session.captured["headers"]
+    assert headers["Authorization"] == f"Bearer {exchanged}"
+    assert headers["Editor-Version"]  # from copilot_request_headers
+    assert "Copilot-Integration-Id" in headers
+    assert "x-initiator" in headers
+
+
+async def _coro(value):
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -655,6 +748,12 @@ def test_poolmanager_auto_free_adds_openrouter_zero_pricing():
         # Paid entry — should NOT be added.
         CatalogEntry(provider="openrouter", model="anthropic/claude-sonnet-4.6",
                      cost_input=3e-6, cost_output=1.5e-5),
+        # OpenRouter uses negative pricing sentinels for routers whose
+        # underlying model determines the charge — these are not free.
+        CatalogEntry(provider="openrouter", model="openrouter/pareto-code",
+                     cost_input=-1.0, cost_output=-1.0),
+        CatalogEntry(provider="openrouter", model="openrouter/partial-sentinel",
+                     cost_input=0.0, cost_output=-1.0),
         # Already-static entry — should stay put, not be re-added.
         CatalogEntry(provider="openai-codex", model="gpt-5.6-luna"),
     ]
@@ -667,6 +766,8 @@ def test_poolmanager_auto_free_adds_openrouter_zero_pricing():
     assert ("openai-codex", "gpt-5.6-luna") in pool_models  # static kept
     assert ("openrouter", "stealth/ox-alpha") in pool_models  # free added
     assert ("openrouter", "anthropic/claude-sonnet-4.6") not in pool_models  # paid excluded
+    assert ("openrouter", "openrouter/pareto-code") not in pool_models
+    assert ("openrouter", "openrouter/partial-sentinel") not in pool_models
 
     # The runtime model list (self.models) must also reflect the addition
     # so PoolManager.select() can pick it.

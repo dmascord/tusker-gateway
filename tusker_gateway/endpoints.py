@@ -733,7 +733,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
             if tracer is not None and tracer.enabled and root_span is not None:
                 root_span.attributes["tusker.model"] = str(body.get("model") or "")
             config = request.app["config"]
-            client = PassthroughClient(config, QualityDB(config["quality_db_path"]), request.app["http_session"])
+            client = PassthroughClient(config, QualityDB(config["quality_db_path"]), request.app["http_session"], catalog_registry=request.app.get("catalog_registry"))
             tools = body.get("tools") if isinstance(body.get("tools"), list) else None
             pool_name = _pool_name(body) or "passthrough"
             bypass_cache = request.headers.get("X-Tusker-Cache", "").strip().lower() == "bypass"
@@ -997,7 +997,7 @@ async def responses_handler(request: web.Request) -> web.Response | web.StreamRe
             "stream": bool(body.get("stream", False)),
         })
         config = request.app["config"]
-        client = PassthroughClient(config, QualityDB(config["quality_db_path"]), request.app["http_session"])
+        client = PassthroughClient(config, QualityDB(config["quality_db_path"]), request.app["http_session"], catalog_registry=request.app.get("catalog_registry"))
         _, _, result = await _call_with_pool_fallback(config, chat_body, client, request=request)
         if isinstance(result, dict) and "choices" in result:
             text = result.get("choices", [{}])[0].get("message", {}).get("content", "")
@@ -1151,12 +1151,7 @@ async def images_handler(request: web.Request) -> web.Response:
 
 
 async def tts_handler(request: web.Request) -> web.Response:
-    """POST /v1/audio/speech.
-
-    Text-to-speech endpoint. Returns binary audio (mp3/pcm/opus/...) with the
-    upstream's Content-Type. Dispatches to OpenAI when an OPENAI_API_KEY is
-    configured, otherwise to OpenRouter.
-    """
+    """POST /v1/audio/speech and return upstream-generated binary audio."""
     try:
         body = await request.json()
         model = body.get("model", "tts-1")

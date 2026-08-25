@@ -38,7 +38,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable
+from typing import Any, Awaitable, Callable, Iterable
 
 import aiohttp
 
@@ -108,10 +108,41 @@ class CatalogClient:
         # explicitly via ``client.set_api_key(...)`` when wiring up
         # a registry — env-var lookup is the caller's responsibility.
         self._api_key: str | None = None
+        self._token_source: Callable[[], Awaitable[str | None]] | None = None
 
     def set_api_key(self, api_key: str | None) -> None:
         """Inject an API key for catalog fetches. Pass None to clear."""
         self._api_key = api_key.strip() if isinstance(api_key, str) and api_key.strip() else None
+
+    def set_token_source(
+        self, source: Callable[[], Awaitable[str | None]] | None
+    ) -> None:
+        """Inject an async callable returning a per-refresh auth token.
+
+        Used by Codex/Copilot catalogs whose endpoints require a
+        short-lived OAuth bearer that the static ``set_api_key`` model
+        can't represent. The callable is invoked from
+        :meth:`_resolve_token`; a falsy return is treated as
+        unauthenticated (the request will fail upstream as 401/400,
+        and the cached catalog state is retained). Pass None to clear.
+        """
+        self._token_source = source
+
+    async def _resolve_token(self) -> str | None:
+        """Return the token to use for the next fetch, if any.
+
+        Prefers the dynamic ``_token_source`` (OAuth rotator) and falls
+        back to the static ``_api_key`` (long-lived bearer) so
+        subclasses don't have to special-case either.
+        """
+        if self._token_source is not None:
+            try:
+                tok = await self._token_source()
+            except Exception:
+                tok = None
+            if tok:
+                return tok
+        return self._api_key
 
     def _auth_headers(self, base: dict[str, str] | None = None) -> dict[str, str]:
         """Return headers dict including Authorization if an API key is set.
@@ -165,16 +196,6 @@ class CatalogClient:
                     self.provider, len(self._entries), exc,
                 )
 
-    async def fetch(self, session: aiohttp.ClientSession) -> list[CatalogEntry]:
-        """Subclasses override. Return the fresh catalog."""
-        raise NotImplementedError
-
-
-# ---------------------------------------------------------------------------
-# Codex
-# ---------------------------------------------------------------------------
-
-
 class CodexCatalog(CatalogClient):
     """Codex catalog from chatgpt.com/backend-api/codex/models."""
 
@@ -184,10 +205,20 @@ class CodexCatalog(CatalogClient):
     ENDPOINT = "https://chatgpt.com/backend-api/codex/models?client_version=0.0.0"
 
     async def fetch(self, session: aiohttp.ClientSession) -> list[CatalogEntry]:
-        headers = {
-            "User-Agent": "tusker-gateway/1.0 (catalog-refresh)",
-            "accept": "application/json",
-        }
+        # The Codex catalog requires a valid OAuth bearer. The token is
+        # sourced from the same rotator the Codex chat path uses (see
+        # codex_auth_headers / CodexAuthenticator); the Cloudflare bypass
+        # header set is identical so the two paths can't drift.
+        from tusker_gateway.auth_strategies import codex_auth_headers
+        token = await self._resolve_token()
+        if token:
+            headers = codex_auth_headers(token)
+            headers["accept"] = "application/json"
+        else:
+            headers = {
+                "User-Agent": "tusker-gateway/1.0 (catalog-refresh)",
+                "accept": "application/json",
+            }
         async with session.get(self.ENDPOINT, headers=headers) as resp:
             if resp.status != 200:
                 raise CatalogError(f"codex models HTTP {resp.status}")
@@ -213,28 +244,68 @@ class CodexCatalog(CatalogClient):
 
 
 class CopilotCatalog(CatalogClient):
-    """GitHub Copilot catalog from api.githubcopilot.com/models.
+    """GitHub Copilot catalog from a Copilot models endpoint.
 
-    The same endpoint serves github-copilot and github-copilot-enterprise;
-    the response format is identical. Both providers get the same catalog.
+    Public Copilot lives at ``https://api.githubcopilot.com/models``;
+    GHE.com Copilot (with data residency) serves inference and model
+    listing from ``copilot-api.<org>.ghe.com``. Each instance is bound
+    to a single provider key and its own endpoint so the public and
+    enterprise catalogs stay distinct (different host, headers, token).
     """
 
-    provider = "github-copilot"  # Logical: shared with -enterprise
     ttl_secs = DEFAULT_TTLS["github-copilot"]
 
-    ENDPOINT = "https://api.githubcopilot.com/models"
-
-    # The two gateway provider keys we expose the catalog under
-    PROVIDER_KEYS = ("github-copilot", "github-copilot-enterprise")
+    def __init__(
+        self,
+        *,
+        provider: str,
+        endpoint_base: str = "https://api.githubcopilot.com",
+        endpoint: str = "https://api.githubcopilot.com/models",
+    ) -> None:
+        super().__init__()
+        self.provider = provider
+        self.endpoint_base = endpoint_base.rstrip("/")
+        self.endpoint = endpoint
+        # One instance per provider key; each serves only its own key.
+        self.provider_keys = (provider,)
 
     async def fetch(self, session: aiohttp.ClientSession) -> list[CatalogEntry]:
+        # The Copilot catalog requires a valid Copilot API bearer.
+        # On GHE hosts (``copilot-api.``) the raw OAuth token is used
+        # directly — GHE bypasses the ``copilot_internal/v2/token``
+        # exchange entirely (hermes-agent issue #11442). On the public
+        # host the raw token is exchanged for a short-lived API token.
+        from tusker_gateway.copilot_exchange import (
+            copilot_request_headers,
+            exchange_copilot_token,
+        )
         headers = {
             "User-Agent": "tusker-gateway/1.0 (catalog-refresh)",
             "accept": "application/json",
-            "Editor-Version": "tusker/1.0",
-            "Copilot-Integration-Id": "tusker-gateway",
         }
-        async with session.get(self.ENDPOINT, headers=headers) as resp:
+        raw_token = await self._resolve_token()
+        is_ghe = "copilot-api." in self.endpoint_base.lower()
+        if raw_token:
+            if is_ghe:
+                headers["Authorization"] = f"Bearer {raw_token}"
+            else:
+                try:
+                    api_token, _ = await exchange_copilot_token(
+                        raw_token, base_url=self.endpoint_base, http=session
+                    )
+                    headers["Authorization"] = f"Bearer {api_token}"
+                except ValueError:
+                    # Exchange failed; fall back to the raw token. Some
+                    # setups accept it directly and we'd rather log a
+                    # downstream 401 than crash the refresh loop.
+                    headers["Authorization"] = f"Bearer {raw_token}"
+            headers.update(
+                copilot_request_headers(
+                    base_url=self.endpoint_base,
+                    is_vision=False,
+                )
+            )
+        async with session.get(self.endpoint, headers=headers) as resp:
             if resp.status != 200:
                 raise CatalogError(f"copilot models HTTP {resp.status}")
             data = await resp.json()
@@ -247,9 +318,7 @@ class CopilotCatalog(CatalogClient):
             if not isinstance(slug, str) or not slug.strip():
                 continue
             slug = slug.strip()
-            # One entry per provider key so the registry can serve both.
-            for key in self.PROVIDER_KEYS:
-                out.append(CatalogEntry(provider=key, model=slug, raw=m))
+            out.append(CatalogEntry(provider=self.provider, model=slug, raw=m))
         return out
 
 
@@ -602,8 +671,15 @@ class CatalogRegistry:
         OpenCode Zen/Go, Xiaomi, and models.dev."""
         reg = cls()
         reg.register("openai-codex", CodexCatalog())
-        reg.register("github-copilot", CopilotCatalog())
-        reg.register("github-copilot-enterprise", CopilotCatalog())
+        reg.register("github-copilot", CopilotCatalog(provider="github-copilot"))
+        reg.register(
+            "github-copilot-enterprise",
+            CopilotCatalog(
+                provider="github-copilot-enterprise",
+                endpoint_base="https://copilot-api.sita.ghe.com",
+                endpoint="https://copilot-api.sita.ghe.com/models",
+            ),
+        )
         reg.register("openrouter", OpenRouterCatalog())
         reg.register("opencode-zen", OpenCodeCatalog())
         reg.register("opencode-go", OpenCodeGoCatalog())

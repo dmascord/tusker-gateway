@@ -130,7 +130,9 @@ def create_app() -> web.Application:
     # TTS and video handlers (Phase: TTS/video support).
     from tusker_gateway.providers.tts import TTSHandler
     from tusker_gateway.providers.video import VideoHandler
-    app["tts_handler"] = TTSHandler(app["config"])
+    app["tts_handler"] = TTSHandler(
+        app["config"], capability_registry=capability_registry
+    )
     app["video_handler"] = VideoHandler(
         app["config"], capability_registry=capability_registry
     )
@@ -183,10 +185,12 @@ def create_app() -> web.Application:
                 registry = CatalogRegistry.default()
                 # Wire API keys into catalog clients that need them.
                 _wire_catalog_api_keys(
-                    registry, config.get("provider_api_keys", {})
+                    registry, config.get("provider_api_keys", {}),
+                    codex_rotator=app.get("codex_rotator"),
                 )
                 # Wire into PoolManager so extend_pools_with_catalog() can read.
                 pool_manager = app.get("pool_manager")
+                app["catalog_registry"] = registry
                 if pool_manager is not None:
                     pool_manager.catalog_registry = registry
                 await registry.refresh_all(app["http_session"])
@@ -318,12 +322,63 @@ def create_app() -> web.Application:
     return app
 
 
-def _wire_catalog_api_keys(registry, provider_keys: dict[str, str | None]) -> None:
-    """Inject configured bearer keys into authenticated catalog clients."""
+def _wire_catalog_api_keys(
+    registry,
+    provider_keys: dict[str, str | None],
+    codex_rotator: "CodexTokenRotator | None" = None,
+) -> None:
+    """Inject configured bearer keys into authenticated catalog clients.
+
+    Static bearer providers (openrouter/opencode/xiaomi) get a long-lived
+    API key via ``set_api_key``. Codex and Copilot need per-refresh
+    OAuth tokens, so they get an async ``set_token_source`` closure that
+    resolves the current rotator token (or the raw GitHub token, for
+    Copilot) on each fetch — matching the chat-path auth strategy.
+    """
     for provider in ("openrouter", "opencode-zen", "opencode-go", "xiaomi"):
         client = registry.get_client(provider)
         if client is not None:
             client.set_api_key(provider_keys.get(provider))
+
+    async def _codex_token_source() -> str | None:
+        if codex_rotator is None:
+            return None
+        return await codex_rotator.get_token()
+
+    codex_client = registry.get_client("openai-codex")
+    if codex_client is not None:
+        codex_client.set_token_source(_codex_token_source)
+
+    # Public vs enterprise Copilot use different raw tokens. Fetch the
+    # public token from provider_api_keys["github-copilot"] and the
+    # enterprise token from provider_api_keys["github-copilot-enterprise"]
+    # so each catalog client authenticates against its own host.
+    copilot_raw_key = provider_keys.get("github-copilot")
+    copilot_ent_raw_key = provider_keys.get("github-copilot-enterprise")
+
+    async def _copilot_token_source() -> str | None:
+        # Mirrors OAuthAuthenticator: a static GitHub token (gho_/
+        # github_pat_) wins over the OAuth rotator so operators can
+        # override per-deployment, and falls back to the rotator.
+        if copilot_raw_key:
+            return copilot_raw_key
+        if codex_rotator is None:
+            return None
+        return await codex_rotator.get_token()
+
+    async def _copilot_ent_token_source() -> str | None:
+        if copilot_ent_raw_key:
+            return copilot_ent_raw_key
+        if codex_rotator is None:
+            return None
+        return await codex_rotator.get_token()
+
+    copilot_client = registry.get_client("github-copilot")
+    if copilot_client is not None:
+        copilot_client.set_token_source(_copilot_token_source)
+    copilot_ent_client = registry.get_client("github-copilot-enterprise")
+    if copilot_ent_client is not None:
+        copilot_ent_client.set_token_source(_copilot_ent_token_source)
 
 
 def _secrets_compare(a: str, b: str) -> bool:

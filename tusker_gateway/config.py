@@ -231,7 +231,7 @@ DEFAULT_PROVIDER_REGISTRY: dict[str, ProviderConfig] = {
     "opencode-zen": ProviderConfig("opencode-zen", "bearer", "https://opencode.ai/zen", "/v1/chat/completions", auth_env="OPENCODE_ZEN_API_KEY"),
     "openai-codex": ProviderConfig("openai-codex", "codex", "https://chatgpt.com/backend-api/codex", "/responses", pool_env="CODEX_CREDENTIALS", auth_type="codex", model_header="x-openai-gpt-model", zdr_ok=True),
     "github-copilot": ProviderConfig("github-copilot", "oauth", "https://api.githubcopilot.com", "/chat/completions", pool_env="CODEX_CREDENTIALS", auth_type="oauth", model_header="x-github-gpt-model"),
-    "github-copilot-enterprise": ProviderConfig("github-copilot-enterprise", "oauth", "https://api.githubcopilot.com", "/chat/completions", pool_env="CODEX_CREDENTIALS", auth_type="oauth", model_header="x-github-gpt-model"),
+    "github-copilot-enterprise": ProviderConfig("github-copilot-enterprise", "oauth", "https://copilot-api.sita.ghe.com", "/chat/completions", pool_env="CODEX_CREDENTIALS", auth_type="oauth", model_header="x-github-gpt-model"),
     "local-llm": ProviderConfig("local-llm", "local", "http://localhost:11434", "/v1/chat/completions"),
 }
 

@@ -74,12 +74,20 @@ class OAuthAuthenticator(Authenticator):
             raw_token = await self._rotator.get_token()
 
         if raw_token:
-            try:
-                token, _ = await exchange_copilot_token(raw_token, base_url=endpoint.base_url)
-                headers["Authorization"] = f"Bearer {token}"
-            except ValueError:
-                # Exchange failed — use raw token directly (may work for some providers)
+            # GHE Copilot bypasses the token exchange entirely: the raw
+            # OAuth token is used directly against `copilot-api.<ghe-host>`
+            # (hermes-agent issue #11442). For those hosts, skip exchange —
+            # it reliably 404s/401s and the raw token is what the API wants.
+            base_host = str(endpoint.base_url or "").lower()
+            if "copilot-api." in base_host:
                 headers["Authorization"] = f"Bearer {raw_token}"
+            else:
+                try:
+                    token, _ = await exchange_copilot_token(raw_token, base_url=endpoint.base_url)
+                    headers["Authorization"] = f"Bearer {token}"
+                except ValueError:
+                    # Exchange failed — use raw token directly (may work for some providers)
+                    headers["Authorization"] = f"Bearer {raw_token}"
 
         headers.update(
             copilot_request_headers(
@@ -91,6 +99,34 @@ class OAuthAuthenticator(Authenticator):
             headers[endpoint.model_header] = model
         return headers
 
+def codex_auth_headers(token: str) -> dict[str, str]:
+    """Build the Codex Responses API auth header set for a raw OAuth JWT.
+
+    Mirrors the Cloudflare bypass header configuration required by
+    ``chatgpt.com/backend-api/codex``: sets the ``originator`` and a
+    ``codex_cli_rs`` User-Agent, and decodes the ``chatgpt_account_id``
+    claim from the JWT to populate ``ChatGPT-Account-ID``.
+
+    Used by ``CodexAuthenticator`` for chat requests and by
+    ``CodexCatalog`` for catalog refreshes; both call sites need the
+    same header set to keep the two paths consistent.
+    """
+    headers: dict[str, str] = {
+        "Authorization": f"Bearer {token}",
+        "originator": "codex_cli_rs",
+        "User-Agent": "codex_cli_rs/0.0.0 (Tusker Gateway)",
+    }
+    try:
+        parts = token.split(".")
+        if len(parts) >= 2:
+            payload = parts[1] + "=="  # add padding
+            claims = json.loads(base64.urlsafe_b64decode(payload))
+            acct_id = claims.get("chatgpt_account_id")
+            if acct_id:
+                headers["ChatGPT-Account-ID"] = str(acct_id)
+    except Exception:
+        pass
+    return headers
 
 class CodexAuthenticator(Authenticator):
     """Codex Responses API authenticator.
@@ -120,23 +156,17 @@ class CodexAuthenticator(Authenticator):
             raw_token = await self._rotator.get_token()
 
         if raw_token:
-            headers["Authorization"] = f"Bearer {raw_token}"
-
-        # Cloudflare bypass headers for chatgpt.com/backend-api/codex
-        headers["originator"] = "codex_cli_rs"
-        headers["User-Agent"] = "codex_cli_rs/0.0.0 (Tusker Gateway)"
-        # Extract ChatGPT-Account-ID from JWT if possible
-        if raw_token and isinstance(raw_token, str):
-            try:
-                parts = raw_token.split(".")
-                if len(parts) >= 2:
-                    payload = parts[1] + "=="  # add padding
-                    claims = json.loads(base64.urlsafe_b64decode(payload))
-                    acct_id = claims.get("chatgpt_account_id")
-                    if acct_id:
-                        headers["ChatGPT-Account-ID"] = str(acct_id)
-            except Exception:
-                pass
+            # codex_auth_headers layers the Cloudflare bypass header set
+            # on top of the Bearer token so it doesn't need to be
+            # maintained in two places. Used here for chat requests and
+            # in CodexCatalog for catalog refreshes.
+            headers.update(codex_auth_headers(raw_token))
+        else:
+            # No token: still emit the Cloudflare bypass header set so a
+            # 401 response (the only possible one without a token) at
+            # least passes the JS challenge.
+            headers["originator"] = "codex_cli_rs"
+            headers["User-Agent"] = "codex_cli_rs/0.0.0 (Tusker Gateway)"
 
         if endpoint.model_header:
             headers[endpoint.model_header] = model
