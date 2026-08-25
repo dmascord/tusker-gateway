@@ -7,9 +7,10 @@ gateway pulls live catalogs at startup and periodically refreshes them.
 
 Architecture:
     CatalogClient (TTL cache + http GET)
-        ├── CodexCatalog    (chatgpt.com/backend-api/codex/models)
-        ├── CopilotCatalog  (api.githubcopilot.com/models)
+        ├── CodexCatalog      (chatgpt.com/backend-api/codex/models)
+        ├── CopilotCatalog    (api.githubcopilot.com/models)
         ├── OpenRouterCatalog (openrouter.ai/api/v1/models)
+        ├── XiaomiCatalog     (token-plan-sgp.xiaomimimo.com/v1/models)
         └── ModelsDevCatalog  (models.dev/api.json, pricing DB)
 
     CatalogRegistry — orchestrates refresh, exposes a single
@@ -54,6 +55,7 @@ DEFAULT_TTLS: dict[str, float] = {
     "opencode-zen": 3600.0,       # OpenCode: 60 min (key-filtered)
     "opencode-go": 3600.0,
     "models.dev": 3600.0,          # models.dev: 60 min
+    "xiaomi": 3600.0,             # Xiaomi Token Plan: 60 min
 }
 
 
@@ -67,6 +69,8 @@ class CatalogEntry:
     # Optional pricing (filled by models.dev lookup)
     cost_input: float | None = None
     cost_output: float | None = None
+    # Known input modalities. None means the catalog does not advertise them.
+    input_modalities: frozenset[str] | None = None
 
 
 @dataclass
@@ -346,9 +350,74 @@ class OpenCodeGoCatalog(OpenCodeCatalog):
     ENDPOINT = "https://opencode.ai/zen/go/v1/models"
 
 
- # ---------------------------------------------------------------------------
- # models.dev (pricing DB)
- # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Xiaomi MiMo Token Plan
+# ---------------------------------------------------------------------------
+
+
+class XiaomiCatalog(CatalogClient):
+    """Authenticated Xiaomi Token Plan chat-model catalog.
+
+    Xiaomi's OpenAI-compatible model rows do not carry modality or pricing
+    metadata, so the proven chat models are enriched here. Speech-only ASR
+    and TTS variants are excluded from chat pool discovery.
+    """
+
+    provider = "xiaomi"
+    ttl_secs = DEFAULT_TTLS["xiaomi"]
+
+    ENDPOINT = "https://token-plan-sgp.xiaomimimo.com/v1/models"
+
+    # Per-million-token USD pricing and input support verified for the current
+    # Token Plan chat models. These values let pool policy apply the same
+    # pricing-based heavyweight classification used for other catalogs.
+    MODEL_METADATA: dict[str, tuple[frozenset[str], float, float]] = {
+        "mimo-v2.5": (frozenset({"text", "image"}), 0.14, 0.28),
+        "mimo-v2.5-pro": (frozenset({"text"}), 0.435, 0.87),
+    }
+
+    async def fetch(self, session: aiohttp.ClientSession) -> list[CatalogEntry]:
+        headers = self._auth_headers({
+            "User-Agent": "tusker-gateway/1.0 (catalog-refresh)",
+            "accept": "application/json",
+        })
+        async with session.get(self.ENDPOINT, headers=headers) as resp:
+            if resp.status != 200:
+                raise CatalogError(f"xiaomi models HTTP {resp.status}")
+            data = await resp.json()
+
+        models = data.get("data", []) if isinstance(data, dict) else data
+        out: list[CatalogEntry] = []
+        if not isinstance(models, list):
+            return out
+        for row in models:
+            if not isinstance(row, dict):
+                continue
+            model = row.get("id") or row.get("name")
+            if not isinstance(model, str) or not model.strip():
+                continue
+            model = model.strip()
+            normalized = model.lower()
+            if normalized.endswith("-asr") or "-tts" in normalized:
+                continue
+            metadata = self.MODEL_METADATA.get(normalized)
+            if metadata is None:
+                # The endpoint mixes chat and speech products without a
+                # modality field; only emit models proven to be chat-capable.
+                continue
+            out.append(CatalogEntry(
+                provider=self.provider,
+                model=model,
+                raw=row,
+                cost_input=metadata[1],
+                cost_output=metadata[2],
+                input_modalities=metadata[0],
+            ))
+        return out
+
+
+# ---------------------------------------------------------------------------
+# models.dev (pricing DB)
 # ---------------------------------------------------------------------------
 
 
@@ -530,7 +599,7 @@ class CatalogRegistry:
     @classmethod
     def default(cls) -> "CatalogRegistry":
         """Build the default registry covering Codex, Copilot, OpenRouter,
-        OpenCode Zen/Go, and models.dev."""
+        OpenCode Zen/Go, Xiaomi, and models.dev."""
         reg = cls()
         reg.register("openai-codex", CodexCatalog())
         reg.register("github-copilot", CopilotCatalog())
@@ -538,6 +607,7 @@ class CatalogRegistry:
         reg.register("openrouter", OpenRouterCatalog())
         reg.register("opencode-zen", OpenCodeCatalog())
         reg.register("opencode-go", OpenCodeGoCatalog())
+        reg.register("xiaomi", XiaomiCatalog())
         reg.register("models.dev", ModelsDevCatalog())
         return reg
 

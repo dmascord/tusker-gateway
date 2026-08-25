@@ -170,8 +170,8 @@ def create_app() -> web.Application:
             await sem_cache.initialize()
             startup_log.info("semantic cache initialized")
         # Dynamic model catalog refresh (Codex, Copilot, OpenRouter,
-        # models.dev). Initial refresh is synchronous so the pool has
-        # data on the first request; the background loop keeps it fresh.
+        # OpenCode, Xiaomi, models.dev). Initial refresh is synchronous so
+        # the pool has data on the first request; the background loop keeps it fresh.
         catalog_enabled = os.environ.get("TUSKER_CATALOG_ENABLED", "1").strip().lower()
         if catalog_enabled not in {"0", "false", "no", "off"}:
             try:
@@ -182,11 +182,9 @@ def create_app() -> web.Application:
                 interval_secs = float(os.environ.get("TUSKER_CATALOG_REFRESH_SECS", "300"))
                 registry = CatalogRegistry.default()
                 # Wire API keys into catalog clients that need them.
-                provider_keys = config.get("provider_api_keys", {})
-                for prov in ("openrouter", "opencode-zen", "opencode-go"):
-                    client = registry.get_client(prov)
-                    if client is not None:
-                        client.set_api_key(provider_keys.get(prov))
+                _wire_catalog_api_keys(
+                    registry, config.get("provider_api_keys", {})
+                )
                 # Wire into PoolManager so extend_pools_with_catalog() can read.
                 pool_manager = app.get("pool_manager")
                 if pool_manager is not None:
@@ -318,6 +316,14 @@ def create_app() -> web.Application:
     app.on_cleanup.append(on_cleanup)
     app.on_startup.append(on_startup)
     return app
+
+
+def _wire_catalog_api_keys(registry, provider_keys: dict[str, str | None]) -> None:
+    """Inject configured bearer keys into authenticated catalog clients."""
+    for provider in ("openrouter", "opencode-zen", "opencode-go", "xiaomi"):
+        client = registry.get_client(provider)
+        if client is not None:
+            client.set_api_key(provider_keys.get(provider))
 
 
 def _secrets_compare(a: str, b: str) -> bool:

@@ -61,15 +61,16 @@ For each request to `hermes-code`/`hermes-privacy`/etc:
    - Context window too small for the request
    - **Heavyweight filter** (cheap-tier pools drop heavyweight entries)
    - Cooldown active for this (provider, model)
+   - Required input modalities (for example, image requests skip known text-only models)
    - ZDR + EXCLUDED_PROVIDERS env var (privacy pool only)
 3. **Rank by quality score** (descending) from `model_quality.db`. New models
    use an adaptive floor (median - 20.0 clamped to 20.0).
 4. **Pick the top-ranked candidate** and remember it for the session.
 
-## Dynamic catalog refresh (planned)
+## Dynamic catalog refresh
 
-The gateway will pull live model catalogs from upstream providers at runtime
-to surface new free-tier models without requiring a config edit:
+The gateway pulls live model catalogs from upstream providers at runtime to
+surface eligible models without requiring a config edit:
 
 | Provider | Endpoint | TTL |
 |---|---|---|
@@ -77,14 +78,12 @@ to surface new free-tier models without requiring a config edit:
 | GitHub Copilot | `https://api.githubcopilot.com/models` | 5 min |
 | OpenRouter | `https://openrouter.ai/api/v1/models` | 60 min |
 | models.dev | `https://models.dev/api.json` (pricing DB) | 60 min |
+| Xiaomi MiMo | `https://token-plan-sgp.xiaomimimo.com/v1/models` | 60 min |
 
-The static `TUSKER_POOL_*` configs serve as the explicit **allowlist** — a model
-must be listed there to be eligible. The dynamic catalog then **extends** the
-list with new slugs as upstream providers ship them. To add a brand-new model
-to the pool, add it to `TUSKER_POOL_*`; the catalog refresh will keep it
-present even if upstream renames or moves the slug.
-
-This is the feature being implemented alongside the heavyweight gate.
+Static `TUSKER_POOL_*` entries remain operator-curated baselines. Pools with
+`auto_free: true` also receive eligible catalog entries at startup and on each
+refresh. Catalog-only entries are pruned when they disappear or become
+ineligible; static entries are never pruned.
 
 ## Auto-free catalog merge
 
@@ -104,6 +103,13 @@ free into the pool's allowlist. Discovery differs per upstream:
 | `openrouter` | `pricing.prompt == "0" AND pricing.completion == "0"` |
 | `opencode-zen` | All entries returned by `/zen/v1/models` (the upstream key-filters paid models) |
 | `opencode-go` | All entries returned by `/zen/go/v1/models` (same key-filter) |
+| `xiaomi` | Authenticated Token Plan catalog; proven chat models only, cheap non-ZDR pools only, heavyweight entries excluded |
+
+Xiaomi's catalog does not publish modality metadata. The gateway enriches the
+verified current models: `mimo-v2.5` accepts text and image input;
+`mimo-v2.5-pro` is text-only. ASR and TTS product slugs are excluded from chat
+pools. This metadata is enforced on every pool selection and fallback retry,
+including Anthropic-format image requests after conversion.
 
 **Idempotence across refreshes**: entries we auto-added are tracked
 separately in `PoolManager.auto_added`. When an entry stops being free on

@@ -322,6 +322,23 @@ def _build_extra_body(body: dict[str, Any]) -> dict[str, Any]:
         extra["max_tokens"] = extra.pop("max_completion_tokens")
     return extra
 
+_IMAGE_INPUT_MODALITIES = frozenset({"image"})
+
+
+def _required_input_modalities(messages: Any) -> frozenset[str] | None:
+    """Return pool capabilities required by OpenAI-format messages."""
+    if not isinstance(messages, list):
+        return None
+    for message in messages:
+        if not isinstance(message, dict) or not isinstance(message.get("content"), list):
+            continue
+        if any(
+            isinstance(block, dict) and block.get("type") in {"image_url", "input_image"}
+            for block in message["content"]
+        ):
+            return _IMAGE_INPUT_MODALITIES
+    return None
+
 
 async def _call_with_pool_fallback(
     config: dict[str, Any],
@@ -338,6 +355,7 @@ async def _call_with_pool_fallback(
     than 429 rate-limit, which uses the cooldown path) record failure.
     """
     extra_body = _build_extra_body(body)
+    required_input_modalities = _required_input_modalities(body.get("messages"))
     pool_name = _pool_name(body)
     if pool_name is None:
         provider, model = _route_target(config, body)
@@ -373,14 +391,22 @@ async def _call_with_pool_fallback(
     while True:
         # Pool select() already filters out cooldown-blocked candidates;
         # additionally filter out breaker-open candidates here.
-        selected = pool_mgr.select(pool_name, excluded=excluded)
+        selected = pool_mgr.select(
+            pool_name,
+            excluded=set(excluded),
+            required_input_modalities=required_input_modalities,
+        )
         if breaker is not None and selected is not None:
             while selected is not None:
                 decision = breaker.check(selected[0], selected[1])
                 if decision.allowed:
                     break
                 excluded.add(selected)
-                selected = pool_mgr.select(pool_name, excluded=excluded)
+                selected = pool_mgr.select(
+                    pool_name,
+                    excluded=set(excluded),
+                    required_input_modalities=required_input_modalities,
+                )
         if not selected:
             if last_error is not None:
                 raise last_error
@@ -586,7 +612,10 @@ def _validate_chat_body(body: Any) -> dict[str, Any]:
 def _route_target(config: dict[str, Any], body: dict[str, Any]) -> tuple[str, str]:
     route = resolve_route(body.get("model"), body)
     if route.kind in {"pool", "code"}:
-        selected = PoolManager(config).select(route.pool_name or "code")
+        selected = PoolManager(config).select(
+            route.pool_name or "code",
+            required_input_modalities=_required_input_modalities(body.get("messages")),
+        )
         if not selected:
             raise BadRequestError("No healthy models in pool", code="no_healthy_models")
         return selected

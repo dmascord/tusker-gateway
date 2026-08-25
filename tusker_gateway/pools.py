@@ -69,6 +69,7 @@ class ModelSpec:
     context_window: int
     heavyweight: bool
     zdr_ok: bool  # allowed in ZDR (privacy) pools
+    input_modalities: frozenset[str] | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any], default_window: int = 128_000, zdr: bool = False) -> "ModelSpec":
@@ -83,12 +84,18 @@ class ModelSpec:
             hw = is_heavyweight(model)
         else:
             hw = bool(hw)
+        modalities = data.get("input_modalities")
         return cls(
             provider=provider,
             model=model,
             context_window=ctx,
             heavyweight=hw,
             zdr_ok=zdr and not hw,  # exclude heavyweights in ZDR
+            input_modalities=(
+                frozenset(str(modality) for modality in modalities)
+                if modalities is not None
+                else None
+            ),
         )
 
 
@@ -202,95 +209,94 @@ class PoolManager:
         logger.info("catalog confirmed %s pool entries", confirmed)
         return confirmed
     def extend_pools_with_free_catalog(self) -> dict[str, list[str]]:
-        """Auto-promote free upstream models into pools marked auto_free=True.
+        """Auto-promote eligible catalog models into ``auto_free`` pools.
 
-        For each pool whose ``PoolConfig.auto_free`` is set, scan the
-        catalog for ``(provider, model)`` pairs whose upstream tier is
-        free for the configured API key. These are merged into the
-        pool's static ``models`` list, and ``self.models[name]`` is
-        rebuilt via ``reload_all_pools()`` so the new candidates
-        participate in selection immediately.
+        OpenRouter contributes models whose input and output pricing is zero.
+        OpenCode Zen/Go catalogs are key-filtered, so all advertised models are
+        eligible. Xiaomi's authenticated catalog is also key-filtered, but its
+        models are only added to non-ZDR cheap pools and pricing/slug-based
+        heavyweights are excluded.
 
-        Free-model discovery differs per upstream:
-        - openrouter: ``pricing.prompt == "0" and pricing.completion == "0"``
-          (their explicit free-tier signal).
-        - opencode-zen / opencode-go: ``/v1/models`` is already
-          key-filtered (the response omits paid models the key can't
-          access), so the entire catalog is treated as free-for-this-key.
-
-        The merge is idempotent across catalog refreshes:
-        - Free models newly appearing on the upstream are added.
-        - Free models that have since gone paid are removed from the
-          pool (tracked in ``self.auto_added`` so we don't conflate
-          with operator-curated entries).
-        - Models already in the static allowlist stay where they are.
-
-        Returns a mapping of pool_name -> the list of (provider, model)
-        slugs currently held by the pool after the merge (post-reload).
+        Auto-added entries are tracked separately from operator-curated static
+        entries so refreshes can add and prune models without disturbing the
+        configured allowlist.
         """
         if self.catalog_registry is None:
             return {}
+
         changed = False
         for pool_name, pool in self.pools.items():
             if not pool.auto_free:
                 continue
-            # Static = entries from TUSKER_POOL_* that the operator set
-            # at startup. Frozen at __post_init__ time so we can tell
-            # "operator put it here" apart from "auto_free put it here".
-            static_pairs: set[tuple[str, str]] = set(
-                self._original_static.get(pool_name, frozenset())
-            )
-            # Auto-added = entries we promoted on a previous pass.
-            previously_auto = self.auto_added.get(pool_name, set())
 
-            free_pairs: set[tuple[str, str]] = set()
-            for prov, mode in (
+            static_pairs = set(self._original_static.get(pool_name, frozenset()))
+            eligible: dict[tuple[str, str], dict[str, Any]] = {}
+
+            for provider, mode in (
                 ("openrouter", "pricing"),
                 ("opencode-zen", "all"),
                 ("opencode-go", "all"),
+                ("xiaomi", "xiaomi"),
             ):
-                entries = self.catalog_registry.entries_for(prov)
+                if mode == "xiaomi" and (
+                    pool.zdr or self.pool_keeps_heavyweight(pool_name)
+                ):
+                    continue
+                entries = self.catalog_registry.entries_for(provider)
                 if not entries:
                     continue
-                for e in entries:
+
+                for entry in entries:
                     if mode == "pricing":
-                        if e.cost_input is None or e.cost_input > 0:
+                        if entry.cost_input is None or entry.cost_input > 0:
                             continue
-                        if e.cost_output is None or e.cost_output > 0:
+                        if entry.cost_output is None or entry.cost_output > 0:
                             continue
-                    free_pairs.add((e.provider, e.model))
 
-            # Final set = static entries + (auto-added entries that are
-            # still free). When a previously-auto entry disappears from
-            # the free set, it's pruned here. When a new free entry
-            # appears, it's added.
-            desired_auto = previously_auto & free_pairs
-            new_auto = free_pairs - static_pairs
-            desired = static_pairs | desired_auto | new_auto
-            current = static_pairs | previously_auto
-            if desired == current:
-                # Still idempotent: refresh tracked set without touching pool.
-                self.auto_added[pool_name] = (previously_auto & free_pairs) | new_auto
-                continue
+                    heavyweight = is_heavyweight(
+                        entry.model,
+                        cost_input=entry.cost_input,
+                        cost_output=entry.cost_output,
+                    )
+                    if mode == "xiaomi" and heavyweight:
+                        continue
 
-            new_models = [
-                m for m in pool.models
-                if (m.get("provider", ""), m.get("model", "")) in static_pairs
+                    model_data: dict[str, Any] = {
+                        "provider": entry.provider,
+                        "model": entry.model,
+                    }
+                    if mode == "xiaomi":
+                        model_data["heavyweight"] = heavyweight
+                        if entry.input_modalities is not None:
+                            model_data["input_modalities"] = sorted(entry.input_modalities)
+                    eligible[(entry.provider, entry.model)] = model_data
+
+            desired_auto = set(eligible) - static_pairs
+            static_models = [
+                model for model in pool.models
+                if (model.get("provider", ""), model.get("model", "")) in static_pairs
             ]
-            # Re-add auto entries that are still free, then any newly free.
-            surviving_auto = sorted(previously_auto & free_pairs)
-            new_auto_sorted = sorted(new_auto)
-            new_models.extend({"provider": p, "model": m} for (p, m) in surviving_auto)
-            new_models.extend({"provider": p, "model": m} for (p, m) in new_auto_sorted)
-            pool.models = new_models
-            self.auto_added[pool_name] = (previously_auto & free_pairs) | new_auto
-            changed = True
-            logger.info(
-                "auto_free pool '%s': %d free catalog entries (was %d auto)",
-                pool_name, len(free_pairs), len(previously_auto),
-            )
+            auto_models = [eligible[pair] for pair in sorted(desired_auto)]
+            new_models = static_models + auto_models
+
+            if new_models != pool.models:
+                pool.models = new_models
+                changed = True
+                logger.info(
+                    "auto_free pool '%s': %d eligible catalog entries",
+                    pool_name,
+                    len(desired_auto),
+                )
+            self.auto_added[pool_name] = desired_auto
+
         if changed:
             self.reload_all_pools()
+
+        return {
+            pool_name: [f"{provider}/{model}" for provider, model in sorted(pairs)]
+            for pool_name, pairs in self.auto_added.items()
+        }
+
 
     def reload_all_pools(self) -> None:
         """Rebuild ModelSpec lists from current pool configs.
@@ -323,6 +329,7 @@ class PoolManager:
         preferred: str | None = None,
         heavyweight_ok: bool | None = None,
         excluded: set[tuple[str, str]] | None = None,
+        required_input_modalities: set[str] | frozenset[str] | None = None,
     ) -> tuple[str, str] | None:
         """Select the best (provider, model) from a pool.
 
@@ -331,8 +338,13 @@ class PoolManager:
         ``heavyweight_ok`` defaults to the pool's tier: cheap-tier pools
         (code, privacy) drop heavyweights, premium-tier pools (premium,
         swarm) keep them. Pass an explicit True/False to override.
+
+        ``required_input_modalities`` excludes models whose known input
+        modalities do not cover the request. Models without modality metadata
+        remain eligible for backward compatibility.
         """
         excluded = excluded or set()
+        required_modalities = frozenset(required_input_modalities or ())
         specs = self.models.get(pool_name, [])
         if not specs:
             return None
@@ -355,6 +367,12 @@ class PoolManager:
                             # Context doesn't fit; clear stickiness
                             self._stickiness.pop(key, None)
                             break
+                        if (
+                            s.input_modalities is not None
+                            and not required_modalities.issubset(s.input_modalities)
+                        ):
+                            self._stickiness.pop(key, None)
+                            break
                         # Don't return a sticky heavyweight if the pool
                         # no longer allows it (config changed mid-session).
                         if not heavyweight_ok and s.heavyweight:
@@ -372,6 +390,11 @@ class PoolManager:
             if context_tokens > 0 and s.context_window < context_tokens:
                 continue
             if not heavyweight_ok and s.heavyweight:
+                continue
+            if (
+                s.input_modalities is not None
+                and not required_modalities.issubset(s.input_modalities)
+            ):
                 continue
             if self._cooldowns.is_cooldown(s.provider, s.model):
                 continue

@@ -19,6 +19,7 @@ from aiohttp import web
 from tusker_gateway.budget import BudgetTracker
 from tusker_gateway.circuit_breaker import CircuitBreaker, BreakerDecision
 from tusker_gateway.errors import BadRequestError
+from tusker_gateway.endpoints import _required_input_modalities
 from tusker_gateway.metrics import MetricsRegistry
 from tusker_gateway.passthrough import PassthroughClient
 from tusker_gateway.pools import PoolManager
@@ -467,6 +468,7 @@ async def _call_with_pool_fallback_anthropic(
     client: PassthroughClient,
     tools: list[dict[str, Any]] | None = None,
     breaker: CircuitBreaker | None = None,
+    request: web.Request | None = None,
 ) -> tuple[str, str, Any]:
     """Dispatch OpenAI-format body through pool fallback.
 
@@ -480,16 +482,29 @@ async def _call_with_pool_fallback_anthropic(
         pool_name = route.pool_name
         excluded: set[tuple[str, str]] = set()
         last_error: Exception | None = None
-        pool_mgr = PoolManager(config)
+        required_input_modalities = _required_input_modalities(body.get("messages"))
+        pool_mgr = (
+            request.app.get("pool_manager") or PoolManager(config)
+            if request is not None
+            else PoolManager(config)
+        )
         while True:
-            selected = pool_mgr.select(pool_name, excluded=excluded)
+            selected = pool_mgr.select(
+                pool_name,
+                excluded=set(excluded),
+                required_input_modalities=required_input_modalities,
+            )
             if breaker is not None and selected is not None:
                 while selected is not None:
                     decision = breaker.check(selected[0], selected[1])
                     if decision.allowed:
                         break
                     excluded.add(selected)
-                    selected = pool_mgr.select(pool_name, excluded=excluded)
+                    selected = pool_mgr.select(
+                        pool_name,
+                        excluded=set(excluded),
+                        required_input_modalities=required_input_modalities,
+                    )
             if not selected:
                 if last_error is not None:
                     raise last_error
@@ -626,7 +641,7 @@ async def anthropic_messages_handler(request: web.Request) -> web.Response | web
 
             # Dispatch to backend.
             provider, target_model, result = await _call_with_pool_fallback_anthropic(
-                config, openai_body, client, tools, breaker=breaker,
+                config, openai_body, client, tools, breaker=breaker, request=request,
             )
             logger.debug("selected %s/%s for anthropic model=%s", provider, target_model, original_model)
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from .conftest import HEADERS_AUTH, HEADERS_NO_AUTH
@@ -125,6 +125,26 @@ class TestAnthropicToOpenAI:
         }
         result = anthropic_to_openai(body)
         assert result["messages"][1]["content"] == ""
+
+    def test_image_source_normalizes_to_openai_image_url(self):
+        from tusker_gateway.anthropic_adapter import anthropic_to_openai
+
+        result = anthropic_to_openai({
+            "model": "hermes-code",
+            "max_tokens": 100,
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "image",
+                    "source": {"type": "url", "url": "https://example.test/image.png"},
+                }],
+            }],
+        })
+
+        assert result["messages"][0]["content"] == [{
+            "type": "image_url",
+            "image_url": {"url": "https://example.test/image.png"},
+        }]
 
 
 # ---------------------------------------------------------------------------
@@ -442,6 +462,159 @@ async def test_messages_non_streaming(client):
         assert data["model"] == "claude-3-opus-20240229"
         assert data["usage"]["input_tokens"] == 10
         assert data["usage"]["output_tokens"] == 5
+
+
+@pytest.mark.asyncio
+async def test_messages_pool_image_requirement_is_preserved_across_fallbacks(app, client):
+    pool_manager = MagicMock()
+    pool_manager.select.side_effect = [
+        ("xiaomi", "mimo-v2.5"),
+        ("openai", "gpt-4o"),
+    ]
+    app["pool_manager"] = pool_manager
+    openai_response = {
+        "choices": [{"message": {"content": "seen"}, "finish_reason": "stop"}],
+        "usage": {},
+    }
+
+    with patch("tusker_gateway.anthropic_adapter.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
+        mock_chat.side_effect = [RuntimeError("first provider failed"), openai_response]
+        resp = await client.post(
+            "/v1/messages",
+            json={
+                "model": "hermes-code",
+                "max_tokens": 100,
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": "AAAA",
+                        },
+                    }],
+                }],
+            },
+            headers=HEADERS_AUTH,
+        )
+
+    assert resp.status == 200
+    assert pool_manager.select.call_args_list == [
+        call("code", excluded=set(), required_input_modalities=frozenset({"image"})),
+        call(
+            "code",
+            excluded={("xiaomi", "mimo-v2.5")},
+            required_input_modalities=frozenset({"image"}),
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_messages_pool_image_requirement_is_preserved_after_breaker_skip(app, client):
+    pool_manager = MagicMock()
+    pool_manager.select.side_effect = [
+        ("xiaomi", "mimo-v2.5-pro"),
+        ("xiaomi", "mimo-v2.5"),
+    ]
+    app["pool_manager"] = pool_manager
+    breaker = MagicMock()
+    breaker.check.side_effect = [
+        MagicMock(allowed=False),
+        MagicMock(allowed=True),
+    ]
+    app["breaker"] = breaker
+
+    with patch("tusker_gateway.anthropic_adapter.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
+        mock_chat.return_value = {
+            "choices": [{"message": {"content": "seen"}, "finish_reason": "stop"}],
+            "usage": {},
+        }
+        resp = await client.post(
+            "/v1/messages",
+            json={
+                "model": "hermes-code",
+                "max_tokens": 100,
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "image",
+                        "source": {"type": "url", "url": "https://example.test/image.png"},
+                    }],
+                }],
+            },
+            headers=HEADERS_AUTH,
+        )
+
+    assert resp.status == 200
+    assert pool_manager.select.call_args_list == [
+        call("code", excluded=set(), required_input_modalities=frozenset({"image"})),
+        call(
+            "code",
+            excluded={("xiaomi", "mimo-v2.5-pro")},
+            required_input_modalities=frozenset({"image"}),
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_messages_text_only_pool_request_has_no_modality_requirement(app, client):
+    pool_manager = MagicMock()
+    pool_manager.select.return_value = ("openai", "gpt-4o-mini")
+    app["pool_manager"] = pool_manager
+
+    with patch("tusker_gateway.anthropic_adapter.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
+        mock_chat.return_value = {
+            "choices": [{"message": {"content": "hello"}, "finish_reason": "stop"}],
+            "usage": {},
+        }
+        resp = await client.post(
+            "/v1/messages",
+            json={
+                "model": "hermes-code",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            headers=HEADERS_AUTH,
+        )
+
+    assert resp.status == 200
+    pool_manager.select.assert_called_once_with(
+        "code",
+        excluded=set(),
+        required_input_modalities=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_messages_image_passthrough_does_not_select_from_pool(app, client):
+    pool_manager = MagicMock()
+    app["pool_manager"] = pool_manager
+
+    with patch("tusker_gateway.anthropic_adapter.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
+        mock_chat.return_value = {
+            "choices": [{"message": {"content": "seen"}, "finish_reason": "stop"}],
+            "usage": {},
+        }
+        resp = await client.post(
+            "/v1/messages",
+            json={
+                "model": "openai::gpt-4o",
+                "max_tokens": 100,
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "image",
+                        "source": {"type": "url", "url": "https://example.test/image.png"},
+                    }],
+                }],
+            },
+            headers=HEADERS_AUTH,
+        )
+
+    assert resp.status == 200
+    pool_manager.select.assert_not_called()
+    assert mock_chat.call_args.args[:2] == ("openai", "gpt-4o")
 
 
 @pytest.mark.asyncio

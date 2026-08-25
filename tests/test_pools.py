@@ -87,3 +87,174 @@ def test_cooldown_tracker():
     tracker.cooldown("p1", "m1", 10)
     assert tracker.is_cooldown("p1", "m1")
     assert tracker.is_cooldown("p1", "other")
+
+
+class _CatalogEntry:
+    def __init__(
+        self,
+        provider: str,
+        model: str,
+        *,
+        cost_input: float | None = None,
+        cost_output: float | None = None,
+        input_modalities: frozenset[str] | None = None,
+    ) -> None:
+        self.provider = provider
+        self.model = model
+        self.cost_input = cost_input
+        self.cost_output = cost_output
+        self.input_modalities = input_modalities
+
+
+class _CatalogRegistry:
+    def __init__(self, entries: dict[str, list[_CatalogEntry]]) -> None:
+        self._entries = entries
+
+    def entries_for(self, provider: str) -> list[_CatalogEntry] | None:
+        return self._entries.get(provider)
+
+
+def _xiaomi_pool_manager(tmpdir: str, pools: dict[str, PoolConfig]) -> PoolManager:
+    return PoolManager({
+        "pools": pools,
+        "quality_db_path": os.path.join(tmpdir, "quality.db"),
+        "excluded_providers": [],
+        "provider_api_keys": {"xiaomi": "k-xiaomi"},
+    })
+
+
+def test_selection_filters_known_modalities_and_invalidates_stickiness():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = _xiaomi_pool_manager(tmpdir, {
+            "code": PoolConfig(name="code", models=[
+                {
+                    "provider": "xiaomi",
+                    "model": "mimo-v2.5-pro",
+                    "input_modalities": ["text"],
+                },
+                {
+                    "provider": "xiaomi",
+                    "model": "mimo-v2.5",
+                    "input_modalities": ["text", "image"],
+                },
+            ]),
+        })
+
+        assert manager.select("code", session_id="sticky") == (
+            "xiaomi", "mimo-v2.5-pro",
+        )
+        assert manager.select(
+            "code",
+            excluded={("xiaomi", "mimo-v2.5-pro")},
+            required_input_modalities={"text"},
+        ) == ("xiaomi", "mimo-v2.5")
+        assert manager.select(
+            "code",
+            session_id="sticky",
+            required_input_modalities={"text", "image"},
+        ) == ("xiaomi", "mimo-v2.5")
+        assert manager._stickiness[("sticky", "code")] == (
+            "xiaomi", "mimo-v2.5",
+        )
+
+
+def test_unknown_modalities_remain_eligible_for_existing_providers():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = PoolManager({
+            "pools": {
+                "test": PoolConfig(name="test", models=[
+                    {"provider": "local-llm", "model": "legacy"},
+                ]),
+            },
+            "quality_db_path": os.path.join(tmpdir, "quality.db"),
+            "excluded_providers": [],
+        })
+
+        assert manager.select(
+            "test", required_input_modalities={"text", "image"},
+        ) == ("local-llm", "legacy")
+
+
+def test_xiaomi_catalog_auto_adds_only_nonheavy_chat_models_to_code():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = _xiaomi_pool_manager(tmpdir, {
+            "code": PoolConfig(name="code", models=[], auto_free=True),
+            "privacy": PoolConfig(
+                name="privacy", models=[], zdr=True, auto_free=True,
+            ),
+            "premium": PoolConfig(name="premium", models=[], auto_free=True),
+        })
+        manager.catalog_registry = _CatalogRegistry({
+            "xiaomi": [
+                _CatalogEntry(
+                    "xiaomi",
+                    "mimo-v2.5",
+                    cost_input=0.14,
+                    cost_output=0.28,
+                    input_modalities=frozenset({"text", "image"}),
+                ),
+                _CatalogEntry(
+                    "xiaomi",
+                    "mimo-v2.5-pro",
+                    cost_input=0.435,
+                    cost_output=0.87,
+                    input_modalities=frozenset({"text"}),
+                ),
+                _CatalogEntry(
+                    "xiaomi",
+                    "expensive-chat",
+                    cost_input=1.0,
+                    cost_output=0.5,
+                    input_modalities=frozenset({"text"}),
+                ),
+            ],
+        })
+
+        manager.extend_pools_with_free_catalog()
+
+        code = {(spec.provider, spec.model): spec for spec in manager.models["code"]}
+        assert set(code) == {
+            ("xiaomi", "mimo-v2.5"),
+            ("xiaomi", "mimo-v2.5-pro"),
+        }
+        assert code[("xiaomi", "mimo-v2.5")].input_modalities == frozenset({
+            "text", "image",
+        })
+        assert code[("xiaomi", "mimo-v2.5-pro")].input_modalities == frozenset({
+            "text",
+        })
+        assert manager.models["privacy"] == []
+        assert manager.models["premium"] == []
+
+
+def test_static_xiaomi_privacy_entry_remains_operator_curated():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = _xiaomi_pool_manager(tmpdir, {
+            "privacy": PoolConfig(
+                name="privacy",
+                models=[{
+                    "provider": "xiaomi",
+                    "model": "mimo-v2.5-pro",
+                    "input_modalities": ["text"],
+                }],
+                zdr=True,
+                auto_free=True,
+            ),
+        })
+        manager.catalog_registry = _CatalogRegistry({
+            "xiaomi": [
+                _CatalogEntry(
+                    "xiaomi",
+                    "mimo-v2.5",
+                    cost_input=0.14,
+                    cost_output=0.28,
+                    input_modalities=frozenset({"text", "image"}),
+                ),
+            ],
+        })
+
+        manager.extend_pools_with_free_catalog()
+
+        assert [(spec.provider, spec.model) for spec in manager.models["privacy"]] == [
+            ("xiaomi", "mimo-v2.5-pro"),
+        ]

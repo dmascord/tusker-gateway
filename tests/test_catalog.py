@@ -24,6 +24,7 @@ from tusker_gateway.catalog import (
     OpenCodeCatalog,
     OpenCodeGoCatalog,
     OpenRouterCatalog,
+    XiaomiCatalog,
     _parse_cost_field,
     catalog_refresh_loop,
 )
@@ -215,6 +216,93 @@ async def test_opencode_go_catalog_parses_models():
     assert OpenCodeGoCatalog.ENDPOINT.endswith("/go/v1/models")
 
 
+# ---------------------------------------------------------------------------
+# XiaomiCatalog.fetch
+# ---------------------------------------------------------------------------
+
+
+class RecordingSession(FakeSession):
+    def __init__(self, responses: dict[str, FakeResponse]):
+        super().__init__(responses)
+        self.requests: list[tuple[str, dict[str, Any]]] = []
+
+    def get(self, url: str, **kw):
+        self.requests.append((url, kw))
+        return super().get(url, **kw)
+
+
+@pytest.mark.asyncio
+async def test_xiaomi_catalog_uses_authenticated_token_plan_endpoint_and_ttl():
+    session = RecordingSession({
+        XiaomiCatalog.ENDPOINT: FakeResponse(200, {"data": []}),
+    })
+    catalog = XiaomiCatalog()
+    catalog.set_api_key("tp-test-key")
+
+    await catalog.fetch(session)
+
+    assert (
+        XiaomiCatalog.ENDPOINT
+        == "https://token-plan-sgp.xiaomimimo.com/v1/models"
+    )
+    assert catalog.ttl_secs == 3600.0
+    assert session.requests == [(
+        XiaomiCatalog.ENDPOINT,
+        {"headers": {
+            "User-Agent": "tusker-gateway/1.0 (catalog-refresh)",
+            "accept": "application/json",
+            "Authorization": "Bearer tp-test-key",
+        }},
+    )]
+
+
+@pytest.mark.asyncio
+async def test_xiaomi_catalog_filters_speech_and_enriches_chat_models():
+    body = {
+        "data": [
+            {"id": "mimo-v2.5", "object": "model", "owned_by": "xiaomi"},
+            {"id": "mimo-v2.5-pro", "object": "model", "owned_by": "xiaomi"},
+            {"id": "mimo-v2.5-asr", "object": "model"},
+            {"id": "mimo-v2.5-tts", "object": "model"},
+            {"id": "mimo-v2.5-tts-hd", "object": "model"},
+            {"id": "mimo-v2.5-embedding", "object": "model"},
+        ],
+    }
+
+    entries = await XiaomiCatalog().fetch(
+        FakeSession({"default": FakeResponse(200, body)})
+    )
+    by_model = {entry.model: entry for entry in entries}
+
+    # Speech and other non-chat rows have no modality metadata upstream and
+    # must not enter chat pools.
+    assert set(by_model) == {"mimo-v2.5", "mimo-v2.5-pro"}
+    assert all(entry.provider == "xiaomi" for entry in entries)
+    assert by_model["mimo-v2.5"].input_modalities == frozenset(
+        {"text", "image"}
+    )
+    assert by_model["mimo-v2.5-pro"].input_modalities == frozenset({"text"})
+    assert (
+        by_model["mimo-v2.5"].cost_input,
+        by_model["mimo-v2.5"].cost_output,
+    ) == (0.14, 0.28)
+    assert (
+        by_model["mimo-v2.5-pro"].cost_input,
+        by_model["mimo-v2.5-pro"].cost_output,
+    ) == (0.435, 0.87)
+
+
+def test_app_catalog_key_wiring_injects_xiaomi_key():
+    from tusker_gateway.app import _wire_catalog_api_keys
+
+    registry = CatalogRegistry.default()
+    _wire_catalog_api_keys(registry, {"xiaomi": "tp-startup-key"})
+
+    xiaomi = registry.get_client("xiaomi")
+    assert xiaomi is not None
+    assert xiaomi._auth_headers()["Authorization"] == "Bearer tp-startup-key"
+
+
 def test_catalog_client_set_api_key_injects_auth():
     """set_api_key enables Authorization header via _auth_headers."""
     client = CatalogClient()
@@ -352,7 +440,10 @@ async def test_get_returns_cached_until_ttl_expires(monkeypatch):
 
 def test_registry_default_includes_all_providers():
     reg = CatalogRegistry.default()
-    for prov in ("openai-codex", "github-copilot", "github-copilot-enterprise", "openrouter", "models.dev"):
+    for prov in (
+        "openai-codex", "github-copilot", "github-copilot-enterprise",
+        "openrouter", "opencode-zen", "opencode-go", "xiaomi", "models.dev",
+    ):
         assert reg.get_client(prov) is not None
 
 
