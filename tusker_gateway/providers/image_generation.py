@@ -323,7 +323,7 @@ class ImageGenerationHandler:
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         if extra_headers:
             headers.update(extra_headers)
-        payload = {**body, "model": model}
+        payload = {**body, "model": self._strip_provider_prefix(model)}
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=120)
@@ -341,6 +341,18 @@ class ImageGenerationHandler:
                     return {"status": "ok"}
                 return json.loads(text)
 
+    @staticmethod
+    def _strip_provider_prefix(model: str) -> str:
+        """Strip a leading 'openrouter/' prefix before sending upstream.
+
+        The gateway accepts both 'model' and 'openrouter/model' request ids so
+        clients can pin the routing provider; OpenRouter itself does not
+        understand its own prefix, so it must be removed before the upstream
+        call. Mirrors routing.resolve_route's slash-form partition.
+        """
+        if model.startswith(("openrouter/", "openrouter::")):
+            return model.split("/", 1)[1] if "/" in model else model.split("::", 1)[1]
+        return model
     async def _call_google(
         self,
         model: str,

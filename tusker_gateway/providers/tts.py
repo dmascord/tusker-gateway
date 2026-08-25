@@ -114,7 +114,7 @@ class TTSHandler:
         }
         if extra_headers:
             headers.update(extra_headers)
-        payload = self._normalise_request(model, body)
+        payload = self._normalise_request(self._strip_provider_prefix(model), body)
         timeout = aiohttp.ClientTimeout(total=120)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(url, headers=headers, json=payload) as resp:
@@ -128,6 +128,19 @@ class TTSHandler:
                 audio = await resp.read()
                 content_type = resp.headers.get("Content-Type", "audio/mpeg")
                 return audio, content_type
+
+    @staticmethod
+    def _strip_provider_prefix(model: str) -> str:
+        """Strip a leading 'openrouter/' prefix before sending upstream.
+
+        The gateway accepts both 'model' and 'openrouter/model' request ids so
+        clients can pin the routing provider; OpenRouter itself does not
+        understand its own prefix, so it must be removed before the upstream
+        call. Mirrors routing.resolve_route's slash-form partition.
+        """
+        if model.startswith(("openrouter/", "openrouter::")):
+            return model.split("/", 1)[1] if "/" in model else model.split("::", 1)[1]
+        return model
 
     @staticmethod
     def _normalise_request(model: str, body: Dict[str, Any]) -> Dict[str, Any]:
