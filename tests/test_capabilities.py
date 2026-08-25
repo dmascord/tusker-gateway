@@ -104,11 +104,12 @@ async def test_discover_openrouter_picks_image_output_modalities():
     catalog = {
         "data": [
             {
-                "id": "google/gemini-3-pro-image",
+                "id": "google/gemini-3-pro-image:free",
                 "architecture": {
                     "input_modalities": ["text", "image"],
                     "output_modalities": ["text", "image"],
                 },
+                "pricing": {"prompt": "0", "completion": "0"},
             },
             {
                 "id": "openai/gpt-4o",
@@ -123,6 +124,7 @@ async def test_discover_openrouter_picks_image_output_modalities():
                     "input_modalities": ["text", "audio"],
                     "output_modalities": ["text", "audio"],
                 },
+                "pricing": {"prompt": "0", "completion": "0"},
             },
         ]
     }
@@ -131,7 +133,7 @@ async def test_discover_openrouter_picks_image_output_modalities():
                   lambda url, h: (200, json.dumps(catalog).encode(), {}))
     entries = await discover_openrouter(session, "sk-test")
     by_model = {e.model for e in entries}
-    assert "google/gemini-3-pro-image" in by_model
+    assert "google/gemini-3-pro-image:free" in by_model
     assert "openai/gpt-4o" not in by_model
     # audio model is NOT registered as a TTS capability (no OR speech surface yet)
     assert "openai/gpt-audio" not in by_model
@@ -144,17 +146,78 @@ async def test_discover_openrouter_picks_dedicated_video_models():
     session.route(
         "GET",
         "/api/v1/videos/models",
-        lambda *_: (200, b'{"data":[{"id":"google/veo-3.1"}]}', {}),
+        lambda *_: (200, b'{"data":[{"id":"google/veo-3.1:free","pricing":{"prompt":"0","completion":"0"}}]}', {}),
     )
 
     entries = await discover_openrouter(session, "sk-test")
 
     assert any(
-        entry.model == "google/veo-3.1"
+        entry.model == "google/veo-3.1:free"
         and entry.capability == Capability.VIDEO_GENERATIONS
         for entry in entries
     )
 
+
+@pytest.mark.asyncio
+async def test_discover_openrouter_filters_paid_and_unknown_price_media():
+    catalog = {
+        "data": [
+            {
+                "id": "free/image:free",
+                "architecture": {"output_modalities": ["image"]},
+                "pricing": {"prompt": "0", "completion": "0"},
+            },
+            {
+                "id": "paid/image",
+                "architecture": {"output_modalities": ["image"]},
+                "pricing": {"prompt": "0.000001", "completion": "0.000002"},
+            },
+            {
+                "id": "unknown/image",
+                "architecture": {"output_modalities": ["image"]},
+            },
+        ]
+    }
+    session = _FakeSession()
+    session.route(
+        "GET",
+        "/api/v1/models",
+        lambda *_: (200, json.dumps(catalog).encode(), {}),
+    )
+    session.route(
+        "GET",
+        "/api/v1/images/models",
+        lambda *_: (
+            200,
+            json.dumps(
+                {
+                    "data": [
+                        {
+                            "id": "free/dedicated-image:free",
+                            "pricing": {"prompt": "0", "completion": "0"},
+                        },
+                        {
+                            "id": "paid/dedicated-image",
+                            "pricing": {"prompt": "0.1", "completion": "0"},
+                        },
+                    ]
+                }
+            ).encode(),
+            {},
+        ),
+    )
+    session.route(
+        "GET",
+        "/api/v1/videos/models",
+        lambda *_: (200, b'{"data":[]}', {}),
+    )
+
+    entries = await discover_openrouter(session, "sk-test")
+
+    assert {entry.model for entry in entries} == {
+        "free/image:free",
+        "free/dedicated-image:free",
+    }
 
 @pytest.mark.asyncio
 async def test_discover_openrouter_returns_empty_when_no_key():
@@ -240,7 +303,11 @@ async def test_capabilities_refresh_loop_survives_one_failure_and_recovers():
     session = _FakeSession()
     session.route("GET", "openrouter.ai/api/v1/models",
                   lambda url, h: (200, json.dumps({"data": [
-                      {"id": "openrouter-test/img", "architecture": {"output_modalities": ["image"]}}
+                      {
+                          "id": "openrouter-test/img:free",
+                          "architecture": {"output_modalities": ["image"]},
+                          "pricing": {"prompt": "0", "completion": "0"},
+                      }
                   ]}).encode(), {}))
 
     def _fail(url, body):

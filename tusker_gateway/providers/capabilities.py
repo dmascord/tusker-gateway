@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Iterable
 
 import aiohttp
+from tusker_gateway.catalog import is_free_openrouter_model
 
 logger = logging.getLogger(__name__)
 
@@ -155,7 +156,7 @@ async def discover_openrouter(
     session: aiohttp.ClientSession,
     api_key: str | None,
 ) -> list[CapabilityEntry]:
-    """Discover OpenRouter image and video generation models."""
+    """Discover only explicitly free OpenRouter image and video models."""
     if not api_key:
         return []
     headers = {
@@ -182,7 +183,11 @@ async def discover_openrouter(
             logger.warning("openrouter capability probe %s failed: %s", url, exc)
             return []
         models = (data or {}).get("data", []) if isinstance(data, dict) else []
-        return [model for model in models if isinstance(model, dict)]
+        return [
+            model
+            for model in models
+            if isinstance(model, dict) and is_free_openrouter_model(model)
+        ]
 
     general_models = await fetch_models("https://openrouter.ai/api/v1/models")
     for model in general_models:

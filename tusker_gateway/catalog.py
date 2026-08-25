@@ -427,6 +427,11 @@ def _extract_openrouter_pricing(model_info: dict[str, Any]) -> tuple[float | Non
         _parse_cost_field(pricing.get("completion")),
     )
 
+def is_free_openrouter_model(model_info: dict[str, Any]) -> bool:
+    """Return whether OpenRouter explicitly prices both token directions at zero."""
+    prompt_cost, completion_cost = _extract_openrouter_pricing(model_info)
+    return prompt_cost == 0.0 and completion_cost == 0.0
+
 def _parse_cost_field(value: Any) -> float | None:
     """Parse a models.dev cost field like '0.5 / 1M tokens' or 0.5."""
     if value is None:
