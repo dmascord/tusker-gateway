@@ -621,16 +621,27 @@ class PassthroughClient:
                 await self._codex_rotator.advance()
             raise
         except Exception as exc:
-            # Read & log the body before releasing the response so transient
-            # upstream errors (model unsupported, quota, etc.) show up in logs.
-            try:
-                err_body = await resp.text()
-            except Exception:
-                err_body = "<could not read body>"
-            logger.warning(
-                "codex error %s stream=%s: %s",
-                model, stream, err_body[:300],
-            )
+            # Use the body/status attached by _check_response (raised above)
+            # instead of re-reading the response — aiohttp's resp.text() may
+            # have already been consumed. Auth failures (401/403) are ERROR
+            # level since a credential/model is broken and needs attention.
+            status = getattr(exc, "upstream_status", None)
+            body_text = getattr(exc, "upstream_body", None) or "<no body>"
+            if status in (401, 403):
+                logger.error(
+                    "codex auth error model=%s stream=%s status=%d body=%s",
+                    model, stream, status or 0, body_text[:300],
+                )
+            elif status is not None:
+                logger.warning(
+                    "codex error model=%s stream=%s status=%d body=%s",
+                    model, stream, status, body_text[:300],
+                )
+            else:
+                logger.error(
+                    "codex error model=%s stream=%s body=%s",
+                    model, stream, body_text[:300],
+                )
             resp.release()
             # Advance to next credential on any non-2xx so a sick account
             # doesn't cause the breaker to trip after 5 consecutive failures.
