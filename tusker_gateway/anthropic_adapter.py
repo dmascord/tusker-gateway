@@ -78,17 +78,68 @@ def anthropic_to_openai(body: dict[str, Any]) -> dict[str, Any]:
         if isinstance(content, str):
             messages.append({"role": role, "content": content})
         elif isinstance(content, list):
-            # Extract text parts, join with newlines (Anthropic multi-block).
-            parts = []
-            for block in content:
-                if isinstance(block, dict):
-                    if block.get("type") == "text":
+            has_image = any(
+                isinstance(block, dict) and block.get("type") == "image"
+                for block in content
+            )
+            if not has_image:
+                parts: list[str] = []
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
                         parts.append(block.get("text", ""))
-                    elif block.get("type") == "tool_use":
+                    elif isinstance(block, dict) and block.get("type") in {"tool_use", "tool_result"}:
                         parts.append(json.dumps(block))
-                elif isinstance(block, str):
-                    parts.append(block)
-            messages.append({"role": role, "content": "\n".join(parts)})
+                    elif isinstance(block, str):
+                        parts.append(block)
+                messages.append({"role": role, "content": "\n".join(parts)})
+                continue
+
+            blocks: list[dict[str, Any]] = []
+            for block in content:
+                if isinstance(block, str):
+                    blocks.append({"type": "text", "text": block})
+                    continue
+                if not isinstance(block, dict):
+                    continue
+                block_type = block.get("type")
+                if block_type == "text":
+                    blocks.append({"type": "text", "text": block.get("text", "")})
+                elif block_type == "image":
+                    source = block.get("source", {})
+                    source_type = source.get("type")
+                    if source_type == "base64":
+                        media_type = source.get("media_type")
+                        data = source.get("data")
+                        if not isinstance(media_type, str) or not isinstance(data, str) or not data:
+                            raise BadRequestError(
+                                "Anthropic base64 image source requires media_type and data",
+                                code="invalid_image_source",
+                            )
+                        blocks.append({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{media_type};base64,{data}",
+                            },
+                        })
+                    elif source_type == "url":
+                        url = source.get("url")
+                        if not isinstance(url, str) or not url:
+                            raise BadRequestError(
+                                "Anthropic URL image source requires a non-empty URL",
+                                code="invalid_image_source",
+                            )
+                        blocks.append({
+                            "type": "image_url",
+                            "image_url": {"url": url},
+                        })
+                    else:
+                        raise BadRequestError(
+                            f"Anthropic image source type '{source_type}' cannot be converted to an image URL",
+                            code="unsupported_image_source",
+                        )
+                elif block_type in {"tool_use", "tool_result"}:
+                    blocks.append({"type": "text", "text": json.dumps(block)})
+            messages.append({"role": role, "content": blocks})
         elif content is None:
             messages.append({"role": role, "content": ""})
         else:

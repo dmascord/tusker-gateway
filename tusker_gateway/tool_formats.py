@@ -11,6 +11,73 @@ import json
 import re
 from typing import Any
 
+from tusker_gateway.errors import BadRequestError
+
+_ANTHROPIC_IMAGE_DATA_URL_RE = re.compile(
+    r"^data:(image/[A-Za-z0-9.+-]+);base64,([A-Za-z0-9+/]*={0,2})$"
+)
+
+
+def _openai_content_to_anthropic(content: Any) -> str | list[dict[str, Any]]:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        raise BadRequestError("Message content must be a string or array", code="invalid_content")
+
+    blocks: list[dict[str, Any]] = []
+    for index, block in enumerate(content):
+        if not isinstance(block, dict):
+            raise BadRequestError(
+                f"Message content block {index} must be an object",
+                code="invalid_content",
+            )
+        block_type = block.get("type")
+        if block_type in {"text", "input_text"}:
+            text = block.get("text")
+            if not isinstance(text, str):
+                raise BadRequestError(
+                    f"Message text block {index} must contain a string text field",
+                    code="invalid_content",
+                )
+            blocks.append({"type": "text", "text": text})
+            continue
+        if block_type not in {"image_url", "input_image"}:
+            raise BadRequestError(
+                f"Content block type '{block_type}' is not supported by Anthropic",
+                code="unsupported_content_type",
+            )
+
+        image_url = block.get("image_url")
+        if isinstance(image_url, str):
+            url = image_url
+        elif isinstance(image_url, dict):
+            url = image_url.get("url")
+        else:
+            url = None
+        if not isinstance(url, str) or not url:
+            raise BadRequestError(
+                f"Message image block {index} must contain a non-empty image_url",
+                code="invalid_image_url",
+            )
+        data_match = _ANTHROPIC_IMAGE_DATA_URL_RE.fullmatch(url)
+        if data_match:
+            blocks.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": data_match.group(1),
+                    "data": data_match.group(2),
+                },
+            })
+        elif url.startswith("https://"):
+            blocks.append({"type": "image", "source": {"type": "url", "url": url}})
+        else:
+            raise BadRequestError(
+                f"Message image block {index} must use HTTPS or a base64 image data URL",
+                code="invalid_image_url",
+            )
+    return blocks
+
 
 def _json_args(value: Any) -> str:
     if isinstance(value, str):
@@ -102,7 +169,7 @@ def openai_to_anthropic_tools(tools: Any) -> list[dict[str, Any]]:
 
 
 def openai_messages_to_anthropic(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Convert an OpenAI transcript to Anthropic message blocks."""
+    """Convert an OpenAI transcript, including image input, to Anthropic blocks."""
     result: list[dict[str, Any]] = []
     for message in messages:
         role = message.get("role", "user")
@@ -117,8 +184,13 @@ def openai_messages_to_anthropic(messages: list[dict[str, Any]]) -> list[dict[st
             continue
         if role == "assistant" and message.get("tool_calls"):
             blocks: list[dict[str, Any]] = []
-            if message.get("content"):
-                blocks.append({"type": "text", "text": str(message["content"])})
+            content = message.get("content")
+            if content:
+                converted = _openai_content_to_anthropic(content)
+                if isinstance(converted, str):
+                    blocks.append({"type": "text", "text": converted})
+                else:
+                    blocks.extend(converted)
             for call in normalize_tool_calls(message["tool_calls"]):
                 fn = call["function"]
                 try:
@@ -128,7 +200,7 @@ def openai_messages_to_anthropic(messages: list[dict[str, Any]]) -> list[dict[st
                 blocks.append({"type": "tool_use", "id": call["id"], "name": fn["name"][:200], "input": args})
             result.append({"role": "assistant", "content": blocks})
             continue
-        content = message.get("content", "")
+        content = _openai_content_to_anthropic(message.get("content", ""))
         result.append({"role": "assistant" if role == "assistant" else "user", "content": content})
     return result
 

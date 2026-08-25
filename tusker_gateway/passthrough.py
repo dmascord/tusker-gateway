@@ -204,6 +204,54 @@ class CodexTokenRotator:
             pass  # best-effort persistence
 
 
+def _chat_content_to_responses(content: Any) -> str | list[dict[str, Any]]:
+    """Convert OpenAI chat content into Responses API input content."""
+    if isinstance(content, str):
+        return content
+    if content is None:
+        return ""
+    if not isinstance(content, list):
+        raise ProviderError("Message content must be a string or content array")
+
+    converted: list[dict[str, Any]] = []
+    for index, block in enumerate(content):
+        if not isinstance(block, dict):
+            raise ProviderError(f"Message content block {index} must be an object")
+        block_type = block.get("type")
+        if block_type in {"text", "input_text"}:
+            text = block.get("text")
+            if not isinstance(text, str):
+                raise ProviderError(f"Message text block {index} must contain a string text field")
+            converted.append({"type": "input_text", "text": text})
+        elif block_type in {"image_url", "input_image"}:
+            image_url = block.get("image_url")
+            if isinstance(image_url, dict):
+                url = image_url.get("url")
+                detail = image_url.get("detail")
+            else:
+                url = image_url
+                detail = block.get("detail")
+            if not isinstance(url, str) or not url:
+                raise ProviderError(f"Message image block {index} must contain a non-empty image_url")
+            image_block: dict[str, Any] = {"type": "input_image", "image_url": url}
+            if detail is not None:
+                image_block["detail"] = detail
+            converted.append(image_block)
+        else:
+            raise ProviderError(f"Unsupported message content block type: {block_type}")
+    return converted
+
+
+def _responses_text(content: str | list[dict[str, Any]]) -> str:
+    if isinstance(content, str):
+        return content
+    return "\n".join(
+        block["text"]
+        for block in content
+        if block.get("type") == "input_text"
+    )
+
+
 class PassthroughClient:
     """HTTP client for provider passthrough requests."""
 
@@ -444,16 +492,19 @@ class PassthroughClient:
         input_data: list[dict[str, Any]] = []
         for msg in messages:
             role = msg.get("role")
-            content = msg.get("content")
-            if role == "system":
-                input_data.append({"role": "system", "content": [{"type": "input_text", "text": content}]})
-            elif role == "user":
-                input_data.append({"role": "user", "content": [{"type": "input_text", "text": content}]})
-            elif role == "assistant":
-                # Responses API expects plain content for assistant *input*
-                # items (output_text is for output items only). Hermes-agent
-                # and the Codex CLI both send plain strings here.
-                input_data.append({"role": "assistant", "content": str(content) if content is not None else ""})
+            if role not in {"system", "developer", "user", "assistant"}:
+                continue
+            content = _chat_content_to_responses(msg.get("content"))
+            input_role = "developer" if role == "developer" else role
+            if input_role == "assistant" and isinstance(content, str):
+                # Keep the existing assistant-history wire shape. Responses
+                # accepts assistant input as a plain string; output_text is
+                # reserved for model output items.
+                input_data.append({"role": input_role, "content": content})
+            else:
+                if isinstance(content, str):
+                    content = [{"type": "input_text", "text": content}]
+                input_data.append({"role": input_role, "content": content})
         # Codex backend requires stream=true; force it here regardless of
         # what the caller asked for (the response parser handles SSE).
         body: dict[str, Any] = {
@@ -462,10 +513,12 @@ class PassthroughClient:
             "stream": True,
             "store": False,
         }
-        # Pull the first system message out into `instructions` if present.
-        # Falls back to None so OpenAI can apply its own default.
-        if messages and messages[0].get("role") == "system":
-            sys_text = str(messages[0].get("content") or "").strip()
+        # Pull the first system/developer message into `instructions` if present.
+        # Multimodal system content keeps its image in `input`; only text is
+        # duplicated into instructions.
+        if messages and messages[0].get("role") in {"system", "developer"}:
+            sys_content = _chat_content_to_responses(messages[0].get("content"))
+            sys_text = _responses_text(sys_content).strip()
             if sys_text:
                 body["instructions"] = sys_text
         # Default reasoning effort: medium. Codex backend uses native chain-

@@ -60,6 +60,52 @@ async def test_rate_limiter_returns_429(client_with_rl_and_breaker):
     # We expect at least one 429 in the sequence.
     assert 429 in statuses, f"expected 429, got {statuses}"
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        ("/v1/images/generations", {"model": "gpt-image-1", "prompt": "cat"}),
+        ("/v1/videos", {"model": "sora-2", "prompt": "cat"}),
+    ],
+)
+async def test_media_routes_share_rate_limiter(
+    client_with_rl_and_breaker, path, payload
+):
+    cl, api_key = client_with_rl_and_breaker
+    async def fake_handle_request(**kwargs):
+        return {"status": "ok"}
+
+    handler_name = "image_handler" if path.startswith("/v1/images") else "video_handler"
+    cl.server.app[handler_name].handle_request = fake_handle_request
+    statuses = []
+    for _ in range(5):
+        resp = await cl.post(
+            path,
+            json=payload,
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        statuses.append(resp.status)
+    assert 429 in statuses
+
+
+@pytest.mark.asyncio
+async def test_video_rejects_missing_key_before_provider_call(
+    client_with_rl_and_breaker,
+):
+    cl, api_key = client_with_rl_and_breaker
+    app = cl.server.app
+    app["config"]["provider_api_keys"]["openai"] = None
+
+    resp = await cl.post(
+        "/v1/videos?wait=false",
+        json={"model": "sora-2", "prompt": "cat"},
+        headers={"Authorization": f"Bearer {api_key}"},
+    )
+
+    assert resp.status == 503
+    body = await resp.json()
+    assert body["error"]["code"] == "missing_api_key"
+
 
 @pytest.mark.asyncio
 async def test_metrics_includes_breaker_and_ratelimit_counters(client_with_rl_and_breaker):

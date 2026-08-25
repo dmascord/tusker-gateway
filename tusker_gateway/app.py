@@ -39,6 +39,10 @@ from tusker_gateway.guardrails import init_guard_pipeline, load_guardrails_confi
 from tusker_gateway.metrics import MetricsRegistry
 from tusker_gateway.rate_limit import RateLimiter, load_rate_limit_config_from_env
 from tusker_gateway.tracing import Tracer, load_tracer_config_from_env
+from tusker_gateway.providers.capabilities import (
+    CapabilitiesRegistry,
+    capabilities_refresh_loop,
+)
 
 
 def create_app() -> web.Application:
@@ -108,7 +112,6 @@ def create_app() -> web.Application:
     from tusker_gateway.providers.image_generation import ImageGenerationHandler
     # Build a Codex token rotator so the image handler can use Codex OAuth
     # credentials for image generation when no OPENAI_API_KEY is configured.
-    from pathlib import Path as _AuthPath
     from tusker_gateway.passthrough import CodexTokenRotator
     codex_creds = app["config"].get("codex_credentials") or []
     codex_rotator = CodexTokenRotator(
@@ -116,12 +119,21 @@ def create_app() -> web.Application:
         auth_file=app["config"].get("auth_file"),
     )
     app["codex_rotator"] = codex_rotator
-    app["image_handler"] = ImageGenerationHandler(app["config"])
+    capability_registry = CapabilitiesRegistry(
+        provider_keys=app["config"].get("provider_api_keys", {}),
+        codex_rotator=codex_rotator,
+    )
+    app["capability_registry"] = capability_registry
+    app["image_handler"] = ImageGenerationHandler(
+        app["config"], capability_registry=capability_registry
+    )
     # TTS and video handlers (Phase: TTS/video support).
     from tusker_gateway.providers.tts import TTSHandler
     from tusker_gateway.providers.video import VideoHandler
     app["tts_handler"] = TTSHandler(app["config"])
-    app["video_handler"] = VideoHandler(app["config"])
+    app["video_handler"] = VideoHandler(
+        app["config"], capability_registry=capability_registry
+    )
 
 
     async def on_startup(app):
@@ -131,6 +143,9 @@ def create_app() -> web.Application:
             timeout=aiohttp.ClientTimeout(total=120),
         )
         startup_log.info("HTTP session created")
+        # One stop signal controls every refresh loop using the shared session.
+        stop_event = asyncio.Event()
+        app["refresh_stop_event"] = stop_event
         # Hydrate persistent cooldowns into the in-memory tracker
         try:
             from pathlib import Path as _P
@@ -196,7 +211,8 @@ def create_app() -> web.Application:
                             if pool_manager is not None
                             else None
                         ),
-                    )
+                    ),
+                    name="catalog-refresh",
                 )
                 startup_log.info(
                     "catalog refresh task started (interval=%.0fs, providers=%s)",
@@ -205,15 +221,39 @@ def create_app() -> web.Application:
                 )
             except Exception as exc:
                 startup_log.warning("catalog refresh failed to start: %s", exc)
+        capabilities_enabled = os.environ.get(
+            "TUSKER_CAPABILITIES_ENABLED", "1"
+        ).strip().lower()
+        if capabilities_enabled not in {"0", "false", "no", "off"}:
+            interval_secs = float(
+                os.environ.get("TUSKER_CAPABILITIES_REFRESH_SECS", "3600")
+            )
+            app["capabilities_task"] = asyncio.create_task(
+                capabilities_refresh_loop(
+                    app["capability_registry"],
+                    app["http_session"],
+                    interval_secs,
+                    stop_event,
+                ),
+                name="capabilities-refresh",
+            )
+            # The loop performs its first refresh immediately. Yield once so
+            # startup requests see discovered media providers when available.
+            await asyncio.sleep(0)
+            startup_log.info(
+                "capability refresh task started (interval=%.0fs)",
+                interval_secs,
+            )
 
     async def on_cleanup(app):
-        # Stop the catalog refresh task first so it doesn't try to use
-        # the http_session after it's closed.
-        stop_event = app.get("catalog_stop_event")
+        # Stop refresh tasks before closing the shared HTTP session.
+        stop_event = app.get("refresh_stop_event")
         if stop_event is not None:
             stop_event.set()
-        task = app.get("catalog_task")
-        if task is not None:
+        for task_name in ("catalog_task", "capabilities_task"):
+            task = app.get(task_name)
+            if task is None:
+                continue
             try:
                 await asyncio.wait_for(task, timeout=5.0)
             except (asyncio.TimeoutError, asyncio.CancelledError):

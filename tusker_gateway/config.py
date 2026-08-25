@@ -106,7 +106,13 @@ def load_config() -> dict[str, Any]:
         if key.startswith("PROVIDER_") and key.endswith("_API_KEY") and value:
             provider = key[len("PROVIDER_") : -len("_API_KEY")].lower()
             raw_providers[provider] = value
-    config["provider_api_keys"] = raw_providers
+    # Provider-prefixed aliases used by the deployment manifests.
+    if "google" not in raw_providers and raw_providers.get("gemini"):
+        raw_providers["google"] = raw_providers["gemini"]
+    if "zai" not in raw_providers and raw_providers.get("glm"):
+        raw_providers["zai"] = raw_providers["glm"]
+    if "openai" not in raw_providers and raw_providers.get("openai-direct"):
+        raw_providers["openai"] = raw_providers["openai-direct"]
 
     # Map Hermes-style single-provider env keys into the normalized API-key map.
     # Each entry: target provider name -> source env var name (or already-present key).

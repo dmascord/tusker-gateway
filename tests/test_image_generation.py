@@ -61,8 +61,9 @@ def test_get_provider_for_image_request_openai():
 
 def test_get_provider_for_image_request_openrouter():
     h = ImageGenerationHandler({})
-    assert h.get_provider_for_image_request("openai/gpt-image-1", "/v1/images/generations") == "openrouter"
-    assert h.get_provider_for_image_request("google/gemini-2.5-flash-image", "/v1/images/generations") == "openrouter"
+    assert h.get_provider_for_image_request("openrouter::openai/gpt-image-1", "/v1/images/generations") == "openrouter"
+    assert h.get_provider_for_image_request("openrouter/google/gemini-2.5-flash-image", "/v1/images/generations") == "openrouter"
+    assert h.get_provider_for_image_request("openai/gpt-image-1", "/v1/images/generations") == "openai"
 
 
 def test_get_provider_for_image_request_google():
@@ -71,9 +72,11 @@ def test_get_provider_for_image_request_google():
     assert h.get_provider_for_image_request("imagen-3.0-generate-002", "/v1/images/generations") == "google"
 
 
-def test_get_provider_for_image_request_anthropic():
+def test_get_provider_for_image_request_anthropic_is_rejected():
     h = ImageGenerationHandler({})
-    assert h.get_provider_for_image_request("claude-sonnet-4", "/v1/images/generations") == "anthropic"
+    with pytest.raises(GatewayError) as excinfo:
+        h.get_provider_for_image_request("claude-sonnet-4", "/v1/images/generations")
+    assert excinfo.value.code == "unsupported_model"
 
 
 def test_get_provider_for_image_request_zai():
@@ -173,7 +176,7 @@ async def test_zai_call_zai_posts_to_paas_endpoint():
 
     assert captured["url"] == "https://api.z.ai/api/paas/v4/images/generations"
     assert captured["headers"]["Authorization"] == "Bearer zai-key"
-    assert captured["body"]["model"] == "cogview-4-250304"
+    assert captured["body"]["model"] == "cogView-4-250304"  # canonical rewrite
     assert captured["body"]["prompt"] == "a dragon"
     assert captured["body"]["size"] == "1024x1024"
     assert result["data"][0]["url"] == "https://up.test/img.png"
@@ -451,3 +454,142 @@ async def test_call_openai_codex_extracts_partial_image_b64():
 
     # The final image (from output_item.done) overrides the partial preview.
     assert result["data"][-1]["b64_json"] == "FINAL_BASE64"
+
+
+@pytest.mark.asyncio
+async def test_zai_dispatch_canonicalizes_lowercase_cogview_slug():
+    """Lowercase 'cogview-4-250304' is rewritten to 'cogView-4-250304' before
+    posting to Z.AI's PaaS API. The capital-V form is what the upstream
+    accepts.
+    """
+    from tusker_gateway.providers.image_generation import ImageGenerationHandler
+
+    captured: dict = {}
+
+    class _FakeResp:
+        def __init__(self):
+            self.status = 200
+            self._b = b'{"created":1,"data":[{"url":"https://x/a.png"}]}'
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+        async def read(self):
+            return self._b
+        async def text(self):
+            return self._b.decode()
+        async def json(self):
+            return json.loads(self._b.decode())
+
+    class _FakeSession:
+        def post(self, url, **kwargs):
+            captured["url"] = url
+            captured["json"] = kwargs.get("json", {})
+            return _FakeResp()
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+
+    h = ImageGenerationHandler({})
+    import aiohttp
+    orig = aiohttp.ClientSession
+    aiohttp.ClientSession = lambda *a, **k: _FakeSession()
+    try:
+        result = await h._call_zai(
+            model="cogview-4-250304",
+            path="/v1/images/generations",
+            body={"prompt": "a cat"},
+            api_key="zai-test",
+            extra_headers=None,
+        )
+    finally:
+        aiohttp.ClientSession = orig
+
+    assert captured["json"]["model"] == "cogView-4-250304"
+    assert result["data"][0]["url"] == "https://x/a.png"
+
+
+@pytest.mark.asyncio
+async def test_zai_dispatch_passes_unknown_slugs_through_unchanged():
+    """Models not in the canonical map (e.g., glm-image) are not modified."""
+    from tusker_gateway.providers.image_generation import ImageGenerationHandler
+
+    captured: dict = {}
+
+    class _FakeResp:
+        def __init__(self):
+            self.status = 200
+            self._b = b'{"created":1,"data":[{"url":"https://x/a.png"}]}'
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+        async def read(self):
+            return self._b
+        async def text(self):
+            return self._b.decode()
+        async def json(self):
+            return json.loads(self._b.decode())
+
+    class _FakeSession:
+        def post(self, url, **kwargs):
+            captured["url"] = url
+            captured["json"] = kwargs.get("json", {})
+            return _FakeResp()
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+
+    h = ImageGenerationHandler({})
+    import aiohttp
+    orig = aiohttp.ClientSession
+    aiohttp.ClientSession = lambda *a, **k: _FakeSession()
+    try:
+        await h._call_zai(
+            model="glm-image",
+            path="/v1/images/generations",
+            body={"prompt": "a cat"},
+            api_key="zai-test",
+            extra_headers=None,
+        )
+    finally:
+        aiohttp.ClientSession = orig
+
+    assert captured["json"]["model"] == "glm-image"
+
+
+@pytest.mark.asyncio
+async def test_zai_routes_image_and_video_via_registry():
+    """End-to-end routing check: a populated registry steers both image
+    generation (cogview-4) and video generation (cogvideox-3) to Z.AI
+    without falling back to heuristic string matching.
+    """
+    from tusker_gateway.providers.capabilities import (
+        Capability,
+        CapabilityEntry,
+        CapabilitiesRegistry,
+    )
+    from tusker_gateway.providers.image_generation import ImageGenerationHandler
+    from tusker_gateway.providers.video import VideoHandler
+
+    reg = CapabilitiesRegistry()
+    reg.snapshot.capabilities[Capability.IMAGE_GENERATIONS].append(
+        CapabilityEntry(provider="zai", model="cogView-4-250304", capability=Capability.IMAGE_GENERATIONS)
+    )
+    reg.snapshot.capabilities[Capability.VIDEO_GENERATIONS].append(
+        CapabilityEntry(provider="zai", model="cogvideox-3", capability=Capability.VIDEO_GENERATIONS)
+    )
+
+    img_handler = ImageGenerationHandler({})
+    vid_handler = VideoHandler({})
+
+    # Image request: lowercase slug still routes correctly via registry.
+    assert img_handler.get_provider_for_image_request(
+        "cogview-4-250304", "/v1/images/generations", capability_registry=reg
+    ) == "zai"
+    # Video request: pure registry-based decision, no slash in slug.
+    assert vid_handler.get_provider_for_video_request(
+        "cogvideox-3", capability_registry=reg
+    ) == "zai"

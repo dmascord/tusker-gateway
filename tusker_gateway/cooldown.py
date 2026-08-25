@@ -17,6 +17,17 @@ logger = logging.getLogger(__name__)
 
 MAX_COOLDOWN_SECS = 30 * 86400.0 # 30 days
 
+# Providers whose published rate limits are separated by model (or model
+# class). A 429 from one model on these providers must not evict the other
+# models from the same provider. Providers not listed here retain the more
+# conservative provider-wide behavior.
+MODEL_SCOPED_COOLDOWN_PROVIDERS = frozenset({
+    "openrouter",
+    "google",       # Gemini API
+    "groq",
+    "anthropic",    # supported by custom provider registries
+})
+
 
 
 @dataclass
@@ -62,8 +73,12 @@ class CooldownTracker:
         seconds = min(seconds, MAX_COOLDOWN_SECS)
         until = time.monotonic() + seconds
         self._cooldowns[(provider, model)] = Cooldown(until=until)
-        # Also track at provider level
-        self._provider_default[provider] = Cooldown(until=until)
+        # OpenRouter, Gemini, Groq, and Anthropic publish model/model-class
+        # rate limits. Keep those cooldowns model-scoped; a 429 from one
+        # model must not suppress healthy siblings. An empty model is the
+        # explicit provider-wide sentinel used by the failure circuit.
+        if not model or provider.lower() not in MODEL_SCOPED_COOLDOWN_PROVIDERS:
+            self._provider_default[provider] = Cooldown(until=until)
         logger.info('cooldown set %s/%s for %.0fs', provider, model, seconds)
     def is_cooldown(self, provider: str, model: str) -> bool:
         """Return True if (provider, model) is in cooldown."""

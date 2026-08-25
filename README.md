@@ -15,10 +15,21 @@ quality.py     — SQLite-backed per-model quality scoring (success rate + laten
 pools.py       — PoolManager: candidate lists, selection, session stickiness
 routing.py     — role-alias routing + passthrough detection
 passthrough.py — provider HTTP client + Codex OAuth token rotation
-endpoints.py   — /v1/models, /v1/chat/completions handlers
+endpoints.py   — OpenAI chat, responses, image, TTS, and video handlers
 app.py         — aiohttp application factory + entry point
 __main__.py    — python -m tusker_gateway
 ```
+
+## Media endpoints
+
+| Surface | Route | Providers |
+|---|---|---|
+| Image understanding | `/v1/chat/completions`, `/v1/responses`, `/v1/messages` | Any selected vision-capable chat provider; OpenAI, Anthropic, and Responses content blocks are normalized without downloading remote images in Tusker. |
+| Image generation | `/v1/images/generations` | OpenAI/Codex, OpenRouter, Google Gemini/Imagen, Z.AI CogView/GLM-Image. |
+| Image edits/variations | `/v1/images/edits`, `/v1/images/variations` | OpenAI-compatible image providers; unsupported provider surfaces fail explicitly. |
+| Video generation | `/v1/videos` | OpenAI Sora, OpenRouter video models, Google Veo, Z.AI CogVideoX/Vidu. `wait=false` returns the upstream job; waited Z.AI results retain the signed result URL. |
+
+Capability discovery refreshes supported image/video models from provider catalogs. Anthropic supports image input for understanding, not image generation. Media routes use the same authenticated per-key rate limit, budget, and guardrail preflight as chat.
 
 ## Virtual model aliases
 

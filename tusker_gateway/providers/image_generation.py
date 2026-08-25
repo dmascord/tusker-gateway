@@ -1,14 +1,14 @@
 """Image generation provider support for Tusker AI Gateway.
 
-This module implements image generation support for OpenAI, Google, OpenRouter,
-and Anthropic, extending the existing Tusker architecture to handle image
-generation requests.
+This module implements image generation support for OpenAI, Google,
+OpenRouter, and Z.AI, extending the existing Tusker architecture to handle
+image generation requests. Anthropic is intentionally excluded: it supports
+image input / text output but no native image output API.
 """
 
 from __future__ import annotations
 
 
-import base64
 import json
 import logging
 import time
@@ -17,10 +17,63 @@ from typing import Any, Dict, Optional
 import aiohttp
 
 from tusker_gateway.auth_strategies import get_auth_strategy
-from tusker_gateway.copilot_constants import is_likely_vision_model
+from tusker_gateway.config import DEFAULT_PROVIDER_REGISTRY
 from tusker_gateway.errors import GatewayError
 
 logger = logging.getLogger(__name__)
+MAX_IMAGE_RESPONSE_BYTES = 32 * 1024 * 1024
+MAX_IMAGE_RESULTS = 4
+
+
+async def _read_capped_text(resp: aiohttp.ClientResponse) -> str:
+    """Read one image-provider response with a hard memory bound."""
+    content_length = getattr(resp, "headers", {}).get("Content-Length")
+    if content_length:
+        try:
+            if int(content_length) > MAX_IMAGE_RESPONSE_BYTES:
+                raise GatewayError(
+                    "Image provider response exceeds the gateway size limit",
+                    code="upstream_error",
+                )
+        except ValueError:
+            pass
+    data = bytearray()
+    content = getattr(resp, "content", None)
+    if content is None:
+        data = await resp.read() if hasattr(resp, "read") else (await resp.text()).encode()
+        if len(data) > MAX_IMAGE_RESPONSE_BYTES:
+            raise GatewayError(
+                "Image provider response exceeds the gateway size limit",
+                code="upstream_error",
+            )
+        return data.decode("utf-8")
+    data = bytearray()
+    async for chunk in content.iter_chunked(1024 * 1024):
+        if len(data) + len(chunk) > MAX_IMAGE_RESPONSE_BYTES:
+            raise GatewayError(
+                "Image provider response exceeds the gateway size limit",
+                code="upstream_error",
+            )
+        data.extend(chunk)
+    return data.decode("utf-8")
+
+
+def _append_image_result(images: list[str], value: Any) -> None:
+    if not isinstance(value, str) or not value:
+        return
+    if len(value.encode("utf-8")) > MAX_IMAGE_RESPONSE_BYTES:
+        raise GatewayError(
+            "Generated image exceeds the gateway size limit",
+            code="upstream_error",
+        )
+    if value in images:
+        return
+    if len(images) >= MAX_IMAGE_RESULTS:
+        raise GatewayError(
+            "Image provider returned too many images",
+            code="upstream_error",
+        )
+    images.append(value)
 IMAGE_GEN_MODELS = {
     "gpt-image-2": {"cost_per_1k_tokens": 0.005, "context_window": 8000},
     "gpt-image-1": {"cost_per_1k_tokens": 0.02, "context_window": 8000},
@@ -49,12 +102,33 @@ def _map_model_to_codex(model: str) -> str:
         return "gpt-image-2"
     return model
 
+# Canonical Z.AI model slugs. Z.AI's PaaS API uses mixed case in the
+# docs (``cogView-4-250304``) but most clients pass lowercased slugs.
+# Dispatch always rewrites to the canonical form before posting.
+_ZAI_MODEL_CANONICAL = {
+    "cogview-4-250304": "cogView-4-250304",
+    "cogview": "cogView-4-250304",
+    "cogview4": "cogView-4-250304",
+}
+
+
 
 class ImageGenerationHandler:
     """Handler for image generation requests in the Tusker gateway."""
 
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(
+        self,
+        config: Dict[str, Any],
+        capability_registry: Optional[Any] = None,
+    ):
         self.config = config
+        self.capability_registry = capability_registry
+        configured = config.get("providers", {})
+        configured_names = configured.keys() if isinstance(configured, dict) else ()
+        self._known_gateway_providers = frozenset(DEFAULT_PROVIDER_REGISTRY).union(
+            configured_names,
+            {"anthropic", "codex"},
+        )
 
     def is_image_generation_request(
         self,
@@ -82,24 +156,95 @@ class ImageGenerationHandler:
         self,
         model: str,
         path: str,
+        capability_registry: Optional[Any] = None,
     ) -> str:
-        """Determine which provider to use for an image generation request."""
+        """Determine which provider can serve an image generation request.
+
+        Explicit gateway pins are honoured, while arbitrary upstream namespace
+        prefixes remain part of the model id for capability-registry lookup.
+        """
         model_lower = model.lower()
-        if "/" in model:
-            return "openrouter"
+        if (
+            "claude" in model_lower
+            or model_lower.startswith(("anthropic::", "anthropic/"))
+            or "/anthropic/" in model_lower
+        ):
+            raise GatewayError(
+                "Anthropic models do not support image generation",
+                code="unsupported_model",
+            )
+
+        registry = (
+            capability_registry
+            if capability_registry is not None
+            else self.capability_registry
+        )
+
+        pin_provider: Optional[str] = None
+        if "::" in model:
+            candidate, _, _ = model.partition("::")
+            candidate = candidate.lower()
+            if candidate in self._known_gateway_providers:
+                pin_provider = candidate
+        elif model_lower.startswith("openrouter/"):
+            pin_provider = "openrouter"
+
+        if pin_provider is None and registry is not None:
+            try:
+                snap = registry.snapshot
+                if any(snap.capabilities.values()):
+                    from tusker_gateway.providers.capabilities import Capability
+
+                    capability = {
+                        "/v1/images/edits": Capability.IMAGE_EDITS,
+                        "/v1/images/variations": Capability.IMAGE_VARIATIONS,
+                    }.get(path, Capability.IMAGE_GENERATIONS)
+                    entry = snap.lookup(capability, model)
+                    if entry is not None:
+                        if entry.provider == "anthropic":
+                            raise GatewayError(
+                                "Anthropic models do not support image generation",
+                                code="unsupported_model",
+                            )
+                        return entry.provider
+            except GatewayError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("capability registry lookup failed, falling back: %s", exc)
+
+        if pin_provider is None and "/" in model:
+            candidate, _, _ = model.partition("/")
+            candidate = candidate.lower()
+            if candidate in self._known_gateway_providers:
+                pin_provider = candidate
+
+        if pin_provider in {"anthropic"}:
+            raise GatewayError(
+                "Anthropic models do not support image generation",
+                code="unsupported_model",
+            )
+        if pin_provider in {"codex", "openai-codex"}:
+            return "openai"
+        if pin_provider in {"openai", "openrouter", "google", "zai"}:
+            return pin_provider
+        if pin_provider is not None:
+            raise GatewayError(
+                f"Provider {pin_provider} does not support image generation",
+                code="unsupported_model",
+            )
+
         if "gpt-image" in model_lower or "dall-e" in model_lower:
             return "openai"
         if "gemini" in model_lower or "google" in model_lower or "imagen" in model_lower:
             return "google"
         if "claude" in model_lower or "anthropic" in model_lower:
-            return "anthropic"
-        # Z.ai's own image models (CogView, GLM-Image). The slug is the
-        # unambiguous signal — these never appear on any other upstream
-        # the gateway talks to.
+            raise GatewayError(
+                "Anthropic models do not support image generation",
+                code="unsupported_model",
+            )
         if any(tag in model_lower for tag in ("cogview-", "glm-image")):
             return "zai"
         return "openai"
-
     async def handle_request(
         self,
         model: str,
@@ -110,25 +255,31 @@ class ImageGenerationHandler:
         codex_rotator: Any = None,
     ) -> Dict[str, Any]:
         """Handle an image generation request by dispatching to the right provider."""
-        provider = self.get_provider_for_image_request(model, path)
+        provider = self.get_provider_for_image_request(
+            model,
+            path,
+            capability_registry=self.capability_registry,
+        )
+        if path == "/v1/images/generations":
+            prompt = body.get("prompt")
+            if not isinstance(prompt, str) or not prompt.strip():
+                raise GatewayError(
+                    "Image generation requires a non-empty prompt",
+                    code="missing_prompt",
+                )
         if provider == "openai":
             return await self._call_openai(model, path, body, api_key, extra_headers, codex_rotator)
         if provider == "google":
             return await self._call_google(model, path, body, api_key, extra_headers)
         if provider == "openrouter":
             return await self._call_openrouter(model, path, body, api_key, extra_headers)
-        if provider == "anthropic":
-            return await self._call_anthropic(model, path, body, api_key, extra_headers)
         if provider == "zai":
             return await self._call_zai(model, path, body, api_key, extra_headers)
-        return {
-            "created": int(time.time()),
-            "provider": provider,
-            "model": model,
-            "path": path,
-            "status": "provider_not_configured",
-            "message": f"Image generation via {provider} not configured",
-        }
+        raise GatewayError(
+            f"Provider {provider} does not support image generation",
+            code="unsupported_model",
+        )
+
     async def _call_openai(
         self,
         model: str,
@@ -165,7 +316,7 @@ class ImageGenerationHandler:
             async with session.post(
                 url, headers=headers, json=body, timeout=aiohttp.ClientTimeout(total=120)
             ) as resp:
-                text = await resp.text()
+                text = await _read_capped_text(resp)
                 if resp.status >= 400:
                     logger.warning("OpenAI image gen failed: %s %s", resp.status, text[:200])
                     raise GatewayError(
@@ -229,6 +380,7 @@ class ImageGenerationHandler:
         url = "https://chatgpt.com/backend-api/codex/responses"
         timeout = aiohttp.ClientTimeout(total=300)
         b64_images: list[str] = []
+        retained_bytes = 0
         revised_prompt: Optional[str] = None
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(url, headers=headers, json=payload) as resp:
@@ -242,6 +394,11 @@ class ImageGenerationHandler:
                 # Stream SSE and harvest image_generation_call output items.
                 buffer = b""
                 async for chunk in resp.content.iter_any():
+                    if len(buffer) + len(chunk) > MAX_IMAGE_RESPONSE_BYTES:
+                        raise GatewayError(
+                            "Codex image stream frame exceeds the gateway size limit",
+                            code="upstream_error",
+                        )
                     buffer += chunk
                     while b"\n\n" in buffer:
                         frame, buffer = buffer.split(b"\n\n", 1)
@@ -264,11 +421,22 @@ class ImageGenerationHandler:
                                 payload_obj = event.get("image_generation_call") or event.get("item") or event
                                 result = payload_obj.get("result") if isinstance(payload_obj, dict) else None
                                 if isinstance(result, str) and result:
-                                    b64_images.append(result)
+                                    retained_bytes += len(result.encode("utf-8"))
+                                    if retained_bytes > MAX_IMAGE_RESPONSE_BYTES:
+                                        raise GatewayError(
+                                            "Codex image output exceeds the gateway size limit",
+                                            code="upstream_error",
+                                        )
+                                    _append_image_result(b64_images, result)
                                 partial = payload_obj.get("partial_image_b64") if isinstance(payload_obj, dict) else None
                                 if isinstance(partial, str) and partial and not b64_images:
-                                    # No final result yet; remember the latest partial.
-                                    b64_images.append(partial)
+                                    retained_bytes += len(partial.encode("utf-8"))
+                                    if retained_bytes > MAX_IMAGE_RESPONSE_BYTES:
+                                        raise GatewayError(
+                                            "Codex image output exceeds the gateway size limit",
+                                            code="upstream_error",
+                                        )
+                                    _append_image_result(b64_images, partial)
                                 revised = payload_obj.get("revised_prompt") if isinstance(payload_obj, dict) else None
                                 if revised and not revised_prompt:
                                     revised_prompt = revised
@@ -277,7 +445,13 @@ class ImageGenerationHandler:
                                 if item.get("type") == "image_generation_call":
                                     result = item.get("result")
                                     if isinstance(result, str) and result:
-                                        b64_images.append(result)
+                                        retained_bytes += len(result.encode("utf-8"))
+                                        if retained_bytes > MAX_IMAGE_RESPONSE_BYTES:
+                                            raise GatewayError(
+                                                "Codex image output exceeds the gateway size limit",
+                                                code="upstream_error",
+                                            )
+                                        _append_image_result(b64_images, result)
                                     rp = item.get("revised_prompt")
                                     if rp and not revised_prompt:
                                         revised_prompt = rp
@@ -287,7 +461,13 @@ class ImageGenerationHandler:
                                     if out_item.get("type") == "image_generation_call":
                                         result = out_item.get("result")
                                         if isinstance(result, str) and result:
-                                            b64_images.append(result)
+                                            retained_bytes += len(result.encode("utf-8"))
+                                            if retained_bytes > MAX_IMAGE_RESPONSE_BYTES:
+                                                raise GatewayError(
+                                                    "Codex image output exceeds the gateway size limit",
+                                                    code="upstream_error",
+                                                )
+                                            _append_image_result(b64_images, result)
                                         rp = out_item.get("revised_prompt")
                                         if rp and not revised_prompt:
                                             revised_prompt = rp
@@ -316,10 +496,16 @@ class ImageGenerationHandler:
         api_key: Optional[str],
         extra_headers: Optional[Dict[str, str]],
     ) -> Dict[str, Any]:
-        """Call OpenRouter for vision/image models exposed under provider/model."""
+        """Call OpenRouter's native image generation endpoint."""
         if not api_key:
             raise GatewayError("OpenRouter API key required", code="missing_api_key")
-        url = "https://openrouter.ai/api/v1/images/generations"
+        prompt = body.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise GatewayError(
+                "Image generation requires a non-empty prompt",
+                code="missing_prompt",
+            )
+        url = "https://openrouter.ai/api/v1/images"
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         if extra_headers:
             headers.update(extra_headers)
@@ -328,7 +514,7 @@ class ImageGenerationHandler:
             async with session.post(
                 url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=120)
             ) as resp:
-                text = await resp.text()
+                text = await _read_capped_text(resp)
                 if resp.status >= 400:
                     logger.warning(
                         "OpenRouter image gen failed: %s %s", resp.status, text[:200]
@@ -338,21 +524,105 @@ class ImageGenerationHandler:
                         code="upstream_error",
                     )
                 if not text:
-                    return {"status": "ok"}
-                return json.loads(text)
+                    raise GatewayError(
+                        "OpenRouter image generation returned an empty response",
+                        code="upstream_error",
+                    )
+                try:
+                    return json.loads(text)
+                except json.JSONDecodeError as exc:
+                    raise GatewayError(
+                        "OpenRouter image generation returned invalid JSON",
+                        code="upstream_error",
+                    ) from exc
 
     @staticmethod
     def _strip_provider_prefix(model: str) -> str:
-        """Strip a leading 'openrouter/' prefix before sending upstream.
+        """Strip only an explicit OpenRouter gateway pin.
 
-        The gateway accepts both 'model' and 'openrouter/model' request ids so
-        clients can pin the routing provider; OpenRouter itself does not
-        understand its own prefix, so it must be removed before the upstream
-        call. Mirrors routing.resolve_route's slash-form partition.
+        Upstream namespaces such as ``google/gemini-*`` are part of the model
+        slug and must be preserved verbatim.
         """
-        if model.startswith(("openrouter/", "openrouter::")):
-            return model.split("/", 1)[1] if "/" in model else model.split("::", 1)[1]
+        model_lower = model.lower()
+        if model_lower.startswith("openrouter/"):
+            return model[len("openrouter/") :]
+        if model_lower.startswith("openrouter::"):
+            return model[len("openrouter::") :]
         return model
+
+    @staticmethod
+    def _strip_google_prefix(model: str) -> str:
+        """Strip only an explicit Google gateway pin."""
+        model_lower = model.lower()
+        if model_lower.startswith("google/"):
+            return model[len("google/") :]
+        if model_lower.startswith("google::"):
+            return model[len("google::") :]
+        return model
+
+    @staticmethod
+    def _google_response_format(body: Dict[str, Any]) -> Optional[Dict[str, str]]:
+        """Map safely representable OpenAI image options to Google config."""
+        supplied = body.get("response_format")
+        supplied_format = supplied if isinstance(supplied, dict) else {}
+        response_format: Dict[str, str] = {"type": "image"}
+
+        aspect_ratio = supplied_format.get("aspect_ratio") or body.get("aspect_ratio")
+        valid_aspect_ratios = {"1:1", "16:9", "9:16", "4:3"}
+        if aspect_ratio in valid_aspect_ratios:
+            response_format["aspect_ratio"] = aspect_ratio
+
+        image_size = supplied_format.get("image_size") or body.get("image_size")
+        if isinstance(image_size, str) and image_size.upper() in {"1K", "2K", "4K"}:
+            response_format["image_size"] = image_size.upper()
+
+        size = body.get("size")
+        if isinstance(size, str) and "x" in size.lower():
+            width_text, _, height_text = size.lower().partition("x")
+            try:
+                width = int(width_text)
+                height = int(height_text)
+            except ValueError:
+                width = height = 0
+            for numerator, denominator, label in (
+                (1, 1, "1:1"),
+                (16, 9, "16:9"),
+                (9, 16, "9:16"),
+                (4, 3, "4:3"),
+            ):
+                if width > 0 and width * denominator == height * numerator:
+                    response_format.setdefault("aspect_ratio", label)
+                    break
+            resolution = {1024: "1K", 2048: "2K", 4096: "4K"}.get(
+                max(width, height)
+            )
+            if resolution:
+                response_format.setdefault("image_size", resolution)
+        elif isinstance(size, str) and size.upper() in {"1K", "2K", "4K"}:
+            response_format.setdefault("image_size", size.upper())
+
+        output_format = (
+            supplied_format.get("mime_type")
+            or supplied_format.get("output_format")
+            or (supplied if isinstance(supplied, str) else None)
+            or body.get("output_format")
+        )
+        mime_types = {
+            "png": "image/png",
+            "image/png": "image/png",
+            "jpg": "image/jpeg",
+            "jpeg": "image/jpeg",
+            "image/jpeg": "image/jpeg",
+            "webp": "image/webp",
+            "image/webp": "image/webp",
+        }
+        if isinstance(output_format, str):
+            mime_type = mime_types.get(output_format.lower())
+            if mime_type:
+                response_format["mime_type"] = mime_type
+
+        return response_format if len(response_format) > 1 else None
+
     async def _call_google(
         self,
         model: str,
@@ -361,32 +631,39 @@ class ImageGenerationHandler:
         api_key: Optional[str],
         extra_headers: Optional[Dict[str, str]],
     ) -> Dict[str, Any]:
-        """Call Google image generation API (Imagen or Gemini)."""
+        """Call Google's Interactions API and return OpenAI image data."""
+        if path in {"/v1/images/edits", "/v1/images/variations"}:
+            raise GatewayError(
+                "Google image edits and variations are not supported",
+                code="unsupported_endpoint",
+            )
         if not api_key:
             raise GatewayError("Google API key required", code="missing_api_key")
-        headers = {"Content-Type": "application/json"}
+        prompt = body.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise GatewayError(
+                "Image generation requires a non-empty prompt",
+                code="missing_prompt",
+            )
+
+        headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
         if extra_headers:
             headers.update(extra_headers)
-        if model.lower().startswith("imagen"):
-            url = (
-                f"https://generativelanguage.googleapis.com/v1beta/models/{model}"
-                f":predict?key={api_key}"
-            )
-            payload = {
-                "instances": [{"prompt": body.get("prompt", "")}],
-                "parameters": {"sampleCount": body.get("n", 1)},
-            }
-        else:
-            url = (
-                f"https://generativelanguage.googleapis.com/v1beta/models/{model}"
-                f":generateContent?key={api_key}"
-            )
-            payload = {"contents": [{"parts": [{"text": body.get("prompt", "")}]}]}
+        payload: Dict[str, Any] = {
+            "model": self._strip_google_prefix(model),
+            "input": [{"type": "text", "text": prompt}],
+            "store": False,
+        }
+        response_format = self._google_response_format(body)
+        if response_format:
+            payload["generation_config"] = {"response_format": response_format}
+
+        url = "https://generativelanguage.googleapis.com/v1beta/interactions"
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=120)
             ) as resp:
-                text = await resp.text()
+                text = await _read_capped_text(resp)
                 if resp.status >= 400:
                     logger.warning("Google image gen failed: %s %s", resp.status, text[:200])
                     raise GatewayError(
@@ -394,47 +671,46 @@ class ImageGenerationHandler:
                         code="upstream_error",
                     )
                 if not text:
-                    return {"status": "ok"}
-                return json.loads(text)
-
-    async def _call_anthropic(
-        self,
-        model: str,
-        path: str,
-        body: Dict[str, Any],
-        api_key: Optional[str],
-        extra_headers: Optional[Dict[str, str]],
-    ) -> Dict[str, Any]:
-        """Call Anthropic API for image understanding (no native image gen)."""
-        if not api_key:
-            raise GatewayError("Anthropic API key required", code="missing_api_key")
-        url = "https://api.anthropic.com/v1/messages"
-        headers = {
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-            "Content-Type": "application/json",
-        }
-        if extra_headers:
-            headers.update(extra_headers)
-        payload = {
-            "model": model,
-            "max_tokens": body.get("max_tokens", 1024),
-            "messages": [{"role": "user", "content": body.get("prompt", "")}],
-        }
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=120)
-            ) as resp:
-                text = await resp.text()
-                if resp.status >= 400:
-                    logger.warning("Anthropic image gen failed: %s %s", resp.status, text[:200])
                     raise GatewayError(
-                        f"Anthropic error {resp.status}: {text[:200]}",
+                        "Google image generation returned an empty response",
                         code="upstream_error",
                     )
-                if not text:
-                    return {"status": "ok"}
-                return json.loads(text)
+                try:
+                    response = json.loads(text)
+                except json.JSONDecodeError as exc:
+                    raise GatewayError(
+                        "Google image generation returned invalid JSON",
+                        code="upstream_error",
+                    ) from exc
+
+        images = []
+        steps = response.get("steps", []) if isinstance(response, dict) else []
+        if not isinstance(steps, list):
+            steps = []
+        for step in steps:
+            if not isinstance(step, dict) or step.get("type") != "model_output":
+                continue
+            contents = step.get("content", [])
+            if not isinstance(contents, list):
+                continue
+            for content in contents:
+                if not isinstance(content, dict) or content.get("type") != "image":
+                    continue
+                data = content.get("data")
+                if not isinstance(data, str) or not data:
+                    continue
+                image = {"b64_json": data}
+                media_type = content.get("mime_type")
+                if isinstance(media_type, str) and media_type:
+                    image["media_type"] = media_type
+                images.append(image)
+        if not images:
+            raise GatewayError(
+                "Google image generation returned no image content",
+                code="upstream_error",
+            )
+        return {"created": int(time.time()), "data": images}
+
 
     async def _call_zai(
         self,
@@ -445,13 +721,6 @@ class ImageGenerationHandler:
         extra_headers: Optional[Dict[str, str]],
     ) -> Dict[str, Any]:
         """Call Z.AI image generation API for CogView-4 and GLM-Image models.
-
-        Endpoint: POST https://api.z.ai/api/paas/v4/images/generations
-        Models: cogview-4-250304, glm-image
-        Auth: Bearer (ZAI_API_KEY / GLM_API_KEY)
-
-        Synchronous: returns a JSON object with `data[].url` for the
-        generated image. Same response shape as OpenAI /v1/images/generations.
         """
         if not api_key:
             raise GatewayError("Z.AI API key required", code="missing_api_key")
@@ -466,7 +735,7 @@ class ImageGenerationHandler:
             headers.update(extra_headers)
 
         payload: Dict[str, Any] = {
-            "model": model,
+            "model": _ZAI_MODEL_CANONICAL.get(model.lower(), model),
             "prompt": body.get("prompt", ""),
             "quality": body.get("quality", "hd"),
             "size": body.get("size", "1280x1280"),
@@ -481,7 +750,7 @@ class ImageGenerationHandler:
                 json=payload,
                 timeout=aiohttp.ClientTimeout(total=120),
             ) as resp:
-                text = await resp.text()
+                text = await _read_capped_text(resp)
                 if resp.status >= 400:
                     logger.warning(
                         "Z.AI image gen failed: %s %s", resp.status, text[:200]
@@ -495,6 +764,9 @@ class ImageGenerationHandler:
                 return json.loads(text)
 
 
-def get_image_generation_handler(config: Dict[str, Any]) -> ImageGenerationHandler:
+def get_image_generation_handler(
+    config: Dict[str, Any],
+    capability_registry: Optional[Any] = None,
+) -> ImageGenerationHandler:
     """Get or create an image generation handler instance."""
-    return ImageGenerationHandler(config)
+    return ImageGenerationHandler(config, capability_registry=capability_registry)

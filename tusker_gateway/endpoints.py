@@ -15,7 +15,7 @@ from aiohttp import web
 from tusker_gateway.cache import ResponseCache, make_cache_key
 from tusker_gateway.budget import BudgetTracker
 from tusker_gateway.circuit_breaker import CircuitBreaker, BreakerDecision
-from tusker_gateway.errors import BadRequestError, openai_error
+from tusker_gateway.errors import BadRequestError, GatewayError, openai_error
 from tusker_gateway.metrics import MetricsRegistry
 from tusker_gateway.passthrough import PassthroughClient
 from tusker_gateway.pools import PoolManager
@@ -403,6 +403,161 @@ async def _call_with_pool_fallback(
             excluded.add(selected)
 
 
+def _image_url_value(block: dict[str, Any], *, context: str) -> tuple[str, str | None]:
+    image_url = block.get("image_url")
+    detail = block.get("detail")
+    if isinstance(image_url, dict):
+        url = image_url.get("url")
+        detail = image_url.get("detail", detail)
+    else:
+        url = image_url
+    if not isinstance(url, str) or not url:
+        raise BadRequestError(
+            f"{context} must contain a non-empty image_url",
+            code="invalid_image_url",
+        )
+    if detail is not None and not isinstance(detail, str):
+        raise BadRequestError(
+            f"{context} detail must be a string",
+            code="invalid_image_url",
+        )
+    return url, detail
+
+
+def _validate_message_content(content: Any, *, role: str, context: str) -> None:
+    if isinstance(content, str):
+        return
+    if role == "tool":
+        # Tool outputs are provider-defined JSON/text payloads. Preserve the
+        # existing permissive behavior rather than treating them as media.
+        return
+    if not isinstance(content, list):
+        raise BadRequestError(
+            f"{context} content must be a string or array",
+            code="invalid_content",
+        )
+    for block_index, block in enumerate(content):
+        block_context = f"{context} content[{block_index}]"
+        if not isinstance(block, dict):
+            raise BadRequestError(
+                f"{block_context} must be an object",
+                code="invalid_content",
+            )
+        block_type = block.get("type")
+        if not isinstance(block_type, str) or not block_type:
+            raise BadRequestError(
+                f"{block_context} must contain a type",
+                code="invalid_content",
+            )
+        if block_type in {"text", "input_text"}:
+            if not isinstance(block.get("text"), str):
+                raise BadRequestError(
+                    f"{block_context} must contain a string text field",
+                    code="invalid_content",
+                )
+        elif block_type in {"image_url", "input_image"}:
+            _image_url_value(block, context=block_context)
+
+
+def _responses_content_to_chat(content: Any, *, context: str, role: str = "user") -> Any:
+    if isinstance(content, str):
+        return content
+    if role == "tool":
+        return content
+    if not isinstance(content, list):
+        raise BadRequestError(
+            f"{context} must be a string or array",
+            code="invalid_input",
+        )
+
+    converted: list[dict[str, Any]] = []
+    for block_index, block in enumerate(content):
+        block_context = f"{context}[{block_index}]"
+        if not isinstance(block, dict):
+            raise BadRequestError(
+                f"{block_context} must be an object",
+                code="invalid_input",
+            )
+        block_type = block.get("type")
+        if block_type == "input_text":
+            text = block.get("text")
+            if not isinstance(text, str):
+                raise BadRequestError(
+                    f"{block_context} must contain a string text field",
+                    code="invalid_input",
+                )
+            converted.append({"type": "text", "text": text})
+        elif block_type == "input_image":
+            url, detail = _image_url_value(block, context=block_context)
+            image_url: dict[str, Any] = {"url": url}
+            if detail is not None:
+                image_url["detail"] = detail
+            converted.append({"type": "image_url", "image_url": image_url})
+        elif block_type == "text":
+            if not isinstance(block.get("text"), str):
+                raise BadRequestError(
+                    f"{block_context} must contain a string text field",
+                    code="invalid_input",
+                )
+            converted.append(dict(block))
+        elif block_type == "image_url":
+            _image_url_value(block, context=block_context)
+            converted.append(dict(block))
+        else:
+            raise BadRequestError(
+                f"Unsupported Responses content block type: {block_type}",
+                code="unsupported_content_type",
+            )
+    return converted
+
+
+def _responses_input_to_messages(input_value: Any) -> list[dict[str, Any]]:
+    if isinstance(input_value, str):
+        return [{"role": "user", "content": input_value}]
+    if not isinstance(input_value, list) or not input_value:
+        raise BadRequestError("input must be a string or non-empty array", code="invalid_input")
+
+    if all(isinstance(item, dict) and item.get("type") in {
+        "input_text", "input_image", "text", "image_url",
+    } for item in input_value):
+        return [{
+            "role": "user",
+            "content": _responses_content_to_chat(input_value, context="input"),
+        }]
+
+    messages: list[dict[str, Any]] = []
+    for item_index, item in enumerate(input_value):
+        if not isinstance(item, dict):
+            raise BadRequestError(
+                f"input[{item_index}] must be a message object",
+                code="invalid_input",
+            )
+        if item.get("type") not in {None, "message"}:
+            raise BadRequestError(
+                f"Unsupported Responses input item type: {item.get('type')}",
+                code="unsupported_content_type",
+            )
+        role = item.get("role")
+        if role not in {"system", "developer", "user", "assistant", "tool"}:
+            raise BadRequestError(
+                f"input[{item_index}] must have a valid message role",
+                code="invalid_input",
+            )
+        if "content" not in item:
+            raise BadRequestError(
+                f"input[{item_index}] must contain content",
+                code="invalid_input",
+            )
+        message = {key: value for key, value in item.items() if key != "type"}
+        message["content"] = _responses_content_to_chat(
+            item["content"],
+            context=f"input[{item_index}].content",
+            role=role,
+        )
+        messages.append(message)
+    return messages
+
+
 def _validate_chat_body(body: Any) -> dict[str, Any]:
     if not isinstance(body, dict):
         raise BadRequestError("Request body must be a JSON object", code="invalid_request")
@@ -411,11 +566,18 @@ def _validate_chat_body(body: Any) -> dict[str, Any]:
     messages = body["messages"]
     if not isinstance(messages, list) or not messages:
         raise BadRequestError("messages must be a non-empty array", code="invalid_messages")
-    for message in messages:
-        if not isinstance(message, dict) or message.get("role") not in {"system", "user", "assistant", "tool"}:
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict) or message.get("role") not in {"system", "developer", "user", "assistant", "tool"}:
             raise BadRequestError("Each message must have a valid role", code="invalid_messages")
-        if "content" not in message and message.get("role") != "assistant":
+        role = message["role"]
+        if "content" not in message and role != "assistant":
             raise BadRequestError("Each message must contain content", code="invalid_messages")
+        if "content" in message:
+            _validate_message_content(
+                message["content"],
+                role=role,
+                context=f"messages[{index}]",
+            )
     if "stream" in body and not isinstance(body["stream"], bool):
         raise BadRequestError("stream must be a boolean", code="invalid_stream")
     return body
@@ -799,14 +961,12 @@ async def responses_handler(request: web.Request) -> web.Response | web.StreamRe
         logger.info('responses request model=%s', body.get("model") if isinstance(body, dict) else None)
         if not isinstance(body, dict):
             raise BadRequestError("Request body must be a JSON object", code="invalid_request")
-        input_value = body.get("input")
-        if isinstance(input_value, str):
-            messages = [{"role": "user", "content": input_value}]
-        elif isinstance(input_value, list):
-            messages = input_value
-        else:
-            raise BadRequestError("input must be a string or array", code="invalid_input")
-        chat_body = {"model": body.get("model"), "messages": messages, "stream": bool(body.get("stream", False))}
+        messages = _responses_input_to_messages(body.get("input"))
+        chat_body = _validate_chat_body({
+            "model": body.get("model"),
+            "messages": messages,
+            "stream": bool(body.get("stream", False)),
+        })
         config = request.app["config"]
         client = PassthroughClient(config, QualityDB(config["quality_db_path"]), request.app["http_session"])
         _, _, result = await _call_with_pool_fallback(config, chat_body, client, request=request)
@@ -836,6 +996,80 @@ def _noop_cm():
     return _NoOpCM()
 
 
+async def _media_preflight(
+    request: web.Request,
+    body: dict[str, Any],
+    *,
+    budget_units: int,
+) -> web.Response | None:
+    """Apply the shared auth-key controls before expensive media calls."""
+    api_key = _resolve_api_key(request)
+    ratelimit: RateLimiter | None = request.app.get("ratelimit")
+    if ratelimit is not None and api_key:
+        decision = ratelimit.check(api_key)
+        if not decision.allowed:
+            return web.json_response(
+                openai_error(
+                    decision.reason or "rate limit exceeded",
+                    code="rate_limit_error",
+                    error_type="rate_limit_error",
+                ),
+                status=429,
+                headers={
+                    "Retry-After": str(int(decision.retry_after) + 1),
+                    "X-Tusker-RateLimit-Reason": decision.reason
+                    or "rate limit exceeded",
+                },
+            )
+
+    budget: BudgetTracker | None = request.app.get("budget")
+    if budget is not None and api_key:
+        decision = budget.check(api_key, "media", budget_units)
+        if not decision.allowed:
+            return web.json_response(
+                openai_error(
+                    decision.reason or "budget exceeded",
+                    code="budget_exceeded",
+                    error_type="rate_limit_error",
+                ),
+                status=429,
+                headers={
+                    "X-Tusker-Budget-Reason": decision.reason or "budget exceeded"
+                },
+            )
+
+    guard_pipeline = request.app.get("guard_pipeline")
+    if guard_pipeline is not None:
+        guard_result = await guard_pipeline.run(body)
+        if not guard_result.allowed:
+            return web.json_response(
+                openai_error(
+                    guard_result.message or "request blocked by guardrail",
+                    code="guardrail_blocked",
+                    error_type="invalid_request_error",
+                ),
+                status=400,
+            )
+        if (
+            guard_result.modified_body is not None
+            and guard_result.modified_body is not body
+        ):
+            body.clear()
+            body.update(guard_result.modified_body)
+    return None
+
+
+def _record_media_budget(
+    request: web.Request,
+    *,
+    budget_units: int,
+) -> None:
+    budget: BudgetTracker | None = request.app.get("budget")
+    api_key = _resolve_api_key(request)
+    if budget is not None and api_key:
+        budget.record(api_key, "media", budget_units)
+
+
 async def images_handler(request: web.Request) -> web.Response:
     """POST /v1/images/generations, /v1/images/edits, /v1/images/variations.
 
@@ -844,6 +1078,10 @@ async def images_handler(request: web.Request) -> web.Response:
     """
     try:
         body = await request.json()
+        budget_units = 4096
+        blocked = await _media_preflight(request, body, budget_units=budget_units)
+        if blocked is not None:
+            return blocked
         model = body.get("model", "gpt-image-2")
 
         image_handler = request.app.get("image_handler")
@@ -866,10 +1104,17 @@ async def images_handler(request: web.Request) -> web.Response:
             api_key=api_key,
             codex_rotator=codex_rotator,
         )
+        _record_media_budget(request, budget_units=budget_units)
         return web.json_response(result)
 
-    except Exception as exc:
+    except GatewayError as exc:
         logger.warning("Image generation request failed: %s", exc)
+        return web.json_response(
+            openai_error(exc.message, code=exc.code, error_type=exc.error_type),
+            status=_media_error_status(exc),
+        )
+    except Exception as exc:
+        logger.exception("Unexpected image generation failure")
         return web.json_response(
             openai_error(str(exc), code="image_generation_error", error_type="provider_error"),
             status=502,
@@ -920,6 +1165,10 @@ async def video_handler(request: web.Request) -> web.Response:
     """
     try:
         body = await request.json()
+        budget_units = 32768
+        blocked = await _media_preflight(request, body, budget_units=budget_units)
+        if blocked is not None:
+            return blocked
         model = body.get("model", "sora-2")
         wait = _truthy(request.query.get("wait", "true"))
         video = request.app.get("video_handler")
@@ -938,13 +1187,40 @@ async def video_handler(request: web.Request) -> web.Response:
             api_key=api_key,
             wait=wait,
         )
+        _record_media_budget(request, budget_units=budget_units)
         return web.json_response(result)
-    except Exception as exc:
+    except GatewayError as exc:
         logger.warning("Video request failed: %s", exc)
+        return web.json_response(
+            openai_error(exc.message, code=exc.code, error_type=exc.error_type),
+            status=_media_error_status(exc),
+        )
+    except Exception as exc:
+        logger.exception("Unexpected video request failure")
         return web.json_response(
             openai_error(str(exc), code="video_error", error_type="provider_error"),
             status=502,
         )
+
+
+def _media_error_status(exc: GatewayError) -> int:
+    if exc.code in {
+        "bad_request",
+        "invalid_request",
+        "missing_prompt",
+        "unsupported_endpoint",
+        "unsupported_model",
+        "unsupported_parameter",
+        "unsupported_provider",
+    }:
+        return 400
+    if exc.code == "missing_api_key":
+        return 503
+    if exc.code == "timeout":
+        return 504
+    if exc.code == "upstream_error":
+        return 502
+    return exc.status
 
 
 def _truthy(value: str) -> bool:

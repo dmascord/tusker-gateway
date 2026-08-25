@@ -140,6 +140,12 @@ The observable quality contract is:
 `Retry-After` and recognizes semantic windows such as hourly, daily, and weekly
 limits, subject to the configured cap.
 
+Cooldown scope follows provider semantics: OpenRouter, Google Gemini, Groq, and
+Anthropic are model/model-class scoped, so a 429 from one model does not suppress
+healthy sibling models. Providers without documented model-scoped limits retain
+provider-wide cooldowns. An explicit provider-level cooldown (for example, the
+failure circuit after repeated transport errors) still blocks the whole provider.
+
 `CooldownTracker` provides fast in-memory filtering. `PersistentCooldownStore`
 adds SQLite persistence in `cooldowns.db`, records provider/model windows, and
 hydrates active cooldowns into the tracker at application startup. This avoids

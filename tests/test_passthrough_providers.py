@@ -273,6 +273,17 @@ def test_config_loads_provider_api_keys_env_vars():
     assert cfg["provider_api_keys"]["openai"] == "sk-oa-override"
     assert cfg["provider_api_keys"]["openrouter"] == "sk-or-override"
 
+def test_config_maps_manifest_provider_key_aliases():
+    env = {
+        "PROVIDER_GEMINI_API_KEY": "gemini-key",
+        "PROVIDER_ZAI_API_KEY": "zai-key",
+        "API_KEYS": "k1",
+    }
+    with patch.dict(os.environ, env, clear=False):
+        cfg = load_config()
+    assert cfg["provider_api_keys"]["google"] == "gemini-key"
+    assert cfg["provider_api_keys"]["zai"] == "zai-key"
+
 
 # ---------------------------------------------------------------------------
 # All PROVIDER_ENDPOINTS entries have required fields

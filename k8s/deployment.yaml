@@ -139,10 +139,16 @@ spec:
               optional: true
               name: tusker-env-vault
               key: OPENCODE_ZEN_API_KEY
+        - name: TUSKER_RATELIMIT_ENABLED
+          value: 'true'
         - name: TUSKER_RATELIMIT_DEFAULT_RATE
           value: '10'
         - name: TUSKER_RATELIMIT_DEFAULT_BURST
           value: '20'
+        - name: TUSKER_BUDGETS_ENABLED
+          value: 'true'
+        - name: TUSKER_GLOBAL_DAILY_TOKENS
+          value: '250000'
         ports:
         - containerPort: 8642
           name: http
