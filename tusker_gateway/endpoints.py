@@ -327,21 +327,49 @@ def _build_extra_body(body: dict[str, Any]) -> dict[str, Any]:
         extra["max_tokens"] = extra.pop("max_completion_tokens")
     return extra
 
-def _cooldown_for_exc(exc: RateLimitError) -> float | None:
-    """Derive a circuit-breaker cooldown from a rate-limit exception.
+def _cooldown_for_exc(exc: GatewayError) -> float | None:
+    """Derive a circuit-breaker cooldown from a provider error.
 
-    Returns the 429-derived backoff seconds (e.g. a long value for a
-    quota-exhausted rejection) or ``None`` when it cannot be determined,
-    so the breaker falls back to its policy cooldown.
+    Returns the backoff seconds (e.g. a long value for quota-exhaustion or a
+    permanent 401/403/404) or ``None`` when it cannot be determined / the
+    error is transient, so the breaker falls back to its policy cooldown.
     """
-    from tusker_gateway.cooldown import _cooldown_seconds_for_429
+    from tusker_gateway.cooldown import (
+        _cooldown_seconds_for_429,
+        _cooldown_seconds_for_provider_error,
+    )
 
     try:
-        return _cooldown_seconds_for_429(
-            {"body": exc.body or "", "headers": exc.headers}
-        )
+        if isinstance(exc, RateLimitError):
+            return _cooldown_seconds_for_429(
+                {"body": exc.body or "", "headers": exc.headers}
+            )
+        return _cooldown_seconds_for_provider_error(exc)
     except Exception:
         return None
+
+def _mark_permanently_failed(
+    exc: Exception,
+    provider: str,
+    model: str,
+) -> None:
+    """Record a (provider, model) that returned a permanent 401/403.
+
+    The auto-free pool extension consults this to skip/prune genuinely-dead
+    models (agentic-harness-only, WAF-blocked, wrong-tier) so they don't
+    re-enter rotation and keep failing. Transient 5xx / 429 are NOT marked.
+    """
+    status = getattr(exc, "upstream_status", None)
+    if status in (401, 403):
+        from tusker_gateway.cooldown import mark_permanently_failed
+
+        mark_permanently_failed(provider, model)
+
+def _clear_permanently_failed(provider: str, model: str) -> None:
+    """Clear a permanent-failure marker once a provider/model recovers."""
+    from tusker_gateway.cooldown import clear_permanently_failed
+
+    clear_permanently_failed(provider, model)
 
 _IMAGE_INPUT_MODALITIES = frozenset({"image"})
 
@@ -395,6 +423,7 @@ async def _call_with_pool_fallback(
             )
             if breaker is not None:
                 breaker.record_success(provider, model)
+            _clear_permanently_failed(provider, model)
             return provider, model, result
         except RateLimitError as exc:
             if breaker is not None:
@@ -404,9 +433,14 @@ async def _call_with_pool_fallback(
                     cooldown_secs=_cooldown_for_exc(exc),
                 )
             raise
-        except Exception:
+        except Exception as exc:
             if breaker is not None:
-                breaker.record_failure(provider, model)
+                breaker.record_failure(
+                    provider,
+                    model,
+                    cooldown_secs=(_cooldown_for_exc(exc) if isinstance(exc, GatewayError) else None),
+                )
+            _mark_permanently_failed(exc, provider, model)
             raise
 
     excluded: set[tuple[str, str]] = set()
@@ -450,6 +484,7 @@ async def _call_with_pool_fallback(
             )
             if breaker is not None:
                 breaker.record_success(provider, model)
+            _clear_permanently_failed(provider, model)
             return provider, model, result
         except RateLimitError as exc:
             if breaker is not None:
@@ -462,7 +497,12 @@ async def _call_with_pool_fallback(
             excluded.add(selected)
         except Exception as exc:
             if breaker is not None:
-                breaker.record_failure(provider, model)
+                breaker.record_failure(
+                    provider,
+                    model,
+                    cooldown_secs=(_cooldown_for_exc(exc) if isinstance(exc, GatewayError) else None),
+                )
+            _mark_permanently_failed(exc, provider, model)
             last_error = exc
             excluded.add(selected)
 

@@ -28,6 +28,43 @@ MODEL_SCOPED_COOLDOWN_PROVIDERS = frozenset({
     "groq",
     "anthropic",    # supported by custom provider registries
 })
+# Bodies that indicate a long-lived quota / usage-limit window (hours or
+# days), not a transient rate-limit blip. Backing off 60s for these would
+# hammer the upstream with pointless probes until the window resets.
+_QUOTA_HINTS = (
+    "quota", "quota exceeded", "usage limit", "usage_limit",
+    "capacity", "insufficient", "out of credits", "out of quota",
+    "billing", "subscription limit", "limit reached", "monthly limit",
+    "daily limit", "budget exhausted",
+)
+
+# Non-429 permanent provider failures (401 auth / 403 forbidden / 404
+# not-found). These are not transient blips; a 60s cooldown makes the
+# breaker re-probe a dead model every minute forever. Back off for a long
+# window instead so the gateway leaves permanently-unavailable models alone.
+PERMANENT_ERROR_COOLDOWN_SECS = float(
+    os.environ.get("TUSKER_RETRY_PERMANENT_COOLDOWN", "3600")
+)
+
+# (provider, model) pairs observed returning a permanent 401/403. The
+# auto-free pool skips these so genuinely-dead models (agentic-harness-only,
+# WAF-blocked, wrong-tier) don't re-enter rotation.
+PERMANENTLY_FAILED_MODELS: set[tuple[str, str]] = set()
+
+
+def mark_permanently_failed(provider: str, model: str) -> None:
+    """Record a (provider, model) that returned a permanent 401/403."""
+    PERMANENTLY_FAILED_MODELS.add((provider, model))
+
+
+def clear_permanently_failed(provider: str, model: str) -> None:
+    """Clear a permanent-failure marker once the model recovers."""
+    PERMANENTLY_FAILED_MODELS.discard((provider, model))
+
+
+def is_permanently_failed(provider: str, model: str) -> bool:
+    """Return True if this (provider, model) is known to be permanently dead."""
+    return (provider, model) in PERMANENTLY_FAILED_MODELS
 
 
 
@@ -166,12 +203,6 @@ def _cooldown_seconds_for_429(exc: dict[str, Any]) -> float:
     # for only 60s would hammer the upstream with pointless probes. Treat
     # these as a long cooldown so the gateway stops retrying until the quota
     # window plausibly resets.
-    _QUOTA_HINTS = (
-        "quota", "quota exceeded", "usage limit", "usage_limit",
-        "capacity", "insufficient", "out of credits", "out of quota",
-        "billing", "subscription limit", "limit reached", "monthly limit",
-        "daily limit", "budget exhausted",
-    )
     if any(hint in body_lower for hint in _QUOTA_HINTS):
         quota_cooldown = float(os.environ.get("TUSKER_RETRY_QUOTA_COOLDOWN", "3600"))
         logger.info(
@@ -191,6 +222,32 @@ def _cooldown_seconds_for_429(exc: dict[str, Any]) -> float:
 
     logger.info('429 cooldown: 60.0s for %s', 'unknown')
     return 60.0
+
+def _cooldown_seconds_for_provider_error(exc: Any) -> float | None:
+    """Derive a circuit-breaker cooldown for a non-429 provider error.
+
+    Returns the number of seconds to back off, or ``None`` to fall back to
+    the breaker policy cooldown. The policy default is 60s, which is correct
+    only for transient blips; a permanently-dead model (auth failure, WAF
+    block, agentic-harness-only, or a quota-gated not-found) would otherwise
+    be re-probed every 60s forever.
+
+    - 401 / 403 / 404 (and a quota/usage-limit body) → long cooldown.
+    - 5xx (transient overload) → ``None`` (let the policy cooldown apply).
+    """
+    status = getattr(exc, "upstream_status", None)
+    # Unknown status or a transient 5xx may recover; use the policy cooldown.
+    if status is None or status >= 500:
+        return None
+    body = getattr(exc, "upstream_body", None) or ""
+    body_lower = body.lower()
+    # A quota-exhausted body on a non-429 status is a long-lived daily/monthly
+    # window (e.g. OpenRouter "free-models-per-day-high-balance" surfaced as
+    # 404). Back off until it plausibly resets, not 60s.
+    if any(hint in body_lower for hint in _QUOTA_HINTS):
+        return float(os.environ.get("TUSKER_RETRY_QUOTA_COOLDOWN", "3600"))
+    # 401 auth / 403 forbidden / 404 not-found: permanent for this key/account.
+    return PERMANENT_ERROR_COOLDOWN_SECS
 
 
 # Module-level singleton shared across all request handlers

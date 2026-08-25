@@ -247,6 +247,15 @@ class PoolManager:
                     continue
 
                 for entry in entries:
+                    # Skip models that have permanently failed (401/403:
+                    # WAF-blocked, agentic-harness-only, wrong-tier). They
+                    # would otherwise be re-added and fail on every refresh.
+                    # Excluding them here also prunes previously auto-added
+                    # dead models (they leave `eligible` → `new_models`).
+                    from tusker_gateway.cooldown import is_permanently_failed
+
+                    if is_permanently_failed(entry.provider, entry.model):
+                        continue
                     if mode == "pricing" and not (
                         entry.cost_input == 0.0 and entry.cost_output == 0.0
                     ):

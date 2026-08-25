@@ -695,16 +695,21 @@ class PassthroughClient:
             return
         logger.warning('provider returned %d', resp.status)
         body = await resp.text()
-        if resp.status == 401:
-            raise ProviderError("Provider authentication failed", code="auth_error")
-        if resp.status == 403:
-            raise ProviderError("Provider access forbidden", code="forbidden")
         if resp.status == 429:
             raise RateLimitError(body=body, headers=dict(resp.headers))
-        if resp.status >= 500:
-            raise ProviderError(f"Provider returned {resp.status}: {body[:200]}", code="provider_error")
-        if resp.status != 200:
-            raise ProviderError(f"Provider returned {resp.status}: {body[:200]}", code="provider_error")
+        if resp.status == 401:
+            exc = ProviderError("Provider authentication failed", code="auth_error")
+        elif resp.status == 403:
+            exc = ProviderError("Provider access forbidden", code="forbidden")
+        elif resp.status >= 500:
+            exc = ProviderError(f"Provider returned {resp.status}: {body[:200]}", code="provider_error")
+        else:
+            exc = ProviderError(f"Provider returned {resp.status}: {body[:200]}", code="provider_error")
+        # Carry the upstream status/body so the circuit-breaker failure path
+        # can derive a sensible cooldown for permanent (401/403/404) failures.
+        exc.upstream_status = resp.status
+        exc.upstream_body = body
+        raise exc
 
     async def _stream_events(
         self,
