@@ -15,7 +15,12 @@ from aiohttp import web
 from tusker_gateway.cache import ResponseCache, make_cache_key
 from tusker_gateway.budget import BudgetTracker
 from tusker_gateway.circuit_breaker import CircuitBreaker, BreakerDecision
-from tusker_gateway.errors import BadRequestError, GatewayError, openai_error
+from tusker_gateway.errors import (
+    BadRequestError,
+    GatewayError,
+    RateLimitError,
+    openai_error,
+)
 from tusker_gateway.metrics import MetricsRegistry
 from tusker_gateway.passthrough import PassthroughClient
 from tusker_gateway.pools import PoolManager
@@ -322,6 +327,22 @@ def _build_extra_body(body: dict[str, Any]) -> dict[str, Any]:
         extra["max_tokens"] = extra.pop("max_completion_tokens")
     return extra
 
+def _cooldown_for_exc(exc: RateLimitError) -> float | None:
+    """Derive a circuit-breaker cooldown from a rate-limit exception.
+
+    Returns the 429-derived backoff seconds (e.g. a long value for a
+    quota-exhausted rejection) or ``None`` when it cannot be determined,
+    so the breaker falls back to its policy cooldown.
+    """
+    from tusker_gateway.cooldown import _cooldown_seconds_for_429
+
+    try:
+        return _cooldown_seconds_for_429(
+            {"body": exc.body or "", "headers": exc.headers}
+        )
+    except Exception:
+        return None
+
 _IMAGE_INPUT_MODALITIES = frozenset({"image"})
 
 
@@ -375,6 +396,14 @@ async def _call_with_pool_fallback(
             if breaker is not None:
                 breaker.record_success(provider, model)
             return provider, model, result
+        except RateLimitError as exc:
+            if breaker is not None:
+                breaker.record_failure(
+                    provider,
+                    model,
+                    cooldown_secs=_cooldown_for_exc(exc),
+                )
+            raise
         except Exception:
             if breaker is not None:
                 breaker.record_failure(provider, model)
@@ -422,6 +451,15 @@ async def _call_with_pool_fallback(
             if breaker is not None:
                 breaker.record_success(provider, model)
             return provider, model, result
+        except RateLimitError as exc:
+            if breaker is not None:
+                breaker.record_failure(
+                    provider,
+                    model,
+                    cooldown_secs=_cooldown_for_exc(exc),
+                )
+            last_error = exc
+            excluded.add(selected)
         except Exception as exc:
             if breaker is not None:
                 breaker.record_failure(provider, model)

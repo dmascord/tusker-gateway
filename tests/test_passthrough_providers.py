@@ -273,6 +273,25 @@ def test_config_loads_provider_api_keys_env_vars():
     assert cfg["provider_api_keys"]["openai"] == "sk-oa-override"
     assert cfg["provider_api_keys"]["openrouter"] == "sk-or-override"
 
+def test_config_normalizes_hyphenated_provider_keys():
+    """PROVIDER_*_API_KEY vars for hyphenated providers must map to the
+    hyphenated provider name (not an underscore-keyed garbage entry)."""
+    env = {
+        "PROVIDER_GITHUB_COPILOT_API_KEY": "gho-public",
+        "PROVIDER_GITHUB_COPILOT_ENTERPRISE_API_KEY": "gho-enterprise",
+        "API_KEYS": "k1",
+    }
+    with patch.dict(os.environ, env, clear=False):
+        cfg = load_config()
+    pk = cfg["provider_api_keys"]
+    # The enterprise key must land on the hyphenated provider name so
+    # _wire_catalog_api_keys can find it; the public key stays separate.
+    assert pk["github-copilot"] == "gho-public"
+    assert pk["github-copilot-enterprise"] == "gho-enterprise"
+    # No stray underscore-keyed copies pollute the map.
+    assert "github_copilot" not in pk
+    assert "github_copilot_enterprise" not in pk
+
 def test_config_maps_manifest_provider_key_aliases():
     env = {
         "PROVIDER_GEMINI_API_KEY": "gemini-key",

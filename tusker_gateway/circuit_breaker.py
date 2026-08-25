@@ -130,11 +130,20 @@ class CircuitBreaker:
                     window_total INTEGER NOT NULL DEFAULT 0,
                     window_started_at REAL NOT NULL DEFAULT 0,
                     opened_at REAL,
+                    cooldown_secs REAL,
                     half_open_probe_inflight INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (provider, model)
                 )
                 """
             )
+            # Idempotent migration for pre-existing DBs created before the
+            # per-row cooldown override column existed.
+            cur = conn.execute("PRAGMA table_info(breakers)")
+            cols = {r[1] for r in cur.fetchall()}
+            if "cooldown_secs" not in cols:
+                conn.execute(
+                    "ALTER TABLE breakers ADD COLUMN cooldown_secs REAL"
+                )
             conn.commit()
 
     def _policy_for(self, provider: str) -> BreakerPolicy:
@@ -156,7 +165,12 @@ class CircuitBreaker:
             return BreakerDecision(allowed=True, state=BreakerState.CLOSED)
 
         if state == BreakerState.OPEN:
-            cooldown = self._policy_for(provider).cooldown_secs
+            policy = self._policy_for(provider)
+            cooldown = (
+                row.get("cooldown_secs")
+                if row and row.get("cooldown_secs")
+                else policy.cooldown_secs
+            )
             if opened_at is None or (now - opened_at) >= cooldown:
                 # Transition to HALF_OPEN; allow the caller to probe.
                 self._update(provider, model,
@@ -230,7 +244,9 @@ class CircuitBreaker:
             window_started_at=new_window["window_started_at"],
         )
 
-    def record_failure(self, provider: str, model: str) -> None:
+    def record_failure(
+        self, provider: str, model: str, *, cooldown_secs: float | None = None
+    ) -> None:
         if not self._config.enabled:
             return
         row = self._read(provider, model)
@@ -252,6 +268,7 @@ class CircuitBreaker:
                     state=BreakerState.OPEN.value,
                     opened_at=time.time(),
                     half_open_probe_inflight=0,
+                    **({"cooldown_secs": cooldown_secs} if cooldown_secs else {}),
                 )
                 return
             # CLOSED: bump counters, check trip conditions.
@@ -280,6 +297,7 @@ class CircuitBreaker:
                 window_total=new_window["window_total"],
                 window_started_at=new_window["window_started_at"],
                 **({"opened_at": time.time()} if should_trip else {}),
+                **({"cooldown_secs": cooldown_secs} if cooldown_secs else {}),
             )
         elif should_trip:
             self._update(
@@ -290,6 +308,7 @@ class CircuitBreaker:
                 window_total=new_window["window_total"],
                 window_started_at=new_window["window_started_at"],
                 opened_at=time.time(),
+                **({"cooldown_secs": cooldown_secs} if cooldown_secs else {}),
             )
         else:
             self._update(

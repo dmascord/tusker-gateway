@@ -104,7 +104,7 @@ def load_config() -> dict[str, Any]:
             pass
     for key, value in os.environ.items():
         if key.startswith("PROVIDER_") and key.endswith("_API_KEY") and value:
-            provider = key[len("PROVIDER_") : -len("_API_KEY")].lower()
+            provider = key[len("PROVIDER_") : -len("_API_KEY")].lower().replace("_", "-")
             raw_providers[provider] = value
     # Provider-prefixed aliases used by the deployment manifests.
     if "google" not in raw_providers and raw_providers.get("gemini"):
@@ -131,7 +131,7 @@ def load_config() -> dict[str, Any]:
         "opencode-go": ["OPENCODE_GO_API_KEY"],
         "opencode-zen": ["OPENCODE_ZEN_API_KEY"],
         "github-copilot": ["GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN"],
-        "github-copilot-enterprise": ["GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN"],
+        "github-copilot-enterprise": ["GITHUB_COPILOT_ENTERPRISE_TOKEN"],
 
     }
     for provider, alias_keys in _ENV_KEY_ALIASES.items():
@@ -145,7 +145,7 @@ def load_config() -> dict[str, Any]:
     config["provider_api_keys"] = raw_providers
     for key, value in os.environ.items():
         if key.startswith("PROVIDER_") and key.endswith("_API_KEY") and value:
-            provider = key[len("PROVIDER_") : -len("_API_KEY")].lower()
+            provider = key[len("PROVIDER_") : -len("_API_KEY")].lower().replace("_", "-")
             raw_providers[provider] = value
     config["provider_api_keys"] = raw_providers
 

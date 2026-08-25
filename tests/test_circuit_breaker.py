@@ -162,3 +162,35 @@ def test_load_config_from_env_overrides():
     assert cfg.policy.window_size == 30
     assert cfg.policy.failure_ratio == 0.7
     assert cfg.policy.cooldown_secs == 120
+
+
+def test_quota_failure_uses_long_cooldown_override(tmp_breaker_path):
+    """A 429 that signals quota exhaustion must back off far longer than the
+    60s default so the gateway stops probing an exhausti provider."""
+    cb = CircuitBreaker(_cfg(tmp_breaker_path, consecutive_failures=2, cooldown_secs=60))
+    cb.record_failure("p", "m", cooldown_secs=3600.0)
+    cb.record_failure("p", "m", cooldown_secs=3600.0)
+    d = cb.check("p", "m")
+    assert not d.allowed
+    assert "circuit open" in d.reason
+    # The remaining time must reflect the 3600s override, not the 60s policy.
+    import re as _re
+    remaining = float(_re.search(r"(\d+)s remaining", d.reason).group(1))
+    assert remaining > 3000, f"expected long cooldown, got {remaining}s"
+
+
+def test_quota_exhaustion_429_returns_long_cooldown():
+    """_cooldown_seconds_for_429 must treat quota-exhaustion as a long-lived
+    backoff rather than the 60s transient rate-limit default."""
+    from unittest.mock import patch
+
+    from tusker_gateway.cooldown import _cooldown_seconds_for_429
+
+    with patch.dict(os.environ, {}, clear=True):
+        assert _cooldown_seconds_for_429(
+            {"body": "quota exceeded", "headers": {}}
+        ) == 3600.0
+    # A plain rate limit still uses the short default.
+    assert _cooldown_seconds_for_429(
+        {"body": "rate limit", "headers": {}}
+    ) == 60.0

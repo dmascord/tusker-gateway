@@ -5,6 +5,7 @@ sent to a provider that is in a retry-throttling state.
 """
 from __future__ import annotations
 
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -159,6 +160,24 @@ def _cooldown_seconds_for_429(exc: dict[str, Any]) -> float:
         if unit.startswith("hour"): return n * 3600.0
         if unit.startswith("day"): return n * 86400.0
         if unit.startswith("week"): return n * 7 * 86400.0
+
+    # Quota / usage-limit exhaustion is a long-lived state (the window won't
+    # reset for hours or days), not a transient rate-limit blip. Backing off
+    # for only 60s would hammer the upstream with pointless probes. Treat
+    # these as a long cooldown so the gateway stops retrying until the quota
+    # window plausibly resets.
+    _QUOTA_HINTS = (
+        "quota", "quota exceeded", "usage limit", "usage_limit",
+        "capacity", "insufficient", "out of credits", "out of quota",
+        "billing", "subscription limit", "limit reached", "monthly limit",
+        "daily limit", "budget exhausted",
+    )
+    if any(hint in body_lower for hint in _QUOTA_HINTS):
+        quota_cooldown = float(os.environ.get("TUSKER_RETRY_QUOTA_COOLDOWN", "3600"))
+        logger.info(
+            "429 cooldown: %.0fs for quota-exhausted provider", quota_cooldown
+        )
+        return quota_cooldown
 
     # Generic heuristic fallbacks
     if "week" in body_lower: return 7 * 86400.0
