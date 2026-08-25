@@ -88,13 +88,11 @@ def test_load_config_overrides():
         "TUSKER_OTLP_SERVICE_NAME": "my-service",
         "TUSKER_OTLP_BATCH": "50",
         "TUSKER_OTLP_FLUSH_SECS": "10",
-        "TUSKER_OTLP_STDOUT": "true",
     })
     assert cfg.endpoint == "http://collector:4318"
     assert cfg.service_name == "my-service"
     assert cfg.batch_size == 50
     assert cfg.flush_interval_secs == 10
-    assert cfg.stdout_export is True
 
 
 def test_load_config_with_headers():
@@ -115,7 +113,7 @@ def test_load_config_handles_bad_headers_json():
 
 def test_otlp_body_structure():
     """Verify the export body matches the OTLP/HTTP-JSON spec for resourceSpans."""
-    cfg = TracerConfig(endpoint="http://collector:4318", stdout_export=False)
+    cfg = TracerConfig(endpoint="http://collector:4318")
     t = Tracer(cfg)
     # Capture a span
     with t.span("test", attributes={"k": "v"}) as _:

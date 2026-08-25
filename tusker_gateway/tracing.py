@@ -116,8 +116,6 @@ class TracerConfig:
     headers: dict[str, str] = field(default_factory=dict)
     flush_interval_secs: float = 5.0
     batch_size: int = 100
-    # If True, export also writes to stdout — useful for debugging.
-    stdout_export: bool = False
 
 
 class Tracer:
@@ -255,8 +253,6 @@ class Tracer:
                         logger.warning("OTLP export failed: %s %s", resp.status, await resp.text()[:500])
         except Exception as exc:
             logger.warning("OTLP export error: %s", exc)
-        if self._config.stdout_export:
-            print("[OTLP]", json.dumps(body, indent=2)[:2000])
 
 
 # -- Current-span tracking (process-local) --------------------------------
@@ -298,7 +294,6 @@ def load_tracer_config_from_env(env: dict[str, str] | None = None) -> TracerConf
         headers=headers,
         flush_interval_secs=float(env.get("TUSKER_OTLP_FLUSH_SECS", "5")),
         batch_size=int(env.get("TUSKER_OTLP_BATCH", "100")),
-        stdout_export=env.get("TUSKER_OTLP_STDOUT", "false").lower() in ("1", "true", "yes"),
     )
 
 
