@@ -201,6 +201,7 @@ async def test_video_provider_selection():
     h = VideoHandler({})
     assert h.get_provider_for_video_request("sora-2") == "openai"
     assert h.get_provider_for_video_request("openai/sora-2-pro") == "openrouter"
+    assert h.get_provider_for_video_request("MiniMax-H3") == "minimax"
 
 
 @pytest.mark.asyncio
@@ -546,3 +547,185 @@ async def test_video_zai_poll_fail_status_raises():
     assert ei.value.code == "upstream_error"
     assert "FAIL" in str(ei.value) or "bad prompt" in str(ei.value)
 
+
+
+@pytest.mark.asyncio
+async def test_video_minimax_pin_dispatches_and_no_wait_normalises_create():
+    h = VideoHandler({})
+    assert h.get_provider_for_video_request("minimax::MiniMax-H3") == "minimax"
+
+    session = _FakeSession().add(
+        _FakeResp(200, json.dumps({"task_id": "task-h3-1"}).encode())
+    )
+    captured: dict = {}
+    real_post = session.post
+
+    def post(url, headers=None, json=None, **kwargs):
+        captured.update(url=url, headers=headers, body=json, kwargs=kwargs)
+        return real_post(url, headers=headers, json=json, **kwargs)
+
+    session.post = post
+    with patch("aiohttp.ClientSession", lambda *a, **kw: session):
+        result = await h.handle_request(
+            model="minimax::MiniMax-H3",
+            body={
+                "prompt": "A wave curls over a lighthouse",
+                "seconds": "8",
+                "resolution": "768P",
+                "ratio": "16:9",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "https://assets.test/start.png"},
+                        "role": "reference_image",
+                    }
+                ],
+            },
+            api_key="minimax-key",
+            wait=False,
+        )
+
+    assert captured["url"] == "https://api.minimax.io/v2/video_generation"
+    assert captured["headers"]["Authorization"] == "Bearer minimax-key"
+    assert captured["kwargs"]["allow_redirects"] is False
+    assert captured["body"] == {
+        "model": "MiniMax-H3",
+        "content": [
+            {"type": "text", "text": "A wave curls over a lighthouse"},
+            {
+                "type": "image_url",
+                "image_url": {"url": "https://assets.test/start.png"},
+                "role": "reference_image",
+            },
+        ],
+        "duration": 8,
+        "resolution": "768P",
+        "ratio": "16:9",
+    }
+    assert result == {
+        "id": "task-h3-1",
+        "task_id": "task-h3-1",
+        "model": "MiniMax-H3",
+        "provider": "minimax",
+        "status": "queued",
+        "task": {"task_id": "task-h3-1"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_video_minimax_polls_and_returns_completed_url_without_download():
+    h = VideoHandler({})
+    session = (
+        _FakeSession()
+        .add(_FakeResp(200, json.dumps({"task_id": "task-h3-2"}).encode()))
+        .add(
+            _FakeResp(
+                200,
+                json.dumps({"task": {"id": "task-h3-2", "status": "running"}}).encode(),
+            )
+        )
+        .add(
+            _FakeResp(
+                200,
+                json.dumps(
+                    {
+                        "task": {
+                            "id": "task-h3-2",
+                            "status": "succeeded",
+                            "content": {"url": "https://cdn.minimax.io/h3/output.mp4"},
+                        }
+                    }
+                ).encode(),
+            )
+        )
+    )
+    calls = []
+    real_get = session.get
+
+    def get(url, headers=None, **kwargs):
+        calls.append((url, headers, kwargs))
+        return real_get(url, headers=headers, **kwargs)
+
+    session.get = get
+    with patch("aiohttp.ClientSession", lambda *a, **kw: session):
+        result = await h._call_minimax(
+            model="minimax::MiniMax-H3",
+            body={"prompt": "Clouds racing", "duration": 6, "resolution": "2K"},
+            api_key="minimax-key",
+            extra_headers=None,
+            wait=True,
+            poll_interval=0.001,
+            max_wait=5.0,
+        )
+
+    assert [call[0] for call in calls] == [
+        "https://api.minimax.io/v2/query/video_generation/task-h3-2",
+        "https://api.minimax.io/v2/query/video_generation/task-h3-2",
+    ]
+    assert all(call[1]["Authorization"] == "Bearer minimax-key" for call in calls)
+    assert result["status"] == "completed"
+    assert result["url"] == "https://cdn.minimax.io/h3/output.mp4"
+    assert result["video"] == {"url": "https://cdn.minimax.io/h3/output.mp4"}
+    assert "b64_json" not in result
+    assert session._responses == []
+
+
+@pytest.mark.asyncio
+async def test_video_minimax_requires_api_key():
+    h = VideoHandler({})
+    with pytest.raises(GatewayError) as ei:
+        await h._call_minimax(
+            model="minimax::MiniMax-H3",
+            body={"prompt": "Clouds racing"},
+            api_key=None,
+            extra_headers=None,
+            wait=False,
+        )
+    assert ei.value.code == "missing_api_key"
+    assert "MiniMax" in str(ei.value)
+
+
+@pytest.mark.asyncio
+async def test_video_minimax_create_upstream_failure_is_not_masked():
+    h = VideoHandler({})
+    session = _FakeSession().add(
+        _FakeResp(
+            400,
+            b'{"base_resp":{"status_code":1008,"status_msg":"PAYG required"}}',
+        )
+    )
+    with patch("aiohttp.ClientSession", lambda *a, **kw: session):
+        with pytest.raises(GatewayError) as ei:
+            await h._call_minimax(
+                model="minimax::MiniMax-H3",
+                body={"prompt": "Clouds racing"},
+                api_key="token-plan-key",
+                extra_headers=None,
+                wait=False,
+            )
+    assert ei.value.code == "upstream_error"
+    assert "400" in str(ei.value)
+    assert "PAYG required" in str(ei.value)
+
+
+@pytest.mark.asyncio
+async def test_video_minimax_poll_upstream_failure_is_not_masked():
+    h = VideoHandler({})
+    session = (
+        _FakeSession()
+        .add(_FakeResp(200, json.dumps({"task_id": "task-h3-3"}).encode()))
+        .add(_FakeResp(401, b'{"error":"unauthorized"}'))
+    )
+    with patch("aiohttp.ClientSession", lambda *a, **kw: session):
+        with pytest.raises(GatewayError) as ei:
+            await h._call_minimax(
+                model="minimax::MiniMax-H3",
+                body={"prompt": "Clouds racing"},
+                api_key="bad-key",
+                extra_headers=None,
+                wait=True,
+                poll_interval=0.001,
+                max_wait=5.0,
+            )
+    assert ei.value.code == "upstream_error"
+    assert "poll 401" in str(ei.value)

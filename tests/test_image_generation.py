@@ -181,6 +181,255 @@ async def test_zai_call_zai_posts_to_paas_endpoint():
     assert captured["body"]["size"] == "1024x1024"
     assert result["data"][0]["url"] == "https://up.test/img.png"
 
+
+def test_get_provider_for_image_request_minimax_pin():
+    h = ImageGenerationHandler({})
+    assert (
+        h.get_provider_for_image_request(
+            "minimax::image-01", "/v1/images/generations"
+        )
+        == "minimax"
+    )
+
+
+@pytest.mark.asyncio
+async def test_minimax_posts_supported_fields_and_normalizes_urls():
+    captured: dict = {}
+
+    class FakeResponse:
+        status = 200
+        headers = {}
+
+        async def read(self):
+            return json.dumps(
+                {
+                    "id": "01",
+                    "data": {"image_urls": ["http://signed.example/image.png"]},
+                    "metadata": {"success_count": 1, "failed_count": 0},
+                    "base_resp": {"status_code": 0, "status_msg": "success"},
+                }
+            ).encode()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class FakeSession:
+        def post(self, url, headers=None, json=None, timeout=None):
+            captured["url"] = url
+            captured["headers"] = headers
+            captured["body"] = json
+            return FakeResponse()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    h = ImageGenerationHandler({})
+    with patch(
+        "tusker_gateway.providers.image_generation.aiohttp.ClientSession",
+        return_value=FakeSession(),
+    ):
+        result = await h.handle_request(
+            model="minimax::image-01",
+            path="/v1/images/generations",
+            body={
+                "model": "minimax::image-01",
+                "prompt": "A red panda",
+                "aspect_ratio": "16:9",
+                "n": 1,
+                "prompt_optimizer": True,
+                "user": "must-not-forward",
+            },
+            api_key="minimax-key",
+        )
+
+    assert captured["url"] == "https://api.minimax.io/v1/image_generation"
+    assert captured["headers"]["Authorization"] == "Bearer minimax-key"
+    assert captured["body"] == {
+        "model": "image-01",
+        "prompt": "A red panda",
+        "aspect_ratio": "16:9",
+        "n": 1,
+        "prompt_optimizer": True,
+    }
+    assert result["data"] == [{"url": "http://signed.example/image.png"}]
+    assert isinstance(result["created"], int)
+
+
+@pytest.mark.asyncio
+async def test_minimax_normalizes_base64_images():
+    class FakeResponse:
+        status = 200
+        headers = {}
+
+        async def read(self):
+            return b'{"data":{"image_base64":["BASE64PNG"]},"base_resp":{"status_code":0}}'
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class FakeSession:
+        def post(self, *args, **kwargs):
+            assert kwargs["json"]["response_format"] == "base64"
+            return FakeResponse()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    h = ImageGenerationHandler({})
+    with patch(
+        "tusker_gateway.providers.image_generation.aiohttp.ClientSession",
+        return_value=FakeSession(),
+    ):
+        result = await h.handle_request(
+            model="minimax::image-01",
+            path="/v1/images/generations",
+            body={"prompt": "A red panda", "response_format": "base64"},
+            api_key="minimax-key",
+        )
+
+    assert result["data"] == [{"b64_json": "BASE64PNG"}]
+
+
+@pytest.mark.asyncio
+async def test_minimax_rejects_missing_key_and_unsupported_edit():
+    h = ImageGenerationHandler({})
+    with pytest.raises(GatewayError) as missing_key:
+        await h.handle_request(
+            model="minimax::image-01",
+            path="/v1/images/generations",
+            body={"prompt": "A red panda"},
+            api_key=None,
+        )
+    assert missing_key.value.code == "missing_api_key"
+
+    for path in ("/v1/images/edits", "/v1/images/variations"):
+        with pytest.raises(GatewayError) as unsupported_endpoint:
+            await h.handle_request(
+                model="minimax::image-01",
+                path=path,
+                body={"prompt": "Change the background"},
+                api_key="minimax-key",
+            )
+        assert unsupported_endpoint.value.code == "unsupported_endpoint"
+
+
+@pytest.mark.asyncio
+async def test_minimax_surfaces_http_and_embedded_upstream_errors():
+    class FakeResponse:
+        headers = {}
+
+        def __init__(self, status, payload):
+            self.status = status
+            self.payload = payload
+
+        async def read(self):
+            return self.payload
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class FakeSession:
+        def __init__(self, response):
+            self.response = response
+
+        def post(self, *args, **kwargs):
+            return self.response
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    h = ImageGenerationHandler({})
+    responses = (
+        (FakeResponse(401, b'{"error":"unauthorized"}'), "401"),
+        (
+            FakeResponse(
+                200,
+                b'{"base_resp":{"status_code":2049,"status_msg":"invalid API key"}}',
+            ),
+            "2049",
+        ),
+    )
+    for response, expected in responses:
+        with patch(
+            "tusker_gateway.providers.image_generation.aiohttp.ClientSession",
+            return_value=FakeSession(response),
+        ):
+            with pytest.raises(GatewayError) as excinfo:
+                await h.handle_request(
+                    model="minimax::image-01",
+                    path="/v1/images/generations",
+                    body={"prompt": "A red panda"},
+                    api_key="bad-key",
+                )
+        assert excinfo.value.code == "upstream_error"
+        assert expected in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_minimax_rejects_more_than_gateway_image_limit():
+    class FakeResponse:
+        status = 200
+        headers = {}
+
+        async def read(self):
+            return json.dumps(
+                {
+                    "data": {"image_urls": [f"https://example.test/{i}.png" for i in range(5)]},
+                    "base_resp": {"status_code": 0},
+                }
+            ).encode()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class FakeSession:
+        def post(self, *args, **kwargs):
+            return FakeResponse()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    h = ImageGenerationHandler({})
+    with patch(
+        "tusker_gateway.providers.image_generation.aiohttp.ClientSession",
+        return_value=FakeSession(),
+    ):
+        with pytest.raises(GatewayError) as excinfo:
+            await h.handle_request(
+                model="minimax::image-01",
+                path="/v1/images/generations",
+                body={"prompt": "A red panda", "n": 5},
+                api_key="minimax-key",
+            )
+
+    assert excinfo.value.code == "upstream_error"
+    assert "too many images" in str(excinfo.value)
+
+
 @pytest.mark.asyncio
 async def test_openai_falls_back_to_codex_when_no_api_key():
     h = ImageGenerationHandler(_make_config())

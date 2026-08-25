@@ -1,10 +1,10 @@
 """Video generation provider support for Tusker AI Gateway.
 
-Supports OpenAI Sora, OpenRouter video models, Google Veo, and Z.AI video
-generation. These upstream APIs are asynchronous: create returns a job or
-operation which is polled until completion. OpenAI/OpenRouter/Google content is
-downloaded only from fixed credential origins; Z.AI returns its signed result
-URL without making the gateway fetch a provider-controlled host.
+Supports OpenAI Sora, OpenRouter video models, Google Veo, MiniMax H3, and
+Z.AI video generation. These upstream APIs are asynchronous: create returns a
+job or operation which is polled until completion. OpenAI/OpenRouter/Google
+content is downloaded only from fixed credential origins; MiniMax and Z.AI
+return signed result URLs without making the gateway fetch another host.
 """
 
 import asyncio
@@ -66,7 +66,7 @@ def _is_origin(url: str, origin: str) -> bool:
         and parts.password is None
     )
 
-VIDEO_PROVIDER_PINS = frozenset({"openai", "openrouter", "google", "zai"})
+VIDEO_PROVIDER_PINS = frozenset({"openai", "openrouter", "google", "minimax", "zai"})
 
 class VideoHandler:
     """Dispatch video generation requests to supported upstream providers."""
@@ -113,6 +113,8 @@ class VideoHandler:
         model_lower = model.lower()
         if model_lower.startswith("veo-"):
             return "google"
+        if model_lower.startswith("minimax-h3"):
+            return "minimax"
         # Z.ai's own video models (CogVideoX, Vidu). Slugs are unambiguous.
         if model_lower.startswith(("cogvideox-", "vidu", "viduq1")):
             return "zai"
@@ -137,6 +139,11 @@ class VideoHandler:
         self._require_prompt(body)
         if provider == "google":
             return await self._call_google(
+                model, body, api_key, extra_headers,
+                wait, poll_interval, max_wait,
+            )
+        if provider == "minimax":
+            return await self._call_minimax(
                 model, body, api_key, extra_headers,
                 wait, poll_interval, max_wait,
             )
@@ -635,6 +642,311 @@ class VideoHandler:
                 f"Google Veo operation {operation_name} failed: {error}",
                 code="upstream_error",
             )
+
+    # ----- MiniMax H3 -----
+
+    async def _call_minimax(
+        self,
+        model: str,
+        body: Dict[str, Any],
+        api_key: Optional[str],
+        extra_headers: Optional[Dict[str, str]],
+        wait: bool = True,
+        poll_interval: float = DEFAULT_POLL_INTERVAL,
+        max_wait: float = DEFAULT_MAX_WAIT,
+    ) -> Dict[str, Any]:
+        """Create a MiniMax H3 task and optionally poll it to completion."""
+        if not api_key:
+            raise GatewayError(
+                "MiniMax API key required for video", code="missing_api_key"
+            )
+
+        upstream_model = self._strip_provider_prefix(model)
+        payload = self._minimax_payload(upstream_model, body)
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        if extra_headers:
+            headers.update(
+                key_value
+                for key_value in extra_headers.items()
+                if key_value[0].lower() not in {
+                    "authorization", "content-length", "content-type", "host"
+                }
+            )
+
+        timeout = aiohttp.ClientTimeout(total=max_wait + 60)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                "https://api.minimax.io/v2/video_generation",
+                headers=headers,
+                json=payload,
+                allow_redirects=False,
+            ) as resp:
+                if resp.status >= 400:
+                    err_text = (await resp.text())[:500]
+                    logger.warning(
+                        "MiniMax video create failed: %s %s", resp.status, err_text
+                    )
+                    raise GatewayError(
+                        f"MiniMax video error {resp.status}: {err_text}",
+                        code="upstream_error",
+                    )
+                response = await resp.json()
+            self._raise_minimax_response_error("create", response)
+            task = response.get("task")
+            task_id = response.get("task_id")
+            if not task_id and isinstance(task, dict):
+                task_id = task.get("id") or task.get("task_id")
+            if not isinstance(task_id, str) or not task_id:
+                raise GatewayError(
+                    f"MiniMax video response missing task_id: {response}",
+                    code="upstream_error",
+                )
+
+            job = self._minimax_job(upstream_model, task_id, response)
+            if not wait:
+                return job
+            if job["status"] != "completed":
+                response = await self._poll_minimax(
+                    session, task_id, api_key, poll_interval, max_wait
+                )
+                job = self._minimax_job(upstream_model, task_id, response)
+            return self._finalise_minimax(job)
+
+    @classmethod
+    def _minimax_payload(
+        cls, model: str, body: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        content: list[Dict[str, Any]] = [
+            {"type": "text", "text": cls._require_prompt(body)}
+        ]
+        references = body.get("content")
+        if references is not None:
+            if not isinstance(references, list):
+                raise GatewayError(
+                    "MiniMax video content must be an array",
+                    code="unsupported_parameter",
+                )
+            for reference in references:
+                content.append(cls._minimax_reference(reference))
+
+        input_reference = body.get("input_reference")
+        if input_reference is not None:
+            if isinstance(input_reference, str):
+                input_reference = {"url": input_reference}
+            if not isinstance(input_reference, dict):
+                raise GatewayError(
+                    "MiniMax input_reference must contain a URL",
+                    code="unsupported_parameter",
+                )
+            image_value = input_reference.get("image_url", input_reference.get("url"))
+            if isinstance(image_value, str):
+                image_value = {"url": image_value}
+            content.append(
+                cls._minimax_reference({
+                    "type": "image_url",
+                    "image_url": image_value,
+                    "role": input_reference.get("role", "first_frame"),
+                })
+            )
+
+        duration = body.get("duration", body.get("seconds", 6))
+        if isinstance(duration, str) and duration.isdigit():
+            duration = int(duration)
+        if not isinstance(duration, int) or isinstance(duration, bool) or not 4 <= duration <= 15:
+            raise GatewayError(
+                "MiniMax video duration must be an integer from 4 to 15",
+                code="unsupported_parameter",
+            )
+
+        resolution = body.get("resolution")
+        if resolution is None:
+            resolution = "2K" if str(body.get("size", "")).startswith("2") else "768P"
+        if resolution not in {"768P", "2K"}:
+            raise GatewayError(
+                "MiniMax video resolution must be '768P' or '2K'",
+                code="unsupported_parameter",
+            )
+
+        payload: Dict[str, Any] = {
+            "model": model,
+            "content": content,
+            "duration": duration,
+            "resolution": resolution,
+        }
+        ratio = body.get("ratio") or cls._minimax_ratio_from_size(body.get("size"))
+        has_frame_reference = any(
+            item.get("type") == "image_url"
+            and item.get("role") in {"first_frame", "last_frame"}
+            for item in content
+        )
+        if ratio is not None and not has_frame_reference:
+            payload["ratio"] = ratio
+        elif ratio is None and not has_frame_reference:
+            payload["ratio"] = "16:9"
+        return payload
+
+    @staticmethod
+    def _minimax_reference(reference: Any) -> Dict[str, Any]:
+        if not isinstance(reference, dict):
+            raise GatewayError(
+                "MiniMax video references must be objects",
+                code="unsupported_parameter",
+            )
+        reference_type = reference.get("type")
+        field_by_type = {
+            "image_url": "image_url",
+            "video_url": "video_url",
+            "audio_url": "audio_url",
+        }
+        field = field_by_type.get(reference_type)
+        if field is None:
+            raise GatewayError(
+                f"MiniMax video content type '{reference_type}' is not supported",
+                code="unsupported_parameter",
+            )
+        value = reference.get(field)
+        if isinstance(value, str):
+            value = {"url": value}
+        if not isinstance(value, dict) or not isinstance(value.get("url"), str) or not value["url"]:
+            raise GatewayError(
+                f"MiniMax {reference_type} must contain a URL",
+                code="unsupported_parameter",
+            )
+        block: Dict[str, Any] = {"type": reference_type, field: {"url": value["url"]}}
+        role = reference.get("role")
+        allowed_roles = {
+            "image_url": {"first_frame", "last_frame", "reference_image"},
+            "video_url": {"reference_video"},
+            "audio_url": {"reference_audio"},
+        }
+        if role not in allowed_roles[reference_type]:
+            raise GatewayError(
+                f"MiniMax {reference_type} has an unsupported role",
+                code="unsupported_parameter",
+            )
+        block["role"] = role
+        return block
+
+    @staticmethod
+    def _minimax_ratio_from_size(size: Any) -> Optional[str]:
+        if not isinstance(size, str) or "x" not in size:
+            return None
+        width_text, _, height_text = size.lower().partition("x")
+        try:
+            width, height = int(width_text), int(height_text)
+        except ValueError:
+            return None
+        ratios = {
+            (16, 9): "16:9", (9, 16): "9:16", (4, 3): "4:3",
+            (3, 4): "3:4", (1, 1): "1:1",
+        }
+        from math import gcd
+        divisor = gcd(width, height)
+        return ratios.get((width // divisor, height // divisor)) if divisor else None
+
+    async def _poll_minimax(
+        self,
+        session: aiohttp.ClientSession,
+        task_id: str,
+        api_key: str,
+        poll_interval: float,
+        max_wait: float,
+    ) -> Dict[str, Any]:
+        url = f"https://api.minimax.io/v2/query/video_generation/{task_id}"
+        headers = {"Authorization": f"Bearer {api_key}", "Accept": "application/json"}
+        deadline = asyncio.get_event_loop().time() + max_wait
+        backoff = poll_interval
+        while True:
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                raise GatewayError(
+                    f"MiniMax video task {task_id} did not finish within {max_wait}s",
+                    code="timeout",
+                )
+            async with session.get(url, headers=headers, allow_redirects=False) as resp:
+                if resp.status >= 400:
+                    err_text = (await resp.text())[:300]
+                    raise GatewayError(
+                        f"MiniMax video poll {resp.status}: {err_text}",
+                        code="upstream_error",
+                    )
+                response = await resp.json()
+            self._raise_minimax_response_error(f"task {task_id}", response)
+            task = response.get("task")
+            status = str(task.get("status", "") if isinstance(task, dict) else "").lower()
+            if status in {"success", "succeeded", "completed"}:
+                return response
+            if status in {"fail", "failed", "failure", "cancelled", "canceled"}:
+                error = task.get("error") if isinstance(task, dict) else response
+                raise GatewayError(
+                    f"MiniMax video task {task_id} failed: {error or response}",
+                    code="upstream_error",
+                )
+            await asyncio.sleep(min(backoff, remaining))
+            backoff = min(backoff * 1.5, 30.0)
+
+    @staticmethod
+    def _raise_minimax_response_error(context: str, response: Dict[str, Any]) -> None:
+        base_resp = response.get("base_resp")
+        if isinstance(base_resp, dict) and base_resp.get("status_code") not in (None, 0, "0"):
+            raise GatewayError(
+                f"MiniMax video {context} failed: {base_resp.get('status_msg') or base_resp}",
+                code="upstream_error",
+            )
+
+    @staticmethod
+    def _minimax_job(model: str, task_id: str, response: Dict[str, Any]) -> Dict[str, Any]:
+        task = response.get("task")
+        task = task if isinstance(task, dict) else {}
+        upstream_status = str(task.get("status") or response.get("status") or "queued")
+        status = "completed" if upstream_status.lower() in {
+            "success", "succeeded", "completed"
+        } else "processing" if upstream_status.lower() not in {"queued", "created"} else "queued"
+        return {
+            "id": str(task.get("id") or task.get("task_id") or task_id),
+            "task_id": task_id,
+            "model": model,
+            "provider": "minimax",
+            "status": status,
+            "task": task or response,
+        }
+
+    @staticmethod
+    def _finalise_minimax(job: Dict[str, Any]) -> Dict[str, Any]:
+        """Expose the signed HTTPS result URL without fetching it server-side."""
+        task = job.get("task")
+        content = task.get("content") if isinstance(task, dict) else None
+        url = content.get("url") if isinstance(content, dict) else None
+        if url is None:
+            return job
+        if not isinstance(url, str):
+            raise GatewayError(
+                "MiniMax returned an invalid video URL", code="upstream_error"
+            )
+        try:
+            parts = urlsplit(url)
+            port = parts.port
+        except ValueError:
+            raise GatewayError(
+                "MiniMax returned an invalid video URL", code="upstream_error"
+            )
+        if (
+            parts.scheme != "https"
+            or not parts.hostname
+            or port not in (None, 443)
+            or parts.username is not None
+            or parts.password is not None
+        ):
+            raise GatewayError(
+                "MiniMax returned an unsafe video URL", code="upstream_error"
+            )
+        job["video"] = {"url": url}
+        job["url"] = url
+        return job
 
     # ----- Z.ai (CogVideoX, Vidu) -----
 

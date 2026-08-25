@@ -85,6 +85,7 @@ IMAGE_GEN_MODELS = {
     # Listed for catalog discovery only.
     "cogview-4-250304": {"cost_per_image": 0.0, "context_window": 1024},
     "glm-image": {"cost_per_image": 0.0, "context_window": 1024},
+    "image-01": {"cost_per_image": 0.0, "context_window": 1500},
 }
 
 # Map common OpenAI image model names to the slugs the Codex backend accepts.
@@ -225,7 +226,7 @@ class ImageGenerationHandler:
             )
         if pin_provider in {"codex", "openai-codex"}:
             return "openai"
-        if pin_provider in {"openai", "openrouter", "google", "zai"}:
+        if pin_provider in {"openai", "openrouter", "google", "zai", "minimax"}:
             return pin_provider
         if pin_provider is not None:
             raise GatewayError(
@@ -244,6 +245,8 @@ class ImageGenerationHandler:
             )
         if any(tag in model_lower for tag in ("cogview-", "glm-image")):
             return "zai"
+        if model_lower == "image-01":
+            return "minimax"
         return "openai"
     async def handle_request(
         self,
@@ -275,6 +278,8 @@ class ImageGenerationHandler:
             return await self._call_openrouter(model, path, body, api_key, extra_headers)
         if provider == "zai":
             return await self._call_zai(model, path, body, api_key, extra_headers)
+        if provider == "minimax":
+            return await self._call_minimax(model, path, body, api_key, extra_headers)
         raise GatewayError(
             f"Provider {provider} does not support image generation",
             code="unsupported_model",
@@ -762,6 +767,158 @@ class ImageGenerationHandler:
                 if not text:
                     return {"status": "ok"}
                 return json.loads(text)
+
+
+    @staticmethod
+    def _strip_minimax_prefix(model: str) -> str:
+        """Strip an explicit MiniMax gateway pin from the upstream model id."""
+        if model.lower().startswith("minimax::"):
+            return model[len("minimax::") :]
+        if model.lower().startswith("minimax/"):
+            return model[len("minimax/") :]
+        return model
+
+    async def _call_minimax(
+        self,
+        model: str,
+        path: str,
+        body: Dict[str, Any],
+        api_key: Optional[str],
+        extra_headers: Optional[Dict[str, str]],
+    ) -> Dict[str, Any]:
+        """Call MiniMax image-01 and normalize its result as OpenAI image data."""
+        if path in {"/v1/images/edits", "/v1/images/variations"}:
+            raise GatewayError(
+                "MiniMax image edits and variations are not supported",
+                code="unsupported_endpoint",
+            )
+        if not api_key:
+            raise GatewayError("MiniMax API key required", code="missing_api_key")
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        if extra_headers:
+            headers.update(extra_headers)
+
+        payload: Dict[str, Any] = {
+            "model": self._strip_minimax_prefix(model),
+            "prompt": body["prompt"],
+        }
+        aspect_ratio = body.get("aspect_ratio")
+        if aspect_ratio in {
+            "1:1", "16:9", "4:3", "3:2", "2:3", "3:4", "9:16", "21:9"
+        }:
+            payload["aspect_ratio"] = aspect_ratio
+        width = body.get("width")
+        height = body.get("height")
+        if (
+            isinstance(width, int)
+            and not isinstance(width, bool)
+            and isinstance(height, int)
+            and not isinstance(height, bool)
+        ):
+            payload["width"] = width
+            payload["height"] = height
+        response_format = body.get("response_format")
+        if response_format in {"url", "base64"}:
+            payload["response_format"] = response_format
+        seed = body.get("seed")
+        if isinstance(seed, int) and not isinstance(seed, bool):
+            payload["seed"] = seed
+        n = body.get("n")
+        if isinstance(n, int) and not isinstance(n, bool):
+            payload["n"] = n
+        prompt_optimizer = body.get("prompt_optimizer")
+        if isinstance(prompt_optimizer, bool):
+            payload["prompt_optimizer"] = prompt_optimizer
+
+        url = "https://api.minimax.io/v1/image_generation"
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=120),
+            ) as resp:
+                text = await _read_capped_text(resp)
+                if resp.status >= 400:
+                    logger.warning(
+                        "MiniMax image generation failed: %s %s", resp.status, text[:200]
+                    )
+                    raise GatewayError(
+                        f"MiniMax error {resp.status}: {text[:200]}",
+                        code="upstream_error",
+                    )
+                if not text:
+                    raise GatewayError(
+                        "MiniMax image generation returned an empty response",
+                        code="upstream_error",
+                    )
+                try:
+                    response = json.loads(text)
+                except json.JSONDecodeError as exc:
+                    raise GatewayError(
+                        "MiniMax image generation returned invalid JSON",
+                        code="upstream_error",
+                    ) from exc
+
+        if not isinstance(response, dict):
+            raise GatewayError(
+                "MiniMax image generation returned an invalid response",
+                code="upstream_error",
+            )
+        base_resp = response.get("base_resp")
+        if isinstance(base_resp, dict) and base_resp.get("status_code") not in (None, 0):
+            status_code = base_resp.get("status_code")
+            status_msg = base_resp.get("status_msg", "unknown error")
+            raise GatewayError(
+                f"MiniMax error {status_code}: {status_msg}",
+                code="upstream_error",
+            )
+
+        upstream_data = response.get("data")
+        if not isinstance(upstream_data, dict):
+            upstream_data = {}
+        images: list[Dict[str, str]] = []
+        image_urls = upstream_data.get("image_urls")
+        if isinstance(image_urls, list):
+            for value in image_urls:
+                if isinstance(value, str) and value:
+                    if len(value.encode("utf-8")) > MAX_IMAGE_RESPONSE_BYTES:
+                        raise GatewayError(
+                            "MiniMax image generation returned an oversized image result",
+                            code="upstream_error",
+                        )
+                    if len(images) >= MAX_IMAGE_RESULTS:
+                        raise GatewayError(
+                            "MiniMax image generation returned too many images",
+                            code="upstream_error",
+                        )
+                    images.append({"url": value})
+        image_base64 = upstream_data.get("image_base64")
+        if isinstance(image_base64, list):
+            for value in image_base64:
+                if isinstance(value, str) and value:
+                    if len(value.encode("utf-8")) > MAX_IMAGE_RESPONSE_BYTES:
+                        raise GatewayError(
+                            "MiniMax image generation returned an oversized image result",
+                            code="upstream_error",
+                        )
+                    if len(images) >= MAX_IMAGE_RESULTS:
+                        raise GatewayError(
+                            "MiniMax image generation returned too many images",
+                            code="upstream_error",
+                        )
+                    images.append({"b64_json": value})
+        if not images:
+            raise GatewayError(
+                "MiniMax image generation returned no images",
+                code="upstream_error",
+            )
+        return {"created": int(time.time()), "data": images}
 
 
 def get_image_generation_handler(
