@@ -26,7 +26,7 @@ echo "IMAGE: ${IMAGE}"
 # --- Build ---
 echo "--- Build ---"
 cd "${SRC_DIR}"
-COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)
+COMMIT=${TUSKER_COMMIT:-$(git rev-parse --short HEAD 2>/dev/null || echo unknown)}
 echo "COMMIT: ${COMMIT}"
 buildah bud --build-arg "TUSKER_COMMIT=${COMMIT}" -f Dockerfile -t "${IMAGE}" .
 buildah push "${IMAGE}"
