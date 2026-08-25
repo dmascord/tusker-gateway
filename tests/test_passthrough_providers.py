@@ -453,6 +453,7 @@ async def test_chat_codex_advances_rotator_on_4xx():
 
     with pytest.raises(Exception):
         await client._chat_codex(
+            provider="openai-codex",
             model="gpt-5.4",
             messages=[{"role": "user", "content": "ok"}],
             stream=False,
@@ -494,6 +495,7 @@ async def test_chat_codex_advances_rotator_on_rate_limit():
 
     with pytest.raises(RateLimitError):
         await client._chat_codex(
+            provider="openai-codex",
             model="gpt-5.4",
             messages=[{"role": "user", "content": "ok"}],
             stream=False,
@@ -534,6 +536,7 @@ async def test_chat_codex_folds_reasoning_effort_into_reasoning_object():
 
     with pytest.raises(Exception):
         await client._chat_codex(
+            provider="openai-codex",
             model="gpt-5.4-mini",
             messages=[{"role": "user", "content": "ok"}],
             stream=False,
@@ -581,6 +584,7 @@ async def test_chat_codex_drops_max_tokens_params():
 
     with pytest.raises(Exception):
         await client._chat_codex(
+            provider="openai-codex",
             model="gpt-5.4-mini",
             messages=[{"role": "user", "content": "ok"}],
             stream=False,
