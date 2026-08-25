@@ -475,33 +475,62 @@ async def _discover_google(
     return out
 
 
+# Xiaomi MiMo TTS
 # ---------------------------------------------------------------------------
-# Xiaomi Mimo (no TTS / image / video support per their docs)
-# ---------------------------------------------------------------------------
 
 
-async def _discover_xiaomi(api_key: str | None, session: aiohttp.ClientSession) -> list[CapabilityEntry]:
-    """Confirm Xiaomi has no TTS / image / video surface.
-
-    Acts as a fast-fail so the gateway can route around it cheaply; returns
-    an empty list because the provider is chat-only.
-    """
+async def _discover_xiaomi(
+    api_key: str | None,
+    session: aiohttp.ClientSession,
+) -> list[CapabilityEntry]:
+    """Discover entitled Xiaomi TTS models from the regional model catalog."""
     if not api_key:
         return []
-    base = "https://token-plan-sgp.xiaomimimo.com"
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    paths = ["/v1/audio/speech", "/v1/images/generations", "/v1/videos"]
-    out: list[CapabilityEntry] = []
-    for path in paths:
-        try:
-            async with session.post(base + path, headers=headers, json={}, timeout=aiohttp.ClientTimeout(total=10)) as r:
-                if r.status != 404:
-                    # Unexpected — register nothing and log so a future
-                    # capability expansion can pick this up.
-                    logger.info("xiaomi %s returned unexpected status %s", path, r.status)
-        except Exception as exc:
-            logger.debug("xiaomi capability probe %s failed: %s", path, exc)
-    return out
+    url = "https://token-plan-sgp.xiaomimimo.com/v1/models"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "User-Agent": "tusker-gateway/capabilities",
+    }
+    try:
+        async with session.get(
+            url,
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as response:
+            if response.status != 200:
+                body = (await response.read())[:200].decode("utf-8", "replace")
+                logger.warning(
+                    "xiaomi capability catalog: http %s body=%s",
+                    response.status,
+                    body,
+                )
+                return []
+            data = await response.json()
+    except Exception as exc:
+        logger.warning("xiaomi capability catalog failed: %s", exc)
+        return []
+
+    entries: list[CapabilityEntry] = []
+    seen: set[str] = set()
+    for raw_model in (data or {}).get("data", []):
+        if not isinstance(raw_model, dict):
+            continue
+        model = raw_model.get("id")
+        if (
+            not isinstance(model, str)
+            or not model.lower().startswith("mimo-v2.5-tts")
+            or model in seen
+        ):
+            continue
+        seen.add(model)
+        entries.append(
+            CapabilityEntry(
+                provider="xiaomi",
+                model=model,
+                capability=Capability.TTS_SPEECH,
+            )
+        )
+    return entries
 
 
 # ---------------------------------------------------------------------------

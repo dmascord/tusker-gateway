@@ -16,6 +16,7 @@ from tusker_gateway.providers.capabilities import (
     Capability,
     CapabilityEntry,
     CapabilitiesRegistry,
+    _discover_xiaomi,
     capabilities_refresh_loop,
     discover_openrouter,
     normalise_model_for_lookup,
@@ -231,6 +232,52 @@ async def test_discover_openrouter_swallows_http_error():
     session.route("GET", "openrouter.ai", lambda *_: (503, b"down", {}))
     entries = await discover_openrouter(session, "sk-test")
     assert entries == []
+
+
+# ---------- Xiaomi TTS ----------
+
+
+@pytest.mark.asyncio
+async def test_discover_xiaomi_registers_catalog_tts_models():
+    session = _FakeSession()
+    catalog = {
+        "data": [
+            {"id": "mimo-v2.5"},
+            {"id": "mimo-v2.5-asr"},
+            {"id": "mimo-v2.5-tts"},
+            {"id": "mimo-v2.5-tts-voicedesign"},
+            {"id": "mimo-v2.5-tts-voiceclone"},
+            {"id": "mimo-v2.5-tts-future"},
+        ]
+    }
+    session.route(
+        "GET",
+        "token-plan-sgp.xiaomimimo.com/v1/models",
+        lambda *_: (200, json.dumps(catalog).encode(), {}),
+    )
+
+    entries = await _discover_xiaomi("tp-test", session)
+
+    assert {entry.model for entry in entries} == {
+        "mimo-v2.5-tts",
+        "mimo-v2.5-tts-voicedesign",
+        "mimo-v2.5-tts-voiceclone",
+        "mimo-v2.5-tts-future",
+    }
+    assert all(entry.provider == "xiaomi" for entry in entries)
+    assert all(entry.capability == Capability.TTS_SPEECH for entry in entries)
+
+
+@pytest.mark.asyncio
+async def test_discover_xiaomi_rejects_catalog_without_tts_models():
+    session = _FakeSession()
+    session.route(
+        "GET",
+        "token-plan-sgp.xiaomimimo.com/v1/models",
+        lambda *_: (200, b'{"data":[{"id":"mimo-v2.5"}]}', {}),
+    )
+
+    assert await _discover_xiaomi("tp-test", session) == []
 
 
 # ---------- Lookup / normalisation ----------

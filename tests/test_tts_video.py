@@ -1,4 +1,5 @@
 """Tests for TTS and video generation handlers."""
+import base64
 import json
 from typing import Optional
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -102,6 +103,14 @@ async def test_tts_dispatches_openrouter_for_slash_model():
 
 
 @pytest.mark.asyncio
+async def test_tts_dispatches_xiaomi_models_and_pin():
+    h = TTSHandler({})
+    assert h.get_provider_for_tts_request("mimo-v2.5-tts") == "xiaomi"
+    assert h.get_provider_for_tts_request("mimo-v2.5-tts-voicedesign") == "xiaomi"
+    assert h.get_provider_for_tts_request("xiaomi::mimo-v2.5-tts") == "xiaomi"
+
+
+@pytest.mark.asyncio
 async def test_tts_openai_returns_audio_bytes():
     h = TTSHandler({})
     audio = _mp3_bytes()
@@ -180,6 +189,101 @@ async def test_tts_openrouter_path():
         )
     assert out_bytes == audio
 
+
+
+@pytest.mark.asyncio
+async def test_tts_xiaomi_translates_chat_request_and_decodes_audio():
+    h = TTSHandler({})
+    audio = b"RIFF" + b"\x00" * 64
+    upstream = {
+        "choices": [{"message": {"audio": {"data": base64.b64encode(audio).decode()}}}]
+    }
+    session = _FakeSession().add(
+        _FakeResp(status=200, body=json.dumps(upstream).encode())
+    )
+    calls = []
+    real_post = session.post
+
+    def post(url, headers=None, json=None, **kwargs):
+        calls.append((url, headers, json))
+        return real_post(url, headers=headers, json=json, **kwargs)
+
+    session.post = post
+    with patch("aiohttp.ClientSession", lambda *a, **kw: session):
+        out_bytes, content_type = await h._call_xiaomi(
+            model="xiaomi::mimo-v2.5-tts",
+            body={
+                "input": "Hello from Tusker.",
+                "voice": "Mia",
+                "response_format": "wav",
+                "instructions": "Speak clearly.",
+            },
+            api_key="tp-test",
+            extra_headers=None,
+        )
+
+    assert out_bytes == audio
+    assert content_type == "audio/wav"
+    assert calls == [(
+        "https://token-plan-sgp.xiaomimimo.com/v1/chat/completions",
+        {"Authorization": "Bearer tp-test", "Content-Type": "application/json"},
+        {
+            "model": "mimo-v2.5-tts",
+            "messages": [
+                {"role": "user", "content": "Speak clearly."},
+                {"role": "assistant", "content": "Hello from Tusker."},
+            ],
+            "audio": {"format": "wav", "voice": "Mia"},
+            "stream": False,
+        },
+    )]
+
+
+def test_tts_xiaomi_voice_design_uses_instructions_without_voice():
+    payload, fmt = TTSHandler._normalise_xiaomi_request(
+        "mimo-v2.5-tts-voicedesign",
+        {
+            "input": "Designed speech.",
+            "instructions": "A warm, confident young voice.",
+            "voice": "ignored",
+            "response_format": "mp3",
+        },
+    )
+
+    assert fmt == "mp3"
+    assert payload["messages"] == [
+        {"role": "user", "content": "A warm, confident young voice."},
+        {"role": "assistant", "content": "Designed speech."},
+    ]
+    assert payload["audio"] == {"format": "mp3"}
+
+
+def test_tts_xiaomi_voice_clone_rejects_non_audio_voice():
+    with pytest.raises(GatewayError) as exc_info:
+        TTSHandler._normalise_xiaomi_request(
+            "mimo-v2.5-tts-voiceclone",
+            {"input": "Cloned speech.", "voice": "Mia"},
+        )
+
+    assert "data URI" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_tts_xiaomi_rejects_missing_audio_response():
+    h = TTSHandler({})
+    session = _FakeSession().add(
+        _FakeResp(status=200, body=b'{"choices":[{"message":{}}]}')
+    )
+    with patch("aiohttp.ClientSession", lambda *a, **kw: session):
+        with pytest.raises(GatewayError) as exc_info:
+            await h._call_xiaomi(
+                model="mimo-v2.5-tts",
+                body={"input": "Hello"},
+                api_key="tp-test",
+                extra_headers=None,
+            )
+
+    assert "invalid audio response" in str(exc_info.value)
 
 # ---------- Video ----------
 
