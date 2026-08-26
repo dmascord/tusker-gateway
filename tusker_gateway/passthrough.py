@@ -295,6 +295,7 @@ class PassthroughClient:
         extra_body: dict[str, Any] | None = None,
         upstream_gateway: str | None = None,
         rtk_compress: bool = True,
+        metrics_registry: Any | None = None,
     ) -> dict[str, Any] | AsyncIterator[bytes]:
         """Make a passthrough chat completions call to the provider."""
         logger.info('passthrough %s/%s stream=%s', provider, model, stream)
@@ -305,7 +306,7 @@ class PassthroughClient:
         if rtk_compress and messages:
             from tusker_gateway.rtk import compress_tool_results, is_enabled as rtk_enabled
             if rtk_enabled():
-                messages = compress_tool_results(messages)
+                messages = compress_tool_results(messages, metrics=metrics_registry)
 
         # Resolve the endpoint up front so the dispatch can decide between
         # the standard chat-completions passthrough and the openai-codex

@@ -773,6 +773,7 @@ async def _call_with_pool_fallback(
     tools: list[dict[str, Any]] | None = None,
     breaker: CircuitBreaker | None = None,
     request: web.Request | None = None,
+    metrics_registry: Any | None = None,
 ) -> tuple[str, str, Any]:
     """Call a pool candidate, trying the next candidate after provider failure.
 
@@ -797,6 +798,7 @@ async def _call_with_pool_fallback(
                 stream=bool(body.get("stream")),
                 tools=tools,
                 extra_body=extra_body or None,
+                metrics_registry=metrics_registry,
             )
             if breaker is not None:
                 breaker.record_success(provider, model)
@@ -858,6 +860,7 @@ async def _call_with_pool_fallback(
                 stream=bool(body.get("stream")),
                 tools=tools,
                 extra_body=extra_body or None,
+                metrics_registry=metrics_registry,
             )
             if breaker is not None:
                 breaker.record_success(provider, model)
@@ -1285,7 +1288,11 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                         headers=headers,
                     )
 
-            provider, target_model, result = await _call_with_pool_fallback(config, body, client, tools, breaker=breaker, request=request)
+            provider, target_model, result = await _call_with_pool_fallback(
+                config, body, client, tools,
+                breaker=breaker, request=request,
+                metrics_registry=request.app.get("metrics"),
+            )
             logger.debug('selected rid=%s provider=%s model=%s pool=%s', request_id, provider, target_model, pool_name)
 
             if budget is not None and api_key and isinstance(result, dict):
@@ -1453,7 +1460,10 @@ async def responses_handler(request: web.Request) -> web.Response | web.StreamRe
         })
         config = request.app["config"]
         client = PassthroughClient(config, QualityDB(config["quality_db_path"]), request.app["http_session"], catalog_registry=request.app.get("catalog_registry"))
-        _, _, result = await _call_with_pool_fallback(config, chat_body, client, request=request)
+        _, _, result = await _call_with_pool_fallback(
+            config, chat_body, client, request=request,
+            metrics_registry=request.app.get("metrics"),
+        )
         if isinstance(result, dict) and "choices" in result:
             text = result.get("choices", [{}])[0].get("message", {}).get("content", "")
         else:

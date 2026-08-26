@@ -20,8 +20,12 @@ Metric catalogue:
     tusker_budget_blocks_total{kind}                          counter
     tusker_budget_records_total                                counter
     tusker_budget_refunds_total                                counter
+    tusker_guardrail_blocks_total{kind}                        counter
     tusker_pool_candidates{pool,state}                         gauge
     tusker_cooldowns_active{provider,model}                    gauge
+    tusker_rtk_blocks_total{filter,outcome}                   counter
+    tusker_rtk_bytes_saved_total                               counter
+    tusker_rtk_calls_total{outcome}                           counter
 
 We deliberately scope labels to keep cardinality bounded:
     - `pool` is one of {code, privacy, premium, swarm, passthrough}
@@ -253,6 +257,39 @@ class MetricsRegistry:
             "Requests blocked by guardrail checks",
             ("kind",),
         )
+        # RTK (token-saver) observability.
+        #
+        # tusker_rtk_blocks_total{filter,outcome}
+        #   filter  = the RTK filter that fired (git-diff, cargo-test, ...)
+        #   outcome = "compressed" | "no_savings" | "skipped_short"
+        #             | "skipped_too_large" | "no_match"
+        #   Lets us see which filters actually pay off in production and
+        #   how often a candidate was rejected by the savings threshold.
+        #   Bounded cardinality: 8 filters × 5 outcomes = 40 series.
+        self.rtk_blocks = Counter(
+            "tusker_rtk_blocks_total",
+            "RTK compress_text invocations by filter and outcome",
+            ("filter", "outcome"),
+        )
+        # tusker_rtk_bytes_saved_total
+        #   Sum of (input_bytes - output_bytes) across all compress_text
+        #   calls that actually produced savings. Plot as a rate to see
+        #   real-world savings over time.
+        self.rtk_bytes_saved = Counter(
+            "tusker_rtk_bytes_saved_total",
+            "Total input bytes removed by RTK compression",
+        )
+        # tusker_rtk_calls_total{outcome}
+        #   outcome = "compressed" | "no_match" | "skipped_short"
+        #             | "skipped_too_large"
+        #   Coarse-grained: one counter per content block. Useful for
+        #   answer-ratio dashboards ("of 1k tool outputs, how many were
+        #   actually compressed?").
+        self.rtk_calls = Counter(
+            "tusker_rtk_calls_total",
+            "RTK compress_text invocations by high-level outcome",
+            ("outcome",),
+        )
         self.pool_candidates = Gauge(
             "tusker_pool_candidates",
             "Current number of candidates per pool, partitioned by validity",
@@ -292,6 +329,7 @@ class MetricsRegistry:
             self.cache_hits, self.cache_misses, self.cache_writes, self.cache_evictions,
             self.budget_blocks, self.budget_records, self.budget_refunds, self.guardrail_blocks,
             self.pool_candidates, self.cooldowns_active,
+            self.rtk_blocks, self.rtk_bytes_saved, self.rtk_calls,
         ):
             for line in m.render():
                 parts.append(line)

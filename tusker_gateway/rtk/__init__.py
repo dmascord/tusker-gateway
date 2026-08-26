@@ -418,38 +418,84 @@ _MAX_BLOCK_BYTES = 64 * 1024
 _MIN_SAVINGS_RATIO = 0.10
 
 
-def compress_text(text: str) -> str:
+def compress_text(
+    text: str,
+    *,
+    metrics: Any | None = None,
+) -> str:
     """Apply the best-matching filter to ``text`` and return the result.
 
     Returns the input unchanged if it's already short or if no filter
     produces meaningful savings (≥10% reduction).
+
+    If ``metrics`` is a :class:`tusker_gateway.metrics.MetricsRegistry`,
+    records per-call counters: ``rtk_blocks_total{filter,outcome}``,
+    ``rtk_bytes_saved_total``, ``rtk_calls_total{outcome}``. Filter name
+    in the counter label is the **winning** filter (or ``"none"`` if no
+    specific filter matched and we fell back to dedup / no-op).
     """
-    if not text or len(text) < 200:
+    # Pre-flight checks with metric-side counters so we can see why
+    # compression didn't happen.
+    if not text:
+        if metrics is not None:
+            metrics.rtk_calls.inc({"outcome": "empty"})
+        return text
+    if len(text) < 200:
+        if metrics is not None:
+            metrics.rtk_calls.inc({"outcome": "skipped_short"})
         return text
     if len(text) > _MAX_BLOCK_BYTES:
+        if metrics is not None:
+            metrics.rtk_calls.inc({"outcome": "skipped_too_large"})
         return text
 
     original_len = len(text)
     best = text
-    for _, _matches, apply in _FILTERS:
+    best_filter: str | None = None
+    any_match = False
+    for name, _matches, apply in _FILTERS:
         if not _matches(text):
             continue
+        any_match = True
         candidate = apply(text)
         if len(candidate) < len(best):
             best = candidate
+            best_filter = name
         # If we already beat the savings threshold, stop early.
         if len(best) < original_len * (1 - _MIN_SAVINGS_RATIO):
             break
 
-    return best if len(best) < original_len else text
+    if best is text:
+        # No filter produced savings.
+        outcome = "no_savings" if any_match else "no_match"
+        if metrics is not None:
+            metrics.rtk_blocks.inc({"filter": best_filter or "no_match", "outcome": outcome})
+            metrics.rtk_calls.inc({"outcome": outcome})
+        return text
+
+    if metrics is not None:
+        saved = original_len - len(best)
+        metrics.rtk_blocks.inc(
+            {"filter": best_filter or "unknown", "outcome": "compressed"},
+        )
+        metrics.rtk_bytes_saved.inc(amount=saved)
+        metrics.rtk_calls.inc({"outcome": "compressed"})
+    return best
 
 
-def compress_tool_results(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def compress_tool_results(
+    messages: list[dict[str, Any]],
+    *,
+    metrics: Any | None = None,
+) -> list[dict[str, Any]]:
     """Compress long ``tool_result`` content blocks in an OpenAI messages list.
 
     Operates on a copy (the input list is not mutated) and only touches
     messages whose role is ``tool`` with string content. Any exception
     is logged at debug level and the original messages are returned.
+
+    If ``metrics`` is provided, each ``compress_text`` call records into
+    the RTK metrics counters.
     """
     if not _ENABLED or not messages:
         return messages
@@ -461,9 +507,11 @@ def compress_tool_results(messages: list[dict[str, Any]]) -> list[dict[str, Any]
                 continue
             content = msg.get("content")
             if not isinstance(content, str):
+                if metrics is not None:
+                    metrics.rtk_calls.inc({"outcome": "non_string_content"})
                 out.append(msg)
                 continue
-            compressed = compress_text(content)
+            compressed = compress_text(content, metrics=metrics)
             if compressed is content:
                 out.append(msg)
             else:
