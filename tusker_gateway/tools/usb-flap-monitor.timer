@@ -1,0 +1,14 @@
+[Unit]
+Description=Run USB-flap monitor every minute on visor
+# Only run on the visor node (this script is visor's local monitoring).
+# Visor is the only node with a USB Samsung T5 SSD attached.
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=60s
+# AccuracySec controls how often the timer fires after drift.
+AccuracySec=10s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

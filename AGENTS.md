@@ -18,6 +18,7 @@ Read in order when picking up the repo:
 | `docs/cleanup-2026-08-19.md` | Earlier cleanup pass — context for current code shape. |
 | `docs/migrations/2026-08-21-codex-migration/` | Codex OAuth endpoint move + token-rotation tooling. |
 | `docs/zero-downtime-deploys.md` | Why `strategy: Recreate` and the planned RWX migration. |
+| `docs/incidents/2026-08-26-usb-ssd-flap.md` | USB-SSD flap postmortem + storage migration notes. |
 
 Topic-specific:
 
@@ -52,7 +53,15 @@ always fine.
 
 `pytest tests/ -p no:cacheprovider` — skip
 `tests/test_passthrough_providers.py` for offline runs (hits live upstreams).
-~358 passed + 2 skipped.
+~481 passed + 2 skipped.
+
+## visor USB-flap monitor
+
+A systemd timer on visor (`usb-flap-monitor.timer`) runs every minute and
+calls `tusker_gateway/tools/usb-flap-monitor.sh`. On a USB disconnect/reconnect
+cycle the script writes an `ALERT usb-flap-detected ...` line to the journal;
+forward that to your alerting channel. Defined here so future operators don't
+move critical state onto the visor USB T5 again.
 
 ## Memory
 

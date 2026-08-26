@@ -15,7 +15,13 @@ set -euo pipefail
 NAMESPACE=hermes
 DEPLOY=tusker-gateway
 REGISTRY=registry.tusker.net.au:5000
-SRC_DIR=/srv/opencode/tusker-ai-gateway
+# Use the provided SRC_DIR if the default doesn't exist, otherwise default
+if [ -d "/srv/opencode/tusker-ai-gateway" ]; then
+    SRC_DIR=/srv/opencode/tusker-ai-gateway
+else
+    # Fallback to current directory (useful for local testing)
+    SRC_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+fi
 TAG=${1:-$(date +%Y%m%d%H%M%S)}
 IMAGE="${REGISTRY}/tusker-gateway:swarm-alpine-${TAG}"
 

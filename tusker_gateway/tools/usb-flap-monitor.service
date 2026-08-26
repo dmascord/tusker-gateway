@@ -1,0 +1,12 @@
+[Unit]
+Description=Monitor visor USB bus for Samsung T5 SSD flap events
+# Run on a timer; this unit only exists to be triggered.
+After=systemd-journald.service
+
+[Service]
+Type=oneshot
+# -q suppresses kernel-rate-limit noise; +e ensures we don't fail the unit
+# if dmesg returns warnings. The script is fail-soft by design.
+ExecStart=/usr/local/bin/usb-flap-monitor.sh
+StandardOutput=journal
+StandardError=journal
