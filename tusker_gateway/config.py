@@ -233,8 +233,8 @@ DEFAULT_PROVIDER_REGISTRY: dict[str, ProviderConfig] = {
     "github-copilot": ProviderConfig("github-copilot", "oauth", "https://api.githubcopilot.com", "/chat/completions", pool_env="CODEX_CREDENTIALS", auth_type="oauth", model_header="x-github-gpt-model"),
     "github-copilot-enterprise": ProviderConfig("github-copilot-enterprise", "oauth", "https://copilot-api.sita.ghe.com", "/chat/completions", pool_env="CODEX_CREDENTIALS", auth_type="oauth", model_header="x-github-gpt-model"),
     "local-llm": ProviderConfig("local-llm", "local", "http://localhost:11434", "/v1/chat/completions"),
+    "nvidia": ProviderConfig("nvidia", "bearer", "https://integrate.api.nvidia.com", "/v1/chat/completions", auth_env="NVIDIA_API_KEY"),
 }
-
 
 def _provider_registry_from_env() -> dict[str, ProviderConfig]:
     registry = dict(DEFAULT_PROVIDER_REGISTRY)

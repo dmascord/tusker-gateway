@@ -133,6 +133,12 @@ spec:
               optional: true
               name: tusker-env-vault
               key: OLLAMA_API_KEY
+        - name: PROVIDER_NVIDIA_API_KEY
+          valueFrom:
+            secretKeyRef:
+              optional: true
+              name: tusker-env-vault
+              key: NVIDIA_API_KEY
         - name: PROVIDER_OPENCODE_GO_API_KEY
           valueFrom:
             secretKeyRef:
