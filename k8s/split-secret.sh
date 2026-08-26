@@ -39,6 +39,10 @@ KEYS=(
     "OPENCODE_ZEN_API_KEY"
     "XIAOMI_API_KEY"
     "ZAI_API_KEY"
+    # Hugging Face — used by sentence-transformers/all-MiniLM-L6-v2 to
+    # silence the unauthenticated-Hub warning + lift rate limits.
+    # Sourced from the repo .env (HF_TOKEN preferred, HF_API_KEY fallback).
+    "HF_TOKEN"
     # Gateway's own bearer tokens (clients call Tusker with these).
     "API_KEYS"
 )
@@ -47,19 +51,39 @@ DRY_RUN=0
 if [[ "${1:-}" == "--dry-run" ]]; then
     DRY_RUN=1
 fi
-
 # Resolve the value for a single key. API_KEYS lives as a literal in
-# k8s/deployment.yaml; everything else is in hermes-env-vault.
+# k8s/deployment.yaml; everything else is in hermes-env-vault, with a
+# fallback to the repo .env file for keys not (yet) seeded there
+# (e.g. HF_TOKEN ↔ .env's HF_API_KEY).
 resolve_value() {
     local k="$1"
+    local primary=""
     if [[ "$k" == "API_KEYS" ]]; then
-        kubectl -n "$NAMESPACE" get deploy tusker-gateway \
+        primary=$(kubectl -n "$NAMESPACE" get deploy tusker-gateway \
             -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="API_KEYS")].value}' \
-            2>/dev/null || true
+            2>/dev/null || true)
     else
-        kubectl -n "$NAMESPACE" get secret "$SOURCE_SECRET" \
+        primary=$(kubectl -n "$NAMESPACE" get secret "$SOURCE_SECRET" \
             -o jsonpath="{.data.$k}" 2>/dev/null \
-            | base64 -d 2>/dev/null || true
+            | base64 -d 2>/dev/null || true)
+    fi
+    if [[ -n "$primary" ]]; then
+        echo "$primary"
+        return
+    fi
+    # Fallback to repo .env when the source secret lacks the key.
+    local env_file="${REPO_ROOT:-$(dirname "$(dirname "$(readlink -f "$0")")")}/.env"
+    if [[ -f "$env_file" ]]; then
+        # Try exact key first, then the common HF_TOKEN ↔ HF_API_KEY alias.
+        local line
+        line=$(grep -E "^${k}=" "$env_file" 2>/dev/null | head -1 \
+            || true)
+        if [[ -z "$line" && "$k" == "HF_TOKEN" ]]; then
+            line=$(grep -E "^HF_API_KEY=" "$env_file" 2>/dev/null | head -1 || true)
+        fi
+        if [[ -n "$line" ]]; then
+            echo "${line#*=}"
+        fi
     fi
 }
 

@@ -145,6 +145,12 @@ spec:
               optional: true
               name: tusker-env-vault
               key: OPENCODE_ZEN_API_KEY
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              optional: true
+              name: tusker-env-vault
+              key: HF_TOKEN
         - name: TUSKER_RATELIMIT_ENABLED
           value: 'true'
         - name: TUSKER_RATELIMIT_DEFAULT_RATE
