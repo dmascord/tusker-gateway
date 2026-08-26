@@ -163,6 +163,8 @@ spec:
           value: '10'
         - name: TUSKER_RATELIMIT_DEFAULT_BURST
           value: '20'
+        - name: TUSKER_RTK_ENABLED
+          value: 'true'
         - name: TUSKER_BUDGETS_ENABLED
           value: 'true'
         - name: TUSKER_GLOBAL_DAILY_TOKENS
