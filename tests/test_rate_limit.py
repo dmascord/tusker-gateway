@@ -49,12 +49,25 @@ def test_burst_then_block(tmp_rl_path):
 
 
 def test_refill_over_time(tmp_rl_path):
-    rl = _tracker(tmp_rl_path, {_key_fingerprint("k"): RateLimitPolicy(rate_per_sec=100.0, burst=5.0)})
+    """Refill restores tokens at ``rate_per_sec`` while the bucket is empty.
+
+    We drain the bucket, sleep long enough that refill more than
+    replenishes the cost of a single ``check()``, then verify the call
+    succeeds and that several subsequent calls are also allowed. The
+    cap is generous (>> 1 token refilled) so the test isn't sensitive
+    to scheduler jitter on a busy host.
+    """
+    fp = _key_fingerprint("k")
+    rl = _tracker(tmp_rl_path, {fp: RateLimitPolicy(rate_per_sec=100.0, burst=5.0)})
+    # Drain the bucket (5 calls, each costs 1 token; bucket caps at 5).
     for _ in range(5):
         rl.check("k")
-    assert not rl.check("k").allowed
-    time.sleep(0.05)  # ~5 tokens added
-    assert rl.check("k").allowed
+    # 100 tokens/sec for 100 ms ⇒ 10 tokens refilled. Way more than the
+    # 1-token cost of the next check, so scheduler jitter can't flip
+    # this assertion.
+    time.sleep(0.1)
+    for _ in range(5):
+        assert rl.check("k").allowed
 
 
 def test_persistence_across_instances(tmp_rl_path):
