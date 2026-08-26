@@ -1,8 +1,20 @@
 """Anthropic Messages API adapter.
 
-Converts Anthropic /v1/messages requests to OpenAI chat/completions format,
-dispatches through Tusker's passthrough pool, and translates responses back
-to Anthropic's wire format (both streaming and non-streaming).
+Dispatches ``POST /v1/messages`` through Tusker's passthrough pool,
+translating Anthropic's request/response shapes via the registered
+:mod:`tusker_gateway.translators` module. Format conversion is no longer
+in this file — see ``translators/anthropic.py`` for the pure conversion
+functions.
+
+This module is HTTP glue: auth, budget/circuit/rate-limit preflight,
+pool fallback, and SSE framing. It owns:
+
+- ``anthropic_messages_handler`` — the aiohttp handler for ``/v1/messages``.
+- ``_call_with_pool_fallback_anthropic`` — pool selection + breaker + dispatch.
+- ``_AnthropicSSEStreamAdapter`` — adapts an upstream OpenAI byte stream
+  to the registered Anthropic streaming translator (parses each OpenAI
+  SSE event into a dict, hands it to the translator, yields the raw
+  Anthropic SSE bytes).
 """
 from __future__ import annotations
 
@@ -10,12 +22,12 @@ import asyncio
 import json
 import logging
 import os
-import secrets
 import time
 from typing import Any, AsyncIterator
 
 from aiohttp import web
 
+from tusker_gateway import translators
 from tusker_gateway.budget import BudgetTracker
 from tusker_gateway.circuit_breaker import CircuitBreaker, BreakerDecision
 from tusker_gateway.errors import BadRequestError
@@ -31,219 +43,74 @@ from tusker_gateway.tracing import Tracer
 
 logger = logging.getLogger(__name__)
 
+# Importing translators.anthropic registers the format converter on import.
+from tusker_gateway.translators import ANTHROPIC  # noqa: F401
+from tusker_gateway.translators.anthropic import (  # noqa: F401
+    init_anthropic_stream_state,
+    update_stream_state,
+)
+
+
 # ---------------------------------------------------------------------------
-# Anthropic ↔ OpenAI format translation
+# HTTP-level helpers
 # ---------------------------------------------------------------------------
 
 
-def anthropic_to_openai(body: dict[str, Any]) -> dict[str, Any]:
-    """Convert an Anthropic Messages API request body to OpenAI chat format.
+def _anthropic_to_openai(body: dict[str, Any]) -> dict[str, Any]:
+    """Thin wrapper around the registry for the Anthropic → OpenAI request.
 
-    Handles:
-    - ``system`` (string or list of content blocks) → system message
-    - ``messages`` with str or list content → joined text
-    - Parameter mapping: ``max_tokens``, ``temperature``, ``top_p``,
-      ``stop_sequences`` → ``stop``, ``stream``, ``model``
+    Equivalent to ``translators.translate_request(ANTHROPIC, body)``; kept
+    as a module-level alias because callers in this file already pass the
+    body around as ``openai_body``.
     """
-    openai: dict[str, Any] = {}
-
-    # Model & stream pass through directly.
-    if "model" in body:
-        openai["model"] = body["model"]
-    if "stream" in body:
-        openai["stream"] = bool(body["stream"])
-
-    # System prompt → system message prepended to messages list.
-    system = body.get("system")
-    messages: list[dict[str, Any]] = []
-    if system is not None:
-        if isinstance(system, str):
-            text = system
-        elif isinstance(system, list):
-            # Anthropic allows list-of-content-blocks: extract text parts.
-            parts: list[str] = []
-            for block in system:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    parts.append(block.get("text", ""))
-                elif isinstance(block, str):
-                    parts.append(block)
-            text = "\n".join(parts)
-        else:
-            text = str(system)
-        messages.append({"role": "system", "content": text})
-
-    # Convert Anthropic messages → OpenAI messages.
-    for msg in body.get("messages", []):
-        role = msg.get("role", "")
-        content = msg.get("content")
-        if isinstance(content, str):
-            messages.append({"role": role, "content": content})
-        elif isinstance(content, list):
-            has_image = any(
-                isinstance(block, dict) and block.get("type") == "image"
-                for block in content
-            )
-            if not has_image:
-                parts: list[str] = []
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        parts.append(block.get("text", ""))
-                    elif isinstance(block, dict) and block.get("type") in {"tool_use", "tool_result"}:
-                        parts.append(json.dumps(block))
-                    elif isinstance(block, str):
-                        parts.append(block)
-                messages.append({"role": role, "content": "\n".join(parts)})
-                continue
-
-            blocks: list[dict[str, Any]] = []
-            for block in content:
-                if isinstance(block, str):
-                    blocks.append({"type": "text", "text": block})
-                    continue
-                if not isinstance(block, dict):
-                    continue
-                block_type = block.get("type")
-                if block_type == "text":
-                    blocks.append({"type": "text", "text": block.get("text", "")})
-                elif block_type == "image":
-                    source = block.get("source", {})
-                    source_type = source.get("type")
-                    if source_type == "base64":
-                        media_type = source.get("media_type")
-                        data = source.get("data")
-                        if not isinstance(media_type, str) or not isinstance(data, str) or not data:
-                            raise BadRequestError(
-                                "Anthropic base64 image source requires media_type and data",
-                                code="invalid_image_source",
-                            )
-                        blocks.append({
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:{media_type};base64,{data}",
-                            },
-                        })
-                    elif source_type == "url":
-                        url = source.get("url")
-                        if not isinstance(url, str) or not url:
-                            raise BadRequestError(
-                                "Anthropic URL image source requires a non-empty URL",
-                                code="invalid_image_source",
-                            )
-                        blocks.append({
-                            "type": "image_url",
-                            "image_url": {"url": url},
-                        })
-                    else:
-                        raise BadRequestError(
-                            f"Anthropic image source type '{source_type}' cannot be converted to an image URL",
-                            code="unsupported_image_source",
-                        )
-                elif block_type in {"tool_use", "tool_result"}:
-                    blocks.append({"type": "text", "text": json.dumps(block)})
-            messages.append({"role": role, "content": blocks})
-        elif content is None:
-            messages.append({"role": role, "content": ""})
-        else:
-            messages.append({"role": role, "content": str(content)})
-
-    openai["messages"] = messages
-
-    # Parameter mapping.
-    if "max_tokens" in body:
-        openai["max_tokens"] = body["max_tokens"]
-    if "temperature" in body:
-        openai["temperature"] = body["temperature"]
-    if "top_p" in body:
-        openai["top_p"] = body["top_p"]
-    if "stop_sequences" in body:
-        openai["stop"] = body["stop_sequences"]
-
-    # Tool definitions (Anthropic → OpenAI format).
-    if "tools" in body:
-        openai["tools"] = _convert_anthropic_tools(body["tools"])
-
-    return openai
+    return translators.translate_request(ANTHROPIC, body)
 
 
-def _convert_anthropic_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Convert Anthropic tool definitions to OpenAI function-calling format."""
-    openai_tools: list[dict[str, Any]] = []
-    for tool in tools:
-        openai_tool: dict[str, Any] = {
-            "type": "function",
-            "function": {
-                "name": tool.get("name", ""),
-                "description": tool.get("description", ""),
-                "parameters": tool.get("input_schema", {}),
-            },
-        }
-        openai_tools.append(openai_tool)
-    return openai_tools
+def _openai_to_anthropic(result: dict[str, Any], original_model: str) -> dict[str, Any]:
+    """Convert a non-streaming OpenAI response to Anthropic format.
 
-
-# Stop-reason mapping (OpenAI → Anthropic).
-_STOP_REASON_MAP: dict[str, str] = {
-    "stop": "end_turn",
-    "length": "max_tokens",
-    "tool_calls": "tool_use",
-    "content_filter": "end_turn",
-}
-
-
-def openai_to_anthropic(result: dict[str, Any], original_model: str) -> dict[str, Any]:
-    """Convert a non-streaming OpenAI chat completion response to Anthropic format."""
-    message = result.get("choices", [{}])[0].get("message", {})
-    content_text = message.get("content") or ""
-
-    # Build Anthropic content blocks.
-    content: list[dict[str, Any]] = []
-    if content_text:
-        content.append({"type": "text", "text": content_text})
-
-    # Convert tool_calls if present.
-    for tc in message.get("tool_calls", []):
-        func = tc.get("function", {})
-        content.append({
-            "type": "tool_use",
-            "id": f"toolu_{secrets.token_hex(8)}",
-            "name": func.get("name", ""),
-            "input": json.loads(func.get("arguments", "{}")) if func.get("arguments") else {},
-        })
-
-    openai_finish = result.get("choices", [{}])[0].get("finish_reason", "stop")
-    stop_reason = _STOP_REASON_MAP.get(openai_finish, "end_turn")
-
-    openai_usage = result.get("usage", {})
-
-    return {
-        "id": f"msg_{secrets.token_hex(12)}",
-        "type": "message",
-        "role": "assistant",
-        "content": content,
-        "model": original_model,
-        "stop_reason": stop_reason,
-        "stop_sequence": None,
-        "usage": {
-            "input_tokens": int(openai_usage.get("prompt_tokens", 0)),
-            "output_tokens": int(openai_usage.get("completion_tokens", 0)),
-        },
-    }
+    Wraps ``translators.translate_response(ANTHROPIC, ...)`` and unwraps
+    the single-element list (Anthropic responses are always one chunk).
+    """
+    chunks = translators.translate_response(
+        ANTHROPIC, result, {"original_model": original_model},
+    )
+    return chunks[0] if chunks else {}
 
 
 # ---------------------------------------------------------------------------
-# SSE stream translation (OpenAI → Anthropic)
+# Streaming adapter
 # ---------------------------------------------------------------------------
 
-class AnthropicSSEStreamTranslator:
-    """Wraps an OpenAI SSE byte stream and yields Anthropic SSE events.
 
-    Lifecycle of translated events:
-      1. ``message_start``  (once, on first chunk)
-      2. ``content_block_start`` (once, on first chunk)
-      3. ``content_block_delta`` (per content chunk)
-      4. ``content_block_stop`` (once, at end)
-      5. ``message_delta`` (once, at end)
-      6. ``message_stop`` (once, at end)
+def _parse_openai_sse_chunk(raw: bytes) -> dict[str, Any] | None:
+    """Extract and parse the JSON ``data:`` payload from an OpenAI SSE line.
+
+    Returns ``None`` for ``[DONE]`` sentinels and unparseable frames.
+    """
+    try:
+        text = raw.decode("utf-8").strip()
+    except Exception:
+        return None
+    for line in text.split("\n"):
+        if line.startswith("data: "):
+            data_str = line[6:]
+            if data_str == "[DONE]":
+                return None
+            try:
+                return json.loads(data_str)
+            except json.JSONDecodeError:
+                return None
+    return None
+
+
+class _AnthropicSSEStreamAdapter:
+    """Adapts an upstream OpenAI byte stream to Anthropic SSE bytes.
+
+    Uses the registered Anthropic streaming translator to convert each
+    parsed OpenAI chunk into the appropriate ``content_block_delta`` (or
+    message lifecycle) bytes. The wrapper is intentionally thin: HTTP
+    framing, heartbeats, and error handling live in the calling handler.
     """
 
     def __init__(
@@ -253,135 +120,59 @@ class AnthropicSSEStreamTranslator:
         input_tokens: int = 0,
     ):
         self._stream = openai_stream
-        self._model = model
-        self._input_tokens = input_tokens
-        self._started = False
-        self._output_tokens = 0
-        self._last_stop_reason = "end_turn"
-        self._msg_id = f"msg_{secrets.token_hex(12)}"
-        self._emitted_closing = False
+        self._state = init_anthropic_stream_state()
+        update_stream_state(
+            self._state, model=model, input_tokens=input_tokens,
+        )
 
-    def __aiter__(self):
+    def __aiter__(self) -> "_AnthropicSSEStreamAdapter":
         return self
 
     async def __anext__(self) -> bytes:
-        if self._emitted_closing:
-            raise StopAsyncIteration
+        # Pump the upstream until we have at least one non-empty frame to
+        # emit (translators may return [] for chunks that have no content —
+        # e.g. usage-only or finish-only frames).
+        while True:
+            try:
+                raw = await self._stream.__anext__()
+            except StopAsyncIteration:
+                # Upstream closed — translate the close signal.
+                frames = translators.stream_chunk(ANTHROPIC, None, self._state)
+                if not frames:
+                    raise StopAsyncIteration
+                # Concatenate all frames so the caller sees them as one
+                # logical SSE event burst.
+                return b"".join(frames)
 
-        if not self._started:
-            self._started = True
-            return self._fmt_message_start()
+            parsed = _parse_openai_sse_chunk(raw)
+            if parsed is None:
+                # [DONE] or unparseable — emit the closing sequence.
+                frames = translators.stream_chunk(ANTHROPIC, None, self._state)
+                if not frames:
+                    raise StopAsyncIteration
+                return b"".join(frames)
 
-        try:
-            raw = await self._stream.__anext__()
-        except StopAsyncIteration:
-            self._emitted_closing = True
-            return self._closing_sequence()
+            frames = translators.stream_chunk(ANTHROPIC, parsed, self._state)
+            if frames:
+                return b"".join(frames)
+            # No output for this chunk — loop and pull the next one.
 
-        parsed = self._parse_sse(raw)
-        if parsed is None:
-            # [DONE] or unparseable — emit closing.
-            self._emitted_closing = True
-            return self._closing_sequence()
 
-        if parsed.get("choices"):
-            delta = parsed["choices"][0].get("delta", {})
-            content_text = delta.get("content")
-            finish_reason = parsed["choices"][0].get("finish_reason")
-
-            if content_text:
-                self._output_tokens += max(1, len(content_text) // 4)
-                return self._fmt_text_delta(content_text)
-
-            if finish_reason:
-                self._last_stop_reason = _STOP_REASON_MAP.get(finish_reason, "end_turn")
-
-        # Accumulate usage if present.
-        usage = parsed.get("usage", {})
-        if usage.get("completion_tokens"):
-            self._output_tokens = int(usage["completion_tokens"])
-
-        # No content in this chunk but stream continues — skip silently.
-        return await self.__anext__()
-
-    def _closing_sequence(self) -> bytes:
-        """Build the final three events as a single SSE frame sequence."""
-        parts: list[str] = []
-        # content_block_stop
-        parts.append("event: content_block_stop")
-        parts.append(f"data: {json.dumps({'type': 'content_block_stop', 'index': 0})}")
-        parts.append("")
-        # message_delta
-        parts.append("event: message_delta")
-        parts.append(f'data: {json.dumps({"type": "message_delta", "delta": {"stop_reason": self._last_stop_reason, "stop_sequence": None}, "usage": {"output_tokens": self._output_tokens}})}')
-        parts.append("")
-        # message_stop
-        parts.append("event: message_stop")
-        parts.append('data: {"type": "message_stop"}')
-        parts.append("")
-        return "\n".join(parts).encode("utf-8")
-
-    def _fmt_message_start(self) -> bytes:
-        payload = {
-            "type": "message_start",
-            "message": {
-                "id": self._msg_id,
-                "type": "message",
-                "role": "assistant",
-                "content": [],
-                "model": self._model,
-                "stop_reason": None,
-                "usage": {
-                    "input_tokens": self._input_tokens,
-                    "output_tokens": 0,
-                },
-            },
-        }
-        parts = [
-            "event: message_start",
-            f"data: {json.dumps(payload)}",
-            "",
-            "event: content_block_start",
-            f'data: {json.dumps({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})}',
-            "",
-        ]
-        return "\n".join(parts).encode("utf-8")
-
-    def _fmt_text_delta(self, text: str) -> bytes:
-        payload = {
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": {"type": "text_delta", "text": text},
-        }
-        parts = [
-            "event: content_block_delta",
-            f"data: {json.dumps(payload)}",
-            "",
-        ]
-        return "\n".join(parts).encode("utf-8")
-
-    @staticmethod
-    def _parse_sse(raw: bytes) -> dict[str, Any] | None:
-        """Extract and parse the JSON data from an OpenAI SSE line."""
-        try:
-            text = raw.decode("utf-8").strip()
-        except Exception:
-            return None
-        for line in text.split("\n"):
-            if line.startswith("data: "):
-                data_str = line[6:]
-                if data_str == "[DONE]":
-                    return None
-                try:
-                    return json.loads(data_str)
-                except json.JSONDecodeError:
-                    return None
-        return None
+# Backwards-compatible aliases for callers (including tests) that imported
+# the old module-level names. The actual implementations now live in
+# ``tusker_gateway.translators.anthropic`` and are dispatched through the
+# translator registry.
+anthropic_to_openai = _anthropic_to_openai
+openai_to_anthropic = _openai_to_anthropic
+# Backwards-compatible alias for callers that imported the old class name.
+# Internal use only — external callers should not depend on the class.
+AnthropicSSEStreamTranslator = _AnthropicSSEStreamAdapter
 
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
 
 def _resolve_api_key(request: web.Request) -> str:
     """Return the raw API key from Authorization or x-api-key header."""
@@ -473,7 +264,7 @@ async def _call_with_pool_fallback_anthropic(
     """Dispatch OpenAI-format body through pool fallback.
 
     If the result is a streaming iterator, wraps it in
-    ``AnthropicSSEStreamTranslator`` to produce Anthropic SSE events.
+    ``_AnthropicSSEStreamAdapter`` to produce Anthropic SSE events.
     """
     model = body.get("model", "")
     route = resolve_route(model, body)
@@ -516,7 +307,7 @@ async def _call_with_pool_fallback_anthropic(
                 if breaker is not None:
                     breaker.record_success(prov, mdl)
                 if body.get("stream") and hasattr(result, "__aiter__"):
-                    result = AnthropicSSEStreamTranslator(
+                    result = _AnthropicSSEStreamAdapter(
                         result, model=model,
                         input_tokens=_estimated_tokens(body.get("messages", [])),
                     )
@@ -539,7 +330,7 @@ async def _call_with_pool_fallback_anthropic(
             if breaker is not None:
                 breaker.record_success(route.provider, route.model)
             if body.get("stream") and hasattr(result, "__aiter__"):
-                result = AnthropicSSEStreamTranslator(
+                result = _AnthropicSSEStreamAdapter(
                     result, model=model,
                     input_tokens=_estimated_tokens(body.get("messages", [])),
                 )
@@ -600,7 +391,7 @@ async def anthropic_messages_handler(request: web.Request) -> web.Response | web
             logger.info("anthropic request model=%s stream=%s", original_model, body.get("stream"))
 
             # Convert to OpenAI format.
-            openai_body = anthropic_to_openai(body)
+            openai_body = _anthropic_to_openai(body)
 
             config = request.app["config"]
             client = PassthroughClient(config, QualityDB(config["quality_db_path"]), request.app["http_session"])
@@ -706,7 +497,7 @@ async def anthropic_messages_handler(request: web.Request) -> web.Response | web
                 return resp
 
             # Non-streaming: convert OpenAI → Anthropic format.
-            anthropic_resp = openai_to_anthropic(result, original_model)
+            anthropic_resp = _openai_to_anthropic(result, original_model)
             _emit(status)
             if metrics is not None:
                 usage = (result or {}).get("usage") or {} if isinstance(result, dict) else {}

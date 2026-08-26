@@ -226,6 +226,16 @@ def create_app() -> web.Application:
         capabilities_enabled = os.environ.get(
             "TUSKER_CAPABILITIES_ENABLED", "1"
         ).strip().lower()
+        # RTK (token-saver) opt-in. Default OFF — RTK is a best-effort
+        # text compressor and we want operators to enable it explicitly
+        # once they've reviewed the filter set. See tusker_gateway.rtk.
+        rtk_enabled = os.environ.get(
+            "TUSKER_RTK_ENABLED", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if rtk_enabled:
+            from tusker_gateway.rtk import set_enabled as rtk_set_enabled
+            rtk_set_enabled(True)
+            startup_log.info("rtk token-saver enabled")
         if capabilities_enabled not in {"0", "false", "no", "off"}:
             interval_secs = float(
                 os.environ.get("TUSKER_CAPABILITIES_REFRESH_SECS", "3600")
@@ -316,6 +326,7 @@ def create_app() -> web.Application:
     app.router.add_get("/v1/models", models_handler)
     app.router.add_post("/v1/chat/completions", chat_completions_handler)
     app.router.add_post("/v1/responses", responses_handler)
+    app.router.add_post("/v1/messages", anthropic_messages_handler)
 
     app.on_cleanup.append(on_cleanup)
     app.on_startup.append(on_startup)

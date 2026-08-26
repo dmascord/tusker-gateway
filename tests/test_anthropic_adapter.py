@@ -254,19 +254,24 @@ class TestAnthropicSSEStreamTranslator:
         async for chunk in translator:
             events.append(chunk)
 
-        # First event: message_start + content_block_start
+        # The translator now concatenates message_start + content_block_start
+        # + first text delta into a single emit (rather than emitting one
+        # Anthropic event per upstream chunk). This matches the new registry
+        # chunk-translator contract.
+        assert len(events) == 3
+
+        # First event: message_start + content_block_start + Hello text_delta
         assert b"event: message_start" in events[0]
         assert b"event: content_block_start" in events[0]
+        assert b'"text_delta"' in events[0]
+        assert b'"Hello"' in events[0]
 
-        # Second event: text_delta "Hello"
+        # Second event: text_delta " World"
         assert b'"text_delta"' in events[1]
-        assert b'"Hello"' in events[1]
+        assert b" World" in events[1]
 
-        # Third event: text_delta " World"
-        assert b" World" in events[2]
-
-        # Fourth event: closing sequence (content_block_stop, message_delta, message_stop)
-        closing = events[3]
+        # Third event: closing sequence (content_block_stop, message_delta, message_stop)
+        closing = events[2]
         assert b"event: content_block_stop" in closing
         assert b"event: message_delta" in closing
         assert b'"stop_reason": "end_turn"' in closing
@@ -286,11 +291,12 @@ class TestAnthropicSSEStreamTranslator:
         async for chunk in translator:
             events.append(chunk)
 
-        # Should have: message_start, text_delta, closing
-        assert len(events) == 3
+        # Should have: combined message_start + content_block_start + Hi text_delta,
+        # then closing sequence.
+        assert len(events) == 2
         assert b"event: message_start" in events[0]
-        assert b'"Hi"' in events[1]
-        assert b"event: message_stop" in events[2]
+        assert b'"Hi"' in events[0]
+        assert b"event: message_stop" in events[1]
 
     async def test_no_content_chunks(self):
         from tusker_gateway.anthropic_adapter import AnthropicSSEStreamTranslator
@@ -307,9 +313,11 @@ class TestAnthropicSSEStreamTranslator:
         async for chunk in translator:
             events.append(chunk)
 
-        # message_start, closing (no text_delta since no content was sent)
+        # message_start + content_block_start (combined), then closing
+        # (no text_delta since no content was sent).
         assert len(events) == 2
         assert b"event: message_start" in events[0]
+        assert b"event: content_block_start" in events[0]
         assert b"event: message_stop" in events[1]
 
 
