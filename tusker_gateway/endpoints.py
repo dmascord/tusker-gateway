@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import re
+import secrets
 import time
 import uuid
 from typing import Any, AsyncIterator
@@ -58,11 +60,16 @@ _TOOL_CALL_XML_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Matches the opening of a bare <function=name> block. Used by the stripper to
+# detect when a block has begun but is not yet complete (and may span chunks).
+_FUNCTION_OPEN_RE = re.compile(r"<function=[^\s\"'<>]+>", re.IGNORECASE)
+_FUNCTION_CLOSE_RE = re.compile(r"</\s*function\s*>", re.IGNORECASE)
+
 # Opening tokens that mark the start of a tool-call block. When the tail of
 # the accumulated buffer matches one of these prefixes, we hold it back until
 # the full block has arrived (a block may span several streamed chunks).
 _TOOL_OPENERS = (
-    "<tool_call>",
+    "<​tool_call>",
     "<tool_call",
     "<|tool_call|>",
     "<|tool_call",
@@ -79,10 +86,23 @@ class _ToolCallStripper:
 
     Holds a ``_carry`` tail that may be an incomplete opening token; when a
     complete block is seen it is dropped, otherwise carried text is emitted.
+
+    For the bare ``<function=name>...</function>`` shape (no surrounding
+    ``<​tool_call>`` wrapper) — emitted by Hermes/Qwen-style models — the
+    stripper additionally tracks any *complete* such block it observed in the
+    stream so the caller can promote the markup into a structured
+    ``delta.tool_calls`` frame. Use ``drain_pending_blocks()`` to retrieve
+    them.
     """
 
     def __init__(self) -> None:
         self._carry = ""
+        # When an unclosed bare <function=...> block is observed we buffer it
+        # here until </function> arrives (or flush() drops it). Buffering
+        # avoids the case where the opener regex finds a partial match but
+        # the closing tag arrives in a separate chunk.
+        self._pending_function_block: str | None = None
+        self._pending_blocks: list[str] = []
 
     def _looks_like_opener(self, text: str) -> bool:
         """Return True if `text` is a prefix of a known tool-call opener."""
@@ -98,6 +118,81 @@ class _ToolCallStripper:
         """Process a content chunk, returning the clean (emit-able) text."""
         if not chunk:
             return ""
+        text = self._carry + chunk
+        self._carry = ""
+        out: list[str] = []
+
+        # If we're mid-block (previously saw an unclosed <function=...>),
+        # buffer the new text and look for the matching </function>. Only
+        # when we find the closer do we add the block to _pending_blocks
+        # and resume normal text emission.
+        if self._pending_function_block is not None:
+            closer = _FUNCTION_CLOSE_RE.search(text)
+            if not closer:
+                self._pending_function_block += text
+                return ""
+            # Block closes within this chunk. Emit any prose before the
+            # closer, then stash the complete block and process the
+            # remaining text below.
+            tail = text[closer.end():]
+            self._pending_function_block += text[: closer.end()]
+            self._pending_blocks.append(self._pending_function_block)
+            self._pending_function_block = None
+            text = tail
+
+        # Repeatedly remove complete tool-call blocks. For bare <function=...>
+        # blocks we additionally retain a copy of the matched block in
+        # ``_pending_blocks`` so the caller can promote it into structured
+        # tool_calls instead of just dropping it.
+        while True:
+            m = _TOOL_CALL_XML_RE.search(text)
+            if not m:
+                break
+            out.append(text[: m.start()])
+            block = m.group(0)
+            if _FUNCTION_OPEN_RE.match(block):
+                self._pending_blocks.append(block)
+            text = text[m.end():]
+
+        # Detect an *unclosed* bare <function=...> opener in the remaining
+        # text. If found, split: emit prose up to the opener, buffer the
+        # rest as the start of a cross-chunk block.
+        open_match = _FUNCTION_OPEN_RE.search(text)
+        if open_match:
+            out.append(text[: open_match.start()])
+            self._pending_function_block = text[open_match.start():]
+            return "".join(out)
+
+        # No unclosed opener. If `text` ends with an incomplete opener
+        # prefix that may continue into the next chunk, carry it;
+        # otherwise emit everything.
+        if text:
+            emit_end = len(text)
+            carry = ""
+            for i in range(len(text)):
+                tail = text[i:]
+                if self._looks_like_opener(tail):
+                    emit_end = i
+                    carry = tail
+                    break
+            out.append(text[:emit_end])
+            self._carry = carry
+        return "".join(out)
+
+    def flush(self) -> str:
+        """Drop any remaining carried content (partial opener that never
+        completed). Returns the clean emitted text, usually empty."""
+        carry, self._carry = self._carry, ""
+        return ""
+
+    def drain_pending_blocks(self) -> list[str]:
+        """Return and clear any fully-observed ``<function=...>...</function>``
+        blocks seen during ``feed()`` calls since the last drain. Used by the
+        stream normalizer to promote text-emitted tool calls into structured
+        ``delta.tool_calls`` frames.
+        """
+        blocks, self._pending_blocks = self._pending_blocks, []
+        return blocks
         text = self._carry + chunk
         self._carry = ""
         out: list[str] = []
@@ -161,16 +256,25 @@ async def _normalize_stream(raw_stream: AsyncIterator[bytes]) -> AsyncIterator[b
     This generator splits bundled chunks into separate SSE frames.
 
     Additionally, some open-source models emit XML/Markdown-style
-    ``<tool_call>...<function=...>...</function></tool_call>`` markup in
+    ``<​tool_call>...<function=...>...</function></​tool_call>`` markup in
     the content stream alongside structured ``tool_calls`` deltas. This
     shows up in OMP as raw text tool calls "leaking through". We strip
     that markup from content deltas so OMP sees only the structured
     tool_calls and the surrounding prose.
 
+    For models that emit bare ``<function=name>...</function>`` blocks
+    (Hermes/Qwen-style, often without an enclosing ``<​tool_call>``
+    wrapper) we additionally promote the recognized block into a
+    structured ``delta.tool_calls`` frame so OMP receives a real
+    ``tool_calls`` array and not just stripped text. Blocks may span
+    multiple SSE deltas; the stripper buffers them across chunks.
+
     The upstream yields arbitrary byte chunks from `resp.content.iter_any()`,
     which may contain multiple SSE events. We split on ``\\n\\n`` boundaries,
     process each ``data:`` event individually, and re-emit them.
     """
+    from tusker_gateway.tool_formats import parse_text_tool_calls
+
     buffer = b""
     tool_stripper = _ToolCallStripper()
     saw_finish_reason = False
@@ -178,6 +282,46 @@ async def _normalize_stream(raw_stream: AsyncIterator[bytes]) -> AsyncIterator[b
 
     def _finish_frame() -> bytes:
         return sse_frame(format_openai_chunk(finish_reason="stop"))
+
+    def _tool_calls_frame(parsed_calls: list[dict[str, Any]], template_obj: dict[str, Any]) -> bytes | None:
+        """Build an SSE frame carrying the parsed tool calls as delta.tool_calls.
+
+        Returns ``None`` if there are no calls to emit.
+        """
+        if not parsed_calls:
+            return None
+        # OpenAI stream spec: each tool_calls delta carries an incremental
+        # index, an id, type, and function name/arguments. Our rescue
+        # arrived as a single assembled block, so we emit it whole — clients
+        # (including OMP) accept a single-frame tool_call just fine.
+        openai_calls: list[dict[str, Any]] = []
+        for index, call in enumerate(parsed_calls):
+            fn = call.get("function") or {}
+            name = fn.get("name", "")
+            args = fn.get("arguments", "{}")
+            if not isinstance(args, str):
+                args = json.dumps(args, ensure_ascii=False)
+            cid = call.get("id") or f"call_{index}_{hashlib.sha1(name.encode()).hexdigest()[:10]}"
+            openai_calls.append({
+                "index": index,
+                "id": str(cid),
+                "type": "function",
+                "function": {"name": name, "arguments": args},
+            })
+        delta = {"role": "assistant", "tool_calls": openai_calls}
+        chunk = {
+            **template_obj,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+        }
+        # Strip template choices/role — caller already set them above.
+        chunk.pop("choices", None)
+        chunk = {
+            "id": template_obj.get("id") or f"chatcmpl-{secrets.token_hex(14)}",
+            "object": "chat.completion.chunk",
+            "model": template_obj.get("model") or "tusker-gateway",
+            "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+        }
+        return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode()
 
     async for chunk in raw_stream:
         buffer += chunk
@@ -193,6 +337,9 @@ async def _normalize_stream(raw_stream: AsyncIterator[bytes]) -> AsyncIterator[b
             if stripped == b"data: [DONE]":
                 tool_stripper.flush()
                 saw_done = True
+                # Emit any pending blocks the upstream never got to close
+                # before [DONE]. If we accumulated an unclosed block, drop
+                # it (it never completed) but still pass [DONE] through.
                 yield frame
                 continue
             try:
@@ -253,6 +400,16 @@ async def _normalize_stream(raw_stream: AsyncIterator[bytes]) -> AsyncIterator[b
                 yield f"data: {json.dumps(finish_obj, ensure_ascii=False)}\n\n".encode()
             else:
                 yield f"data: {json.dumps(new_obj, ensure_ascii=False)}\n\n".encode()
+            # After emitting the cleaned content frame, drain any complete
+            # bare <function=...>...</function> blocks the stripper
+            # collected while processing this chunk and promote them into
+            # a structured delta.tool_calls frame. This makes models that
+            # emit tool-call XML as text behave like structured callers.
+            for block in tool_stripper.drain_pending_blocks():
+                parsed = parse_text_tool_calls(block)
+                tool_frame = _tool_calls_frame(parsed, new_obj)
+                if tool_frame is not None:
+                    yield tool_frame
     # Flush any remaining partial frame in the buffer
     if buffer.strip():
         yield buffer

@@ -178,6 +178,128 @@ async def test_stream_normalizer_promotes_reasoning_content(client):
 
 
 @pytest.mark.asyncio
+async def test_stream_normalizer_emits_tool_calls_for_bare_function_blocks(client):
+    """Models that emit bare <function=name>...</function> (no <​tool_call> wrapper)
+    across multiple SSE deltas must not leak the XML into content and must
+    emit a structured delta.tool_calls frame so OMP picks it up.
+
+    Regression for the OMP-reported bug where raw
+        <function=bash>
+        <parameter=command>...</parameter>
+        <parameter=timeout>15</parameter>
+        </function>
+    appeared in the streamed `content` field and no `tool_calls` was ever
+    surfaced, so OMP rendered the markup as visible text and never invoked
+    the tool.
+    """
+    # Each chunk is one SSE event's worth of delta.content from the upstream.
+    async def leaked_stream(*args, **kwargs):
+        yield (
+            b'data: {"choices":[{"index":0,"delta":{"role":"assistant",'
+            b'"content":"I will run that.\\n\\n"},"finish_reason":null}]}\n\n'
+        )
+        yield (
+            b'data: {"choices":[{"index":0,"delta":{'
+            b'"content":"<function=bash>"},"finish_reason":null}]}\n\n'
+        )
+        yield (
+            b'data: {"choices":[{"index":0,"delta":{'
+            b'"content":"\\n<parameter=command>ssh wildduck cat /etc/sender.toml</parameter>"},'
+            b'"finish_reason":null}]}\n\n'
+        )
+        yield (
+            b'data: {"choices":[{"index":0,"delta":{'
+            b'"content":"\\n<parameter=timeout>15</parameter>"},'
+            b'"finish_reason":null}]}\n\n'
+        )
+        yield (
+            b'data: {"choices":[{"index":0,"delta":{'
+            b'"content":"\\n</function>"},"finish_reason":null}]}\n\n'
+        )
+        yield (
+            b'data: {"choices":[{"index":0,"delta":{},'
+            b'"finish_reason":"stop"}]}\n\n'
+        )
+        yield b'data: [DONE]\n\n'
+
+    with patch("tusker_gateway.endpoints.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
+        mock_chat.return_value = leaked_stream()
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-code",
+                "messages": [{"role": "user", "content": "check sender config"}],
+                "stream": True,
+            },
+            headers=HEADERS_AUTH,
+        )
+        assert resp.status == 200
+        body = await resp.read()
+
+    text = body.decode("utf-8", errors="replace")
+    import json as _json
+
+    leaked_present = False
+    prose_present = False
+    tool_calls_seen: list[dict] = []
+    for line in text.splitlines():
+        if not line.startswith("data: ") or line.strip() == "data: [DONE]":
+            continue
+        try:
+            obj = _json.loads(line[len("data: "):])
+        except Exception:
+            continue
+        for ch in obj.get("choices", []):
+            delta = ch.get("delta", {}) or {}
+            content = delta.get("content") or ""
+            if "<function" in content or "tool_call" in content or "<parameter=" in content:
+                leaked_present = True
+            if "I will run that" in content:
+                prose_present = True
+            tc = delta.get("tool_calls")
+            if isinstance(tc, list):
+                for item in tc:
+                    if isinstance(item, dict):
+                        tool_calls_seen.append(item)
+
+    # (1) Markup must NOT leak into the streamed content.
+    assert not leaked_present, f"tool-call XML leaked into stream: {text!r}"
+    # (2) Prose around the tool-call block must survive.
+    assert prose_present, f"prose around tool call missing from stream: {text!r}"
+    # (3) A structured tool_calls delta must be emitted with the parsed name + args.
+    assert tool_calls_seen, f"no delta.tool_calls emitted: {text!r}"
+    fn = tool_calls_seen[0].get("function") or {}
+    assert fn.get("name") == "bash", f"unexpected tool name: {tool_calls_seen!r}"
+    args_raw = fn.get("arguments")
+    if isinstance(args_raw, str):
+        args = _json.loads(args_raw)
+    elif isinstance(args_raw, dict):
+        args = args_raw
+    else:
+        args = {}
+    assert args.get("command") == "ssh wildduck cat /etc/sender.toml"
+    assert str(args.get("timeout")) == "15"
+
+
+def test_stripper_handles_bare_function_block_split_across_many_chunks():
+    """The bare <function=name>...</function> shape (no <​tool_call> wrapper) must
+    be stripped even when its opener, every <parameter=...> line, and the
+    closing </function> arrive in separate stream chunks."""
+    s = _ToolCallStripper()
+    chunks = [
+        "I will run that.\n\n",
+        "<function=bash>",
+        "\n<parameter=command>ssh wildduck cat /etc/sender.toml</parameter>",
+        "\n<parameter=timeout>15</parameter>",
+        "\n</function>",
+    ]
+    combined = "".join(s.feed(c) for c in chunks) + s.flush()
+    assert "<function" not in combined, f"function block leaked: {combined!r}"
+    assert "<parameter=" not in combined, f"parameter block leaked: {combined!r}"
+    assert "I will run that" in combined
+
+
+@pytest.mark.asyncio
 async def test_stream_normalizer_injects_finish_when_upstream_omits_it(client):
     """If the upstream stream ends without a finish_reason chunk, the gateway
     must synthesize one so OMP doesn't report
