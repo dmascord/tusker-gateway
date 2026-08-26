@@ -64,6 +64,38 @@ _TOOL_CALL_XML_RE = re.compile(
 # detect when a block has begun but is not yet complete (and may span chunks).
 _FUNCTION_OPEN_RE = re.compile(r"<function=[^\s\"'<>]+>", re.IGNORECASE)
 _FUNCTION_CLOSE_RE = re.compile(r"</\s*function\s*>", re.IGNORECASE)
+# Matches a <parameter=...>...</parameter> sibling inside a function block.
+# Used to decide whether a buffered <function=...>...</function> block is
+# actually a tool call (with real arguments) versus a model that opened a
+# block, wrote prose inside it, and closed it without ever emitting params.
+_PARAMETER_RE = re.compile(r"<\s*parameter\b", re.IGNORECASE)
+# Orphan closing tags — closing tags that arrive with no matching opener
+# observed by the stripper. Models occasionally emit these when they think
+# they're inside a tool-call block (e.g., they've been instructed to use
+# tools via prompt) but never wrote a real <function=...> opener. Without
+# stripping them, OMP renders `</parameter></function>` as visible text.
+_ORPHAN_CLOSE_RE = re.compile(
+    r"</\s*(?:function|parameter|invoke|tool_call|function_call|tool_calls|function_calls|tool_use|tool_invocation)\s*>",
+    re.IGNORECASE,
+)
+# Detect a tail that *might* continue into a `<function=...>` opener but
+# isn't an exact prefix of any known opener. Used to carry partial tokens
+# like `<func`, `<function`, `<function=`, `< function`, `< function =` etc.
+#
+# This is conservative: it only fires when the tail unambiguously looks
+# like the start of a tool-call markup (i.e. begins with `<` immediately
+# followed by an identifier or whitespace). Stray `<` characters in
+# ordinary prose are NOT carried because that would silently swallow
+# legitimate text from the user's view.
+#
+# Note: split-opener edge cases (where a model emits `<functi` in one
+# chunk and `on=bash>` in the next) are not handled. In practice the
+# upstream stream boundary aligns with the token boundary for
+# well-behaved providers, so the full `<function=bash>` opener usually
+# arrives in a single chunk. When it doesn't, the markup leaks as
+# visible text — a known limitation documented in
+# `docs/zero-downtime-deploys.md`-style notes.
+_PARTIAL_OPENER_TAIL_RE = re.compile(r"^<\s*[a-zA-Z_:|\-]*$")
 
 # Opening tokens that mark the start of a tool-call block. When the tail of
 # the accumulated buffer matches one of these prefixes, we hold it back until
@@ -77,6 +109,45 @@ _TOOL_OPENERS = (
     "<function=",
     "<|begin_of_",
 )
+
+
+def _extract_inner_prose(block: str) -> str:
+    """Extract the prose between a bare ``<function=name>`` opener and its
+    ``</function>`` closer, stripping any orphan closing tags inside.
+
+    Used by the stream normalizer to surface ordinary text the model
+    accidentally wrapped in a malformed tool-call block.
+    """
+    open_match = _FUNCTION_OPEN_RE.search(block)
+    if not open_match:
+        return ""
+    close_match = _FUNCTION_CLOSE_RE.search(block, open_match.end())
+    if not close_match:
+        return ""
+    inner = block[open_match.end():close_match.start()]
+    # Strip orphan closing tags inside the inner prose.
+    inner = _ORPHAN_CLOSE_RE.sub("", inner)
+    return inner.strip()
+
+
+def _content_frame(content: str, template_obj: dict[str, Any]) -> bytes:
+    """Build an SSE frame containing only ``delta.content`` (no finish_reason).
+
+    Used to emit prose extracted from a malformed function block.
+    """
+    chunk = {
+        "id": template_obj.get("id") or f"chatcmpl-{secrets.token_hex(14)}",
+        "object": "chat.completion.chunk",
+        "model": template_obj.get("model") or "tusker-gateway",
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"content": content},
+                "finish_reason": None,
+            }
+        ],
+    }
+    return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode()
 
 
 class _ToolCallStripper:
@@ -93,6 +164,13 @@ class _ToolCallStripper:
     stream so the caller can promote the markup into a structured
     ``delta.tool_calls`` frame. Use ``drain_pending_blocks()`` to retrieve
     them.
+
+    The stripper distinguishes *well-formed* function blocks (those that
+    contain at least one ``<parameter=k>v</parameter>`` sibling) from
+    *malformed* ones (model wrote prose inside the block, or emitted only
+    closing tags). Only well-formed blocks are eligible for promotion to a
+    structured ``delta.tool_calls``; malformed blocks have their markup
+    stripped but the inner prose is emitted as ordinary text.
     """
 
     def __init__(self) -> None:
@@ -102,7 +180,12 @@ class _ToolCallStripper:
         # avoids the case where the opener regex finds a partial match but
         # the closing tag arrives in a separate chunk.
         self._pending_function_block: str | None = None
-        self._pending_blocks: list[str] = []
+        # Blocks that completed (or matched a single-chunk regex) get
+        # stashed here so the caller can promote them into structured
+        # ``delta.tool_calls`` frames. We track them as tuples of
+        # ``(block, had_params)`` so the caller can decide whether each
+        # block is well-formed.
+        self._pending_blocks: list[tuple[str, bool]] = []
 
     def _looks_like_opener(self, text: str) -> bool:
         """Return True if `text` is a prefix of a known tool-call opener."""
@@ -113,6 +196,25 @@ class _ToolCallStripper:
             if opener.startswith(lower):
                 return True
         return False
+
+    def _looks_like_partial_opener_tail(self, text: str) -> bool:
+        """Return True if `text` could be the prefix of a tool-call opener
+        but doesn't yet match a known opener (e.g. ``<func``, ``<function``,
+        ``< function``). Used to carry partial tokens across chunks so that
+        split openers can be reassembled.
+        """
+        if not text:
+            return False
+        # Anything that's already a known opener is handled elsewhere.
+        if self._looks_like_opener(text):
+            return True
+        # Otherwise look for a tail that's clearly the start of *some* tool
+        # markup. ``_PARTIAL_OPENER_TAIL_RE`` matches `<` followed by an
+        # in-progress identifier (letters, `:`, `|`, `-`).
+        return bool(_PARTIAL_OPENER_TAIL_RE.search(text))
+
+    def _stash_block(self, block: str, had_params: bool) -> None:
+        self._pending_blocks.append((block, had_params))
 
     def feed(self, chunk: str) -> str:
         """Process a content chunk, returning the clean (emit-able) text."""
@@ -129,14 +231,19 @@ class _ToolCallStripper:
         if self._pending_function_block is not None:
             closer = _FUNCTION_CLOSE_RE.search(text)
             if not closer:
+                # Buffer the chunk. We re-check for parameters on the full
+                # assembled block when the closer arrives (in case the
+                # <parameter ...> tag was split across chunks).
                 self._pending_function_block += text
                 return ""
-            # Block closes within this chunk. Emit any prose before the
-            # closer, then stash the complete block and process the
-            # remaining text below.
+            # Block closes within this chunk. Stash the complete block and
+            # process the remaining text below. Check the *full* assembled
+            # block for parameter siblings — handles the case where a
+            # parameter tag was split mid-token across chunks.
             tail = text[closer.end():]
             self._pending_function_block += text[: closer.end()]
-            self._pending_blocks.append(self._pending_function_block)
+            had_params = bool(_PARAMETER_RE.search(self._pending_function_block))
+            self._stash_block(self._pending_function_block, had_params)
             self._pending_function_block = None
             text = tail
 
@@ -151,8 +258,127 @@ class _ToolCallStripper:
             out.append(text[: m.start()])
             block = m.group(0)
             if _FUNCTION_OPEN_RE.match(block):
-                self._pending_blocks.append(block)
+                # Track whether this single-chunk block has real parameters.
+                had_params = bool(_PARAMETER_RE.search(block))
+                self._stash_block(block, had_params)
             text = text[m.end():]
+
+        # Strip orphan closing tags (`</parameter>`, `</function>`, etc.) that
+        # arrive with no matching opener observed by the stripper. Models
+        # occasionally emit these when they think they're already inside a
+        # tool-call block (e.g., instructed via prompt to use tools) but never
+        # wrote a real `<function=...> opener. Without stripping them OMP
+        # renders `</parameter></function>` as visible text content.
+        text = _ORPHAN_CLOSE_RE.sub("", text)
+
+        # Detect an *unclosed* bare <function=...> opener in the remaining
+        # text. If found, split: emit prose up to the opener, buffer the
+        # rest as the start of a cross-chunk block.
+        open_match = _FUNCTION_OPEN_RE.search(text)
+        if open_match:
+            out.append(text[: open_match.start()])
+            self._pending_function_block = text[open_match.start():]
+            # Parameter detection is done on the assembled block at close
+            # time (see the close-detection code above), so we don't track
+            # it per-chunk here.
+            return "".join(out)
+
+        # No unclosed opener. If `text` ends with an incomplete opener
+        # prefix that may continue into the next chunk, carry that prefix
+        # and emit the rest. We walk the last ``max_opener_len`` characters
+        # only — a stray ``<`` in the middle of ordinary text (e.g. ``1 < 2``)
+        # outside that window is not considered.
+        if text:
+            carry = ""
+            max_opener_len = 64
+            search_from = max(0, len(text) - max_opener_len)
+            for i in range(search_from, len(text)):
+                tail = text[i:]
+                if self._looks_like_opener(tail) or self._looks_like_partial_opener_tail(tail):
+                    carry = tail
+                    break
+            if carry:
+                out.append(text[: -len(carry)])
+            else:
+                out.append(text)
+            self._carry = carry
+        return "".join(out)
+
+    def flush(self) -> str:
+        """Drop any remaining carried content (partial opener that never
+        completed). Returns the clean emitted text, usually empty."""
+        carry, self._carry = self._carry, ""
+        # Drop any unclosed function block — we never received its
+        # </function>, so it's not safe to promote.
+        self._pending_function_block = None
+        return ""
+
+    def drain_pending_blocks(self) -> list[tuple[str, bool]]:
+        """Return and clear any fully-observed ``<function=...>...</function>``
+        blocks seen during ``feed()`` calls since the last drain. Each entry
+        is ``(block_text, had_parameters)`` where ``had_parameters`` is True
+        iff the block contained at least one ``<parameter=k>v</parameter>``
+        sibling.
+
+        Used by the stream normalizer to promote text-emitted tool calls
+        into structured ``delta.tool_calls`` frames. Only blocks with
+        ``had_parameters=True`` should be promoted; malformed blocks (no
+        parameters) should be dropped and their inner prose emitted as
+        ordinary text.
+        """
+        blocks, self._pending_blocks = self._pending_blocks, []
+        return blocks
+        text = self._carry + chunk
+        self._carry = ""
+        out: list[str] = []
+
+        # If we're mid-block (previously saw an unclosed <function=...>),
+        # buffer the new text and look for the matching </function>. Only
+        # when we find the closer do we add the block to _pending_blocks
+        # and resume normal text emission.
+        if self._pending_function_block is not None:
+            closer = _FUNCTION_CLOSE_RE.search(text)
+            if not closer:
+                # Buffer the chunk. We re-check for parameters on the full
+                # assembled block when the closer arrives (in case the
+                # <parameter ...> tag was split across chunks).
+                self._pending_function_block += text
+                return ""
+            # Block closes within this chunk. Stash the complete block and
+            # process the remaining text below. Check the *full* assembled
+            # block for parameter siblings — handles the case where a
+            # parameter tag was split mid-token across chunks.
+            tail = text[closer.end():]
+            self._pending_function_block += text[: closer.end()]
+            had_params = bool(_PARAMETER_RE.search(self._pending_function_block))
+            self._pending_blocks.append((self._pending_function_block, had_params))
+            self._pending_function_block = None
+            text = tail
+
+        # Repeatedly remove complete tool-call blocks. For bare <function=...>
+        # blocks we additionally retain a copy of the matched block in
+        # ``_pending_blocks`` so the caller can promote it into structured
+        # tool_calls instead of just dropping it.
+        while True:
+            m = _TOOL_CALL_XML_RE.search(text)
+            if not m:
+                break
+            out.append(text[: m.start()])
+            block = m.group(0)
+            if _FUNCTION_OPEN_RE.match(block):
+                # Track whether the block has real <parameter=k>...</parameter>
+                # siblings so we can decide later whether to promote it.
+                had_params = bool(_PARAMETER_RE.search(block))
+                self._pending_blocks.append((block, had_params))
+            text = text[m.end():]
+
+        # Strip orphan closing tags (`</parameter>`, `</function>`, etc.) that
+        # arrive with no matching opener observed by the stripper. Models
+        # occasionally emit these when they think they're already inside a
+        # tool-call block (e.g., instructed via prompt to use tools) but never
+        # wrote a real `<function=...>` opener. Without stripping them OMP
+        # renders `</parameter></function>` as visible text content.
+        text = _ORPHAN_CLOSE_RE.sub("", text)
 
         # Detect an *unclosed* bare <function=...> opener in the remaining
         # text. If found, split: emit prose up to the opener, buffer the
@@ -185,47 +411,21 @@ class _ToolCallStripper:
         carry, self._carry = self._carry, ""
         return ""
 
-    def drain_pending_blocks(self) -> list[str]:
+    def drain_pending_blocks(self) -> list[tuple[str, bool]]:
         """Return and clear any fully-observed ``<function=...>...</function>``
-        blocks seen during ``feed()`` calls since the last drain. Used by the
-        stream normalizer to promote text-emitted tool calls into structured
-        ``delta.tool_calls`` frames.
+        blocks seen during ``feed()`` calls since the last drain. Each entry
+        is ``(block_text, had_parameters)`` where ``had_parameters`` is True
+        iff the block contained at least one ``<parameter=k>v</parameter>``
+        sibling.
+
+        Used by the stream normalizer to promote text-emitted tool calls
+        into structured ``delta.tool_calls`` frames. Only blocks with
+        ``had_parameters=True`` should be promoted; malformed blocks (no
+        parameters) should be dropped and their inner prose emitted as
+        ordinary text.
         """
         blocks, self._pending_blocks = self._pending_blocks, []
         return blocks
-        text = self._carry + chunk
-        self._carry = ""
-        out: list[str] = []
-
-        # Repeatedly remove complete tool-call blocks.
-        while True:
-            m = _TOOL_CALL_XML_RE.search(text)
-            if not m:
-                break
-            out.append(text[: m.start()])
-            text = text[m.end():]
-
-        # Now `text` contains no complete tool block. Check whether its
-        # trailing suffix is an incomplete opener prefix that may continue
-        # into the next chunk; carry it if so, otherwise emit it.
-        if text:
-            emit_end = len(text)
-            carry = ""
-            for i in range(len(text)):
-                tail = text[i:]
-                if self._looks_like_opener(tail):
-                    emit_end = i
-                    carry = tail
-                    break
-            out.append(text[:emit_end])
-            self._carry = carry
-        return "".join(out)
-
-    def flush(self) -> str:
-        """Drop any remaining carried content (partial opener that never
-        completed). Returns the clean emitted text, usually empty."""
-        carry, self._carry = self._carry, ""
-        return ""
 
 
 def _strip_xml_tool_calls(content: str) -> str:
@@ -375,8 +575,11 @@ async def _normalize_stream(raw_stream: AsyncIterator[bytes]) -> AsyncIterator[b
             has_tools = bool(tc) and isinstance(tc, list) and len(tc) > 0
             # Strip XML/Markdown tool-call markup from content deltas using
             # a stateful stripper so markup spanning multiple streamed chunks
-            # is still recognized and dropped.
-            if has_content and "<" in raw_content:
+            # is still recognized and dropped. We always call feed() when
+            # there's content — even if this chunk contains no `<` — so the
+            # stripper's carry (a partial opener from the previous chunk)
+            # gets reassembled with this chunk's content.
+            if has_content:
                 cleaned = tool_stripper.feed(raw_content)
                 if not cleaned and has_tools:
                     delta = {k: v for k, v in delta.items() if k != "content"}
@@ -402,14 +605,31 @@ async def _normalize_stream(raw_stream: AsyncIterator[bytes]) -> AsyncIterator[b
                 yield f"data: {json.dumps(new_obj, ensure_ascii=False)}\n\n".encode()
             # After emitting the cleaned content frame, drain any complete
             # bare <function=...>...</function> blocks the stripper
-            # collected while processing this chunk and promote them into
-            # a structured delta.tool_calls frame. This makes models that
-            # emit tool-call XML as text behave like structured callers.
-            for block in tool_stripper.drain_pending_blocks():
-                parsed = parse_text_tool_calls(block)
-                tool_frame = _tool_calls_frame(parsed, new_obj)
-                if tool_frame is not None:
-                    yield tool_frame
+            # collected while processing this chunk.
+            #
+            # Well-formed blocks (those with at least one
+            # <parameter=k>v</parameter> sibling) are promoted into a
+            # structured delta.tool_calls frame so OMP receives a real
+            # tool_calls array.
+            #
+            # Malformed blocks (model wrote prose inside an unclosed
+            # function block, or emitted a function block with no
+            # arguments) are dropped from the tool_calls promotion, but
+            # their inner prose between <function=...> and </function> is
+            # extracted and emitted as ordinary text content so OMP still
+            # sees what the model actually said.
+            for block, had_params in tool_stripper.drain_pending_blocks():
+                if had_params:
+                    parsed = parse_text_tool_calls(block)
+                    tool_frame = _tool_calls_frame(parsed, new_obj)
+                    if tool_frame is not None:
+                        yield tool_frame
+                else:
+                    prose = _extract_inner_prose(block)
+                    if prose:
+                        # Emit as a content frame after the (already-emitted)
+                        # main content frame, so OMP renders it inline.
+                        yield _content_frame(prose, new_obj)
     # Flush any remaining partial frame in the buffer
     if buffer.strip():
         yield buffer

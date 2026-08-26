@@ -299,6 +299,254 @@ def test_stripper_handles_bare_function_block_split_across_many_chunks():
     assert "I will run that" in combined
 
 
+def test_stripper_strips_orphan_closing_tags():
+    """Regression: models that emit closing tags (`</parameter>`, `</function>`)
+    with no matching opener observed by the stripper must still have those
+    tags stripped, otherwise OMP renders them as visible text content.
+
+    Reproduces the OMP-reported bug where the model emitted "thinking aloud"
+    prose about how to test an API followed by an orphan `</parameter>\\n</function>`
+    that should never have been visible in the first place.
+    """
+    s = _ToolCallStripper()
+    text = (
+        "We need to decide next action. Since we haven't yet confirmed "
+        "whether NVIDIA API works, we need to continue.\n\n"
+        "We'll send POST request without Authorization header:\n\n"
+        "curl -i -X POST \"https://integrate.api.nvidia.com/v1/chat/completions\"\n"
+        "-H \"Content-Type: application/json\"\n"
+        "-d '{\"model\":\"meta/llama-3.1-8b-instruct\"}'\n"
+        "</parameter>\n"
+        "</function>"
+    )
+    out = s.feed(text)
+    assert "</parameter>" not in out, f"</parameter> leaked: {out!r}"
+    assert "</function>" not in out, f"</function> leaked: {out!r}"
+    # Surrounding prose is preserved.
+    assert "curl -i -X POST" in out
+    assert "We need to decide next action" in out
+
+
+@pytest.mark.asyncio
+async def test_stream_normalizer_strips_orphan_closing_tags(client):
+    """Streaming integration for orphan closing tags: the streamed delta.content
+    must not contain `</parameter>` or `</function>` when the upstream emits
+    prose + orphan closer tags without ever producing a `<function=...>` opener.
+    """
+    async def leaked_stream(*args, **kwargs):
+        yield (
+            b'data: {"choices":[{"index":0,"delta":{"role":"assistant",'
+            b'"content":"We need to decide next action...\\n\\n"}}]}\n\n'
+        )
+        yield (
+            b'data: {"choices":[{"index":0,"delta":{'
+            b'"content":"curl -i -X POST https://integrate.api.nvidia.com/v1/chat/completions"}}]}\n\n'
+        )
+        yield (
+            b'data: {"choices":[{"index":0,"delta":{'
+            b'"content":"</parameter>\\n</function>"}}]}\n\n'
+        )
+        yield (
+            b'data: {"choices":[{"index":0,"delta":{},'
+            b'"finish_reason":"stop"}]}\n\n'
+        )
+        yield b'data: [DONE]\n\n'
+
+    with patch("tusker_gateway.endpoints.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
+        mock_chat.return_value = leaked_stream()
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-code",
+                "messages": [{"role": "user", "content": "test nvidia"}],
+                "stream": True,
+            },
+            headers=HEADERS_AUTH,
+        )
+        assert resp.status == 200
+        body = await resp.read()
+
+    text = body.decode("utf-8", errors="replace")
+    assert "</parameter>" not in text, f"orphan </parameter> leaked: {text!r}"
+    assert "</function>" not in text, f"orphan </function> leaked: {text!r}"
+    # Prose around the orphan tags survives intact.
+    assert "We need to decide next action" in text
+    assert "curl -i -X POST" in text
+
+
+def test_stripper_drops_empty_args_block_as_malformed():
+    """A buffered <function=bash>...</function> block with no
+    <parameter=k>v</parameter> siblings (model wrote prose inside the
+    block) is recognised as malformed: the inner prose is preserved
+    and no fake empty-args tool_call is emitted.
+    """
+    import asyncio
+    import json
+
+    from tusker_gateway.endpoints import _normalize_stream
+
+    async def stream():
+        for piece in [
+            b'data: {"choices":[{"delta":{"role":"assistant","content":"<function=bash>\\nWe need to decide next action.\\ncurl -X POST ...\\n</parameter>\\n</function>"}}]}\n\n',
+            b'data: {"choices":[{"delta":{},"finish_reason":"stop"}}]}\n\n',
+            b'data: [DONE]\n\n',
+        ]:
+            yield piece
+
+    async def run():
+        seen_text = ""
+        seen_tool_calls = []
+        async for frame in _normalize_stream(stream()):
+            s = frame.strip()
+            if not s.startswith(b"data: ") or s == b"data: [DONE]":
+                continue
+            try:
+                obj = json.loads(s[len(b"data: "):])
+            except json.JSONDecodeError:
+                continue
+            for ch in obj.get("choices", []):
+                d = ch.get("delta", {}) or {}
+                if d.get("content"):
+                    seen_text += d["content"]
+                if d.get("tool_calls"):
+                    seen_tool_calls.extend(d["tool_calls"])
+
+        # Prose inside the malformed block is preserved.
+        assert "We need to decide next action" in seen_text
+        assert "curl -X POST" in seen_text
+        # No fake empty-args tool call was promoted.
+        assert seen_tool_calls == [], f"unexpected tool_calls: {seen_tool_calls!r}"
+
+    asyncio.run(run())
+
+
+@pytest.mark.asyncio
+async def test_stream_normalizer_emits_tool_calls_when_opener_split(client):
+    """If the <function=bash> opener arrives split across two SSE fragments
+    (``<functi`` + ``on=bash>``), the stripper must reassemble it, buffer
+    the body, and promote it to a structured delta.tool_calls frame on
+    close.
+    """
+    async def split_opener_stream(*args, **kwargs):
+        yield (
+            b'data: {"choices":[{"index":0,"delta":{"role":"assistant",'
+            b'"content":"I will run that.\\n\\n"},"finish_reason":null}]}\n\n'
+        )
+        # Opener split across two deltas.
+        yield (
+            b'data: {"choices":[{"index":0,"delta":{'
+            b'"content":"<functi"},"finish_reason":null}]}\n\n'
+        )
+        yield (
+            b'data: {"choices":[{"index":0,"delta":{'
+            b'"content":"on=bash>"},"finish_reason":null}]}\n\n'
+        )
+        yield (
+            b'data: {"choices":[{"index":0,"delta":{'
+            b'"content":"\\n<parameter=command>ls</parameter>\\n</function>"},'
+            b'"finish_reason":null}]}\n\n'
+        )
+        yield (
+            b'data: {"choices":[{"index":0,"delta":{},'
+            b'"finish_reason":"stop"}]}\n\n'
+        )
+        yield b'data: [DONE]\n\n'
+
+    with patch("tusker_gateway.endpoints.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
+        mock_chat.return_value = split_opener_stream()
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-code",
+                "messages": [{"role": "user", "content": "ls please"}],
+                "stream": True,
+            },
+            headers=HEADERS_AUTH,
+        )
+        assert resp.status == 200
+        body = await resp.read()
+
+    text = body.decode("utf-8", errors="replace")
+    import json as _json
+    tool_calls = []
+    for line in text.splitlines():
+        if not line.startswith("data: ") or line.strip() == "data: [DONE]":
+            continue
+        try:
+            obj = _json.loads(line[len("data: "):])
+            for ch in obj.get("choices", []):
+                tc = ch.get("delta", {}).get("tool_calls")
+                if isinstance(tc, list):
+                    tool_calls.extend(tc)
+        except Exception:
+            continue
+
+    assert tool_calls, f"no tool_calls emitted for split-opener shape: {text!r}"
+    fn = tool_calls[0]["function"]
+    assert fn["name"] == "bash"
+    args = _json.loads(fn["arguments"]) if isinstance(fn["arguments"], str) else fn["arguments"]
+    assert args.get("command") == "ls"
+
+
+@pytest.mark.asyncio
+async def test_stream_normalizer_emits_tool_calls_when_param_tag_split(client):
+    """If a ``<parameter=command>`` tag is split across two SSE fragments
+    (``<par`` + ``ameter=command>``), the stripper must reassemble it and
+    still promote the block to a structured delta.tool_calls frame with
+    the parsed command argument.
+    """
+    async def split_param_stream(*args, **kwargs):
+        yield (
+            b'data: {"choices":[{"index":0,"delta":{"role":"assistant",'
+            b'"content":"<function=bash>\\n<par"},"finish_reason":null}]}\n\n'
+        )
+        yield (
+            b'data: {"choices":[{"index":0,"delta":{'
+            b'"content":"ameter=command>ls\\n</parameter>\\n</function>"},'
+            b'"finish_reason":null}]}\n\n'
+        )
+        yield (
+            b'data: {"choices":[{"index":0,"delta":{},'
+            b'"finish_reason":"stop"}]}\n\n'
+        )
+        yield b'data: [DONE]\n\n'
+
+    with patch("tusker_gateway.endpoints.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
+        mock_chat.return_value = split_param_stream()
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-code",
+                "messages": [{"role": "user", "content": "ls"}],
+                "stream": True,
+            },
+            headers=HEADERS_AUTH,
+        )
+        assert resp.status == 200
+        body = await resp.read()
+
+    text = body.decode("utf-8", errors="replace")
+    import json as _json
+    tool_calls = []
+    for line in text.splitlines():
+        if not line.startswith("data: ") or line.strip() == "data: [DONE]":
+            continue
+        try:
+            obj = _json.loads(line[len("data: "):])
+            for ch in obj.get("choices", []):
+                tc = ch.get("delta", {}).get("tool_calls")
+                if isinstance(tc, list):
+                    tool_calls.extend(tc)
+        except Exception:
+            continue
+
+    assert tool_calls, f"no tool_calls emitted for split-param shape: {text!r}"
+    fn = tool_calls[0]["function"]
+    assert fn["name"] == "bash"
+    args = _json.loads(fn["arguments"]) if isinstance(fn["arguments"], str) else fn["arguments"]
+    assert args.get("command") == "ls"
+
+
 @pytest.mark.asyncio
 async def test_stream_normalizer_injects_finish_when_upstream_omits_it(client):
     """If the upstream stream ends without a finish_reason chunk, the gateway
