@@ -20,6 +20,7 @@ from tusker_gateway.circuit_breaker import CircuitBreaker, BreakerDecision
 from tusker_gateway.errors import (
     BadRequestError,
     GatewayError,
+    MalformedToolCallError,
     RateLimitError,
     openai_error,
 )
@@ -680,6 +681,7 @@ async def _normalize_stream(
     provider: str | None = None,
     model: str | None = None,
     request_id: str | None = None,
+    tools_requested: bool = False,
 ) -> AsyncIterator[bytes]:
     """Sanitize and normalize a provider's OpenAI-compatible SSE stream.
 
@@ -687,7 +689,9 @@ async def _normalize_stream(
     before client output. This covers providers that send tool XML in
     ``delta.content``, providers that send native ``tool_calls`` plus a
     duplicate XML copy, and providers that put ``finish_reason`` in the same
-    event as the call.
+    event as the call. When ``tools_requested`` is true, an executable-looking
+    envelope that cannot be parsed is rejected instead of being silently
+    downgraded to a successful prose response.
     """
     from tusker_gateway.tool_formats import (
         parse_text_tool_calls,
@@ -701,7 +705,21 @@ async def _normalize_stream(
     saw_finish_reason = False
     saw_done = False
     saw_tool_call = False
+    saw_tool_markup = False
     emitted_finish_reason: str | None = None
+
+    def malformed_tool_error() -> MalformedToolCallError:
+        marker_types = tuple(sorted(tool_markup_seen)) or ("unknown",)
+        logger.warning(
+            "malformed tool response rejected provider=%s model=%s request_id=%s marker_types=%s",
+            provider or "unknown",
+            model or "unknown",
+            request_id or "unknown",
+            ",".join(marker_types),
+        )
+        return MalformedToolCallError(marker_types=marker_types)
+
+    tool_markup_seen: set[str] = set()
 
     def finish_frame(reason: str) -> bytes:
         return sse_frame(format_openai_chunk(finish_reason=reason, model=model))
@@ -748,6 +766,8 @@ async def _normalize_stream(
                 continue
             if stripped == b"data: [DONE]":
                 tool_stripper.flush()
+                if tools_requested and saw_tool_markup and not saw_tool_call:
+                    raise malformed_tool_error()
                 if emitted_finish_reason is None:
                     emitted_finish_reason = "tool_calls" if saw_tool_call else "stop"
                     yield finish_frame(emitted_finish_reason)
@@ -795,6 +815,9 @@ async def _normalize_stream(
             tc = delta.get("tool_calls")
             has_tools = isinstance(tc, list) and bool(tc)
             raw_marker_types = tool_markup_kinds(raw_content)
+            if raw_marker_types:
+                saw_tool_markup = True
+                tool_markup_seen.update(raw_marker_types)
             cleaned_content = ""
             has_content = isinstance(raw_content, str) and bool(raw_content)
             if has_content:
@@ -859,6 +882,8 @@ async def _normalize_stream(
                             if tool_frame is not None:
                                 pending_tool_frames.append(tool_frame)
                     else:
+                        if tools_requested and not has_tools and not saw_tool_call:
+                            raise malformed_tool_error()
                         # A wrapper can contain malformed markup or ordinary
                         # prose. Preserve the latter without forwarding the
                         # executable-looking envelope.
@@ -866,6 +891,8 @@ async def _normalize_stream(
                         if prose:
                             pending_prose_frames.append(_content_frame(prose, new_obj))
                 elif not eligible:
+                    if tools_requested and not has_tools and not saw_tool_call:
+                        raise malformed_tool_error()
                     prose = _extract_inner_prose(block)
                     if prose:
                         pending_prose_frames.append(_content_frame(prose, new_obj))
@@ -942,9 +969,75 @@ async def _normalize_stream(
             request_id or "unknown",
             len(buffer),
         )
+    if tools_requested and saw_tool_markup and not saw_tool_call:
+        raise malformed_tool_error()
     if emitted_finish_reason is None:
         emitted_finish_reason = "tool_calls" if saw_tool_call else "stop"
         yield finish_frame(emitted_finish_reason)
+
+
+class _PreparedStream:
+    """Marker wrapper for a stream whose first normalized event was probed."""
+
+    def __init__(self, iterator: AsyncIterator[bytes]) -> None:
+        self.iterator = iterator
+
+    def __aiter__(self) -> AsyncIterator[bytes]:
+        return self.iterator
+
+
+async def _prepend_stream(
+    first: bytes,
+    rest: AsyncIterator[bytes],
+) -> AsyncIterator[bytes]:
+    yield first
+    async for chunk in rest:
+        yield chunk
+
+
+async def _close_async_iterator(iterator: Any) -> None:
+    """Close an async generator when stream preflight rejects a candidate."""
+    close = getattr(iterator, "aclose", None)
+    if close is not None:
+        try:
+            await close()
+        except Exception:
+            logger.debug("failed to close rejected upstream stream", exc_info=True)
+
+
+async def _prepare_stream_result(
+    result: Any,
+    *,
+    provider: str,
+    model: str,
+    request_id: str | None,
+    tools_requested: bool,
+) -> Any:
+    """Probe the first normalized event before committing a client response.
+
+    Tool calls are normally the first useful stream event. Probing that event
+    lets the pool fallback path reject a malformed envelope before aiohttp
+    sends OMP its 200 response. The first event is replayed so successful
+    streams retain their normal output and latency after the probe.
+    """
+    if not tools_requested or not hasattr(result, "__aiter__"):
+        return result
+
+    normalized = _normalize_stream(
+        result,
+        provider=provider,
+        model=model,
+        request_id=request_id,
+        tools_requested=True,
+    )
+    try:
+        first = await normalized.__anext__()
+    except StopAsyncIteration:
+        return _PreparedStream(normalized)
+    except Exception:
+        await _close_async_iterator(normalized)
+        raise
+    return _PreparedStream(_prepend_stream(first, normalized))
 
 
 def _pool_name(body: dict[str, Any]) -> str | None:
@@ -1231,6 +1324,13 @@ async def _call_with_pool_fallback(
                 extra_body=extra_body or None,
                 metrics_registry=metrics_registry,
             )
+            result = await _prepare_stream_result(
+                result,
+                provider=provider,
+                model=model,
+                request_id=request_id,
+                tools_requested=bool(tools) and bool(body.get("stream")),
+            )
             if breaker is not None:
                 breaker.record_success(provider, model)
             _clear_permanently_failed(provider, model)
@@ -1315,6 +1415,13 @@ async def _call_with_pool_fallback(
                 tool_choice=body.get("tool_choice"),
                 extra_body=extra_body or None,
                 metrics_registry=metrics_registry,
+            )
+            result = await _prepare_stream_result(
+                result,
+                provider=provider,
+                model=model,
+                request_id=request_id,
+                tools_requested=bool(tools) and bool(body.get("stream")),
             )
             if breaker is not None:
                 breaker.record_success(provider, model)
@@ -1999,12 +2106,18 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                         # Emit finish_reason chunk (distinct from content to satisfy OMP)
                         await resp.write(sse_frame(format_openai_chunk(finish_reason=finish_reason)))
                     else:
-                        async for chunk in _normalize_stream(
-                            result,
-                            provider=provider,
-                            model=target_model,
-                            request_id=request_id,
-                        ):
+                        stream_result = (
+                            result.iterator
+                            if isinstance(result, _PreparedStream)
+                            else _normalize_stream(
+                                result,
+                                provider=provider,
+                                model=target_model,
+                                request_id=request_id,
+                                tools_requested=bool(tools),
+                            )
+                        )
+                        async for chunk in stream_result:
                             await resp.write(chunk)
                 except (ConnectionResetError, ConnectionError, BrokenPipeError) as exc:
                     stream_ok = False

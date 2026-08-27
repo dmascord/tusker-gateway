@@ -41,6 +41,26 @@ class ProviderError(GatewayError):
     error_type = "provider_error"
 
 
+class MalformedToolCallError(ProviderError):
+    """An upstream model emitted tool markup that could not be parsed safely."""
+
+    def __init__(
+        self,
+        *,
+        marker_types: tuple[str, ...] = (),
+    ) -> None:
+        markers = ",".join(marker_types) or "unknown"
+        super().__init__(
+            "Provider emitted malformed tool-call markup",
+            code="malformed_tool_call",
+        )
+        # These attributes let the normal provider-fallback path cool down and
+        # exclude the candidate without exposing model output to the caller.
+        self.upstream_status = 502
+        self.upstream_body = f"malformed tool-call markup: {markers}"
+        self.marker_types = marker_types
+
+
 class RateLimitError(GatewayError):
     """A rate-limit / cooldown hit on a provider pool."""
 

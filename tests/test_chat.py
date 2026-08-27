@@ -188,6 +188,73 @@ async def test_chat_stream_provider_502_falls_back_before_client_response(app, c
 
 
 @pytest.mark.asyncio
+async def test_chat_stream_malformed_tool_markup_falls_back_before_client_response(app, client):
+    """Malformed tool text must not become a successful OMP stop."""
+    pool_manager = MagicMock()
+    pool_manager.select.side_effect = [
+        ("openrouter", "nvidia/malformed-tool-model"),
+        ("openai", "tool-capable-fallback"),
+    ]
+    app["pool_manager"] = pool_manager
+
+    async def malformed_stream(*args, **kwargs):
+        yield (
+            b'data: {"choices":[{"index":0,"delta":{"role":"assistant",'
+            b'"content":"I will inspect the manifests. <tool_call>find /Volumes/dev/dev/k8s -name \\\"*.yaml\\\" -exec grep -l \\\"ConfigMap\\\" {} \\\\; </parameter></function></tool_call>"},'
+            b'"finish_reason":"stop"}]}'
+            b'\n\n'
+        )
+
+    async def valid_stream(*args, **kwargs):
+        payload = {
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call-fallback-1",
+                        "type": "function",
+                        "function": {
+                            "name": "read",
+                            "arguments": '{"path":"/Volumes/dev/dev/k8s"}',
+                        },
+                    }],
+                },
+                "finish_reason": "tool_calls",
+            }],
+        }
+        yield f"data: {json.dumps(payload)}\n\n".encode()
+
+    with patch("tusker_gateway.endpoints.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
+        mock_chat.side_effect = [malformed_stream(), valid_stream()]
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-code",
+                "messages": [{"role": "user", "content": "find ConfigMaps"}],
+                "tools": [{"type": "function", "function": {"name": "read"}}],
+                "stream": True,
+            },
+            headers=HEADERS_AUTH,
+        )
+        body = await resp.read()
+
+    assert resp.status == 200
+    assert b"malformed-tool-model" not in body
+    assert b'"name": "read"' in body
+    assert b'"finish_reason": "tool_calls"' in body
+    assert pool_manager.select.call_args_list == [
+        call("code", excluded=set(), required_input_modalities=None, requires_tools=True),
+        call(
+            "code",
+            excluded={("openrouter", "nvidia/malformed-tool-model")},
+            required_input_modalities=None,
+            requires_tools=True,
+        ),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_chat_pool_input_image_requires_image_after_breaker_skip(app, client):
     pool_manager = MagicMock()
     pool_manager.select.side_effect = [
