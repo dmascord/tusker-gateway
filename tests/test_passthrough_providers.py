@@ -536,6 +536,7 @@ async def test_stream_error_envelope_is_raised_before_stream_is_returned(
     response.status = 200
     response.url = "https://upstream.example/v1/chat/completions"
     response.content = _AsyncChunks([
+        b'data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n',
         b'data: {"error":{"message":"Upstream error from Nvidia: '
         b'ResourceExhausted: Worker local total request limit reached (16/16)",'
         b'"code":502}}\n\n',

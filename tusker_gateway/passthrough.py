@@ -45,6 +45,7 @@ _STREAM_ERROR_HINTS = (
     "worker local total request limit",
 )
 _UPSTREAM_PREFETCH_MAX_BYTES = 64 * 1024
+_UPSTREAM_PREFETCH_MAX_EVENTS = 4
 
 
 def _stream_status(value: Any) -> int | None:
@@ -137,6 +138,41 @@ def _stream_error_from_frame(
         _safe_upstream_body(exc.upstream_body),
     )
     return exc
+
+
+def _stream_frame_is_ready(frame: bytes) -> bool:
+    """Return whether a non-error frame proves useful output has begun."""
+    data_lines = [
+        line[5:].lstrip()
+        for line in frame.splitlines()
+        if line.lower().startswith(b"data:")
+    ]
+    if not data_lines:
+        return False
+    payload = b"\n".join(data_lines).strip()
+    if payload == b"[DONE]":
+        return True
+    try:
+        parsed = json.loads(payload)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return False
+    if not isinstance(parsed, dict):
+        return False
+    choices = parsed.get("choices")
+    if not isinstance(choices, list):
+        return False
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        if choice.get("finish_reason"):
+            return True
+        delta = choice.get("delta") or {}
+        if isinstance(delta, dict) and any(
+            delta.get(key)
+            for key in ("content", "reasoning_content", "tool_calls", "function_call")
+        ):
+            return True
+    return False
 
 
 def _upstream_failure_cooldown_seconds(exc: BaseException) -> float | None:
@@ -736,26 +772,44 @@ class PassthroughClient:
         prefetched: list[bytes] = []
         pending = bytearray()
         reached_eof = False
+        prefetched_bytes = 0
+        event_count = 0
 
-        while b"\n\n" not in pending and len(pending) < _UPSTREAM_PREFETCH_MAX_BYTES:
-            try:
-                chunk = await upstream_iterator.__anext__()
-            except StopAsyncIteration:
-                reached_eof = True
+        # Role-only and metadata events are common before the first token.
+        # Keep reading through those events so a proxy cannot hide an
+        # immediate provider error behind an otherwise successful HTTP 200.
+        while (
+            event_count < _UPSTREAM_PREFETCH_MAX_EVENTS
+            and prefetched_bytes < _UPSTREAM_PREFETCH_MAX_BYTES
+        ):
+            while b"\n\n" not in pending and prefetched_bytes < _UPSTREAM_PREFETCH_MAX_BYTES:
+                try:
+                    chunk = await upstream_iterator.__anext__()
+                except StopAsyncIteration:
+                    reached_eof = True
+                    break
+                if not chunk:
+                    continue
+                prefetched.append(chunk)
+                prefetched_bytes += len(chunk)
+                pending.extend(chunk)
+
+            if b"\n\n" not in pending:
+                if reached_eof or prefetched_bytes >= _UPSTREAM_PREFETCH_MAX_BYTES:
+                    frame = bytes(pending)
+                    pending.clear()
+                    error = _stream_error_from_frame(
+                        frame,
+                        provider=provider,
+                        model=model,
+                    )
+                    if error is not None:
+                        raise error
                 break
-            if not chunk:
-                continue
-            prefetched.append(chunk)
-            pending.extend(chunk)
 
-        if b"\n\n" in pending:
-            frames = pending.split(b"\n\n")[:-1]
-        elif reached_eof or len(pending) >= _UPSTREAM_PREFETCH_MAX_BYTES:
-            frames = [bytes(pending)] if pending else []
-        else:
-            frames = []
-
-        for frame in frames:
+            frame, remainder = pending.split(b"\n\n", 1)
+            pending = bytearray(remainder)
+            event_count += 1
             error = _stream_error_from_frame(
                 frame,
                 provider=provider,
@@ -763,6 +817,8 @@ class PassthroughClient:
             )
             if error is not None:
                 raise error
+            if _stream_frame_is_ready(frame):
+                break
 
         return prefetched, upstream_iterator
 
