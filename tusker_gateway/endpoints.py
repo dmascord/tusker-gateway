@@ -24,7 +24,7 @@ from tusker_gateway.errors import (
     openai_error,
 )
 from tusker_gateway.metrics import MetricsRegistry
-from tusker_gateway.passthrough import PassthroughClient
+from tusker_gateway.passthrough import PassthroughClient, _safe_upstream_body
 from tusker_gateway.pools import PoolManager
 from tusker_gateway.quality import QualityDB
 from tusker_gateway.rate_limit import RateLimiter
@@ -1138,6 +1138,20 @@ def _cooldown_for_exc(exc: GatewayError) -> float | None:
     except Exception:
         return None
 
+
+def _max_pool_provider_attempts() -> int:
+    """Bound per-request fallback work so one outage cannot stall OMP."""
+    try:
+        return max(1, int(os.environ.get("TUSKER_MAX_PROVIDER_ATTEMPTS", "6")))
+    except ValueError:
+        return 6
+
+
+def _pool_failure_summary(exc: BaseException) -> str:
+    """Return a bounded, redacted provider failure for operational logs."""
+    body = getattr(exc, "upstream_body", None) or getattr(exc, "body", None) or str(exc)
+    return _safe_upstream_body(str(body), limit=300)
+
 def _mark_permanently_failed(
     exc: Exception,
     provider: str,
@@ -1188,6 +1202,7 @@ async def _call_with_pool_fallback(
     request: web.Request | None = None,
     metrics_registry: Any | None = None,
     initial_selection: tuple[str, str] | None = None,
+    request_id: str | None = None,
 ) -> tuple[str, str, Any]:
     """Call a pool candidate, trying the next candidate after provider failure.
 
@@ -1247,7 +1262,20 @@ async def _call_with_pool_fallback(
     else:
         pool_mgr = PoolManager(config)
     pending_selection = initial_selection
+    attempts = 0
+    max_attempts = _max_pool_provider_attempts()
     while True:
+        if attempts >= max_attempts:
+            logger.warning(
+                "pool fallback attempt limit reached rid=%s pool=%s attempts=%d last_error=%s",
+                request_id or "unknown",
+                pool_name,
+                attempts,
+                _pool_failure_summary(last_error) if last_error is not None else "none",
+            )
+            if last_error is not None:
+                raise last_error
+            raise BadRequestError("No healthy models in pool", code="no_healthy_models")
         # A semantic-cache lookup resolves a concrete candidate first so the
         # cached response cannot be returned for a different provider/model.
         if pending_selection is not None:
@@ -1269,6 +1297,16 @@ async def _call_with_pool_fallback(
             excluded.add(selected)
             continue
         provider, model = selected
+        attempts += 1
+        logger.info(
+            "pool fallback attempt rid=%s pool=%s candidate=%s/%s attempt=%d/%d",
+            request_id or "unknown",
+            pool_name,
+            provider,
+            model,
+            attempts,
+            max_attempts,
+        )
         try:
             result = await client.chat(
                 provider, model, body["messages"],
@@ -1291,6 +1329,17 @@ async def _call_with_pool_fallback(
                 )
             last_error = exc
             excluded.add(selected)
+            logger.warning(
+                "pool candidate failed rid=%s pool=%s candidate=%s/%s attempt=%d/%d status=%s body=%s",
+                request_id or "unknown",
+                pool_name,
+                provider,
+                model,
+                attempts,
+                max_attempts,
+                getattr(exc, "upstream_status", None),
+                _pool_failure_summary(exc),
+            )
         except Exception as exc:
             if breaker is not None:
                 breaker.record_failure(
@@ -1301,6 +1350,17 @@ async def _call_with_pool_fallback(
             _mark_permanently_failed(exc, provider, model)
             last_error = exc
             excluded.add(selected)
+            logger.warning(
+                "pool candidate failed rid=%s pool=%s candidate=%s/%s attempt=%d/%d status=%s body=%s",
+                request_id or "unknown",
+                pool_name,
+                provider,
+                model,
+                attempts,
+                max_attempts,
+                getattr(exc, "upstream_status", None),
+                _pool_failure_summary(exc),
+            )
 
 
 def _image_url_value(block: dict[str, Any], *, context: str) -> tuple[str, str | None]:
@@ -1811,6 +1871,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                 breaker=breaker, request=request,
                 metrics_registry=request.app.get("metrics"),
                 initial_selection=semantic_target,
+                request_id=request_id,
             )
             logger.debug('selected rid=%s provider=%s model=%s pool=%s', request_id, provider, target_model, pool_name)
 

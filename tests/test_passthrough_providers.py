@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from tusker_gateway.config import load_config
+from tusker_gateway.errors import ProviderError
 from tusker_gateway.passthrough import PROVIDER_ENDPOINTS, PassthroughClient
 from tusker_gateway.quality import QualityDB
 from tusker_gateway.routing import Route, resolve_route, split_model
@@ -67,6 +68,25 @@ def bearer_client(mock_http, quality_db):
 def oauth_client(mock_http, quality_db):
     """PassthroughClient with OAuth credentials configured."""
     return PassthroughClient(_oauth_config(), quality_db, mock_http)
+
+
+class _AsyncChunks:
+    """Small async byte source used to exercise the stream prefetch path."""
+
+    def __init__(self, chunks: list[bytes]):
+        self._chunks = iter(chunks)
+
+    def __aiter__(self):
+        return self
+
+    def iter_any(self):
+        return self
+
+    async def __anext__(self) -> bytes:
+        try:
+            return next(self._chunks)
+        except StopIteration as exc:
+            raise StopAsyncIteration from exc
 
 
 # ---------------------------------------------------------------------------
@@ -505,6 +525,66 @@ async def test_chat_codex_advances_rotator_on_4xx():
         )
     # Advance must have been called because of the 400.
     assert rotator.advance.await_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_stream_error_envelope_is_raised_before_stream_is_returned(
+    mock_http, quality_db, tmp_path,
+):
+    """HTTP-200 SSE provider errors must remain eligible for pool fallback."""
+    response = MagicMock()
+    response.status = 200
+    response.url = "https://upstream.example/v1/chat/completions"
+    response.content = _AsyncChunks([
+        b'data: {"error":{"message":"Upstream error from Nvidia: '
+        b'ResourceExhausted: Worker local total request limit reached (16/16)",'
+        b'"code":502}}\n\n',
+    ])
+    response.release = MagicMock()
+    mock_http.request = AsyncMock(return_value=response)
+    config = _base_config(quality_db_path=str(tmp_path / "quality.db"))
+    client = PassthroughClient(config, quality_db, mock_http)
+
+    with pytest.raises(ProviderError) as caught:
+        await client.chat(
+            "openrouter",
+            "nvidia/test-model",
+            [{"role": "user", "content": "hello"}],
+            stream=True,
+        )
+
+    assert caught.value.upstream_status == 502
+    assert "ResourceExhausted" in caught.value.message
+    assert response.release.called
+
+
+@pytest.mark.asyncio
+async def test_stream_prefetch_preserves_successful_upstream_bytes(
+    mock_http, quality_db, tmp_path,
+):
+    """Prefetching an ordinary SSE event must not change stream bytes."""
+    response = MagicMock()
+    response.status = 200
+    response.url = "https://upstream.example/v1/chat/completions"
+    expected = [
+        b'data: {"choices":[{"delta":{"content":"ok"}}]}\n',
+        b'\ndata: [DONE]\n\n',
+    ]
+    response.content = _AsyncChunks(expected)
+    response.release = MagicMock()
+    mock_http.request = AsyncMock(return_value=response)
+    config = _base_config(quality_db_path=str(tmp_path / "quality.db"))
+    client = PassthroughClient(config, quality_db, mock_http)
+
+    stream = await client.chat(
+        "openrouter",
+        "openai/test-model",
+        [{"role": "user", "content": "hello"}],
+        stream=True,
+    )
+    output = [chunk async for chunk in stream]
+
+    assert output == expected
 
 
 @pytest.mark.asyncio

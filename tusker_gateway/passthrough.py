@@ -39,6 +39,144 @@ def _safe_upstream_body(body: str | None, *, limit: int = 500) -> str:
     return redacted[:limit]
 
 
+_STREAM_ERROR_HINTS = (
+    "resourceexhausted",
+    "upstream error",
+    "worker local total request limit",
+)
+_UPSTREAM_PREFETCH_MAX_BYTES = 64 * 1024
+
+
+def _stream_status(value: Any) -> int | None:
+    """Extract an HTTP-like status from a provider error payload."""
+    if isinstance(value, bool):
+        return None
+    try:
+        status = int(value)
+    except (TypeError, ValueError):
+        return None
+    return status if 100 <= status <= 599 else None
+
+
+def _stream_error_from_frame(
+    frame: bytes,
+    *,
+    provider: str,
+    model: str,
+) -> ProviderError | None:
+    """Turn an upstream SSE error envelope into a fallback-eligible error.
+
+    Some OpenAI-compatible proxies return HTTP 200 and put an upstream 5xx
+    inside the first SSE event. If that event is passed through, the gateway
+    has already committed a 200 response to OMP and cannot select a fallback.
+    """
+    data_lines = [
+        line[5:].lstrip()
+        for line in frame.splitlines()
+        if line.lower().startswith(b"data:")
+    ]
+    if not data_lines:
+        return None
+    payload = b"\n".join(data_lines).strip()
+    if not payload or payload == b"[DONE]":
+        return None
+    try:
+        parsed = json.loads(payload)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+
+    error_present = parsed.get("error") is not None or parsed.get("errors") is not None
+    error_obj = parsed.get("error")
+    if error_obj is None:
+        error_obj = parsed.get("errors")
+
+    if isinstance(error_obj, list):
+        error_obj = error_obj[0] if error_obj else None
+    if isinstance(error_obj, dict):
+        message = (
+            error_obj.get("message")
+            or error_obj.get("detail")
+            or error_obj.get("type")
+            or json.dumps(error_obj, ensure_ascii=False)
+        )
+        code = error_obj.get("code")
+        status = _stream_status(error_obj.get("status")) or _stream_status(code)
+    elif error_obj is not None:
+        message = str(error_obj)
+        code = parsed.get("code")
+        status = _stream_status(parsed.get("status")) or _stream_status(code)
+    else:
+        raw_lower = payload.lower()
+        # Do not interpret ordinary assistant content as an error. The hint
+        # fallback is only used for payloads without a normal choices array.
+        if isinstance(parsed.get("choices"), list) or not any(
+            hint.encode() in raw_lower for hint in _STREAM_ERROR_HINTS
+        ):
+            return None
+        message = parsed.get("message") or parsed.get("detail") or payload.decode(
+            "utf-8", errors="replace"
+        )
+        code = parsed.get("code")
+        status = _stream_status(parsed.get("status")) or _stream_status(code)
+
+    if not error_present and not message:
+        return None
+    if not isinstance(message, str):
+        message = str(message)
+    message = message[:500]
+    exc = ProviderError(message, code=str(code) if code is not None else "provider_error")
+    exc.upstream_status = status or 502
+    exc.upstream_body = payload.decode("utf-8", errors="replace")[:2000]
+    logger.warning(
+        "upstream SSE error envelope provider=%s model=%s status=%s body=%s",
+        provider,
+        model,
+        exc.upstream_status,
+        _safe_upstream_body(exc.upstream_body),
+    )
+    return exc
+
+
+def _upstream_failure_cooldown_seconds(exc: BaseException) -> float | None:
+    """Return a short model cooldown for retryable stream failures."""
+    status = getattr(exc, "upstream_status", None)
+    if status is not None:
+        try:
+            if not 500 <= int(status) < 600:
+                return None
+        except (TypeError, ValueError):
+            return None
+    elif not isinstance(exc, (asyncio.TimeoutError, aiohttp.ClientError)):
+        return None
+    try:
+        return max(
+            1.0,
+            float(os.environ.get("TUSKER_UPSTREAM_FAILURE_COOLDOWN_SECS", "60")),
+        )
+    except ValueError:
+        return 60.0
+
+
+def _persist_cooldown(
+    config: dict[str, Any],
+    provider: str,
+    model: str,
+    seconds: float,
+) -> None:
+    """Persist a cooldown without making the provider path fail."""
+    try:
+        from pathlib import Path
+
+        from tusker_gateway.persistent_cooldown import PersistentCooldownStore
+
+        db_path = Path(config.get("quality_db_path", "data/quality.db")).parent / "cooldowns.db"
+        PersistentCooldownStore(db_path=db_path).record(provider, model, seconds)
+    except Exception:
+        pass
+
+
 # Per-read timeout for upstream SSE streams. The `total` budget below is the
 # hard cap on the whole request; `sock_read` caps the *gap* between bytes so a
 # stalled provider surfaces as a clean timeout instead of hanging silently
@@ -349,6 +487,37 @@ class PassthroughClient:
             return None
         return getattr(self, "_codex_rotator", None)
 
+    async def _record_stream_failure(
+        self,
+        provider: str,
+        model: str,
+        exc: BaseException,
+        started: float,
+    ) -> None:
+        """Record a stream setup failure and cool down the bad candidate."""
+        latency_ms = (time.monotonic() - started) * 1000
+        await self._record_quality(provider, model, False, latency_ms)
+
+        seconds = _upstream_failure_cooldown_seconds(exc)
+        if seconds is not None:
+            tracker = global_tracker()
+            tracker.cooldown(provider, model, seconds)
+            _persist_cooldown(self._config, provider, model, seconds)
+            if tracker.record_failure(provider):
+                provider_seconds = 300.0
+                tracker.cooldown(provider, "", provider_seconds)
+                _persist_cooldown(self._config, provider, "", provider_seconds)
+
+        body = getattr(exc, "upstream_body", None) or str(exc)
+        logger.warning(
+            "provider stream setup failed provider=%s model=%s status=%s cooldown=%s body=%s",
+            provider,
+            model,
+            getattr(exc, "upstream_status", None),
+            f"{seconds:.0f}s" if seconds is not None else "none",
+            _safe_upstream_body(body),
+        )
+
     async def chat(
         self,
         provider: str,
@@ -457,6 +626,11 @@ class PassthroughClient:
             )
             try:
                 await self._check_response(resp, provider=provider, model=model)
+                prefetched_chunks, upstream_iterator = await self._prefetch_stream(
+                    resp,
+                    provider=provider,
+                    model=model,
+                )
             except RateLimitError as exc:
                 from tusker_gateway.cooldown import _cooldown_seconds_for_429
                 tracker = global_tracker()
@@ -473,7 +647,8 @@ class PassthroughClient:
                 except Exception:
                     pass
                 raise
-            except Exception:
+            except Exception as exc:
+                await self._record_stream_failure(provider, model, exc, start)
                 resp.release()
                 raise
             # Record quality on streaming success
@@ -483,7 +658,13 @@ class PassthroughClient:
                 global_tracker().clear_failures(provider)
             except Exception:
                 pass
-            return self._stream_events(resp, provider=provider, model=model)
+            return self._stream_events(
+                resp,
+                provider=provider,
+                model=model,
+                initial_chunks=prefetched_chunks,
+                stream_iterator=upstream_iterator,
+            )
         try:
             async with self._http.request(
                 "POST", url, headers=headers, json=body,
@@ -533,7 +714,58 @@ class PassthroughClient:
                 except Exception:
                     pass
             logger.warning('provider error %s/%s: %s', provider, model, exc)
+            if isinstance(exc, ProviderError):
+                raise
             raise ProviderError(str(exc)) from exc
+
+    async def _prefetch_stream(
+        self,
+        resp: aiohttp.ClientResponse,
+        *,
+        provider: str,
+        model: str,
+    ) -> tuple[list[bytes], AsyncIterator[bytes]]:
+        """Read enough of an upstream stream to catch an immediate error.
+
+        The consumed bytes and the same iterator are returned so successful
+        streams are byte-for-byte preserved. The bounded prefetch prevents a
+        malformed provider response without SSE separators from buffering an
+        unbounded amount of data.
+        """
+        upstream_iterator = resp.content.iter_any().__aiter__()
+        prefetched: list[bytes] = []
+        pending = bytearray()
+        reached_eof = False
+
+        while b"\n\n" not in pending and len(pending) < _UPSTREAM_PREFETCH_MAX_BYTES:
+            try:
+                chunk = await upstream_iterator.__anext__()
+            except StopAsyncIteration:
+                reached_eof = True
+                break
+            if not chunk:
+                continue
+            prefetched.append(chunk)
+            pending.extend(chunk)
+
+        if b"\n\n" in pending:
+            frames = pending.split(b"\n\n")[:-1]
+        elif reached_eof or len(pending) >= _UPSTREAM_PREFETCH_MAX_BYTES:
+            frames = [bytes(pending)] if pending else []
+        else:
+            frames = []
+
+        for frame in frames:
+            error = _stream_error_from_frame(
+                frame,
+                provider=provider,
+                model=model,
+            )
+            if error is not None:
+                raise error
+
+        return prefetched, upstream_iterator
+
     async def _build_request(
         self,
         provider: str,
@@ -839,6 +1071,8 @@ class PassthroughClient:
         *,
         provider: str | None = None,
         model: str | None = None,
+        initial_chunks: list[bytes] | None = None,
+        stream_iterator: AsyncIterator[bytes] | None = None,
     ) -> AsyncIterator[bytes]:
         """Pump an upstream SSE response byte-for-byte to the gateway caller.
 
@@ -856,7 +1090,10 @@ class PassthroughClient:
         upstream_str = str(upstream) if upstream is not None else (provider or "?")
         status = getattr(resp, "status", None)
         try:
-            async for chunk in resp.content.iter_any():
+            for chunk in initial_chunks or []:
+                yield chunk
+            iterator = stream_iterator or resp.content.iter_any()
+            async for chunk in iterator:
                 yield chunk
         except aiohttp.ServerDisconnectedError as exc:
             logger.info(

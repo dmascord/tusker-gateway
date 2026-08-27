@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from tusker_gateway.budget import BudgetDecision
+from tusker_gateway.errors import ProviderError
 from .conftest import HEADERS_AUTH, HEADERS_NO_AUTH
 
 
@@ -137,6 +138,51 @@ async def test_chat_pool_image_requirement_is_preserved_across_fallbacks(app, cl
             "code",
             excluded={("xiaomi", "mimo-v2.5")},
             required_input_modalities=frozenset({"image"}),
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_provider_502_falls_back_before_client_response(app, client):
+    """A stream setup 502 must select a fallback before sending HTTP 200."""
+    pool_manager = MagicMock()
+    pool_manager.select.side_effect = [
+        ("openrouter", "nvidia/saturated-model"),
+        ("openai", "gpt-4o-mini"),
+    ]
+    app["pool_manager"] = pool_manager
+
+    failure = ProviderError(
+        "Upstream error from Nvidia: ResourceExhausted: worker limit reached",
+        code="provider_error",
+    )
+    failure.upstream_status = 502
+    failure.upstream_body = '{"error":{"code":502}}'
+
+    async def fallback_stream(*args, **kwargs):
+        yield b'data: {"choices":[{"delta":{"content":"fallback"}}]}\n\n'
+
+    with patch("tusker_gateway.endpoints.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
+        mock_chat.side_effect = [failure, fallback_stream()]
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-code",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+            },
+            headers=HEADERS_AUTH,
+        )
+        content = await resp.read()
+
+    assert resp.status == 200
+    assert b"fallback" in content
+    assert pool_manager.select.call_args_list == [
+        call("code", excluded=set(), required_input_modalities=None),
+        call(
+            "code",
+            excluded={("openrouter", "nvidia/saturated-model")},
+            required_input_modalities=None,
         ),
     ]
 
