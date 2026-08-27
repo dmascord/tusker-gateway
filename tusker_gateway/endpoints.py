@@ -1062,10 +1062,12 @@ async def _prepare_stream_result(
     """Preflight a tool stream before committing a client response.
 
     A provider may emit ordinary reasoning/text before a malformed tool
-    envelope. Probing only the first event lets that failure arrive after
-    aiohttp has sent a 200, which makes pool fallback impossible. Buffer until
-    a structured/promoted call or a clean terminal event is observed, then
-    replay the buffered prefix so successful streams retain their output.
+    envelope, including after an upstream terminal frame. Probing only a
+    prefix lets that failure arrive after aiohttp has sent a 200, which makes
+    pool fallback impossible. Consume the normalized stream completely before
+    returning so every validation failure occurs before the client response is
+    committed, then replay the buffered stream so successful streams retain
+    their output.
     """
     if not tools_requested or not hasattr(result, "__aiter__"):
         return result
@@ -1080,21 +1082,27 @@ async def _prepare_stream_result(
     )
     buffered: list[bytes] = []
     buffered_bytes = 0
-    preflight_decision = "eof"
+    saw_tool_call = False
+    saw_terminal = False
     try:
         async for frame in normalized:
             buffered.append(frame)
             buffered_bytes += len(frame)
             has_tool_call, has_terminal = _stream_frame_signal(frame)
             if has_tool_call:
-                preflight_decision = "tool_call"
-                break
-            if has_terminal and not require_tool_call:
-                preflight_decision = "terminal"
-                break
+                saw_tool_call = True
+            if has_terminal:
+                saw_terminal = True
     except Exception:
         await _close_async_iterator(normalized)
         raise
+    preflight_decision = (
+        "tool_call"
+        if saw_tool_call
+        else "terminal"
+        if saw_terminal
+        else "eof"
+    )
     logger.info(
         "tool stream preflight provider=%s model=%s request_id=%s decision=%s frames=%d bytes=%d",
         provider,
