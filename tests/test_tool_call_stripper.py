@@ -327,6 +327,37 @@ def test_stripper_strips_orphan_closing_tags():
     assert "We need to decide next action" in out
 
 
+def test_stripper_handles_generic_invoke_block_split_across_chunks():
+    s = _ToolCallStripper()
+    assert s.feed('<invoke name="bash">') == ""
+    assert s.feed('<parameter name="command">ls</parameter>') == ""
+    assert s.feed('</invoke> after') == " after"
+    blocks = s.drain_pending_blocks()
+    assert len(blocks) == 1
+    assert blocks[0][1] is True
+
+
+def test_stripper_handles_generic_opener_split_inside_attribute():
+    s = _ToolCallStripper()
+    assert s.feed('before <invoke name="') == "before "
+    assert s.feed('bash">') == ""
+    assert s.feed('<parameter name="command">ls</parameter>') == ""
+    assert s.feed('</invoke> after') == " after"
+    blocks = s.drain_pending_blocks()
+    assert len(blocks) == 1
+    assert blocks[0][0].startswith('<invoke name="bash">')
+
+
+def test_stripper_buffers_json_wrapper_until_closing_tag():
+    s = _ToolCallStripper()
+    assert s.feed('before <tool_call>{"name":"bash","args":') == "before "
+    assert s.feed('{}') == ""
+    assert s.feed('}</tool_call> after') == " after"
+    blocks = s.drain_pending_blocks()
+    assert len(blocks) == 1
+    assert '<tool_call>{"name":"bash","args":{}}</tool_call>' in blocks[0][0]
+
+
 @pytest.mark.asyncio
 async def test_stream_normalizer_strips_orphan_closing_tags(client):
     """Streaming integration for orphan closing tags: the streamed delta.content
@@ -418,6 +449,144 @@ def test_stripper_drops_empty_args_block_as_malformed():
         assert seen_tool_calls == [], f"unexpected tool_calls: {seen_tool_calls!r}"
 
     asyncio.run(run())
+
+
+@pytest.mark.asyncio
+async def test_stream_normalizer_deduplicates_native_call_and_finishes_as_tool_call():
+    """A native call plus XML text in one event must be emitted once."""
+    import json
+
+    async def stream():
+        payload = {
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "role": "assistant",
+                    "content": (
+                        "I will run that. "
+                        "<function=bash><parameter=command>ls</parameter></function>"
+                    ),
+                    "tool_calls": [{
+                        "id": "native-1",
+                        "type": "function",
+                        "function": {"name": "bash", "arguments": '{"command":"ls"}'},
+                    }],
+                },
+                "finish_reason": "stop",
+            }],
+        }
+        yield f"data: {json.dumps(payload)}\n\n".encode()
+        yield b"data: [DONE]\n\n"
+
+    from tusker_gateway.endpoints import _normalize_stream
+
+    frames = []
+    async for raw in _normalize_stream(stream(), provider="test", model="m"):
+        text = raw.strip()
+        if not text.startswith(b"data: ") or text == b"data: [DONE]":
+            continue
+        frames.append(json.loads(text[len(b"data: "):]))
+
+    tool_deltas = []
+    content = []
+    finish_reasons = []
+    for frame in frames:
+        for choice in frame.get("choices", []):
+            delta = choice.get("delta", {}) or {}
+            if delta.get("content"):
+                content.append(delta["content"])
+            if delta.get("tool_calls"):
+                tool_deltas.extend(delta["tool_calls"])
+            if choice.get("finish_reason"):
+                finish_reasons.append(choice["finish_reason"])
+
+    assert "<function" not in "".join(content)
+    assert len(tool_deltas) == 1
+    assert tool_deltas[0]["id"] == "native-1"
+    assert finish_reasons == ["tool_calls"]
+
+
+@pytest.mark.asyncio
+async def test_stream_normalizer_buffers_split_json_tool_wrapper():
+    """A JSON wrapper must not emit its payload before the closing tag."""
+    import json
+
+    async def stream():
+        for content in (
+            'before <tool_call>{"name":"bash","args":',
+            "{}",
+            '}</tool_call> after',
+        ):
+            payload = {"choices": [{"delta": {"content": content}}]}
+            yield f"data: {json.dumps(payload)}\n\n".encode()
+        yield b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    from tusker_gateway.endpoints import _normalize_stream
+
+    content_parts = []
+    tool_calls = []
+    async for raw in _normalize_stream(stream(), provider="test", model="m"):
+        line = raw.strip()
+        if not line.startswith(b"data: ") or line == b"data: [DONE]":
+            continue
+        obj = json.loads(line[len(b"data: "):])
+        for choice in obj.get("choices", []):
+            delta = choice.get("delta", {}) or {}
+            if delta.get("content"):
+                content_parts.append(delta["content"])
+            if delta.get("tool_calls"):
+                tool_calls.extend(delta["tool_calls"])
+
+    assert "<tool_call>" not in "".join(content_parts)
+    assert "before" in "".join(content_parts)
+    assert "after" in "".join(content_parts)
+    assert tool_calls[0]["function"]["name"] == "bash"
+
+
+@pytest.mark.asyncio
+async def test_stream_normalizer_handles_id_suffixed_omp_dots_tool_wrapper():
+    """OMP/DOTS wrapper markup is buffered and promoted exactly once."""
+    import json
+
+    async def stream():
+        for content in (
+            "before <tool_calls:abc123><tool_call:abc123>bash<tool_sep:abc123>",
+            "<arg_key:abc123>command</arg_key:abc123>"
+            "<arg_value:abc123>ls -la</arg_value:abc123>",
+            "</tool_call:abc123></tool_calls:abc123> after",
+        ):
+            payload = {"choices": [{"delta": {"content": content}}]}
+            yield f"data: {json.dumps(payload)}\n\n".encode()
+        yield b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    from tusker_gateway.endpoints import _normalize_stream
+
+    content_parts = []
+    tool_calls = []
+    finish_reasons = []
+    async for raw in _normalize_stream(stream(), provider="test", model="m"):
+        line = raw.strip()
+        if not line.startswith(b"data: ") or line == b"data: [DONE]":
+            continue
+        obj = json.loads(line[len(b"data: "):])
+        for choice in obj.get("choices", []):
+            delta = choice.get("delta", {}) or {}
+            if delta.get("content"):
+                content_parts.append(delta["content"])
+            if delta.get("tool_calls"):
+                tool_calls.extend(delta["tool_calls"])
+            if choice.get("finish_reason"):
+                finish_reasons.append(choice["finish_reason"])
+
+    assert "<tool_call" not in "".join(content_parts)
+    assert "before" in "".join(content_parts)
+    assert "after" in "".join(content_parts)
+    assert len(tool_calls) == 1
+    assert tool_calls[0]["function"]["name"] == "bash"
+    assert json.loads(tool_calls[0]["function"]["arguments"]) == {"command": "ls -la"}
+    assert finish_reasons == ["tool_calls"]
 
 
 @pytest.mark.asyncio

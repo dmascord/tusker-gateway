@@ -110,17 +110,37 @@ def create_app() -> web.Application:
 
     # Image generation handler (Phase: image/video generation support).
     from tusker_gateway.providers.image_generation import ImageGenerationHandler
-    # Build a Codex token rotator so the image handler can use Codex OAuth
-    # credentials for image generation when no OPENAI_API_KEY is configured.
+    # Build one rotator per OAuth/Codex provider. These pools are deliberately
+    # independent: a Copilot token must never be selected for chatgpt.com, and
+    # a Codex credential must never be used to authenticate a Copilot catalog.
     from tusker_gateway.passthrough import CodexTokenRotator
-    codex_creds = app["config"].get("codex_credentials") or []
-    codex_rotator = CodexTokenRotator(
-        codex_creds,
-        auth_file=app["config"].get("auth_file"),
-    )
+    config = app["config"]
+    credential_rotators: dict[str, CodexTokenRotator] = {}
+    configured_pools = config.get("credential_pools")
+    if isinstance(configured_pools, dict):
+        for provider_name, credentials in configured_pools.items():
+            provider = str(provider_name).lower()
+            if provider not in {
+                "openai-codex",
+                "github-copilot",
+                "github-copilot-enterprise",
+            } or not isinstance(credentials, list):
+                continue
+            credential_rotators[provider] = CodexTokenRotator(
+                [credential for credential in credentials if isinstance(credential, dict)],
+                auth_file=(config.get("auth_file") if provider == "openai-codex" else None),
+            )
+    codex_rotator = credential_rotators.get("openai-codex")
+    if codex_rotator is None:
+        codex_rotator = CodexTokenRotator(
+            config.get("codex_credentials") or [],
+            auth_file=config.get("auth_file"),
+        )
+        credential_rotators["openai-codex"] = codex_rotator
+    app["credential_rotators"] = credential_rotators
     app["codex_rotator"] = codex_rotator
     capability_registry = CapabilitiesRegistry(
-        provider_keys=app["config"].get("provider_api_keys", {}),
+        provider_keys=config.get("provider_api_keys", {}),
         codex_rotator=codex_rotator,
     )
     app["capability_registry"] = capability_registry
@@ -144,6 +164,11 @@ def create_app() -> web.Application:
         app["http_session"] = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=120),
         )
+        for rotator in app.get("credential_rotators", {}).values():
+            # The rotators are constructed before aiohttp startup so they can
+            # also be passed to handlers during app assembly. Attach the
+            # shared session before catalog/capability refresh begins.
+            rotator._http = app["http_session"]
         startup_log.info("HTTP session created")
         # One stop signal controls every refresh loop using the shared session.
         stop_event = asyncio.Event()
@@ -187,6 +212,7 @@ def create_app() -> web.Application:
                 _wire_catalog_api_keys(
                     registry, config.get("provider_api_keys", {}),
                     codex_rotator=app.get("codex_rotator"),
+                    credential_rotators=app.get("credential_rotators"),
                 )
                 # Wire into PoolManager so extend_pools_with_catalog() can read.
                 pool_manager = app.get("pool_manager")
@@ -232,10 +258,34 @@ def create_app() -> web.Application:
         rtk_enabled = os.environ.get(
             "TUSKER_RTK_ENABLED", "0"
         ).strip().lower() in {"1", "true", "yes", "on"}
-        if rtk_enabled:
-            from tusker_gateway.rtk import set_enabled as rtk_set_enabled
-            rtk_set_enabled(True)
-            startup_log.info("rtk token-saver enabled")
+        from tusker_gateway.rtk import set_enabled as rtk_set_enabled
+
+        # Set the global explicitly in both directions. This matters for
+        # in-process reloads/tests where a previous app instance may have
+        # enabled RTK before a new instance starts with the flag off.
+        rtk_set_enabled(rtk_enabled)
+        app["rtk_enabled"] = rtk_enabled
+        startup_log.info(
+            "rtk token-saver state enabled=%s env=TUSKER_RTK_ENABLED",
+            rtk_enabled,
+        )
+        from tusker_gateway.tool_formats import tool_diagnostics_enabled
+
+        startup_log.info(
+            "tool markup diagnostics state enabled=%s env=TUSKER_TOOL_DIAGNOSTICS",
+            tool_diagnostics_enabled(),
+        )
+        startup_log.info(
+            "provider auth inventory static_keys=%s credential_pools=%s",
+            sorted(
+                provider for provider, key in config.get("provider_api_keys", {}).items()
+                if key
+            ),
+            {
+                provider: len(credentials)
+                for provider, credentials in config.get("credential_pools", {}).items()
+            },
+        )
         if capabilities_enabled not in {"0", "false", "no", "off"}:
             interval_secs = float(
                 os.environ.get("TUSKER_CAPABILITIES_REFRESH_SECS", "3600")
@@ -337,6 +387,7 @@ def _wire_catalog_api_keys(
     registry,
     provider_keys: dict[str, str | None],
     codex_rotator: "CodexTokenRotator | None" = None,
+    credential_rotators: dict[str, "CodexTokenRotator"] | None = None,
 ) -> None:
     """Inject configured bearer keys into authenticated catalog clients.
 
@@ -351,10 +402,16 @@ def _wire_catalog_api_keys(
         if client is not None:
             client.set_api_key(provider_keys.get(provider))
 
+    def _rotator_for(provider: str):
+        if credential_rotators is None:
+            return codex_rotator
+        return credential_rotators.get(provider)
+
     async def _codex_token_source() -> str | None:
-        if codex_rotator is None:
+        rotator = _rotator_for("openai-codex")
+        if rotator is None:
             return None
-        return await codex_rotator.get_token()
+        return await rotator.get_token()
 
     codex_client = registry.get_client("openai-codex")
     if codex_client is not None:
@@ -366,6 +423,8 @@ def _wire_catalog_api_keys(
     # so each catalog client authenticates against its own host.
     copilot_raw_key = provider_keys.get("github-copilot")
     copilot_ent_raw_key = provider_keys.get("github-copilot-enterprise")
+    copilot_rotator = _rotator_for("github-copilot")
+    copilot_ent_rotator = _rotator_for("github-copilot-enterprise")
 
     async def _copilot_token_source() -> str | None:
         # Mirrors OAuthAuthenticator: a static GitHub token (gho_/
@@ -373,16 +432,16 @@ def _wire_catalog_api_keys(
         # override per-deployment, and falls back to the rotator.
         if copilot_raw_key:
             return copilot_raw_key
-        if codex_rotator is None:
+        if copilot_rotator is None:
             return None
-        return await codex_rotator.get_token()
+        return await copilot_rotator.get_token()
 
     async def _copilot_ent_token_source() -> str | None:
         if copilot_ent_raw_key:
             return copilot_ent_raw_key
-        if codex_rotator is None:
+        if copilot_ent_rotator is None:
             return None
-        return await codex_rotator.get_token()
+        return await copilot_ent_rotator.get_token()
 
     copilot_client = registry.get_client("github-copilot")
     if copilot_client is not None:

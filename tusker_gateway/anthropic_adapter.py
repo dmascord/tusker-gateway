@@ -31,7 +31,7 @@ from tusker_gateway import translators
 from tusker_gateway.budget import BudgetTracker
 from tusker_gateway.circuit_breaker import CircuitBreaker, BreakerDecision
 from tusker_gateway.errors import BadRequestError
-from tusker_gateway.endpoints import _required_input_modalities
+from tusker_gateway.endpoints import _normalize_stream, _required_input_modalities
 from tusker_gateway.metrics import MetricsRegistry
 from tusker_gateway.passthrough import PassthroughClient
 from tusker_gateway.pools import PoolManager
@@ -39,6 +39,7 @@ from tusker_gateway.quality import QualityDB
 from tusker_gateway.rate_limit import RateLimiter
 from tusker_gateway.routing import resolve_route
 from tusker_gateway.sse import sse_heartbeat_loop
+from tusker_gateway.tool_formats import normalize_response_tool_calls
 from tusker_gateway.tracing import Tracer
 
 logger = logging.getLogger(__name__)
@@ -304,11 +305,21 @@ async def _call_with_pool_fallback_anthropic(
             try:
                 result = await client.chat(prov, mdl, body["messages"],
                                           stream=bool(body.get("stream")), tools=tools)
+                if isinstance(result, dict):
+                    result = normalize_response_tool_calls(
+                        result,
+                        source=f"{prov}/{mdl}",
+                    )
                 if breaker is not None:
                     breaker.record_success(prov, mdl)
                 if body.get("stream") and hasattr(result, "__aiter__"):
                     result = _AnthropicSSEStreamAdapter(
-                        result, model=model,
+                        _normalize_stream(
+                            result,
+                            provider=prov,
+                            model=mdl,
+                        ),
+                        model=model,
                         input_tokens=_estimated_tokens(body.get("messages", [])),
                     )
                 return prov, mdl, result
@@ -327,11 +338,21 @@ async def _call_with_pool_fallback_anthropic(
         try:
             result = await client.chat(route.provider, route.model, body["messages"],
                                       stream=bool(body.get("stream")), tools=tools)
+            if isinstance(result, dict):
+                result = normalize_response_tool_calls(
+                    result,
+                    source=f"{route.provider}/{route.model}",
+                )
             if breaker is not None:
                 breaker.record_success(route.provider, route.model)
             if body.get("stream") and hasattr(result, "__aiter__"):
                 result = _AnthropicSSEStreamAdapter(
-                    result, model=model,
+                    _normalize_stream(
+                        result,
+                        provider=route.provider,
+                        model=route.model,
+                    ),
+                    model=model,
                     input_tokens=_estimated_tokens(body.get("messages", [])),
                 )
             return route.provider, route.model, result

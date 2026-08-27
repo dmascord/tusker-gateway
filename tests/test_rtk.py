@@ -21,6 +21,28 @@ from tusker_gateway.rtk import (
 )
 
 
+@pytest.mark.asyncio
+async def test_create_app_reads_rtk_environment_flag(tmp_path, monkeypatch):
+    """Startup applies TUSKER_RTK_ENABLED and exposes the runtime state."""
+    from aiohttp.web_runner import AppRunner
+
+    from tusker_gateway.app import create_app
+
+    monkeypatch.setenv("TUSKER_RTK_ENABLED", "true")
+    monkeypatch.setenv("TUSKER_CATALOG_ENABLED", "0")
+    monkeypatch.setenv("TUSKER_CAPABILITIES_ENABLED", "0")
+    monkeypatch.setenv("QUALITY_DB_PATH", str(tmp_path / "quality.db"))
+
+    app = create_app()
+    runner = AppRunner(app)
+    await runner.setup()
+    try:
+        assert app["rtk_enabled"] is True
+        assert is_enabled() is True
+    finally:
+        await runner.cleanup()
+
+
 # ---------------------------------------------------------------------------
 # Test fixtures
 # ---------------------------------------------------------------------------

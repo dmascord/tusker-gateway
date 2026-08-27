@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from typing import Any, AsyncIterator
 
@@ -23,6 +24,19 @@ from tusker_gateway.errors import (
 from tusker_gateway.quality import QualityDB
 
 logger = logging.getLogger(__name__)
+
+_SENSITIVE_ERROR_VALUE_RE = re.compile(
+    r"(?i)(\b(?:authorization|api[_ -]?key|access[_ -]?token|refresh[_ -]?token|token)\b\s*[:=]\s*)([\"']?)[^\s,\"'}]+",
+)
+
+
+def _safe_upstream_body(body: str | None, *, limit: int = 500) -> str:
+    """Return a bounded provider error body without echoing credentials."""
+    if not body:
+        return "<empty>"
+    compact = " ".join(body.split())
+    redacted = _SENSITIVE_ERROR_VALUE_RE.sub(r"\1<redacted>", compact)
+    return redacted[:limit]
 
 
 # Per-read timeout for upstream SSE streams. The `total` budget below is the
@@ -280,7 +294,45 @@ class PassthroughClient:
                 codex_creds = load_auth_file(auth_file)
             except Exception:
                 codex_creds = []
-        self._codex_rotator = CodexTokenRotator(codex_creds, auth_file=auth_file, http_client=http_client)
+        self._credential_rotators: dict[str, CodexTokenRotator] = {}
+        configured_pools = config.get("credential_pools")
+        self._credential_pools_configured = isinstance(configured_pools, dict)
+        if isinstance(configured_pools, dict):
+            for provider_name, credentials in configured_pools.items():
+                if not isinstance(credentials, list):
+                    continue
+                provider_key = str(provider_name).lower()
+                # Environment-provided provider pools are authoritative and
+                # should not be written back over the shared auth.json file.
+                # Codex keeps persistence because its legacy pool is stored
+                # there and the rotator refreshes it in place.
+                pool_auth_file = auth_file if provider_key == "openai-codex" else None
+                self._credential_rotators[provider_key] = CodexTokenRotator(
+                    [credential for credential in credentials if isinstance(credential, dict)],
+                    auth_file=pool_auth_file,
+                    http_client=http_client,
+                )
+
+        self._codex_rotator = self._credential_rotators.get("openai-codex")
+        if self._codex_rotator is None:
+            self._codex_rotator = CodexTokenRotator(
+                codex_creds,
+                auth_file=auth_file,
+                http_client=http_client,
+            )
+
+    def _rotator_for(self, provider: str) -> CodexTokenRotator | None:
+        """Return the provider-specific credential rotator when configured."""
+        provider_key = provider.lower()
+        rotators = getattr(self, "_credential_rotators", {})
+        if provider_key in rotators:
+            return rotators[provider_key]
+        # Once the caller supplies a pool map, an absent provider is an
+        # intentional empty pool. Falling back to Codex here would recreate
+        # the cross-provider credential leak this map is meant to prevent.
+        if getattr(self, "_credential_pools_configured", False):
+            return None
+        return getattr(self, "_codex_rotator", None)
 
     async def chat(
         self,
@@ -387,7 +439,7 @@ class PassthroughClient:
                 ),
             )
             try:
-                await self._check_response(resp)
+                await self._check_response(resp, provider=provider, model=model)
             except RateLimitError as exc:
                 from tusker_gateway.cooldown import _cooldown_seconds_for_429
                 tracker = global_tracker()
@@ -420,10 +472,13 @@ class PassthroughClient:
                 "POST", url, headers=headers, json=body,
                 timeout=aiohttp.ClientTimeout(total=120),
             ) as resp:
-                await self._check_response(resp)
+                await self._check_response(resp, provider=provider, model=model)
                 result = await resp.json()
                 from tusker_gateway.tool_formats import normalize_response_tool_calls
-                result = normalize_response_tool_calls(result)
+                result = normalize_response_tool_calls(
+                    result,
+                    source=f"{provider}/{model}",
+                )
                 latency_ms = (time.monotonic() - start) * 1000
                 await self._record_quality(provider, model, True, latency_ms)
                 logger.debug('quality recorded %s/%s success=True', provider, model)
@@ -480,7 +535,10 @@ class PassthroughClient:
         from tusker_gateway.tool_formats import normalize_tools
 
         endpoint_model = ProviderConfig.from_raw(endpoint)
-        strategy = get_auth_strategy(endpoint_model.auth_type, self._codex_rotator)
+        strategy = get_auth_strategy(
+            endpoint_model.auth_type,
+            self._rotator_for(provider),
+        )
         headers: dict[str, str] = {
             "Content-Type": "application/json",
             **(extra_headers or {}),
@@ -518,15 +576,16 @@ class PassthroughClient:
         from tusker_gateway.tool_formats import normalize_tools
         endpoint_raw = endpoint or PROVIDER_ENDPOINTS["openai-codex"]
         endpoint_model = ProviderConfig.from_raw(endpoint_raw)
+        rotator = self._rotator_for(provider)
         # Honor the patched endpoint's auth_type (test-only override path).
         # Default to "codex" so production keeps its dedicated auth strategy.
         auth_type = endpoint_raw.get("auth_type") or endpoint_model.auth_type or "codex"
         if auth_type == "codex":
-            strategy = get_auth_strategy("codex", self._codex_rotator)
+            strategy = get_auth_strategy("codex", rotator)
         elif auth_type == "oauth":
-            strategy = get_auth_strategy("oauth", self._codex_rotator)
+            strategy = get_auth_strategy("oauth", rotator)
         else:
-            strategy = get_auth_strategy("bearer", self._codex_rotator)
+            strategy = get_auth_strategy("bearer", getattr(self, "_codex_rotator", None))
         headers = {
             "Content-Type": "application/json",
             **(extra_headers or {}),
@@ -611,7 +670,7 @@ class PassthroughClient:
         start = time.monotonic()
         resp = await self._http.request("POST", url, headers=headers, json=body, timeout=aiohttp.ClientTimeout(total=120))
         try:
-            await self._check_response(resp)
+            await self._check_response(resp, provider=provider, model=model)
         except RateLimitError as exc:
             resp.release()
             from tusker_gateway.cooldown import _cooldown_seconds_for_429
@@ -627,8 +686,8 @@ class PassthroughClient:
                 pass
             # Advance to next credential so the next request doesn't keep
             # hammering a rate-limited account.
-            if self._codex_rotator and self._codex_rotator.size > 1:
-                await self._codex_rotator.advance()
+            if rotator and rotator.size > 1:
+                await rotator.advance()
             raise
         except Exception as exc:
             # Use the body/status attached by _check_response (raised above)
@@ -636,7 +695,7 @@ class PassthroughClient:
             # have already been consumed. Auth failures (401/403) are ERROR
             # level since a credential/model is broken and needs attention.
             status = getattr(exc, "upstream_status", None)
-            body_text = getattr(exc, "upstream_body", None) or "<no body>"
+            body_text = _safe_upstream_body(getattr(exc, "upstream_body", None))
             if status in (401, 403):
                 logger.error(
                     "codex auth error model=%s stream=%s status=%d body=%s",
@@ -655,10 +714,16 @@ class PassthroughClient:
             resp.release()
             # Advance to next credential on any non-2xx so a sick account
             # doesn't cause the breaker to trip after 5 consecutive failures.
-            if self._codex_rotator and self._codex_rotator.size > 1:
-                await self._codex_rotator.advance()
+            if rotator and rotator.size > 1:
+                await rotator.advance()
             raise
         result = await self._parse_codex_sse_async(resp)
+        from tusker_gateway.tool_formats import normalize_response_tool_calls
+
+        result = normalize_response_tool_calls(
+            result,
+            source=f"{provider}/{model}",
+        )
         latency_ms = (time.monotonic() - start) * 1000
         await self._record_quality(provider, model, True, latency_ms)
         return result
@@ -711,11 +776,22 @@ class PassthroughClient:
 
 
     @staticmethod
-    async def _check_response(resp: aiohttp.ClientResponse) -> None:
+    async def _check_response(
+        resp: aiohttp.ClientResponse,
+        *,
+        provider: str | None = None,
+        model: str | None = None,
+    ) -> None:
         if resp.status == 200:
             return
-        logger.warning('provider returned %d', resp.status)
         body = await resp.text()
+        logger.warning(
+            "provider response error provider=%s model=%s status=%d body=%s",
+            provider or "unknown",
+            model or "unknown",
+            resp.status,
+            _safe_upstream_body(body),
+        )
         if resp.status == 429:
             raise RateLimitError(body=body, headers=dict(resp.headers))
         if resp.status == 401:

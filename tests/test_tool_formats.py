@@ -75,6 +75,60 @@ def test_normalize_response_tool_calls():
     assert msg["tool_calls"][0]["function"]["name"] == "b"
     assert msg["content"] == "" # stripped
 
+
+def test_normalize_response_tool_calls_strips_duplicate_native_markup():
+    """Native calls must not leave a second executable-looking text copy."""
+    resp = {
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": (
+                    "I will run that.\n"
+                    "<function=bash>"
+                    "<parameter=command>ls</parameter>"
+                    "</function>"
+                ),
+                "tool_calls": [{
+                    "id": "native-1",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": '{"command":"ls"}'},
+                }],
+            },
+            "finish_reason": "tool_calls",
+        }],
+    }
+
+    message = normalize_response_tool_calls(resp)["choices"][0]["message"]
+    assert message["content"] == "I will run that."
+    assert len(message["tool_calls"]) == 1
+    assert message["tool_calls"][0]["id"] == "native-1"
+
+
+def test_strip_tool_text_removes_json_and_namespaced_invocation_envelopes():
+    text = (
+        "before <tool_call>{\"name\":\"bash\",\"args\":{}}"
+        "</tool_call>"
+        "<dsml:invoke name=\"bash\"><dsml:parameter name=\"x\">1"
+        "</dsml:parameter></dsml:invoke> after"
+    )
+    assert strip_tool_text(text) == "before  after"
+
+
+def test_omp_dots_id_suffixed_tool_envelope_is_parsed_and_removed():
+    text = (
+        "before "
+        "<tool_calls:abc123><tool_call:abc123>bash<tool_sep:abc123>"
+        "<arg_key:abc123>command</arg_key:abc123>"
+        "<arg_value:abc123>ls -la</arg_value:abc123>"
+        "</tool_call:abc123></tool_calls:abc123>"
+        " after"
+    )
+    calls = parse_text_tool_calls(text)
+    assert len(calls) == 1
+    assert calls[0]["function"]["name"] == "bash"
+    assert json.loads(calls[0]["function"]["arguments"]) == {"command": "ls -la"}
+    assert strip_tool_text(text) == "before  after"
+
 def test_malformed_hermes_xml_function_block():
     """<function=name> with bare name and sibling <parameter=k>v</parameter> tags.
 

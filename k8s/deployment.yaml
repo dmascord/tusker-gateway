@@ -67,12 +67,6 @@ spec:
               optional: true
               name: tusker-env-vault
               key: GITHUB_COPILOT_ENTERPRISE_TOKEN
-        - name: PROVIDER_OPENAI_CODEX_API_KEY
-          valueFrom:
-            secretKeyRef:
-              optional: true
-              name: tusker-env-vault
-              key: COPILOT_GITHUB_TOKEN
         - name: PROVIDER_OPENROUTER_API_KEY
           valueFrom:
             secretKeyRef:
@@ -164,6 +158,8 @@ spec:
         - name: TUSKER_RATELIMIT_DEFAULT_BURST
           value: '20'
         - name: TUSKER_RTK_ENABLED
+          value: 'true'
+        - name: TUSKER_TOOL_DIAGNOSTICS
           value: 'true'
         - name: TUSKER_BUDGETS_ENABLED
           value: 'true'

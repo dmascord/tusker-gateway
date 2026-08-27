@@ -8,14 +8,82 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import os
 import re
 from typing import Any
 
 from tusker_gateway.errors import BadRequestError
 
+logger = logging.getLogger(__name__)
+
 _ANTHROPIC_IMAGE_DATA_URL_RE = re.compile(
     r"^data:(image/[A-Za-z0-9.+-]+);base64,([A-Za-z0-9+/]*={0,2})$"
 )
+
+_TOOL_WRAPPER_TAG_RE = re.compile(
+    r"<\s*\|?\s*/?\s*(?:[\w-]+:)?(?:tool_call|function_call|tool_calls|function_calls|tool_use|tool_invocation|dots_function_call|dots_tool_call)(?::[^>\s]+)?\s*\|?\s*>",
+    re.IGNORECASE,
+)
+_JSON_TOOL_BLOCK_RE = re.compile(
+    r"<\s*\|?\s*(?:tool_call|function_call)\s*\|?\s*>.*?<\s*/\s*\|?\s*(?:tool_call|function_call)\s*\|?\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+_TOOL_CLOSE_TAG_RE = re.compile(
+    r"<\s*/\s*(?:[\w-]+:)?(?:function|parameter|invoke|tool|tool_call|function_call|tool_calls|function_calls|tool_use|tool_invocation|dots_function_call|dots_tool_call|arg_key|arg_value|tool_sep)(?::[^>\s]+)?\s*>",
+    re.IGNORECASE,
+)
+_CUSTOM_TOOL_BLOCK_RE = re.compile(
+    r"<\s*tool_calls(?::[^>\s]+)?\s*>\s*"
+    r"<\s*tool_call(?::[^>\s]+)?\s*>\s*(?P<name>[\w.-]+)\s*"
+    r"<\s*tool_sep(?::[^>\s]+)?\s*>\s*(?P<body>.*?)"
+    r"</\s*tool_call(?::[^>\s]+)?\s*>\s*"
+    r"</\s*tool_calls(?::[^>\s]+)?\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+_CUSTOM_ARG_PAIR_RE = re.compile(
+    r"<\s*arg_key(?::[^>\s]+)?\s*>(.*?)</\s*arg_key(?::[^>\s]+)?\s*>\s*"
+    r"<\s*arg_value(?::[^>\s]+)?\s*>(.*?)</\s*arg_value(?::[^>\s]+)?\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+_GENERIC_TOOL_BLOCK_RE = re.compile(
+    r"<\s*(?:[\w:-]+:)?(?:invoke|function|tool)\s+name\s*=\s*[\"']([^\"']+)[\"'][^>]*>.*?"
+    r"<\s*/\s*(?:[\w:-]+:)?(?:invoke|function|tool)\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+_BARE_FUNCTION_BLOCK_RE = re.compile(
+    r"<\s*function\s*=\s*[\"']?[^\s\"'<>]+[\"']?\s*>.*?"
+    r"<\s*/\s*function\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+_TEXT_FALLBACK_RE = re.compile(r"\bTOOL_CALL\s*:\s*[\w.-]+\s*\(", re.IGNORECASE)
+_ID_SUFFIXED_TOOL_RE = re.compile(
+    r"<\s*/?\s*(?:tool_calls?|arg_key|arg_value|tool_sep):",
+    re.IGNORECASE,
+)
+
+
+def tool_diagnostics_enabled() -> bool:
+    """Return whether safe tool-markup diagnostics are enabled."""
+    return os.environ.get("TUSKER_TOOL_DIAGNOSTICS", "0").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def tool_markup_kinds(text: Any) -> tuple[str, ...]:
+    """Classify tool markup without returning any of its payload."""
+    if not isinstance(text, str) or not text:
+        return ()
+    patterns = (
+        ("text_fallback", _TEXT_FALLBACK_RE),
+        ("id_suffixed", _ID_SUFFIXED_TOOL_RE),
+        ("json_wrapper", _JSON_TOOL_BLOCK_RE),
+        ("generic_block", _GENERIC_TOOL_BLOCK_RE),
+        ("bare_function", _BARE_FUNCTION_BLOCK_RE),
+        ("wrapper", _TOOL_WRAPPER_TAG_RE),
+        ("closing_tag", _TOOL_CLOSE_TAG_RE),
+    )
+    return tuple(name for name, pattern in patterns if pattern.search(text))
 
 
 def _openai_content_to_anthropic(content: Any) -> str | list[dict[str, Any]]:
@@ -224,12 +292,25 @@ def parse_text_tool_calls(text: Any) -> list[dict[str, Any]]:
     if not isinstance(text, str) or not text.strip():
         return []
     calls: list[dict[str, Any]] = []
-    # 1. JSON payload inside <tool_call> / <function_call>.
-    for match in re.finditer(r"<(?:tool_call|function_call)>\s*(\{.*?\})\s*</(?:tool_call|function_call)>", text, re.I | re.S):
+    # 1. OMP/DOTS' ID-suffixed tool envelope.
+    for match in _CUSTOM_TOOL_BLOCK_RE.finditer(text):
+        args = {
+            key.strip(): value.strip()
+            for key, value in _CUSTOM_ARG_PAIR_RE.findall(match.group("body"))
+        }
+        calls.append({"name": match.group("name").strip(), "arguments": args})
+
+    # 2. JSON payload inside <tool_call> / <function_call>.
+    for match in re.finditer(
+        r"<\s*\|?\s*(?:tool_call|function_call)\s*\|?\s*>\s*(\{.*?\})\s*"
+        r"<\s*/\s*\|?\s*(?:tool_call|function_call)\s*\|?\s*>",
+        text,
+        re.I | re.S,
+    ):
         call = _parse_json_call(match.group(1))
         if call:
             calls.append(call)
-    # 2. Claude-style function_calls/invoke and DSML namespaced variants.
+    # 3. Claude-style function_calls/invoke and DSML namespaced variants.
     # Handles: <invoke name="bash">, <dsml:invoke name="bash">, <ds:function name="bash">
     for match in re.finditer(r"<(?:[\w:-]+:)?(?:invoke|function|tool)\s+name=[\"']([^\"']+)[\"'][^>]*>(.*?)</(?:[\w:-]+:)?(?:invoke|function|tool)>", text, re.I | re.S):
         name, inner = match.groups()
@@ -238,7 +319,7 @@ def parse_text_tool_calls(text: Any) -> list[dict[str, Any]]:
             key, value = param.groups()
             args[key or "value"] = value.strip()
         calls.append({"name": name.strip(), "arguments": args})
-    # 3. Newer DSML: <tool_name> + <parameters> fields.
+    # 4. Newer DSML: <tool_name> + <parameters> fields.
     for block in re.finditer(r"<tool_call[^>]*>(.*?)</tool_call>", text, re.I | re.S):
         inner = block.group(1)
         name_match = re.search(r"<(?:tool_name|name)>(.*?)</(?:tool_name|name)>", inner, re.I | re.S)
@@ -246,7 +327,7 @@ def parse_text_tool_calls(text: Any) -> list[dict[str, Any]]:
             args_match = re.search(r"<(?:parameters|args)>(.*?)</(?:parameters|args)>", inner, re.I | re.S)
             args = _parse_json_call(args_match.group(1).strip()) if args_match else None
             calls.append({"name": name_match.group(1).strip(), "arguments": (args or {}).get("arguments", {})})
-    # 4. Self-closing tool invocation with JSON arguments.
+    # 5. Self-closing tool invocation with JSON arguments.
     # Handles: <tool_invocation name="bash" arguments={...} />
     for match in re.finditer(r"<tool_invocation\s+name=[\"']([^\"']+)[\"']\s+arguments=(\{.*?\})[^>]*?/?>", text, re.I | re.S):
         try:
@@ -254,7 +335,7 @@ def parse_text_tool_calls(text: Any) -> list[dict[str, Any]]:
         except json.JSONDecodeError:
             args = {"raw": match.group(2)}
         calls.append({"name": match.group(1), "arguments": args})
-    # 5. TOOL_CALL: name({...}) fallback.
+    # 6. TOOL_CALL: name({...}) fallback.
     for match in re.finditer(r"TOOL_CALL:\s*([\w.-]+)\s*\((.*?)\)", text, re.I | re.S):
         args = match.group(2).strip()
         try:
@@ -263,7 +344,7 @@ def parse_text_tool_calls(text: Any) -> list[dict[str, Any]]:
             args_obj = {"raw": args}
         calls.append({"name": match.group(1), "arguments": args_obj})
 
-    # 6. Malformed Hermes/Qwen-style XML: <function=name>...<parameter=k>v</parameter>...</function>
+    # 7. Malformed Hermes/Qwen-style XML: <function=name>...<parameter=k>v</parameter>...</function>
     # The opening/closing tags for <function> may be bare or quoted; parameters are siblings, not nested.
     # Example:
     #   <tool_call>
@@ -293,7 +374,11 @@ def parse_text_tool_calls(text: Any) -> list[dict[str, Any]]:
                 inner, re.I | re.S,
             ):
                 args[f"arg_{len(args)}"] = param.group(1).strip()
-        calls.append({"name": name, "arguments": args})
+        # A bare function block without parameter tags is commonly prose
+        # wrapped in a malformed tool envelope. Do not turn that into a
+        # fake empty-argument invocation.
+        if args:
+            calls.append({"name": name, "arguments": args})
 
     return normalize_tool_calls(calls)
 
@@ -302,21 +387,40 @@ def strip_tool_text(text: Any) -> Any:
     """Remove recognized tool markup while retaining ordinary assistant text."""
     if not isinstance(text, str):
         return text
-    cleaned = re.sub(r"TOOL_CALL:.*$", "", text, flags=re.I | re.M)
-    cleaned = re.sub(r"<(?:tool_call|function_call|tool_calls|function_calls|tool_use|tool_invocation|dsml:invoke|ds:function)\b[^>]*>.*?</(?:tool_call|function_call|tool_calls|function_calls|tool_use|tool_invocation|dsml:invoke|ds:function)>", "", cleaned, flags=re.I | re.S)
-    # Strip well-formed <function=name>...</function> blocks (multi-line, possibly nested params).
+    # Remove OMP/DOTS' ID-suffixed envelope before stripping individual tags.
+    cleaned = _CUSTOM_TOOL_BLOCK_RE.sub("", text)
+    # Only match the fallback call syntax, not the ``tool_call:ID`` XML tag
+    # used by OMP/DOTS envelopes.
     cleaned = re.sub(
-        r"<\s*function\s*=\s*[\"']?[^\s\"'<>]+[\"']?\s*>.*?<\s*/\s*function\s*>",
-        "", cleaned, flags=re.I | re.S,
+        r"\bTOOL_CALL\s*:\s*[\w.-]+\s*\(.*$",
+        "",
+        cleaned,
+        flags=re.I | re.M,
     )
+    # Remove complete JSON tool envelopes before removing wrapper tags, so
+    # their JSON payload cannot be displayed as assistant prose.
+    cleaned = _JSON_TOOL_BLOCK_RE.sub("", cleaned)
+    # Remove wrapper tags in both plain and pipe-delimited forms. The
+    # payload is handled by the more specific block patterns below.
+    cleaned = _TOOL_WRAPPER_TAG_RE.sub("", cleaned)
+    cleaned = _GENERIC_TOOL_BLOCK_RE.sub("", cleaned)
+    # Strip well-formed <function=name>...</function> blocks (multi-line,
+    # possibly containing sibling parameter tags).
+    cleaned = _BARE_FUNCTION_BLOCK_RE.sub("", cleaned)
     # Strip malformed <function=name</parameter>...</function> blocks (legacy fallback).
     cleaned = re.sub(r"<function=[^\s<>]+</parameter>.*?</function>", "", cleaned, flags=re.I | re.S)
     cleaned = re.sub(r"<tool_invocation[^>]*/>", "", cleaned, flags=re.I)
-    cleaned = re.sub(r"<(?:(?:MiMoML|DSML)[|｜]?|[|｜](?:MiMoML|DSML)[|｜]?)\s*[^>]*>", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"</?\s*(?:(?:MiMoML|DSML)[|｜]?|[|｜](?:MiMoML|DSML)[|｜]?)\s*[^>]*>", "", cleaned, flags=re.I)
+    # Models sometimes emit only closing tags after abandoning a call.
+    cleaned = _TOOL_CLOSE_TAG_RE.sub("", cleaned)
     return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
 
 
-def normalize_response_tool_calls(response: dict[str, Any]) -> dict[str, Any]:
+def normalize_response_tool_calls(
+    response: dict[str, Any],
+    *,
+    source: str | None = None,
+) -> dict[str, Any]:
     """Normalize provider response tool calls and rescue text-formatted calls."""
     out = dict(response)
     choices = out.get("choices")
@@ -340,17 +444,33 @@ def normalize_response_tool_calls(response: dict[str, Any]) -> dict[str, Any]:
                     continue
                 if "toolUse" in part:
                     found_calls.append(part["toolUse"])
-                elif "text" in part:
+                elif isinstance(part.get("text"), str):
                     text_parts.append(part["text"])
-            if found_calls:
-                message["tool_calls"] = found_calls
+            if found_calls or text_parts:
+                if found_calls:
+                    message["tool_calls"] = found_calls
                 content = "\n\n".join(text_parts) if text_parts else None
 
-        calls = normalize_tool_calls(message.get("tool_calls"))
-        if not calls:
-            calls = parse_text_tool_calls(content)
-            if calls:
-                content = strip_tool_text(content)
+        native_calls = normalize_tool_calls(message.get("tool_calls"))
+        text_calls = parse_text_tool_calls(content)
+        calls = native_calls or text_calls
+
+        # Sanitize assistant text even when the provider returned native calls.
+        # Providers frequently emit both representations, and leaving the text
+        # copy intact makes clients such as OMP display/execute it twice.
+        if isinstance(content, str):
+            cleaned = strip_tool_text(content)
+            if cleaned != content:
+                logger.info(
+                    "assistant tool markup sanitized source=%s marker_types=%s raw_chars=%d cleaned_chars=%d native_calls=%d text_calls=%d",
+                    source or "unknown",
+                    ",".join(tool_markup_kinds(content)) or "unknown",
+                    len(content),
+                    len(cleaned),
+                    len(native_calls),
+                    len(text_calls),
+                )
+            content = cleaned
 
         if calls:
             message["tool_calls"] = calls

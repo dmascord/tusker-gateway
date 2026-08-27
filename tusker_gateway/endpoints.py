@@ -56,14 +56,42 @@ def _sse_heartbeat_secs() -> float:
 
 
 _TOOL_CALL_XML_RE = re.compile(
-    r"<\|?\s*/?\s*tool_call\s*\|?>|<function=[\s\S]*?</function>",
+    # JSON-in-wrapper calls need to be matched before the individual wrapper
+    # tags, otherwise the JSON payload is emitted as ordinary assistant text.
+    # OMP/DOTS also emits an ID-suffixed envelope around this shape:
+    # <tool_calls:id><tool_call:id>bash<tool_sep:id>...
+    r"<\s*tool_calls(?::[^>\s]+)?\s*>\s*"
+    r"<\s*tool_call(?::[^>\s]+)?\s*>\s*[\w.-]+\s*"
+    r"<\s*tool_sep(?::[^>\s]+)?\s*>[\s\S]*?"
+    r"</\s*tool_call(?::[^>\s]+)?\s*>\s*"
+    r"</\s*tool_calls(?::[^>\s]+)?\s*>"
+    r"|<\s*(?:tool_call|function_call)\s*>\s*\{[\s\S]*?\}\s*</\s*(?:tool_call|function_call)\s*>"
+    r"|<\s*(?:[\w:-]+:)?(?:invoke|function|tool)\s+name\s*=\s*[\"'][^\"']+[\"'][^>]*>[\s\S]*?</\s*(?:[\w:-]+:)?(?:invoke|function|tool)\s*>"
+    r"|<\s*function\s*=\s*[\"']?[^\s\"'<>]+[\"']?\s*>[\s\S]*?</\s*function\s*>"
+    r"|<\s*tool_invocation\b[^>]*/>"
+    r"|<\s*\|?\s*/?\s*(?:tool_call|function_call|tool_calls|function_calls|tool_use|tool_invocation|dots_function_call|dots_tool_call)(?::[^>\s]+)?\s*\|?\s*>",
     re.IGNORECASE,
 )
 
 # Matches the opening of a bare <function=name> block. Used by the stripper to
 # detect when a block has begun but is not yet complete (and may span chunks).
-_FUNCTION_OPEN_RE = re.compile(r"<function=[^\s\"'<>]+>", re.IGNORECASE)
+_FUNCTION_OPEN_RE = re.compile(
+    r"<\s*function\s*=\s*[\"']?\s*[^\s\"'<>]+\s*[\"']?\s*>",
+    re.IGNORECASE,
+)
 _FUNCTION_CLOSE_RE = re.compile(r"</\s*function\s*>", re.IGNORECASE)
+_GENERIC_OPEN_RE = re.compile(
+    r"<\s*(?:[\w:-]+:)?(?P<tag>invoke|function|tool)\s+name\s*=\s*[\"'][^\"']+[\"'][^>]*>",
+    re.IGNORECASE,
+)
+_GENERIC_SELF_CLOSING_RE = re.compile(
+    r"<\s*(?:[\w:-]+:)?(?:invoke|function|tool|tool_invocation)\b[^>]*/\s*>",
+    re.IGNORECASE,
+)
+_JSON_TOOL_PAYLOAD_RE = re.compile(
+    r"<\s*(?:tool_call|function_call)\s*>\s*\{",
+    re.IGNORECASE,
+)
 # Matches a <parameter=...>...</parameter> sibling inside a function block.
 # Used to decide whether a buffered <function=...>...</function> block is
 # actually a tool call (with real arguments) versus a model that opened a
@@ -75,7 +103,7 @@ _PARAMETER_RE = re.compile(r"<\s*parameter\b", re.IGNORECASE)
 # tools via prompt) but never wrote a real <function=...> opener. Without
 # stripping them, OMP renders `</parameter></function>` as visible text.
 _ORPHAN_CLOSE_RE = re.compile(
-    r"</\s*(?:function|parameter|invoke|tool_call|function_call|tool_calls|function_calls|tool_use|tool_invocation)\s*>",
+    r"<\s*/\s*(?:[\w:-]+:)?(?:function|parameter|invoke|tool|tool_call|function_call|tool_calls|function_calls|tool_use|tool_invocation|dots_function_call|dots_tool_call|arg_key|arg_value|tool_sep)(?::[^>\s]+)?\s*>",
     re.IGNORECASE,
 )
 # Detect a tail that *might* continue into a `<function=...>` opener but
@@ -88,26 +116,43 @@ _ORPHAN_CLOSE_RE = re.compile(
 # ordinary prose are NOT carried because that would silently swallow
 # legitimate text from the user's view.
 #
-# Note: split-opener edge cases (where a model emits `<functi` in one
-# chunk and `on=bash>` in the next) are not handled. In practice the
-# upstream stream boundary aligns with the token boundary for
-# well-behaved providers, so the full `<function=bash>` opener usually
-# arrives in a single chunk. When it doesn't, the markup leaks as
-# visible text — a known limitation documented in
-# `docs/zero-downtime-deploys.md`-style notes.
 _PARTIAL_OPENER_TAIL_RE = re.compile(r"^<\s*[a-zA-Z_:|\-]*$")
+_GENERIC_PARTIAL_OPEN_RE = re.compile(
+    r"^<\s*(?:[\w-]+:)?(?:invoke|function|tool|tool_invocation)\b[^>]*$",
+    re.IGNORECASE,
+)
+_CUSTOM_PARTIAL_OPEN_RE = re.compile(
+    r"^<\s*\|?\s*(?:tool_calls?|function_calls?|dots_function_call|dots_tool_call)(?::[^>\s]*)?\s*\|?$",
+    re.IGNORECASE,
+)
+_WRAPPER_OPEN_RE = re.compile(
+    r"<\s*\|?\s*(?P<tag>(?:tool_call|function_call|tool_calls|function_calls|tool_use|tool_invocation|dots_function_call|dots_tool_call)(?::[^>\s]+)?)\s*\|?\s*>",
+    re.IGNORECASE,
+)
+_WRAPPER_CLOSE_RE = re.compile(
+    r"<\s*/\s*\|?\s*(?P<tag>(?:tool_call|function_call|tool_calls|function_calls|tool_use|tool_invocation|dots_function_call|dots_tool_call)(?::[^>\s]+)?)\s*\|?\s*>",
+    re.IGNORECASE,
+)
 
 # Opening tokens that mark the start of a tool-call block. When the tail of
 # the accumulated buffer matches one of these prefixes, we hold it back until
 # the full block has arrived (a block may span several streamed chunks).
 _TOOL_OPENERS = (
-    "<​tool_call>",
+    "<tool_call>",
     "<tool_call",
+    "<tool_calls",
     "<|tool_call|>",
     "<|tool_call",
+    "<|tool_calls",
     "<|start_header|>",
     "<function=",
+    "<function_calls",
     "<|begin_of_",
+    "<dots_function_call",
+    "<dots_tool_call",
+    "<invoke",
+    "<function",
+    "<tool",
 )
 
 
@@ -180,6 +225,8 @@ class _ToolCallStripper:
         # avoids the case where the opener regex finds a partial match but
         # the closing tag arrives in a separate chunk.
         self._pending_function_block: str | None = None
+        self._pending_generic_block: tuple[str, str] | None = None
+        self._pending_wrapper_block: tuple[str, str] | None = None
         # Blocks that completed (or matched a single-chunk regex) get
         # stashed here so the caller can promote them into structured
         # ``delta.tool_calls`` frames. We track them as tuples of
@@ -211,7 +258,11 @@ class _ToolCallStripper:
         # Otherwise look for a tail that's clearly the start of *some* tool
         # markup. ``_PARTIAL_OPENER_TAIL_RE`` matches `<` followed by an
         # in-progress identifier (letters, `:`, `|`, `-`).
-        return bool(_PARTIAL_OPENER_TAIL_RE.search(text))
+        return bool(
+            _PARTIAL_OPENER_TAIL_RE.search(text)
+            or _GENERIC_PARTIAL_OPEN_RE.search(text)
+            or _CUSTOM_PARTIAL_OPEN_RE.search(text)
+        )
 
     def _stash_block(self, block: str, had_params: bool) -> None:
         self._pending_blocks.append((block, had_params))
@@ -223,6 +274,26 @@ class _ToolCallStripper:
         text = self._carry + chunk
         self._carry = ""
         out: list[str] = []
+
+        # A JSON tool envelope is commonly streamed as
+        # ``<tool_call>`` + JSON + ``</tool_call>``. If we remove the opening
+        # tag before the closing tag arrives, the JSON payload becomes visible
+        # assistant text. Buffer the complete wrapper instead and let the
+        # normalizer parse it once it closes.
+        if self._pending_wrapper_block is not None:
+            pending, tag = self._pending_wrapper_block
+            closer = re.search(
+                rf"<\s*/\s*\|?\s*{re.escape(tag)}\s*\|?\s*>",
+                text,
+                re.IGNORECASE,
+            )
+            if not closer:
+                self._pending_wrapper_block = (pending + text, tag)
+                return ""
+            pending += text[: closer.end()]
+            self._stash_block(pending, True)
+            self._pending_wrapper_block = None
+            text = text[closer.end():]
 
         # If we're mid-block (previously saw an unclosed <function=...>),
         # buffer the new text and look for the matching </function>. Only
@@ -247,6 +318,38 @@ class _ToolCallStripper:
             self._pending_function_block = None
             text = tail
 
+        if self._pending_generic_block is not None:
+            pending, tag = self._pending_generic_block
+            closer = re.search(
+                rf"<\s*/\s*(?:[\w:-]+:)?{re.escape(tag)}\s*>",
+                text,
+                re.IGNORECASE,
+            )
+            if not closer:
+                self._pending_generic_block = (pending + text, tag)
+                return ""
+            pending += text[: closer.end()]
+            self._stash_block(pending, True)
+            self._pending_generic_block = None
+            text = text[closer.end():]
+
+        wrapper_open = _WRAPPER_OPEN_RE.search(text)
+        if wrapper_open:
+            tag = wrapper_open.group("tag")
+            closer = re.search(
+                rf"<\s*/\s*\|?\s*{re.escape(tag)}\s*\|?\s*>",
+                text[wrapper_open.end():],
+                re.IGNORECASE,
+            )
+            out.append(text[: wrapper_open.start()])
+            if closer:
+                close_end = wrapper_open.end() + closer.end()
+                self._stash_block(text[wrapper_open.start():close_end], True)
+                text = text[close_end:]
+            else:
+                self._pending_wrapper_block = (text[wrapper_open.start():], tag)
+                return "".join(out)
+
         # Repeatedly remove complete tool-call blocks. For bare <function=...>
         # blocks we additionally retain a copy of the matched block in
         # ``_pending_blocks`` so the caller can promote it into structured
@@ -261,6 +364,15 @@ class _ToolCallStripper:
                 # Track whether this single-chunk block has real parameters.
                 had_params = bool(_PARAMETER_RE.search(block))
                 self._stash_block(block, had_params)
+            elif (
+                _GENERIC_OPEN_RE.search(block)
+                or _GENERIC_SELF_CLOSING_RE.search(block)
+                or _JSON_TOOL_PAYLOAD_RE.search(block)
+            ):
+                # The generic/JSON forms are valid even with an empty
+                # argument object; parse_text_tool_calls decides the final
+                # shape when the block is promoted.
+                self._stash_block(block, True)
             text = text[m.end():]
 
         # Strip orphan closing tags (`</parameter>`, `</function>`, etc.) that
@@ -282,6 +394,19 @@ class _ToolCallStripper:
             # time (see the close-detection code above), so we don't track
             # it per-chunk here.
             return "".join(out)
+
+        generic_open = _GENERIC_OPEN_RE.search(text)
+        if generic_open:
+            tag = generic_open.group("tag")
+            closer = re.search(
+                rf"<\s*/\s*(?:[\w:-]+:)?{re.escape(tag)}\s*>",
+                text[generic_open.end():],
+                re.IGNORECASE,
+            )
+            if not closer:
+                out.append(text[: generic_open.start()])
+                self._pending_generic_block = (text[generic_open.start():], tag)
+                return "".join(out)
 
         # No unclosed opener. If `text` ends with an incomplete opener
         # prefix that may continue into the next chunk, carry that prefix
@@ -311,104 +436,8 @@ class _ToolCallStripper:
         # Drop any unclosed function block — we never received its
         # </function>, so it's not safe to promote.
         self._pending_function_block = None
-        return ""
-
-    def drain_pending_blocks(self) -> list[tuple[str, bool]]:
-        """Return and clear any fully-observed ``<function=...>...</function>``
-        blocks seen during ``feed()`` calls since the last drain. Each entry
-        is ``(block_text, had_parameters)`` where ``had_parameters`` is True
-        iff the block contained at least one ``<parameter=k>v</parameter>``
-        sibling.
-
-        Used by the stream normalizer to promote text-emitted tool calls
-        into structured ``delta.tool_calls`` frames. Only blocks with
-        ``had_parameters=True`` should be promoted; malformed blocks (no
-        parameters) should be dropped and their inner prose emitted as
-        ordinary text.
-        """
-        blocks, self._pending_blocks = self._pending_blocks, []
-        return blocks
-        text = self._carry + chunk
-        self._carry = ""
-        out: list[str] = []
-
-        # If we're mid-block (previously saw an unclosed <function=...>),
-        # buffer the new text and look for the matching </function>. Only
-        # when we find the closer do we add the block to _pending_blocks
-        # and resume normal text emission.
-        if self._pending_function_block is not None:
-            closer = _FUNCTION_CLOSE_RE.search(text)
-            if not closer:
-                # Buffer the chunk. We re-check for parameters on the full
-                # assembled block when the closer arrives (in case the
-                # <parameter ...> tag was split across chunks).
-                self._pending_function_block += text
-                return ""
-            # Block closes within this chunk. Stash the complete block and
-            # process the remaining text below. Check the *full* assembled
-            # block for parameter siblings — handles the case where a
-            # parameter tag was split mid-token across chunks.
-            tail = text[closer.end():]
-            self._pending_function_block += text[: closer.end()]
-            had_params = bool(_PARAMETER_RE.search(self._pending_function_block))
-            self._pending_blocks.append((self._pending_function_block, had_params))
-            self._pending_function_block = None
-            text = tail
-
-        # Repeatedly remove complete tool-call blocks. For bare <function=...>
-        # blocks we additionally retain a copy of the matched block in
-        # ``_pending_blocks`` so the caller can promote it into structured
-        # tool_calls instead of just dropping it.
-        while True:
-            m = _TOOL_CALL_XML_RE.search(text)
-            if not m:
-                break
-            out.append(text[: m.start()])
-            block = m.group(0)
-            if _FUNCTION_OPEN_RE.match(block):
-                # Track whether the block has real <parameter=k>...</parameter>
-                # siblings so we can decide later whether to promote it.
-                had_params = bool(_PARAMETER_RE.search(block))
-                self._pending_blocks.append((block, had_params))
-            text = text[m.end():]
-
-        # Strip orphan closing tags (`</parameter>`, `</function>`, etc.) that
-        # arrive with no matching opener observed by the stripper. Models
-        # occasionally emit these when they think they're already inside a
-        # tool-call block (e.g., instructed via prompt to use tools) but never
-        # wrote a real `<function=...>` opener. Without stripping them OMP
-        # renders `</parameter></function>` as visible text content.
-        text = _ORPHAN_CLOSE_RE.sub("", text)
-
-        # Detect an *unclosed* bare <function=...> opener in the remaining
-        # text. If found, split: emit prose up to the opener, buffer the
-        # rest as the start of a cross-chunk block.
-        open_match = _FUNCTION_OPEN_RE.search(text)
-        if open_match:
-            out.append(text[: open_match.start()])
-            self._pending_function_block = text[open_match.start():]
-            return "".join(out)
-
-        # No unclosed opener. If `text` ends with an incomplete opener
-        # prefix that may continue into the next chunk, carry it;
-        # otherwise emit everything.
-        if text:
-            emit_end = len(text)
-            carry = ""
-            for i in range(len(text)):
-                tail = text[i:]
-                if self._looks_like_opener(tail):
-                    emit_end = i
-                    carry = tail
-                    break
-            out.append(text[:emit_end])
-            self._carry = carry
-        return "".join(out)
-
-    def flush(self) -> str:
-        """Drop any remaining carried content (partial opener that never
-        completed). Returns the clean emitted text, usually empty."""
-        carry, self._carry = self._carry, ""
+        self._pending_generic_block = None
+        self._pending_wrapper_block = None
         return ""
 
     def drain_pending_blocks(self) -> list[tuple[str, bool]]:
@@ -441,12 +470,14 @@ def _strip_xml_tool_calls(content: str) -> str:
     We only strip when the markup contains tool-call-shaped tags so normal
     text mentioning "tool_call" is preserved.
     """
-    if not content or "<" not in content:
+    if not content:
         return content
-    return _TOOL_CALL_XML_RE.sub("", content)
+    from tusker_gateway.tool_formats import strip_tool_text
+
+    return strip_tool_text(content)
 
 
-async def _normalize_stream(raw_stream: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
+async def _normalize_stream_legacy(raw_stream: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
     """Normalize upstream SSE chunks for OMP/client compatibility.
 
     Some upstream providers bundle `delta.content` and `finish_reason` in the
@@ -640,6 +671,262 @@ async def _normalize_stream(raw_stream: AsyncIterator[bytes]) -> AsyncIterator[b
     # terminated cleanly) to avoid emitting a chunk after the sentinel.
     if not saw_finish_reason and not saw_done:
         yield _finish_frame()
+
+
+async def _normalize_stream(
+    raw_stream: AsyncIterator[bytes],
+    *,
+    provider: str | None = None,
+    model: str | None = None,
+    request_id: str | None = None,
+) -> AsyncIterator[bytes]:
+    """Sanitize and normalize a provider's OpenAI-compatible SSE stream.
+
+    The upstream iterator is intentionally normalized at the last boundary
+    before client output. This covers providers that send tool XML in
+    ``delta.content``, providers that send native ``tool_calls`` plus a
+    duplicate XML copy, and providers that put ``finish_reason`` in the same
+    event as the call.
+    """
+    from tusker_gateway.tool_formats import (
+        parse_text_tool_calls,
+        strip_tool_text,
+        tool_diagnostics_enabled,
+        tool_markup_kinds,
+    )
+
+    buffer = b""
+    tool_stripper = _ToolCallStripper()
+    saw_finish_reason = False
+    saw_done = False
+    saw_tool_call = False
+
+    def finish_frame(reason: str) -> bytes:
+        return sse_frame(format_openai_chunk(finish_reason=reason, model=model))
+
+    def tool_calls_frame(
+        parsed_calls: list[dict[str, Any]],
+        template_obj: dict[str, Any],
+    ) -> bytes | None:
+        if not parsed_calls:
+            return None
+        openai_calls: list[dict[str, Any]] = []
+        for index, call in enumerate(parsed_calls):
+            fn = call.get("function") or {}
+            name = str(fn.get("name") or "")
+            args = fn.get("arguments", "{}")
+            if not isinstance(args, str):
+                args = json.dumps(args, ensure_ascii=False)
+            cid = call.get("id") or f"call_{index}_{hashlib.sha1(name.encode()).hexdigest()[:10]}"
+            openai_calls.append({
+                "index": index,
+                "id": str(cid),
+                "type": "function",
+                "function": {"name": name, "arguments": args},
+            })
+        return sse_frame({
+            "id": template_obj.get("id") or f"chatcmpl-{secrets.token_hex(14)}",
+            "object": "chat.completion.chunk",
+            "model": template_obj.get("model") or model or "tusker-gateway",
+            "choices": [{
+                "index": 0,
+                "delta": {"role": "assistant", "tool_calls": openai_calls},
+                "finish_reason": None,
+            }],
+        })
+
+    async for chunk in raw_stream:
+        buffer += chunk
+        while b"\n\n" in buffer:
+            frame, buffer = buffer.split(b"\n\n", 1)
+            frame += b"\n\n"
+            stripped = frame.strip()
+            if not stripped.startswith(b"data: "):
+                yield frame
+                continue
+            if stripped == b"data: [DONE]":
+                tool_stripper.flush()
+                if not saw_finish_reason:
+                    yield finish_frame("tool_calls" if saw_tool_call else "stop")
+                saw_done = True
+                yield frame
+                continue
+            try:
+                obj = json.loads(stripped[len(b"data: "):])
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                # An invalid JSON event is not useful to an OpenAI client, but
+                # preserving it is still preferable to silently changing the
+                # provider stream.
+                yield frame
+                continue
+            choices = obj.get("choices")
+            if not isinstance(choices, list) or not choices:
+                yield frame
+                continue
+            choice = choices[0]
+            if not isinstance(choice, dict):
+                yield frame
+                continue
+            delta = dict(choice.get("delta") or {})
+            fr = choice.get("finish_reason")
+            if fr:
+                saw_finish_reason = True
+
+            raw_content = delta.get("content")
+            reasoning_content = delta.get("reasoning_content")
+            if raw_content is None and reasoning_content is not None:
+                raw_content = reasoning_content
+                delta["content"] = reasoning_content
+                delta.pop("reasoning_content", None)
+
+            tc = delta.get("tool_calls")
+            has_tools = isinstance(tc, list) and bool(tc)
+            raw_marker_types = tool_markup_kinds(raw_content)
+            cleaned_content = ""
+            has_content = isinstance(raw_content, str) and bool(raw_content)
+            if has_content:
+                cleaned_content = tool_stripper.feed(raw_content)
+                # ``strip_tool_text`` strips outer whitespace, so only apply
+                # it when the stateful pass left an actual markup hint. This
+                # preserves token-boundary spaces in ordinary prose.
+                if re.search(
+                    r"\bTOOL_CALL\s*:\s*[\w.-]+\s*\(|<\s*(?:/?(?:tool_call|function_call|tool_calls|function_calls|tool_use|tool_invocation|dots_function_call|dots_tool_call|function|parameter|invoke|tool|arg_key|arg_value|tool_sep)|(?:dsml|mimoml):)",
+                    cleaned_content,
+                    re.IGNORECASE,
+                ):
+                    cleaned_content = strip_tool_text(cleaned_content)
+                if cleaned_content != raw_content:
+                    logger.info(
+                        "assistant tool markup sanitized stream=true provider=%s model=%s request_id=%s marker_types=%s raw_chars=%d cleaned_chars=%d native_calls=%d",
+                        provider or "unknown",
+                        model or "unknown",
+                        request_id or "unknown",
+                        ",".join(raw_marker_types) or "unknown",
+                        len(raw_content),
+                        len(cleaned_content),
+                        len(tc) if isinstance(tc, list) else 0,
+                    )
+                if cleaned_content:
+                    delta["content"] = cleaned_content
+                else:
+                    delta.pop("content", None)
+
+            new_choice = {**choice, "delta": delta}
+            new_obj = {**obj, "choices": [new_choice, *choices[1:]]}
+
+            pending_tool_frames: list[bytes] = []
+            pending_prose_frames: list[bytes] = []
+            text_calls_detected = 0
+            # Native tool calls take precedence over a duplicate text copy.
+            # The stripper still removes the text representation, but does
+            # not make the client execute the same call twice.
+            if not has_tools:
+                direct_text_calls = (
+                    parse_text_tool_calls(raw_content)
+                    if isinstance(raw_content, str)
+                    and re.search(
+                        r"\bTOOL_CALL\s*:\s*[\w.-]+\s*\(",
+                        raw_content,
+                        re.IGNORECASE,
+                    )
+                    else []
+                )
+                direct_frame = tool_calls_frame(direct_text_calls, new_obj)
+                text_calls_detected += len(direct_text_calls)
+                if direct_frame is not None:
+                    pending_tool_frames.append(direct_frame)
+
+            for block, eligible in tool_stripper.drain_pending_blocks():
+                if eligible:
+                    parsed = parse_text_tool_calls(block)
+                    text_calls_detected += len(parsed)
+                    if parsed:
+                        if not has_tools:
+                            tool_frame = tool_calls_frame(parsed, new_obj)
+                            if tool_frame is not None:
+                                pending_tool_frames.append(tool_frame)
+                    else:
+                        # A wrapper can contain malformed markup or ordinary
+                        # prose. Preserve the latter without forwarding the
+                        # executable-looking envelope.
+                        prose = _extract_inner_prose(block) or strip_tool_text(block)
+                        if prose:
+                            pending_prose_frames.append(_content_frame(prose, new_obj))
+                elif not eligible:
+                    prose = _extract_inner_prose(block)
+                    if prose:
+                        pending_prose_frames.append(_content_frame(prose, new_obj))
+
+            content_changed = isinstance(raw_content, str) and cleaned_content != raw_content
+            if tool_diagnostics_enabled() and (
+                raw_marker_types
+                or content_changed
+                or text_calls_detected
+                or has_tools
+            ):
+                logger.info(
+                    "tool diagnostics stream provider=%s model=%s request_id=%s marker_types=%s raw_chars=%d cleaned_chars=%d native_calls=%d text_calls=%d",
+                    provider or "unknown",
+                    model or "unknown",
+                    request_id or "unknown",
+                    ",".join(raw_marker_types) or "unknown",
+                    len(raw_content) if isinstance(raw_content, str) else 0,
+                    len(cleaned_content),
+                    len(tc) if isinstance(tc, list) else 0,
+                    text_calls_detected,
+                )
+
+            if pending_tool_frames or has_tools:
+                saw_tool_call = True
+            has_promoted_tools = bool(pending_tool_frames)
+            has_delta_content = bool(delta.get("content"))
+
+            if fr:
+                # Finish is always last. In particular, a same-event text
+                # function block must be promoted before this frame.
+                if has_delta_content:
+                    content_delta = {
+                        key: value for key, value in delta.items()
+                        if key not in ("role", "tool_calls")
+                    }
+                    yield f"data: {json.dumps({**new_obj, 'choices': [{**new_choice, 'delta': content_delta, 'finish_reason': None}]}, ensure_ascii=False)}\n\n".encode()
+                for prose_frame in pending_prose_frames:
+                    yield prose_frame
+                if has_tools:
+                    tools_only = {"role": delta.get("role"), "tool_calls": tc}
+                    yield f"data: {json.dumps({**new_obj, 'choices': [{**new_choice, 'delta': tools_only, 'finish_reason': None}]}, ensure_ascii=False)}\n\n".encode()
+                for tool_frame in pending_tool_frames:
+                    yield tool_frame
+                reason = "tool_calls" if saw_tool_call else fr
+                yield f"data: {json.dumps({**new_obj, 'choices': [{**new_choice, 'delta': {}, 'finish_reason': reason}]}, ensure_ascii=False)}\n\n".encode()
+            elif has_promoted_tools:
+                if has_delta_content:
+                    content_delta = {
+                        key: value for key, value in delta.items()
+                        if key not in ("role", "tool_calls")
+                    }
+                    if content_delta:
+                        yield f"data: {json.dumps({**new_obj, 'choices': [{**new_choice, 'delta': content_delta, 'finish_reason': None}]}, ensure_ascii=False)}\n\n".encode()
+                for prose_frame in pending_prose_frames:
+                    yield prose_frame
+                for tool_frame in pending_tool_frames:
+                    yield tool_frame
+            else:
+                if has_delta_content or has_tools or delta:
+                    yield f"data: {json.dumps(new_obj, ensure_ascii=False)}\n\n".encode()
+                for prose_frame in pending_prose_frames:
+                    yield prose_frame
+
+    if buffer.strip():
+        logger.warning(
+            "dropping unterminated upstream SSE tail provider=%s model=%s request_id=%s bytes=%d",
+            provider or "unknown",
+            model or "unknown",
+            request_id or "unknown",
+            len(buffer),
+        )
+    if not saw_finish_reason and not saw_done:
+        yield finish_frame("tool_calls" if saw_tool_call else "stop")
 
 
 def _pool_name(body: dict[str, Any]) -> str | None:
@@ -1295,6 +1582,14 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
             )
             logger.debug('selected rid=%s provider=%s model=%s pool=%s', request_id, provider, target_model, pool_name)
 
+            if isinstance(result, dict):
+                from tusker_gateway.tool_formats import normalize_response_tool_calls
+
+                result = normalize_response_tool_calls(
+                    result,
+                    source=f"{provider}/{target_model}",
+                )
+
             if budget is not None and api_key and isinstance(result, dict):
                 usage = result.get("usage") or {}
                 used = int(usage.get("total_tokens") or _estimated_tokens(body["messages"]))
@@ -1383,7 +1678,12 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                         # Emit finish_reason chunk (distinct from content to satisfy OMP)
                         await resp.write(sse_frame(format_openai_chunk(finish_reason=finish_reason)))
                     else:
-                        async for chunk in _normalize_stream(result):
+                        async for chunk in _normalize_stream(
+                            result,
+                            provider=provider,
+                            model=target_model,
+                            request_id=request_id,
+                        ):
                             await resp.write(chunk)
                 except (ConnectionResetError, ConnectionError, BrokenPipeError) as exc:
                     stream_ok = False
@@ -1464,6 +1764,13 @@ async def responses_handler(request: web.Request) -> web.Response | web.StreamRe
             config, chat_body, client, request=request,
             metrics_registry=request.app.get("metrics"),
         )
+        if isinstance(result, dict):
+            from tusker_gateway.tool_formats import normalize_response_tool_calls
+
+            result = normalize_response_tool_calls(
+                result,
+                source=f"responses/{body.get('model') or config['model_name']}",
+            )
         if isinstance(result, dict) and "choices" in result:
             text = result.get("choices", [{}])[0].get("message", {}).get("content", "")
         else:

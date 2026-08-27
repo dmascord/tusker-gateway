@@ -68,8 +68,8 @@ def _parse_env_json_list(env_var: str) -> list[dict[str, Any]]:
     try:
         parsed = json.loads(raw)
         if isinstance(parsed, list):
-            return parsed
-        return [parsed]
+            return [item for item in parsed if isinstance(item, dict)]
+        return [parsed] if isinstance(parsed, dict) else []
     except json.JSONDecodeError:
         return []
 
@@ -155,14 +155,22 @@ def load_config() -> dict[str, Any]:
         auth_file = str(_Path.home() / ".hermes" / "auth.json")
     config["auth_file"] = auth_file
     config["codex_credentials"] = _parse_env_json_list("CODEX_CREDENTIALS")
+    auth_file_credentials: list[dict[str, Any]] = []
+    try:
+        from tusker_gateway.copilot_enroll import load_auth_file as _load_auth
+        auth_file_credentials = [
+            credential for credential in _load_auth(auth_file)
+            if isinstance(credential, dict)
+        ]
+    except (OSError, TypeError, ValueError):
+        pass
     if not config["codex_credentials"]:
         try:
-            from tusker_gateway.copilot_enroll import load_auth_file as _load_auth
-            creds = _load_auth(auth_file)
+            creds = auth_file_credentials
             # Filter to openai-codex credentials for the codex pool
             config["codex_credentials"] = [
                 c for c in creds
-                if c.get("provider", "openai-codex") == "openai-codex"
+                if str(c.get("provider", "openai-codex")).lower() == "openai-codex"
             ]
             # If no provider tag is present, keep all creds (legacy list-format file).
             if not config["codex_credentials"] and any(
@@ -172,10 +180,39 @@ def load_config() -> dict[str, Any]:
         except (OSError, TypeError, ValueError):
             pass
 
+    # Each OAuth/Codex provider may declare its own JSON credential-pool env
+    # var. Keep the legacy CODEX_CREDENTIALS fallback for openai-codex, but do
+    # not silently feed that pool into Copilot or enterprise requests.
+    credential_pools: dict[str, list[dict[str, Any]]] = {}
+    for provider, provider_config in config["providers"].items():
+        pool_env = provider_config.pool_env
+        if not pool_env:
+            continue
+        pool = _parse_env_json_list(pool_env)
+        if not pool and pool_env != pool_env.upper():
+            pool = _parse_env_json_list(pool_env.upper())
+        if not pool and provider == "openai-codex":
+            pool = config["codex_credentials"]
+        if not pool:
+            pool = [
+                credential for credential in auth_file_credentials
+                if str(credential.get("provider", "openai-codex")).lower() == provider
+            ]
+        credential_pools[provider] = pool
+    if "openai-codex" not in credential_pools:
+        credential_pools["openai-codex"] = config["codex_credentials"]
+    config["credential_pools"] = credential_pools
+
     from pathlib import Path as _Path
     default_db = "/home/tusker/.hermes/model_quality.db" if _Path("/home/tusker").exists() else "/tmp/tusker-quality.db"
     config["quality_db_path"] = os.environ.get("QUALITY_DB_PATH", default_db)
-    logger.info('config loaded: %d providers, %d pools, quality_db=%s', len(config.get("providers", {})), len(config.get("pools", {})), config["quality_db_path"])
+    logger.info(
+        'config loaded: %d providers, %d pools, credential_pools=%s, quality_db=%s',
+        len(config.get("providers", {})),
+        len(config.get("pools", {})),
+        {provider: len(credentials) for provider, credentials in credential_pools.items()},
+        config["quality_db_path"],
+    )
     return config
 
 
@@ -229,9 +266,9 @@ DEFAULT_PROVIDER_REGISTRY: dict[str, ProviderConfig] = {
     "ollama-cloud": ProviderConfig("ollama-cloud", "bearer", "https://ollama.com", "/v1/chat/completions", auth_env="OLLAMA_API_KEY"),
     "opencode-go": ProviderConfig("opencode-go", "bearer", "https://opencode.ai/zen/go/v1", "/chat/completions", auth_env="OPENCODE_GO_API_KEY", zdr_ok=True),
     "opencode-zen": ProviderConfig("opencode-zen", "bearer", "https://opencode.ai/zen", "/v1/chat/completions", auth_env="OPENCODE_ZEN_API_KEY"),
-    "openai-codex": ProviderConfig("openai-codex", "codex", "https://chatgpt.com/backend-api/codex", "/responses", pool_env="CODEX_CREDENTIALS", auth_type="codex", model_header="x-openai-gpt-model", zdr_ok=True),
-    "github-copilot": ProviderConfig("github-copilot", "oauth", "https://api.githubcopilot.com", "/chat/completions", pool_env="CODEX_CREDENTIALS", auth_type="oauth", model_header="x-github-gpt-model"),
-    "github-copilot-enterprise": ProviderConfig("github-copilot-enterprise", "oauth", "https://copilot-api.sita.ghe.com", "/chat/completions", pool_env="CODEX_CREDENTIALS", auth_type="oauth", model_header="x-github-gpt-model"),
+    "openai-codex": ProviderConfig("openai-codex", "codex", "https://chatgpt.com/backend-api/codex", "/responses", pool_env="opencode_codex_credentials", auth_type="codex", model_header="x-openai-gpt-model", zdr_ok=True),
+    "github-copilot": ProviderConfig("github-copilot", "oauth", "https://api.githubcopilot.com", "/chat/completions", pool_env="GITHUB_COPILOT_CREDENTIALS", auth_type="oauth", model_header="x-github-gpt-model"),
+    "github-copilot-enterprise": ProviderConfig("github-copilot-enterprise", "oauth", "https://copilot-api.sita.ghe.com", "/chat/completions", pool_env="GITHUB_COPILOT_ENTERPRISE_CREDENTIALS", auth_type="oauth", model_header="x-github-gpt-model"),
     "local-llm": ProviderConfig("local-llm", "local", "http://localhost:11434", "/v1/chat/completions"),
     "nvidia": ProviderConfig("nvidia", "bearer", "https://integrate.api.nvidia.com", "/v1/chat/completions", auth_env="NVIDIA_API_KEY"),
 }

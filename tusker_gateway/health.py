@@ -15,10 +15,13 @@ _GIT_COMMIT = os.environ.get("TUSKER_COMMIT", "unknown").strip()
 def health_handler(request: web.Request) -> web.Response:
     """GET /health — liveness probe."""
     logger.debug('health check')
+    from tusker_gateway.rtk import is_enabled
+
     return web.json_response({
         "status": "ok",
         "version": "0.1.0",
         "commit": _GIT_COMMIT,
+        "rtk_enabled": request.app.get("rtk_enabled", is_enabled()),
     })
 
 
@@ -90,6 +93,7 @@ def status_handler(request: web.Request) -> web.Response:
     from tusker_gateway.config import load_config
     from tusker_gateway.quality import QualityDB
     from tusker_gateway.pools import PoolManager
+    from tusker_gateway.rtk import is_enabled
 
     config = load_config()
     quality = QualityDB(config["quality_db_path"])
@@ -110,5 +114,6 @@ def status_handler(request: web.Request) -> web.Response:
         "pools": pools.status(),
         "quality": quality.status(),
         "purged_cooldowns": purged,
+        "rtk_enabled": request.app.get("rtk_enabled", is_enabled()),
     }
     return web.json_response(status)

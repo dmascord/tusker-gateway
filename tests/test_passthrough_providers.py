@@ -245,6 +245,50 @@ def test_config_loads_codex_credentials_single_object():
     assert cfg["codex_credentials"] == [cred]
 
 
+def test_config_loads_independent_credential_pools(monkeypatch):
+    """Each OAuth/Codex provider reads only its declared credential pool."""
+    codex = [{"token": "codex-token"}]
+    copilot = [{"token": "copilot-token"}]
+    enterprise = [{"token": "enterprise-token"}]
+    monkeypatch.setenv("CODEX_CREDENTIALS", json.dumps(codex))
+    monkeypatch.delenv("OPENCODE_CODEX_CREDENTIALS", raising=False)
+    monkeypatch.setenv("GITHUB_COPILOT_CREDENTIALS", json.dumps(copilot))
+    monkeypatch.setenv(
+        "GITHUB_COPILOT_ENTERPRISE_CREDENTIALS", json.dumps(enterprise)
+    )
+
+    cfg = load_config()
+
+    assert cfg["credential_pools"]["openai-codex"] == codex
+    assert cfg["credential_pools"]["github-copilot"] == copilot
+    assert cfg["credential_pools"]["github-copilot-enterprise"] == enterprise
+
+
+@pytest.mark.asyncio
+async def test_passthrough_provider_rotator_selection(mock_http, quality_db):
+    """A configured pool map prevents credentials crossing provider hosts."""
+    client = PassthroughClient(
+        _base_config(
+            codex_credentials=[{"token": "legacy-codex"}],
+            credential_pools={
+                "openai-codex": [{"token": "codex-token"}],
+                "github-copilot": [{"token": "copilot-token"}],
+                "github-copilot-enterprise": [{"token": "enterprise-token"}],
+            },
+        ),
+        quality_db,
+        mock_http,
+    )
+
+    assert await client._rotator_for("openai-codex").get_token() == "codex-token"
+    assert await client._rotator_for("github-copilot").get_token() == "copilot-token"
+    assert (
+        await client._rotator_for("github-copilot-enterprise").get_token()
+        == "enterprise-token"
+    )
+    assert client._rotator_for("unknown-provider") is None
+
+
 def test_config_loads_provider_api_keys_json():
     """PROVIDER_API_KEYS JSON dict is loaded."""
     env = {

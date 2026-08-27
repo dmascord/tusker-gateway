@@ -6,13 +6,22 @@ This removes auth-specific branching from PassthroughClient.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
+import logging
 from typing import Any
 
 from tusker_gateway.copilot_constants import EDITOR_VERSION, EXCHANGE_USER_AGENT, is_likely_vision_model
 from tusker_gateway.copilot_exchange import copilot_request_headers, exchange_copilot_token
 from tusker_gateway.models import ProviderConfig
 from tusker_gateway.passthrough import CodexTokenRotator
+
+logger = logging.getLogger(__name__)
+
+
+def _token_fingerprint(token: str) -> str:
+    """Return a non-secret identifier for auth diagnostics."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:12]
 
 
 class Authenticator:
@@ -67,11 +76,31 @@ class OAuthAuthenticator(Authenticator):
         # Try static token from provider_api_keys first (e.g. gho_ token),
         # then fall back to CodexTokenRotator for OAuth device-code pools.
         raw_token: str | None = None
+        token_source = "none"
         provider_key = config.get("provider_api_keys", {}).get(provider.lower())
         if provider_key:
             raw_token = provider_key
+            token_source = "provider_api_key"
         elif self._rotator:
             raw_token = await self._rotator.get_token()
+            if raw_token:
+                token_source = "credential_rotator"
+
+        if raw_token:
+            logger.debug(
+                "provider auth credential selected provider=%s model=%s source=%s fingerprint=%s",
+                provider,
+                model,
+                token_source,
+                _token_fingerprint(raw_token),
+            )
+        else:
+            logger.warning(
+                "provider auth credential missing provider=%s model=%s source=%s",
+                provider,
+                model,
+                token_source,
+            )
 
         if raw_token:
             # GHE Copilot bypasses the token exchange entirely: the raw
@@ -149,11 +178,31 @@ class CodexAuthenticator(Authenticator):
         headers: dict[str, str] = {}
         # Try static token from provider_api_keys first, then rotator pool
         raw_token: str | None = None
+        token_source = "none"
         provider_key = config.get("provider_api_keys", {}).get(provider.lower())
         if provider_key:
             raw_token = provider_key
+            token_source = "provider_api_key"
         elif self._rotator:
             raw_token = await self._rotator.get_token()
+            if raw_token:
+                token_source = "credential_rotator"
+
+        if raw_token:
+            logger.debug(
+                "codex auth credential selected provider=%s model=%s source=%s fingerprint=%s",
+                provider,
+                model,
+                token_source,
+                _token_fingerprint(raw_token),
+            )
+        else:
+            logger.warning(
+                "codex auth credential missing provider=%s model=%s source=%s",
+                provider,
+                model,
+                token_source,
+            )
 
         if raw_token:
             # codex_auth_headers layers the Cloudflare bypass header set
