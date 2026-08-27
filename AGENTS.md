@@ -18,7 +18,7 @@ Read in order when picking up the repo:
 | `docs/cleanup-2026-08-19.md` | Earlier cleanup pass — context for current code shape. |
 | `docs/migrations/2026-08-21-codex-migration/` | Codex OAuth endpoint move + token-rotation tooling. |
 | `docs/zero-downtime-deploys.md` | Why `strategy: Recreate` and the planned RWX migration. |
-| `docs/incidents/2026-08-26-usb-ssd-flap.md` | USB-SSD flap postmortem + storage migration notes. |
+| `docs/incidents/2026-08-26-usb-ssd-flap.md` | USB-SSD flap postmortem, storage migration, and Longhorn v1.12.1 upgrade notes. |
 
 Topic-specific:
 

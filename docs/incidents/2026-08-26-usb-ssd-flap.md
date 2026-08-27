@@ -79,6 +79,32 @@ When retrying this, the right path is to first do a Longhorn version-aligned sna
 
 The USB T5 is still attached to visor but no longer used for tusker-gateway data. When the other-app PVCs on it (`pvc-2afe302d`, `pvc-84387ebb`) are migrated off, the drive can be physically unplugged and the USB-flap monitor can be removed.
 
+## Longhorn v1.12.1 upgrade (2026-08-27)
+
+Upgraded Longhorn from chart `1.12.0` to `1.12.1` (app version `v1.12.0` → `v1.12.1`) via `helm upgrade longhorn longhorn/longhorn --version 1.12.1`. The cluster went through Helm chart revision 2 → 4 (revision 3 was a no-op because `--reuse-values` carried the previously computed image tag `v1.12.0` forward; the explicit `--set image.*.tag=v1.12.1` overrides were required).
+
+The upgrade delivered two concrete benefits:
+
+1. **Fixes the kernel-6.12+ ext4 read-only detection bug** ([Issue #13482](https://github.com/longhorn/longhorn/issues/13482)) that caused today's incident. ext4 ≥ 6.12 reports `emergency_ro` rather than `ro`, and pre-v1.12.1 Longhorn didn't check for that flag — so the read-only filesystem from the USB flap was invisible to Longhorn, the replica wasn't auto-salvaged, and the volume stayed `degraded` until operator intervention. **This fix is the durable solution to today's outage class.**
+
+2. **Cleans up the stuck replica and accepts `numberOfReplicas=2`.** On v1.12.1, bumping `tusker-home` to `numberOfReplicas=2` succeeded within ~3 minutes (replica #2 came up on `wytch` in 15 seconds). On v1.12.0 it sat in `stopped` for 17+ hours with no reconciliation.
+
+### Operational notes from the upgrade
+
+- **`--reuse-values` semantics**: Helm's `--reuse-values` carries forward the **computed values** from the previous release, including chart defaults that were rendered. To override chart defaults (like image tags), pass explicit `--set` or use a values file.
+- **NetworkPolicy defaults**: v1.12.1 enables internal NetworkPolicies by default. We explicitly disabled this with `--set networkPolicies.enabled=false` because (a) we don't run Prometheus/ServiceMonitor scrapers so there's no immediate benefit, and (b) our Calico CNI setup with BGP routing may need separate tuning for the policies to work cleanly. This is a future hardening step, separate from the FilesystemReadOnly fix that mattered here.
+- **Wynk storage constraint**: One manager pod couldn't schedule on `wynk` because `wynk` has only 6.7 GiB of ephemeral-storage capacity (vs the manager pod's `/boot` HostPath volume requirement). This is a pre-existing constraint on the edge node and didn't cause issues — 5 of 6 managers running is sufficient for HA.
+
+### Final post-upgrade state
+
+- Helm chart: `longhorn-1.12.1`, app version `v1.12.1`
+- 5/6 Longhorn managers running (visor, wyrm, wyzard, wytch, wyvern — wynk excluded by taint/storage)
+- All CSI components (`csi-attacher`, `csi-provisioner`, `csi-resizer`, `csi-snapshotter`) and `longhorn-ui`, `longhorn-driver-deployer` running on v1.12.1
+- Engine image `ei-493e04e7 (v1.12.1)` deployed; replicas still running on `v1.12.0` engine image but can be upgraded with `concurrentAutomaticEngineUpgradePerNodeLimit` setting when ready
+- `tusker-home`: `numReplicas=2`, replicas running on `visor` and `wytch`, robust, healthy
+- Pre-upgrade safety-net snapshot `pre-upgrade-1.12.1-1787791143` retained as a rollback reference (size 81.8 MB)
+- S3 backup `backup-pre-upgrade-1.12.1-1787791169` completed (in case the on-cluster snapshot is also affected by future disk failures)
+
 ## References
 
 - Live USB event log: visor `dmesg | grep -E "usb|sdd|sdc|dm-"` around 2026-08-26T05:27
