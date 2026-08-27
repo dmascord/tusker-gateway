@@ -977,7 +977,7 @@ async def _normalize_stream(
 
 
 class _PreparedStream:
-    """Marker wrapper for a stream whose first normalized event was probed."""
+    """Marker wrapper for a stream whose safe prefix was preflighted."""
 
     def __init__(self, iterator: AsyncIterator[bytes]) -> None:
         self.iterator = iterator
@@ -987,12 +987,38 @@ class _PreparedStream:
 
 
 async def _prepend_stream(
-    first: bytes,
+    prefix: list[bytes],
     rest: AsyncIterator[bytes],
 ) -> AsyncIterator[bytes]:
-    yield first
+    for chunk in prefix:
+        yield chunk
     async for chunk in rest:
         yield chunk
+
+
+def _stream_frame_signal(frame: bytes) -> tuple[bool, bool]:
+    """Return ``(has_tool_call, has_terminal)`` for a normalized SSE frame."""
+    stripped = frame.strip()
+    if not stripped.startswith(b"data: "):
+        return False, False
+    try:
+        obj = json.loads(stripped[len(b"data: "):])
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return False, False
+    choices = obj.get("choices")
+    if not isinstance(choices, list):
+        return False, False
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        delta = choice.get("delta")
+        if isinstance(delta, dict):
+            tool_calls = delta.get("tool_calls")
+            if isinstance(tool_calls, list) and tool_calls:
+                return True, False
+        if choice.get("finish_reason") is not None:
+            return False, True
+    return False, False
 
 
 async def _close_async_iterator(iterator: Any) -> None:
@@ -1013,12 +1039,13 @@ async def _prepare_stream_result(
     request_id: str | None,
     tools_requested: bool,
 ) -> Any:
-    """Probe the first normalized event before committing a client response.
+    """Preflight a tool stream before committing a client response.
 
-    Tool calls are normally the first useful stream event. Probing that event
-    lets the pool fallback path reject a malformed envelope before aiohttp
-    sends OMP its 200 response. The first event is replayed so successful
-    streams retain their normal output and latency after the probe.
+    A provider may emit ordinary reasoning/text before a malformed tool
+    envelope. Probing only the first event lets that failure arrive after
+    aiohttp has sent a 200, which makes pool fallback impossible. Buffer until
+    a structured/promoted call or a clean terminal event is observed, then
+    replay the buffered prefix so successful streams retain their output.
     """
     if not tools_requested or not hasattr(result, "__aiter__"):
         return result
@@ -1030,14 +1057,33 @@ async def _prepare_stream_result(
         request_id=request_id,
         tools_requested=True,
     )
+    buffered: list[bytes] = []
+    buffered_bytes = 0
+    preflight_decision = "eof"
     try:
-        first = await normalized.__anext__()
-    except StopAsyncIteration:
-        return _PreparedStream(normalized)
+        async for frame in normalized:
+            buffered.append(frame)
+            buffered_bytes += len(frame)
+            has_tool_call, has_terminal = _stream_frame_signal(frame)
+            if has_tool_call:
+                preflight_decision = "tool_call"
+                break
+            if has_terminal:
+                preflight_decision = "terminal"
+                break
     except Exception:
         await _close_async_iterator(normalized)
         raise
-    return _PreparedStream(_prepend_stream(first, normalized))
+    logger.info(
+        "tool stream preflight provider=%s model=%s request_id=%s decision=%s frames=%d bytes=%d",
+        provider,
+        model,
+        request_id or "unknown",
+        preflight_decision,
+        len(buffered),
+        buffered_bytes,
+    )
+    return _PreparedStream(_prepend_stream(buffered, normalized))
 
 
 def _pool_name(body: dict[str, Any]) -> str | None:

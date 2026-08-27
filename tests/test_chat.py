@@ -200,7 +200,10 @@ async def test_chat_stream_malformed_tool_markup_falls_back_before_client_respon
     async def malformed_stream(*args, **kwargs):
         yield (
             b'data: {"choices":[{"index":0,"delta":{"role":"assistant",'
-            b'"content":"I will inspect the manifests. <tool_call>find /Volumes/dev/dev/k8s -name \\\"*.yaml\\\" -exec grep -l \\\"ConfigMap\\\" {} \\\\; </parameter></function></tool_call>"},'
+            b'"content":"I will inspect the manifests."},"finish_reason":null}]}\n\n'
+        )
+        yield (
+            b'data: {"choices":[{"index":0,"delta":{"content":" <tool_call>find /Volumes/dev/dev/k8s -name \\\"*.yaml\\\" -exec grep -l \\\"ConfigMap\\\" {} \\\\; </parameter></function></tool_call>"},'
             b'"finish_reason":"stop"}]}'
             b'\n\n'
         )
