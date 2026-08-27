@@ -40,14 +40,37 @@ spec:
         - name: API_KEYS
           value: d36fa730d29ed2e8749708ffc7ff7453d5c68a84b9b17360f15bffa9fb0a6a6d,1669ed9f11c615b5cb60fdfa60d23b4373c503de306eaa90039a20790427aef0,4f9736e8bfa246e74ffc11279cf59d2fe4b381cc70159255a9f78e26932bbb1f,e6507e72971c8e015b2958930497e3baaf75607e2dc178ae44f1db671bd49e0d
         - name: TUSKER_SEMANTIC_CACHE_ENABLED
-          # The embedding model is optional and is not baked into the image.
-          # Keep startup independent of Hugging Face availability until the
-          # model is packaged or mounted on the PVC.
+          # Keep the production switch explicit. The image contains the
+          # pinned model and the safety gates below are ready for a canary.
           value: 'false'
         - name: TUSKER_SEMANTIC_CACHE_THRESHOLD
-          value: '0.85'
+          value: '0.92'
         - name: TUSKER_SEMANTIC_CACHE_TTL
-          value: '3600'
+          value: '300'
+        - name: TUSKER_SEMANTIC_CACHE_MAX_ENTRIES
+          value: '5000'
+        - name: TUSKER_SEMANTIC_CACHE_MAX_INPUT_CHARS
+          value: '12000'
+        - name: TUSKER_SEMANTIC_CACHE_MAX_RESPONSE_BYTES
+          value: '262144'
+        - name: TUSKER_SEMANTIC_CACHE_MODEL
+          value: sentence-transformers/all-MiniLM-L6-v2
+        - name: TUSKER_SEMANTIC_CACHE_MODEL_REVISION
+          value: 1110a243fdf4706b3f48f1d95db1a4f5529b4d41
+        - name: TUSKER_SEMANTIC_CACHE_DEVICE
+          value: cpu
+        - name: TUSKER_SEMANTIC_CACHE_LOCAL_FILES_ONLY
+          value: 'true'
+        - name: TUSKER_SEMANTIC_CACHE_INIT_TIMEOUT_SECS
+          value: '120'
+        - name: TUSKER_SEMANTIC_CACHE_OPERATION_TIMEOUT_SECS
+          value: '2'
+        - name: TUSKER_SEMANTIC_CACHE_MAX_CONCURRENT_OPERATIONS
+          value: '2'
+        - name: TUSKER_SEMANTIC_CACHE_REQUIRE_DETERMINISTIC
+          value: 'true'
+        - name: TUSKER_SEMANTIC_CACHE_EXCLUDED_POOLS
+          value: privacy
         - name: TUSKER_SEMANTIC_CACHE_PATH
           value: /home/tusker/.hermes/semantic_cache
         - name: TUSKER_POOL_CODE
@@ -228,17 +251,14 @@ spec:
               - '10'
         resources:
           requests:
-            memory: 256Mi
-            cpu: 100m
+            memory: 768Mi
+            cpu: 500m
             ephemeral-storage: 1Gi
           limits:
             # The cluster admission policy expects resources.limits to exist;
             # ephemeral-storage caps stay well within the 2Gi/4Gi defaults
             # (see ValidatingAdmissionPolicy 'ephemeral-storage-limit').
-            # Memory has no upper bound here because the semantic-cache
-            # embedding model (all-MiniLM-L6-v2) blows past 512Mi during
-            # init and OOMKills the container — revisit once a lighter
-            # model is in use.
+            memory: 1Gi
             ephemeral-storage: 4Gi
       volumes:
       - name: tusker-home

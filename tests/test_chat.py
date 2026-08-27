@@ -4,10 +4,28 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
+from tusker_gateway.budget import BudgetDecision
 from .conftest import HEADERS_AUTH, HEADERS_NO_AUTH
+
+
+class _FakeSemanticCache:
+    enabled = True
+    config = SimpleNamespace(
+        excluded_pools=("privacy",),
+        require_deterministic=True,
+    )
+
+    def __init__(self, query_results=None):
+        self.embed_messages = AsyncMock(return_value=[1.0, 0.0])
+        self.query = AsyncMock(side_effect=query_results or [None])
+        self.store = AsyncMock()
+
+    def stats_snapshot(self):
+        return {"hits": 0, "misses": 0, "writes": 0, "evictions": 0}
 
 
 @pytest.mark.asyncio
@@ -193,6 +211,179 @@ async def test_chat_text_only_pool_request_has_no_modality_requirement(app, clie
         excluded=set(),
         required_input_modalities=None,
     )
+
+
+@pytest.mark.asyncio
+async def test_semantic_cache_uses_concrete_route_and_does_not_cross_hit(app, client):
+    semantic = _FakeSemanticCache([
+        None,
+        {"id": "cached", "choices": [{"message": {"content": "cached answer"}}]},
+    ])
+    app["semantic_cache"] = semantic
+    pool_manager = MagicMock()
+    pool_manager.select.return_value = ("openai", "gpt-4o-mini")
+    app["pool_manager"] = pool_manager
+
+    with patch("tusker_gateway.endpoints.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
+        mock_chat.return_value = {
+            "id": "upstream",
+            "choices": [{"message": {"role": "assistant", "content": "fresh answer"}}],
+        }
+        payload = {
+            "model": "hermes-code",
+            "messages": [{"role": "user", "content": "answer this"}],
+            "temperature": 0,
+        }
+        first = await client.post("/v1/chat/completions", json=payload, headers=HEADERS_AUTH)
+        second = await client.post("/v1/chat/completions", json=payload, headers=HEADERS_AUTH)
+
+    assert first.status == 200
+    assert second.status == 200
+    assert (await second.json())["id"] == "cached"
+    mock_chat.assert_awaited_once()
+    assert semantic.store.await_count == 1
+    assert semantic.query.await_count == 2
+    assert semantic.query.call_args_list[0].kwargs["scope"] == semantic.query.call_args_list[1].kwargs["scope"]
+    assert semantic.store.call_args.kwargs["scope"] == semantic.query.call_args_list[0].kwargs["scope"]
+    assert mock_chat.call_args.args[:2] == ("openai", "gpt-4o-mini")
+
+
+@pytest.mark.asyncio
+async def test_semantic_cache_requires_explicit_deterministic_request(app, client):
+    semantic = _FakeSemanticCache()
+    app["semantic_cache"] = semantic
+    with patch("tusker_gateway.endpoints.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
+        mock_chat.return_value = {
+            "choices": [{"message": {"role": "assistant", "content": "fresh"}}],
+        }
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "openai::gpt-4o-mini",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            headers=HEADERS_AUTH,
+        )
+
+    assert resp.status == 200
+    semantic.embed_messages.assert_not_awaited()
+    semantic.query.assert_not_awaited()
+    semantic.store.assert_not_awaited()
+    mock_chat.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_semantic_cache_skips_structured_output_requests(app, client):
+    semantic = _FakeSemanticCache()
+    app["semantic_cache"] = semantic
+    with patch("tusker_gateway.endpoints.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
+        mock_chat.return_value = {
+            "choices": [{"message": {"role": "assistant", "content": "{}"}}],
+        }
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "openai::gpt-4o-mini",
+                "messages": [{"role": "user", "content": "return JSON"}],
+                "temperature": 0,
+                "response_format": {"type": "json_object"},
+            },
+            headers=HEADERS_AUTH,
+        )
+
+    assert resp.status == 200
+    semantic.embed_messages.assert_not_awaited()
+    semantic.query.assert_not_awaited()
+    semantic.store.assert_not_awaited()
+    mock_chat.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_semantic_cache_skips_any_zdr_pool_even_without_name(app, client):
+    semantic = _FakeSemanticCache()
+    app["semantic_cache"] = semantic
+    app["config"]["pools"]["code"].zdr = True
+    with patch("tusker_gateway.endpoints.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
+        mock_chat.return_value = {
+            "choices": [{"message": {"role": "assistant", "content": "fresh"}}],
+        }
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-code",
+                "messages": [{"role": "user", "content": "private"}],
+                "temperature": 0,
+            },
+            headers=HEADERS_AUTH,
+        )
+
+    assert resp.status == 200
+    semantic.embed_messages.assert_not_awaited()
+    semantic.query.assert_not_awaited()
+    semantic.store.assert_not_awaited()
+    mock_chat.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_semantic_cache_never_handles_tool_requests(app, client):
+    semantic = _FakeSemanticCache()
+    app["semantic_cache"] = semantic
+    pool_manager = MagicMock()
+    pool_manager.select.return_value = ("openai", "tool-model")
+    app["pool_manager"] = pool_manager
+    with patch("tusker_gateway.endpoints.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
+        mock_chat.return_value = {
+            "choices": [{
+                "message": {"tool_calls": [{"id": "call-1"}]},
+                "finish_reason": "tool_calls",
+            }],
+        }
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-code",
+                "messages": [{"role": "user", "content": "run it"}],
+                "tools": [{"type": "function", "function": {"name": "bash"}}],
+                "tool_choice": "required",
+            },
+            headers=HEADERS_AUTH,
+        )
+
+    assert resp.status == 200
+    semantic.embed_messages.assert_not_awaited()
+    semantic.query.assert_not_awaited()
+    semantic.store.assert_not_awaited()
+    mock_chat.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_budget_rejection_happens_before_semantic_cache(app, client):
+    semantic = _FakeSemanticCache([
+        {"id": "must-not-be-used", "choices": [{"message": {"content": "cached"}}]},
+    ])
+    app["semantic_cache"] = semantic
+    budget = MagicMock()
+    budget.check.return_value = BudgetDecision(
+        allowed=False,
+        reason="daily cap exceeded",
+        cap_name="daily",
+    )
+    app["budget"] = budget
+    with patch("tusker_gateway.endpoints.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "openai::gpt-4o-mini",
+                "messages": [{"role": "user", "content": "hello"}],
+                "temperature": 0,
+            },
+            headers=HEADERS_AUTH,
+        )
+
+    assert resp.status == 429
+    semantic.embed_messages.assert_not_awaited()
+    semantic.query.assert_not_awaited()
+    mock_chat.assert_not_awaited()
 
 
 @pytest.mark.asyncio

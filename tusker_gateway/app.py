@@ -88,7 +88,15 @@ def create_app() -> web.Application:
         sem_cache_cfg = load_semantic_cache_config_from_env()
         app["semantic_cache"] = SemanticCache(sem_cache_cfg)
         if sem_cache_cfg.enabled:
-            log.info("semantic cache enabled (similarity=%.2f, model=%s)", sem_cache_cfg.similarity_threshold, sem_cache_cfg.model_name)
+            log.info(
+                "semantic cache configured enabled=true similarity=%.2f model=%s revision=%s local_files_only=%s deterministic_only=%s excluded_pools=%s",
+                sem_cache_cfg.similarity_threshold,
+                sem_cache_cfg.model_name,
+                sem_cache_cfg.model_revision or "unversioned",
+                sem_cache_cfg.local_files_only,
+                sem_cache_cfg.require_deterministic,
+                ",".join(sem_cache_cfg.excluded_pools) or "none",
+            )
         else:
             log.info("semantic cache disabled")
     except ImportError:
@@ -195,7 +203,10 @@ def create_app() -> web.Application:
         sem_cache = app.get("semantic_cache")
         if sem_cache is not None and sem_cache.enabled:
             await sem_cache.initialize()
-            startup_log.info("semantic cache initialized")
+            startup_log.info(
+                "semantic cache initialization complete enabled=%s",
+                sem_cache.enabled,
+            )
         # Dynamic model catalog refresh (Codex, Copilot, OpenRouter,
         # OpenCode, Xiaomi, models.dev). Initial refresh is synchronous so
         # the pool has data on the first request; the background loop keeps it fresh.

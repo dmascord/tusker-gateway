@@ -12,6 +12,7 @@ from tusker_gateway.cache import (
     canonical_json,
     load_cache_config_from_env,
     make_cache_key,
+    make_caller_scope,
 )
 
 
@@ -56,6 +57,17 @@ def test_make_cache_key_differs_with_tools():
     tools2 = [{"type": "function", "function": {"name": "read"}}]
     assert make_cache_key(pool_name="code", model="m", messages=msgs, tools=tools1, extra_body=None) != \
            make_cache_key(pool_name="code", model="m", messages=msgs, tools=tools2, extra_body=None)
+
+
+def test_make_cache_key_differs_with_caller_scope():
+    msgs = [{"role": "user", "content": "hi"}]
+    assert make_cache_key(
+        pool_name="code", model="m", messages=msgs, tools=None, extra_body=None,
+        caller_scope=make_caller_scope("caller-a"),
+    ) != make_cache_key(
+        pool_name="code", model="m", messages=msgs, tools=None, extra_body=None,
+        caller_scope=make_caller_scope("caller-b"),
+    )
 
 
 def test_disabled_cache_returns_none():

@@ -17,11 +17,15 @@ def health_handler(request: web.Request) -> web.Response:
     logger.debug('health check')
     from tusker_gateway.rtk import is_enabled
 
+    semantic_cache = request.app.get("semantic_cache")
     return web.json_response({
         "status": "ok",
         "version": "0.1.0",
         "commit": _GIT_COMMIT,
         "rtk_enabled": request.app.get("rtk_enabled", is_enabled()),
+        "semantic_cache_enabled": bool(
+            semantic_cache is not None and semantic_cache.enabled
+        ),
     })
 
 
@@ -115,5 +119,14 @@ def status_handler(request: web.Request) -> web.Response:
         "quality": quality.status(),
         "purged_cooldowns": purged,
         "rtk_enabled": request.app.get("rtk_enabled", is_enabled()),
+    }
+    semantic_cache = request.app.get("semantic_cache")
+    status["semantic_cache"] = {
+        "enabled": bool(semantic_cache is not None and semantic_cache.enabled),
+        "stats": (
+            semantic_cache.stats_snapshot()
+            if semantic_cache is not None
+            else {}
+        ),
     }
     return web.json_response(status)

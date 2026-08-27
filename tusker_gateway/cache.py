@@ -63,6 +63,11 @@ def _hash_part(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
+def make_caller_scope(api_key: str) -> str:
+    """Return a stable, non-reversible cache namespace for an API key."""
+    return _hash_part(api_key) if api_key else ""
+
+
 def make_cache_key(
     *,
     pool_name: str | None,
@@ -70,11 +75,22 @@ def make_cache_key(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None,
     extra_body: dict[str, Any] | None,
+    caller_scope: str | None = None,
+    provider: str | None = None,
+    target_model: str | None = None,
 ) -> str:
-    """Compute the deterministic cache key for a chat-completion request."""
+    """Compute the deterministic cache key for a chat-completion request.
+
+    ``caller_scope`` should be a one-way API-key/tenant fingerprint.  It is
+    optional for backwards-compatible callers, but the HTTP endpoint always
+    supplies it so cached responses cannot cross caller boundaries.
+    """
     parts = [
+        f"caller={caller_scope or ''}",
         f"pool={pool_name or ''}",
         f"model={model or ''}",
+        f"provider={provider or ''}",
+        f"target_model={target_model or ''}",
         _hash_part(canonical_json(messages)),
         _hash_part(canonical_json(tools or [])),
         _hash_part(canonical_json(extra_body or {})),
@@ -264,5 +280,6 @@ __all__ = [
     "ResponseCache",
     "canonical_json",
     "load_cache_config_from_env",
+    "make_caller_scope",
     "make_cache_key",
 ]

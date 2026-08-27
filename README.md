@@ -12,6 +12,7 @@ cooldown.py    — per-(provider, model) cooldown tracking with 429 parsing
 auth.py        — Bearer token verification (fail-closed)
 health.py      — /health, /ready, /status endpoints
 quality.py     — SQLite-backed per-model quality scoring (success rate + latency decay)
+semantic_cache.py — Scoped, bounded semantic response cache (opt-in)
 pools.py       — PoolManager: candidate lists, selection, session stickiness
 routing.py     — role-alias routing + passthrough detection
 passthrough.py — provider HTTP client + Codex OAuth token rotation
@@ -48,3 +49,4 @@ Capability discovery refreshes supported image/video models from provider catalo
 4. **Heavyweight filtering** — ZDR/privacy pools exclude heavyweight models by default.
 5. **Codex token rotation** — pool of OAuth credentials, rotated on failures.
 6. **Virtual alias guard** — the advertised model name (e.g. `tusker-gateway`) is never persisted as a session's model or sent to a provider.
+7. **Semantic cache isolation** — approximate response reuse is restricted to deterministic text requests and scoped by caller, pool, and concrete route; tool calls and ZDR traffic are excluded. See `docs/semantic-cache.md`.

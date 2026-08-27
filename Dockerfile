@@ -5,6 +5,7 @@ LABEL org.opencontainers.image.title="tusker-gateway" \
        org.opencontainers.image.source="https://github.com/dmascord/tusker-gateway"
 
 ARG TUSKER_COMMIT=unknown
+ARG TUSKER_SEMANTIC_CACHE_MODEL_REVISION=1110a243fdf4706b3f48f1d95db1a4f5529b4d41
 ENV TUSKER_COMMIT=${TUSKER_COMMIT}
 WORKDIR /opt/tusker-gateway
 
@@ -23,6 +24,17 @@ COPY README.md ./
 RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
 RUN pip install --no-cache-dir --upgrade pip \
  && pip install --no-cache-dir ".[semantic-cache]"
+
+# Bake the pinned CPU embedding model into the image.  Runtime startup is
+# offline by default, so a Hugging Face outage cannot delay or change the
+# model used for cache keys.  The cache directory is made readable by the
+# unprivileged runtime user below.
+ENV HF_HOME=/opt/huggingface \
+    HF_HUB_DISABLE_TELEMETRY=1 \
+    TUSKER_SEMANTIC_CACHE_MODEL_REVISION=${TUSKER_SEMANTIC_CACHE_MODEL_REVISION}
+RUN mkdir -p /opt/huggingface \
+ && python -c "import os; from sentence_transformers import SentenceTransformer; SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2', device='cpu', revision=os.environ['TUSKER_SEMANTIC_CACHE_MODEL_REVISION'])" \
+ && chown -R nobody:nogroup /opt/huggingface
 
 # Persistent data (quality DB, cooldowns, OAuth pool)
 RUN mkdir -p /home/tusker/.hermes && chown -R nobody:nogroup /home/tusker

@@ -10,7 +10,7 @@ dependencies = [
     "aiohttp>=3.9,<4",
 ]
 [project.optional-dependencies]
-semantic-cache = ["chromadb>=0.5", "sentence-transformers>=3.0"]
+semantic-cache = ["chromadb==1.5.9", "sentence-transformers==6.0.0"]
 
 [project.scripts]
 tusker-gateway = "tusker_gateway.__main__:main"

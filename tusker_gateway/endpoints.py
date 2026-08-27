@@ -14,7 +14,7 @@ from typing import Any, AsyncIterator
 
 from aiohttp import web
 
-from tusker_gateway.cache import ResponseCache, make_cache_key
+from tusker_gateway.cache import ResponseCache, make_cache_key, make_caller_scope
 from tusker_gateway.budget import BudgetTracker
 from tusker_gateway.circuit_breaker import CircuitBreaker, BreakerDecision
 from tusker_gateway.errors import (
@@ -29,6 +29,7 @@ from tusker_gateway.pools import PoolManager
 from tusker_gateway.quality import QualityDB
 from tusker_gateway.rate_limit import RateLimiter
 from tusker_gateway.routing import resolve_route
+from tusker_gateway.semantic_cache import make_semantic_scope, response_contains_tool_calls
 from tusker_gateway.sse import (
     format_openai_chunk,
     sse_done,
@@ -1008,6 +1009,114 @@ def _build_extra_body(body: dict[str, Any]) -> dict[str, Any]:
         extra["max_tokens"] = extra.pop("max_completion_tokens")
     return extra
 
+
+def _has_non_text_content(messages: Any) -> bool:
+    """Return True for image/audio/tool content that semantic caching skips."""
+    if not isinstance(messages, list):
+        return True
+    for message in messages:
+        if not isinstance(message, dict):
+            return True
+        if message.get("role") in {"tool", "function"}:
+            return True
+        if message.get("tool_calls") or message.get("function_call"):
+            return True
+        content = message.get("content")
+        if isinstance(content, list):
+            for part in content:
+                if not isinstance(part, dict) or part.get("type") not in {"text", "input_text"}:
+                    return True
+    return False
+
+
+def _has_tool_content(messages: Any) -> bool:
+    """Return True when the conversation contains tool state or calls."""
+    if not isinstance(messages, list):
+        return True
+    for message in messages:
+        if not isinstance(message, dict):
+            return True
+        if message.get("role") in {"tool", "function"}:
+            return True
+        if message.get("tool_calls") or message.get("function_call"):
+            return True
+    return False
+
+
+def _semantic_cache_bypass_reason(
+    body: dict[str, Any],
+    *,
+    pool_name: str,
+    api_key: str,
+    sem_cache: Any,
+    zdr_pool: bool = False,
+) -> str | None:
+    """Return why a request is ineligible for approximate response reuse."""
+    if not api_key:
+        return "missing_caller_scope"
+    if zdr_pool or pool_name in getattr(sem_cache.config, "excluded_pools", ("privacy",)):
+        return "excluded_pool"
+    if body.get("stream"):
+        return "streaming"
+    if body.get("tools"):
+        return "tools"
+    if body.get("tool_choice") is not None:
+        return "tool_choice"
+    if _has_non_text_content(body.get("messages")):
+        return "non_text_content"
+    if body.get("response_format") is not None:
+        return "response_format"
+    if not getattr(sem_cache.config, "require_deterministic", True):
+        return None
+
+    temperature = body.get("temperature")
+    if isinstance(temperature, bool) or not isinstance(temperature, (int, float)) or float(temperature) != 0.0:
+        return "temperature_not_zero"
+    top_p = body.get("top_p")
+    if top_p is not None and (isinstance(top_p, bool) or not isinstance(top_p, (int, float)) or float(top_p) != 1.0):
+        return "top_p_not_one"
+    for field in ("presence_penalty", "frequency_penalty"):
+        value = body.get(field)
+        if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float)) or float(value) != 0.0):
+            return f"{field}_nonzero"
+    if body.get("n", 1) != 1:
+        return "multiple_completions"
+    if body.get("logit_bias"):
+        return "logit_bias"
+    return None
+
+
+def _select_cache_route_target(
+    config: dict[str, Any],
+    body: dict[str, Any],
+    request: web.Request,
+    breaker: CircuitBreaker | None,
+) -> tuple[str, str] | None:
+    """Resolve one healthy concrete route for a semantic-cache namespace."""
+    route = resolve_route(body.get("model"), body)
+    if route.kind == "passthrough" and route.provider and route.model:
+        if breaker is not None and not breaker.check(route.provider, route.model).allowed:
+            return None
+        return route.provider, route.model
+    if route.kind not in {"pool", "code"}:
+        return None
+
+    pool_name = route.pool_name or "code"
+    pool_manager = request.app.get("pool_manager") or PoolManager(config)
+    required_modalities = _required_input_modalities(body.get("messages"))
+    excluded: set[tuple[str, str]] = set()
+    while True:
+        selected = pool_manager.select(
+            pool_name,
+            excluded=set(excluded),
+            required_input_modalities=required_modalities,
+        )
+        if selected is None:
+            return None
+        if breaker is None or breaker.check(selected[0], selected[1]).allowed:
+            return selected
+        excluded.add(selected)
+
 def _cooldown_for_exc(exc: GatewayError) -> float | None:
     """Derive a circuit-breaker cooldown from a provider error.
 
@@ -1078,6 +1187,7 @@ async def _call_with_pool_fallback(
     breaker: CircuitBreaker | None = None,
     request: web.Request | None = None,
     metrics_registry: Any | None = None,
+    initial_selection: tuple[str, str] | None = None,
 ) -> tuple[str, str, Any]:
     """Call a pool candidate, trying the next candidate after provider failure.
 
@@ -1136,33 +1246,28 @@ async def _call_with_pool_fallback(
         pool_mgr = request.app.get("pool_manager") or PoolManager(config)
     else:
         pool_mgr = PoolManager(config)
+    pending_selection = initial_selection
     while True:
-        # Pool select() already filters out cooldown-blocked candidates;
-        # additionally filter out breaker-open candidates here.
-        select_kwargs: dict[str, Any] = {
-            "excluded": set(excluded),
-            "required_input_modalities": required_input_modalities,
-        }
-        if requires_tools:
-            select_kwargs["requires_tools"] = True
-        selected = pool_mgr.select(pool_name, **select_kwargs)
-        if breaker is not None and selected is not None:
-            while selected is not None:
-                decision = breaker.check(selected[0], selected[1])
-                if decision.allowed:
-                    break
-                excluded.add(selected)
-                select_kwargs = {
-                    "excluded": set(excluded),
-                    "required_input_modalities": required_input_modalities,
-                }
-                if requires_tools:
-                    select_kwargs["requires_tools"] = True
-                selected = pool_mgr.select(pool_name, **select_kwargs)
+        # A semantic-cache lookup resolves a concrete candidate first so the
+        # cached response cannot be returned for a different provider/model.
+        if pending_selection is not None:
+            selected = pending_selection
+            pending_selection = None
+        else:
+            select_kwargs: dict[str, Any] = {
+                "excluded": set(excluded),
+                "required_input_modalities": required_input_modalities,
+            }
+            if requires_tools:
+                select_kwargs["requires_tools"] = True
+            selected = pool_mgr.select(pool_name, **select_kwargs)
         if not selected:
             if last_error is not None:
                 raise last_error
             raise BadRequestError("No healthy models in pool", code="no_healthy_models")
+        if breaker is not None and not breaker.check(selected[0], selected[1]).allowed:
+            excluded.add(selected)
+            continue
         provider, model = selected
         try:
             result = await client.chat(
@@ -1439,15 +1544,17 @@ async def metrics_handler(request: web.Request) -> web.Response:
         metrics.budget_blocks._values[("ratelimit_allowed",)] = float(s["allowed"])  # noqa: SLF001
         metrics.budget_blocks._values[("ratelimit_blocked",)] = float(s["blocked"])  # noqa: SLF001
     sem_cache = request.app.get("semantic_cache")
-    if sem_cache is not None and sem_cache.enabled:
+    if sem_cache is not None:
         s = sem_cache.stats_snapshot()
-        for kind, value in (
-            ("hits", s["hits"]),
-            ("misses", s["misses"]),
-            ("writes", s["writes"]),
-            ("evictions", s["evictions"]),
+        for metric, key in (
+            (metrics.semantic_cache_hits, "hits"),
+            (metrics.semantic_cache_misses, "misses"),
+            (metrics.semantic_cache_writes, "writes"),
+            (metrics.semantic_cache_evictions, "evictions"),
+            (metrics.semantic_cache_errors, "errors"),
+            (metrics.semantic_cache_skips, "skips"),
         ):
-            metrics.budget_blocks._values[(f"semantic_{kind}",)] = float(value)  # noqa: SLF001
+            metric._values[()] = float(s.get(key, 0))  # noqa: SLF001
     body = metrics.render()
     return web.Response(
         status=200,
@@ -1483,6 +1590,17 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
         ml = model_label if model_label is not None else target_model
         metrics.requests_total.inc({"pool": pool_name, "provider": pl, "model": ml, "status": status_label})
         metrics.request_duration.observe(time.monotonic() - started, {"pool": pool_name, "provider": pl, "model": ml})
+
+    def _record_cached_usage(cached: dict[str, Any]) -> None:
+        """Count a cache response against the caller's budget as well."""
+        if budget is None or not api_key:
+            return
+        usage = cached.get("usage") or {}
+        prompt_estimate = _estimated_tokens(body["messages"])
+        completion_tokens = int(usage.get("completion_tokens") or 0)
+        reported_total = int(usage.get("total_tokens") or 0)
+        used = max(prompt_estimate, prompt_estimate + completion_tokens, reported_total)
+        budget.record(api_key, pool_name, used)
 
     # Top-level span (synchronous context).
     span_cm = (
@@ -1542,6 +1660,10 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                 if guard_result.modified_body is not None:
                     body = guard_result.modified_body
 
+            # Guards may normalize or remove request fields, so derive cache
+            # eligibility and routing from the final body.
+            tools = body.get("tools") if isinstance(body.get("tools"), list) else None
+            pool_name = _pool_name(body) or "passthrough"
 
             # Rate-limit pre-flight (cheapest check, runs first).
             if ratelimit is not None and api_key:
@@ -1561,48 +1683,8 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                         headers=headers,
                     )
 
-            # Cache lookup
-            cache_key: str | None = None
-            if cache is not None and not body.get("stream", False) and not bypass_cache:
-                cache_key = make_cache_key(
-                    pool_name=pool_name,
-                    model=body.get("model"),
-                    messages=body["messages"],
-                    tools=tools,
-                    extra_body=body.get("extra_body"),
-                )
-                hit = cache.get(cache_key)
-                if hit is not None:
-                    logger.debug('cache hit key=%s', cache_key[:16])
-                    if metrics is not None:
-                        metrics.requests_total.inc(
-                            {"pool": pool_name, "provider": "cache", "model": str(body.get("model") or ""), "status": "cache_hit"}
-                        )
-                        metrics.request_duration.observe(time.monotonic() - started, {"pool": pool_name, "provider": "cache", "model": str(body.get("model") or "")})
-                    return web.json_response(hit)
-
-            # Semantic cache lookup (after exact-match miss).
-            sem_hit: dict[str, Any] | None = None
-            if (
-                sem_cache is not None
-                and sem_cache.enabled
-                and not body.get("stream", False)
-                and not bypass_cache
-            ):
-                sem_hit = await sem_cache.query(body["messages"])
-                if sem_hit is not None:
-                    logger.info('semantic cache hit model=%s', body.get("model"))
-                    if metrics is not None:
-                        metrics.requests_total.inc(
-                            {"pool": pool_name, "provider": "semantic_cache", "model": str(body.get("model") or ""), "status": "cache_hit"}
-                        )
-                        metrics.request_duration.observe(time.monotonic() - started, {"pool": pool_name, "provider": "semantic_cache", "model": str(body.get("model") or "")})
-                    # Also store in exact-match cache for faster subsequent lookups.
-                    if cache is not None and cache_key is not None:
-                        cache.put(cache_key, sem_hit)
-                    return web.json_response(sem_hit)
-
-            # Budget pre-flight
+            # Budget pre-flight must happen before either cache can return a
+            # response; otherwise cached requests bypass quota enforcement.
             if budget is not None and api_key:
                 est = _estimated_tokens(body["messages"])
                 decision = budget.check(api_key, pool_name, est)
@@ -1618,10 +1700,117 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                         headers=headers,
                     )
 
+            caller_scope = make_caller_scope(api_key)
+            cacheable_request = (
+                not body.get("stream", False)
+                and not tools
+                and body.get("tool_choice") is None
+                and not _has_tool_content(body.get("messages"))
+            )
+            semantic_scope: str | None = None
+            semantic_embedding: list[float] | None = None
+            semantic_target: tuple[str, str] | None = None
+            semantic_bypass_reason: str | None = None
+            if sem_cache is not None and sem_cache.enabled:
+                pool_config = config.get("pools", {}).get(pool_name)
+                semantic_bypass_reason = _semantic_cache_bypass_reason(
+                    body,
+                    pool_name=pool_name,
+                    api_key=api_key,
+                    sem_cache=sem_cache,
+                    zdr_pool=bool(getattr(pool_config, "zdr", False)),
+                )
+                if semantic_bypass_reason is None and not bypass_cache:
+                    semantic_target = _select_cache_route_target(
+                        config, body, request, breaker
+                    )
+                    if semantic_target is None:
+                        semantic_bypass_reason = "route_unavailable"
+                    else:
+                        semantic_scope = make_semantic_scope(
+                            caller_scope=caller_scope,
+                            pool_name=pool_name,
+                            requested_model=body.get("model"),
+                            provider=semantic_target[0],
+                            target_model=semantic_target[1],
+                            extra_body=_build_extra_body(body),
+                        )
+                if semantic_bypass_reason is not None:
+                    logger.debug(
+                        "semantic cache bypass rid=%s model=%s pool=%s reason=%s",
+                        request_id,
+                        body.get("model"),
+                        pool_name,
+                        semantic_bypass_reason,
+                    )
+
+            # Cache lookup
+            cache_key: str | None = None
+            if cache is not None and cacheable_request and not bypass_cache:
+                cache_key = make_cache_key(
+                    pool_name=pool_name,
+                    model=body.get("model"),
+                    messages=body["messages"],
+                    tools=tools,
+                    extra_body=_build_extra_body(body),
+                    caller_scope=caller_scope,
+                    provider=semantic_target[0] if semantic_target else None,
+                    target_model=semantic_target[1] if semantic_target else None,
+                )
+                hit = cache.get(cache_key)
+                if hit is not None:
+                    if response_contains_tool_calls(hit):
+                        logger.warning(
+                            "exact cache entry rejected tool-call response rid=%s key=%s",
+                            request_id,
+                            cache_key[:12],
+                        )
+                        cache.invalidate(cache_key)
+                    else:
+                        _record_cached_usage(hit)
+                        logger.debug('cache hit key=%s', cache_key[:16])
+                        if metrics is not None:
+                            metrics.requests_total.inc(
+                                {"pool": pool_name, "provider": "cache", "model": str(body.get("model") or ""), "status": "cache_hit"}
+                            )
+                            metrics.request_duration.observe(time.monotonic() - started, {"pool": pool_name, "provider": "cache", "model": str(body.get("model") or "")})
+                        return web.json_response(hit)
+
+            # Semantic cache lookup (after exact-match miss).
+            sem_hit: dict[str, Any] | None = None
+            if (
+                semantic_scope is not None
+                and sem_cache is not None
+            ):
+                semantic_embedding = await sem_cache.embed_messages(body["messages"])
+                if semantic_embedding is not None:
+                    sem_hit = await sem_cache.query(
+                        body["messages"],
+                        scope=semantic_scope,
+                        embedding=semantic_embedding,
+                    )
+                if sem_hit is not None:
+                    _record_cached_usage(sem_hit)
+                    logger.info(
+                        "semantic cache hit rid=%s model=%s pool=%s target=%s/%s",
+                        request_id,
+                        body.get("model"),
+                        pool_name,
+                        semantic_target[0] if semantic_target else "unknown",
+                        semantic_target[1] if semantic_target else "unknown",
+                    )
+                    if metrics is not None:
+                        metrics.requests_total.inc(
+                            {"pool": pool_name, "provider": "semantic_cache", "model": str(body.get("model") or ""), "status": "cache_hit"}
+                        )
+                        metrics.request_duration.observe(time.monotonic() - started, {"pool": pool_name, "provider": "semantic_cache", "model": str(body.get("model") or "")})
+                    return web.json_response(sem_hit)
+
             provider, target_model, result = await _call_with_pool_fallback(
                 config, body, client, tools,
                 breaker=breaker, request=request,
                 metrics_registry=request.app.get("metrics"),
+                initial_selection=semantic_target,
             )
             logger.debug('selected rid=%s provider=%s model=%s pool=%s', request_id, provider, target_model, pool_name)
 
@@ -1641,23 +1830,51 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
             if (
                 cache is not None
                 and not bypass_cache
-                and not body.get("stream", False)
+                and cacheable_request
                 and isinstance(result, dict)
-                and cache_key is not None
+                and not response_contains_tool_calls(result)
             ):
-                cache.put(cache_key, result)
-                logger.debug('cache stored key=%s', cache_key[:16])
+                store_cache_key = make_cache_key(
+                    pool_name=pool_name,
+                    model=body.get("model"),
+                    messages=body["messages"],
+                    tools=tools,
+                    extra_body=_build_extra_body(body),
+                    caller_scope=caller_scope,
+                    provider=provider if semantic_target else None,
+                    target_model=target_model if semantic_target else None,
+                )
+                cache.put(store_cache_key, result)
+                logger.debug('cache stored key=%s', store_cache_key[:16])
 
             # Store in semantic cache (non-streaming dict responses only).
             if (
                 sem_cache is not None
                 and sem_cache.enabled
                 and not bypass_cache
-                and not body.get("stream", False)
+                and semantic_scope is not None
+                and semantic_embedding is not None
                 and isinstance(result, dict)
+                and not response_contains_tool_calls(result)
             ):
-                await sem_cache.store(body["messages"], result)
-                logger.debug('semantic cache stored model=%s', body.get("model"))
+                store_scope = make_semantic_scope(
+                    caller_scope=caller_scope,
+                    pool_name=pool_name,
+                    requested_model=body.get("model"),
+                    provider=provider,
+                    target_model=target_model,
+                    extra_body=_build_extra_body(body),
+                )
+                await sem_cache.store(
+                    body["messages"],
+                    result,
+                    scope=store_scope,
+                    embedding=semantic_embedding,
+                )
+                logger.debug(
+                    'semantic cache stored model=%s target=%s/%s',
+                    body.get("model"), provider, target_model,
+                )
 
             if body.get("stream", False):
                 resp = web.StreamResponse(

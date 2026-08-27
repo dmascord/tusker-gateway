@@ -32,7 +32,8 @@ Concurrency:
 Failure semantics:
     - Provider 5xx → tokens refunded (so a flaky provider doesn't burn budget).
     - Provider 4xx → tokens NOT refunded (caller error, provider still charged us).
-    - Cache hit   → tokens NOT counted (no provider call happened).
+    - Cache hit   → the response's reported tokens (or prompt estimate) are
+                    counted so cache hits cannot bypass caller quotas.
 """
 from __future__ import annotations
 

@@ -17,6 +17,12 @@ Metric catalogue:
     tusker_cache_misses_total                                  counter
     tusker_cache_writes_total                                  counter
     tusker_cache_evictions_total                               counter
+    tusker_semantic_cache_hits_total                            counter
+    tusker_semantic_cache_misses_total                          counter
+    tusker_semantic_cache_writes_total                          counter
+    tusker_semantic_cache_evictions_total                       counter
+    tusker_semantic_cache_errors_total                          counter
+    tusker_semantic_cache_skips_total                           counter
     tusker_budget_blocks_total{kind}                          counter
     tusker_budget_records_total                                counter
     tusker_budget_refunds_total                                counter
@@ -241,6 +247,24 @@ class MetricsRegistry:
         self.cache_evictions = Counter(
             "tusker_cache_evictions_total", "Cache evictions (expired or LRU)"
         )
+        self.semantic_cache_hits = Counter(
+            "tusker_semantic_cache_hits_total", "Semantic cache hits"
+        )
+        self.semantic_cache_misses = Counter(
+            "tusker_semantic_cache_misses_total", "Semantic cache misses"
+        )
+        self.semantic_cache_writes = Counter(
+            "tusker_semantic_cache_writes_total", "Semantic cache writes"
+        )
+        self.semantic_cache_evictions = Counter(
+            "tusker_semantic_cache_evictions_total", "Semantic cache evictions"
+        )
+        self.semantic_cache_errors = Counter(
+            "tusker_semantic_cache_errors_total", "Semantic cache errors"
+        )
+        self.semantic_cache_skips = Counter(
+            "tusker_semantic_cache_skips_total", "Semantic cache skips"
+        )
         self.budget_blocks = Counter(
             "tusker_budget_blocks_total",
             "Requests blocked because a budget cap was exceeded",
@@ -327,6 +351,9 @@ class MetricsRegistry:
         for m in (
             self.requests_total, self.tokens_total, self.request_duration,
             self.cache_hits, self.cache_misses, self.cache_writes, self.cache_evictions,
+            self.semantic_cache_hits, self.semantic_cache_misses,
+            self.semantic_cache_writes, self.semantic_cache_evictions,
+            self.semantic_cache_errors, self.semantic_cache_skips,
             self.budget_blocks, self.budget_records, self.budget_refunds, self.guardrail_blocks,
             self.pool_candidates, self.cooldowns_active,
             self.rtk_blocks, self.rtk_bytes_saved, self.rtk_calls,
