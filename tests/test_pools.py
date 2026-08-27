@@ -35,6 +35,28 @@ def test_pool_selection_logic():
         assert sel2 == sel3, f"stickiness broken: {sel2} vs {sel3}"
 
 
+def test_unrated_model_does_not_outrank_measured_model():
+    """New catalog entries must not outrank a proven healthy candidate."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config = {
+            "pools": {
+                "test": PoolConfig(
+                    name="test",
+                    models=[
+                        {"provider": "openai", "model": "new-model"},
+                        {"provider": "groq", "model": "proven-model"},
+                    ],
+                )
+            },
+            "quality_db_path": os.path.join(tmpdir, "quality.db"),
+            "excluded_providers": [],
+            "provider_api_keys": {"groq": "k-groq", "openai": "k-openai"},
+        }
+        mgr = PoolManager(config)
+        mgr._quality.record("groq", "proven-model", True, 500.0)
+        assert mgr.select("test") == ("groq", "proven-model")
+
+
 def test_unkeyed_bearer_provider_soft_fails():
     """A bearer-kind provider with no API key is dropped from the pool at
     build time instead of preventing startup — the pod stays up, the

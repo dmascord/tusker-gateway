@@ -116,7 +116,13 @@ class CooldownTracker:
         # model must not suppress healthy siblings. An empty model is the
         # explicit provider-wide sentinel used by the failure circuit.
         if not model or provider.lower() not in MODEL_SCOPED_COOLDOWN_PROVIDERS:
-            self._provider_default[provider] = Cooldown(until=until)
+            # Keep the longest active provider-wide window. Multiple models
+            # can report different Retry-After values during one outage; a
+            # later, shorter response must not make the provider eligible
+            # again before the longer window expires.
+            current = self._provider_default.get(provider)
+            if current is None or current.until < until:
+                self._provider_default[provider] = Cooldown(until=until)
         logger.info('cooldown set %s/%s for %.0fs', provider, model, seconds)
     def is_cooldown(self, provider: str, model: str) -> bool:
         """Return True if (provider, model) is in cooldown."""

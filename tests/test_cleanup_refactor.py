@@ -84,6 +84,29 @@ def test_persistent_cooldown_record_and_is_active(tmp_path: Path):
     assert store.is_active("openai-codex", "gpt-5.6-luna")
 
 
+def test_persistent_cooldown_records_provider_scope_for_shared_limits(tmp_path: Path):
+    """Provider-wide cooldowns survive restarts for non-model-scoped APIs."""
+    db = tmp_path / "cooldowns.db"
+    store = PersistentCooldownStore(db_path=db)
+    store.record("github-copilot-enterprise", "gpt-5.6-luna", 60.0)
+    assert store.is_active("github-copilot-enterprise", "gpt-5.6-luna")
+    assert store.is_provider_active("github-copilot-enterprise")
+
+
+def test_persistent_provider_cooldown_keeps_longest_window(tmp_path: Path):
+    """A later shorter retry window must not shorten an active outage."""
+    db = tmp_path / "cooldowns.db"
+    store = PersistentCooldownStore(db_path=db)
+    store.record_provider("github-copilot-enterprise", 120.0)
+    store.record_provider("github-copilot-enterprise", 1.0)
+    with store._connect() as conn:
+        remaining = conn.execute(
+            "SELECT until_epoch - ? FROM provider_cooldowns WHERE provider = ?",
+            (time.time(), "github-copilot-enterprise"),
+        ).fetchone()[0]
+    assert remaining > 100.0
+
+
 def test_persistent_cooldown_purge_expired(tmp_path: Path):
     """Expired rows are removed by purge_expired."""
     db = tmp_path / "cooldowns.db"

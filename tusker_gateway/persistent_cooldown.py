@@ -16,7 +16,12 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-from tusker_gateway.cooldown import Cooldown, CooldownTracker, MAX_COOLDOWN_SECS
+from tusker_gateway.cooldown import (
+    MODEL_SCOPED_COOLDOWN_PROVIDERS,
+    Cooldown,
+    CooldownTracker,
+    MAX_COOLDOWN_SECS,
+)
 
 
 @dataclass
@@ -56,7 +61,8 @@ class PersistentCooldownStore:
         if seconds <= 0:
             return
         seconds = min(seconds, MAX_COOLDOWN_SECS)
-        until_epoch = time.time() + seconds
+        now = time.time()
+        until_epoch = now + seconds
         with self._connect() as conn:
             conn.execute(
                 """
@@ -66,28 +72,45 @@ class PersistentCooldownStore:
                     until_epoch = excluded.until_epoch,
                     updated_at = excluded.updated_at
                 """,
-                (provider, model, until_epoch, time.time()),
+                (provider, model, until_epoch, now),
             )
+            # Cooldowns are provider-wide unless the provider publishes
+            # model-scoped limits. Persist the same scope that
+            # CooldownTracker enforces in memory so a restart cannot
+            # immediately probe every model in a quota-exhausted provider.
+            if not model or provider.lower() not in MODEL_SCOPED_COOLDOWN_PROVIDERS:
+                self._upsert_provider(conn, provider, until_epoch, now)
             conn.commit()
         logger.debug('persisted cooldown %s/%s for %.0fs', provider, model, seconds)
+
+    @staticmethod
+    def _upsert_provider(
+        conn: sqlite3.Connection,
+        provider: str,
+        until_epoch: float,
+        updated_at: float,
+    ) -> None:
+        """Store the longest active provider-wide cooldown."""
+        conn.execute(
+            """
+            INSERT INTO provider_cooldowns (provider, until_epoch, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(provider) DO UPDATE SET
+                until_epoch = MAX(provider_cooldowns.until_epoch, excluded.until_epoch),
+                updated_at = excluded.updated_at
+            """,
+            (provider, until_epoch, updated_at),
+        )
 
     def record_provider(self, provider: str, seconds: float) -> None:
         """Persist a provider cooldown until `seconds` from now."""
         if seconds <= 0:
             return
         seconds = min(seconds, MAX_COOLDOWN_SECS)
-        until_epoch = time.time() + seconds
+        now = time.time()
+        until_epoch = now + seconds
         with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO provider_cooldowns (provider, until_epoch, updated_at)
-                VALUES (?, ?, ?)
-                ON CONFLICT(provider) DO UPDATE SET
-                    until_epoch = excluded.until_epoch,
-                    updated_at = excluded.updated_at
-                """,
-                (provider, until_epoch, time.time()),
-            )
+            self._upsert_provider(conn, provider, until_epoch, now)
             conn.commit()
 
     def is_provider_active(self, provider: str) -> bool:

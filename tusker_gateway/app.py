@@ -219,13 +219,35 @@ def create_app() -> web.Application:
                 app["catalog_registry"] = registry
                 if pool_manager is not None:
                     pool_manager.catalog_registry = registry
-                await registry.refresh_all(app["http_session"])
+                startup_timeout_secs = float(
+                    os.environ.get("TUSKER_CATALOG_STARTUP_TIMEOUT_SECS", "10")
+                )
+                catalog_started = asyncio.get_running_loop().time()
+                try:
+                    await asyncio.wait_for(
+                        registry.refresh_all(app["http_session"]),
+                        timeout=startup_timeout_secs,
+                    )
+                except asyncio.TimeoutError:
+                    startup_log.warning(
+                        "catalog initial refresh timed out after %.1fs; continuing with static pools",
+                        startup_timeout_secs,
+                    )
+                except Exception as exc:
+                    startup_log.warning(
+                        "catalog initial refresh failed; continuing with static pools: %s",
+                        exc,
+                    )
+                startup_log.info(
+                    "catalog initial refresh window elapsed=%.1fs",
+                    asyncio.get_running_loop().time() - catalog_started,
+                )
                 if pool_manager is not None:
-                    pool_manager.extend_pools_with_catalog()
+                    catalog_counts = pool_manager.extend_pools_with_catalog()
                     auto_free = pool_manager.extend_pools_with_free_catalog()
                     startup_log.info(
                         "catalog confirmed %d pool entries; auto_free pools: %s",
-                        sum(pool_manager.extend_pools_with_catalog().values()),
+                        sum(catalog_counts.values()),
                         {k: len(v) for k, v in auto_free.items() if any("openrouter/" in s or "opencode-" in s.split("/")[0] for s in v)},
                     )
                 app["catalog_task"] = asyncio.create_task(

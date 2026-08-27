@@ -1498,7 +1498,6 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
     with span_cm as root_span:
         try:
             body = _validate_chat_body(await request.json())
-            logger.info('chat request rid=%s model=%s pool=%s stream=%s', request_id, body.get("model"), pool_name, body.get("stream"))
             if tracer is not None and tracer.enabled and root_span is not None:
                 root_span.attributes["tusker.model"] = str(body.get("model") or "")
             config = request.app["config"]
@@ -1524,6 +1523,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                     "+".join(sorted(_required_input_modalities(body.get("messages")) or ())) or "none",
                 )
             pool_name = _pool_name(body) or "passthrough"
+            logger.info('chat request rid=%s model=%s pool=%s stream=%s', request_id, body.get("model"), pool_name, body.get("stream"))
             bypass_cache = request.headers.get("X-Tusker-Cache", "").strip().lower() == "bypass"
 
             # Guard pipeline: input/output guards.

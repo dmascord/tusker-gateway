@@ -40,7 +40,10 @@ spec:
         - name: API_KEYS
           value: d36fa730d29ed2e8749708ffc7ff7453d5c68a84b9b17360f15bffa9fb0a6a6d,1669ed9f11c615b5cb60fdfa60d23b4373c503de306eaa90039a20790427aef0,4f9736e8bfa246e74ffc11279cf59d2fe4b381cc70159255a9f78e26932bbb1f,e6507e72971c8e015b2958930497e3baaf75607e2dc178ae44f1db671bd49e0d
         - name: TUSKER_SEMANTIC_CACHE_ENABLED
-          value: 'true'
+          # The embedding model is optional and is not baked into the image.
+          # Keep startup independent of Hugging Face availability until the
+          # model is packaged or mounted on the PVC.
+          value: 'false'
         - name: TUSKER_SEMANTIC_CACHE_THRESHOLD
           value: '0.85'
         - name: TUSKER_SEMANTIC_CACHE_TTL
@@ -67,6 +70,24 @@ spec:
               optional: true
               name: tusker-env-vault
               key: GITHUB_COPILOT_ENTERPRISE_TOKEN
+        - name: OPENAI_CODEX_CREDENTIALS
+          valueFrom:
+            secretKeyRef:
+              optional: true
+              name: tusker-env-vault
+              key: OPENAI_CODEX_CREDENTIALS
+        - name: GITHUB_COPILOT_CREDENTIALS
+          valueFrom:
+            secretKeyRef:
+              optional: true
+              name: tusker-env-vault
+              key: GITHUB_COPILOT_CREDENTIALS
+        - name: GITHUB_COPILOT_ENTERPRISE_CREDENTIALS
+          valueFrom:
+            secretKeyRef:
+              optional: true
+              name: tusker-env-vault
+              key: GITHUB_COPILOT_ENTERPRISE_CREDENTIALS
         - name: PROVIDER_OPENROUTER_API_KEY
           valueFrom:
             secretKeyRef:
@@ -161,6 +182,10 @@ spec:
           value: 'true'
         - name: TUSKER_TOOL_DIAGNOSTICS
           value: 'true'
+        - name: TUSKER_CATALOG_STARTUP_TIMEOUT_SECS
+          value: '10'
+        - name: TUSKER_UPSTREAM_SOCK_READ_SECS
+          value: '30'
         - name: TUSKER_BUDGETS_ENABLED
           value: 'true'
         - name: TUSKER_GLOBAL_DAILY_TOKENS
