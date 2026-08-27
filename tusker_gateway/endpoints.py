@@ -22,6 +22,7 @@ from tusker_gateway.errors import (
     GatewayError,
     MalformedToolCallError,
     RateLimitError,
+    RequiredToolCallError,
     openai_error,
 )
 from tusker_gateway.metrics import MetricsRegistry
@@ -682,6 +683,7 @@ async def _normalize_stream(
     model: str | None = None,
     request_id: str | None = None,
     tools_requested: bool = False,
+    require_tool_call: bool = False,
 ) -> AsyncIterator[bytes]:
     """Sanitize and normalize a provider's OpenAI-compatible SSE stream.
 
@@ -718,6 +720,15 @@ async def _normalize_stream(
             ",".join(marker_types),
         )
         return MalformedToolCallError(marker_types=marker_types)
+
+    def required_tool_error() -> RequiredToolCallError:
+        logger.warning(
+            "required tool response rejected provider=%s model=%s request_id=%s",
+            provider or "unknown",
+            model or "unknown",
+            request_id or "unknown",
+        )
+        return RequiredToolCallError()
 
     tool_markup_seen: set[str] = set()
 
@@ -766,6 +777,8 @@ async def _normalize_stream(
                 continue
             if stripped == b"data: [DONE]":
                 tool_stripper.flush()
+                if require_tool_call and not saw_tool_call:
+                    raise required_tool_error()
                 if tools_requested and saw_tool_markup and not saw_tool_call:
                     raise malformed_tool_error()
                 if emitted_finish_reason is None:
@@ -882,6 +895,8 @@ async def _normalize_stream(
                             if tool_frame is not None:
                                 pending_tool_frames.append(tool_frame)
                     else:
+                        if require_tool_call and not has_tools and not saw_tool_call:
+                            raise required_tool_error()
                         if tools_requested and not has_tools and not saw_tool_call:
                             raise malformed_tool_error()
                         # A wrapper can contain malformed markup or ordinary
@@ -891,6 +906,8 @@ async def _normalize_stream(
                         if prose:
                             pending_prose_frames.append(_content_frame(prose, new_obj))
                 elif not eligible:
+                    if require_tool_call and not has_tools and not saw_tool_call:
+                        raise required_tool_error()
                     if tools_requested and not has_tools and not saw_tool_call:
                         raise malformed_tool_error()
                     prose = _extract_inner_prose(block)
@@ -969,6 +986,8 @@ async def _normalize_stream(
             request_id or "unknown",
             len(buffer),
         )
+    if require_tool_call and not saw_tool_call:
+        raise required_tool_error()
     if tools_requested and saw_tool_markup and not saw_tool_call:
         raise malformed_tool_error()
     if emitted_finish_reason is None:
@@ -1038,6 +1057,7 @@ async def _prepare_stream_result(
     model: str,
     request_id: str | None,
     tools_requested: bool,
+    require_tool_call: bool = False,
 ) -> Any:
     """Preflight a tool stream before committing a client response.
 
@@ -1056,6 +1076,7 @@ async def _prepare_stream_result(
         model=model,
         request_id=request_id,
         tools_requested=True,
+        require_tool_call=require_tool_call,
     )
     buffered: list[bytes] = []
     buffered_bytes = 0
@@ -1068,7 +1089,7 @@ async def _prepare_stream_result(
             if has_tool_call:
                 preflight_decision = "tool_call"
                 break
-            if has_terminal:
+            if has_terminal and not require_tool_call:
                 preflight_decision = "terminal"
                 break
     except Exception:
@@ -1089,6 +1110,13 @@ async def _prepare_stream_result(
 def _pool_name(body: dict[str, Any]) -> str | None:
     route = resolve_route(body.get("model"), body)
     return route.pool_name or "code" if route.kind in {"pool", "code"} else None
+
+
+def _tool_choice_requires_call(tool_choice: Any) -> bool:
+    """Return whether an OpenAI chat request requires a tool call."""
+    if tool_choice == "required":
+        return True
+    return isinstance(tool_choice, dict) and tool_choice.get("type") == "function"
 
 
 def _resolve_api_key(request: web.Request) -> str:
@@ -1376,6 +1404,7 @@ async def _call_with_pool_fallback(
                 model=model,
                 request_id=request_id,
                 tools_requested=bool(tools) and bool(body.get("stream")),
+                require_tool_call=_tool_choice_requires_call(body.get("tool_choice")),
             )
             if breaker is not None:
                 breaker.record_success(provider, model)
@@ -1468,6 +1497,7 @@ async def _call_with_pool_fallback(
                 model=model,
                 request_id=request_id,
                 tools_requested=bool(tools) and bool(body.get("stream")),
+                require_tool_call=_tool_choice_requires_call(body.get("tool_choice")),
             )
             if breaker is not None:
                 breaker.record_success(provider, model)
@@ -2161,6 +2191,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                                 model=target_model,
                                 request_id=request_id,
                                 tools_requested=bool(tools),
+                                require_tool_call=_tool_choice_requires_call(body.get("tool_choice")),
                             )
                         )
                         async for chunk in stream_result:

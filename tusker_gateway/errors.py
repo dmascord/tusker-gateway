@@ -61,6 +61,18 @@ class MalformedToolCallError(ProviderError):
         self.marker_types = marker_types
 
 
+class RequiredToolCallError(ProviderError):
+    """An upstream model ended without honoring ``tool_choice=required``."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Provider did not produce a required tool call",
+            code="required_tool_call_missing",
+        )
+        self.upstream_status = 502
+        self.upstream_body = "required tool call missing"
+
+
 class RateLimitError(GatewayError):
     """A rate-limit / cooldown hit on a provider pool."""
 

@@ -258,6 +258,63 @@ async def test_chat_stream_malformed_tool_markup_falls_back_before_client_respon
 
 
 @pytest.mark.asyncio
+async def test_chat_stream_required_tool_call_falls_back_on_clean_stop(app, client):
+    """A strict tool request must not accept a text-only provider stop."""
+    pool_manager = MagicMock()
+    pool_manager.select.side_effect = [
+        ("openrouter", "nvidia/no-tool-model"),
+        ("openai", "tool-capable-fallback"),
+    ]
+    app["pool_manager"] = pool_manager
+
+    async def clean_stop_stream(*args, **kwargs):
+        yield (
+            b'data: {"choices":[{"index":0,"delta":{"role":"assistant",'
+            b'"content":"I cannot run that."},"finish_reason":"stop"}]}\n\n'
+        )
+
+    async def valid_stream(*args, **kwargs):
+        payload = {
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "id": "call-required-1",
+                        "type": "function",
+                        "function": {
+                            "name": "read",
+                            "arguments": '{"path":"/tmp/does-not-exist"}',
+                        },
+                    }],
+                },
+                "finish_reason": "tool_calls",
+            }],
+        }
+        yield f"data: {json.dumps(payload)}\n\n".encode()
+
+    with patch("tusker_gateway.endpoints.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
+        mock_chat.side_effect = [clean_stop_stream(), valid_stream()]
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-code",
+                "messages": [{"role": "user", "content": "read the file"}],
+                "tools": [{"type": "function", "function": {"name": "read"}}],
+                "tool_choice": "required",
+                "stream": True,
+            },
+            headers=HEADERS_AUTH,
+        )
+        body = await resp.read()
+
+    assert resp.status == 200
+    assert b"I cannot run that" not in body
+    assert b'"name": "read"' in body
+    assert b'"finish_reason": "tool_calls"' in body
+    assert pool_manager.select.call_count == 2
+
+
+@pytest.mark.asyncio
 async def test_chat_pool_input_image_requires_image_after_breaker_skip(app, client):
     pool_manager = MagicMock()
     pool_manager.select.side_effect = [
