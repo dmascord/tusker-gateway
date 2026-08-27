@@ -152,6 +152,15 @@ def test_load_budget_config_handles_malformed_json():
     assert cfg.caps == {}
 
 
+@pytest.mark.parametrize("value", ["", "0", "-1", "not-a-number"])
+def test_non_positive_or_invalid_global_cap_is_unlimited(value):
+    cfg = load_budget_config_from_env(env={
+        "TUSKER_BUDGETS_ENABLED": "true",
+        "TUSKER_GLOBAL_DAILY_TOKENS": value,
+    })
+    assert cfg.global_daily_tokens is None
+
+
 def test_key_fingerprint_deterministic():
     assert _key_fingerprint("k1") == _key_fingerprint("k1")
     assert _key_fingerprint("k1") != _key_fingerprint("k2")

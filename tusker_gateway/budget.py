@@ -341,11 +341,24 @@ def load_budget_config_from_env(env: dict[str, str] | None = None) -> BudgetConf
                     )
         except json.JSONDecodeError:
             pass
+    raw_global_cap = env.get("TUSKER_GLOBAL_DAILY_TOKENS")
+    global_daily_tokens: int | None = None
+    if raw_global_cap and raw_global_cap.strip():
+        try:
+            parsed_global_cap = int(raw_global_cap)
+        except ValueError:
+            logger.warning("ignoring invalid TUSKER_GLOBAL_DAILY_TOKENS=%r", raw_global_cap)
+        else:
+            # Non-positive values are an explicit way to leave the optional
+            # global cap unconfigured; a missing value is the normal default.
+            if parsed_global_cap > 0:
+                global_daily_tokens = parsed_global_cap
+
     return BudgetConfig(
         enabled=enabled,
         path=env.get("TUSKER_BUDGETS_PATH") or _default_path(),
         caps=caps,
-        global_daily_tokens=int(env["TUSKER_GLOBAL_DAILY_TOKENS"]) if env.get("TUSKER_GLOBAL_DAILY_TOKENS") else None,
+        global_daily_tokens=global_daily_tokens,
     )
 
 

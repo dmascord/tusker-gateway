@@ -210,9 +210,7 @@ spec:
         - name: TUSKER_UPSTREAM_SOCK_READ_SECS
           value: '30'
         - name: TUSKER_BUDGETS_ENABLED
-          value: 'true'
-        - name: TUSKER_GLOBAL_DAILY_TOKENS
-          value: '250000'
+          value: 'false'
         ports:
         - containerPort: 8642
           name: http
