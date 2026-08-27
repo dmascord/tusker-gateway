@@ -266,6 +266,21 @@ def _responses_text(content: str | list[dict[str, Any]]) -> str:
     )
 
 
+def _responses_tool_choice(tool_choice: Any) -> Any:
+    """Translate a Chat Completions tool choice to Responses API shape."""
+    if not isinstance(tool_choice, dict):
+        return tool_choice
+    function = tool_choice.get("function")
+    if (
+        tool_choice.get("type") == "function"
+        and isinstance(function, dict)
+        and isinstance(function.get("name"), str)
+        and function["name"]
+    ):
+        return {"type": "function", "name": function["name"]}
+    return tool_choice
+
+
 class PassthroughClient:
     """HTTP client for provider passthrough requests."""
 
@@ -640,7 +655,11 @@ class PassthroughClient:
                  "parameters": t["function"].get("parameters", {"type": "object", "properties": {}})}
                 for t in normalize_tools(tools)
             ]
-            body["tool_choice"] = tool_choice if tool_choice is not None else "auto"
+            body["tool_choice"] = (
+                _responses_tool_choice(tool_choice)
+                if tool_choice is not None
+                else "auto"
+            )
             body["parallel_tool_calls"] = True
         if extra_body:
             # Forward everything from extra_body upstream except the
