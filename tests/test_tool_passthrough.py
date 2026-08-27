@@ -121,6 +121,21 @@ async def test_request_body_normalizes_tools_for_bearer_provider():
     assert body["tools"][0]["function"]["name"] == "bash"
 
 
+@pytest.mark.asyncio
+async def test_request_body_preserves_explicit_tool_choice():
+    http = _mock_http({"choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]})
+    client = PassthroughClient(_cfg(provider_api_keys={"openai": "sk-test"}), QualityDB(":memory:"), http)
+    await client.chat(
+        "openai",
+        "gpt-4o",
+        [{"role": "user", "content": "hi"}],
+        tools=[{"function": {"name": "bash"}}],
+        tool_choice="required",
+    )
+    body = http.request.call_args.kwargs.get("json")
+    assert body["tool_choice"] == "required"
+
+
 def test_openai_messages_to_anthropic_round_trip():
     msgs = [
         {"role": "system", "content": "you are helpful"},
@@ -146,6 +161,22 @@ def test_dsml_namespaced_xml():
     calls = parse_text_tool_calls(text)
     assert len(calls) == 1
     assert calls[0]["function"]["name"] == "s"
+
+
+def test_anthropic_tool_choice_maps_to_openai_required():
+    from tusker_gateway.translators.anthropic import request_anthropic_to_openai
+
+    converted = request_anthropic_to_openai({
+        "model": "hermes-code",
+        "messages": [{"role": "user", "content": "run it"}],
+        "tools": [{
+            "name": "bash",
+            "description": "run a command",
+            "input_schema": {"type": "object", "properties": {}},
+        }],
+        "tool_choice": {"type": "any"},
+    })
+    assert converted["tool_choice"] == "required"
 
 
 def test_tool_invocation_self_closing():

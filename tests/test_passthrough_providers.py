@@ -595,6 +595,45 @@ async def test_chat_codex_folds_reasoning_effort_into_reasoning_object():
 
 
 @pytest.mark.asyncio
+async def test_chat_codex_preserves_explicit_tool_choice():
+    """Codex must honor a caller's required/specific tool selection."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from tusker_gateway.passthrough import CodexTokenRotator, PassthroughClient
+
+    client = PassthroughClient.__new__(PassthroughClient)
+    client._codex_rotator = CodexTokenRotator([
+        {"access_token": "tok-a", "expires_at_ms": 9999999999999},
+    ])
+    client._config = {"quality_db_path": "/tmp/q.db"}
+    client._http = MagicMock()
+    captured: dict = {}
+
+    class FakeHTTPRequest:
+        async def __call__(self, _method, _url, *, headers=None, json=None, timeout=None, **_kw):
+            captured["json"] = json
+            resp = MagicMock()
+            resp.status = 400
+            resp.text = AsyncMock(return_value='{"detail":"ignored for test"}')
+            return resp
+
+    client._http.request = FakeHTTPRequest()
+
+    with pytest.raises(Exception):
+        await client._chat_codex(
+            provider="openai-codex",
+            model="gpt-5.4-mini",
+            messages=[{"role": "user", "content": "run it"}],
+            stream=False,
+            api_key=None,
+            tools=[{"function": {"name": "bash"}}],
+            tool_choice="required",
+        )
+
+    assert captured["json"]["tool_choice"] == "required"
+
+
+@pytest.mark.asyncio
 async def test_chat_codex_drops_max_tokens_params():
     """_chat_codex must drop every max-tokens flavour
     (max_tokens / max_completion_tokens / max_output_tokens) from the

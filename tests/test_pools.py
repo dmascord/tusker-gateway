@@ -98,12 +98,14 @@ class _CatalogEntry:
         cost_input: float | None = None,
         cost_output: float | None = None,
         input_modalities: frozenset[str] | None = None,
+        raw: dict | None = None,
     ) -> None:
         self.provider = provider
         self.model = model
         self.cost_input = cost_input
         self.cost_output = cost_output
         self.input_modalities = input_modalities
+        self.raw = raw or {}
 
 
 class _CatalogRegistry:
@@ -173,6 +175,53 @@ def test_unknown_modalities_remain_eligible_for_existing_providers():
         assert manager.select(
             "test", required_input_modalities={"text", "image"},
         ) == ("local-llm", "legacy")
+
+
+def test_selection_filters_catalog_models_without_tools_or_images():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = PoolManager({
+            "pools": {
+                "code": PoolConfig(name="code", models=[
+                    {"provider": "openrouter", "model": "text-only"},
+                    {"provider": "openrouter", "model": "image-no-tools"},
+                    {"provider": "openrouter", "model": "tool-image"},
+                ]),
+            },
+            "quality_db_path": os.path.join(tmpdir, "quality.db"),
+            "excluded_providers": [],
+            "provider_api_keys": {"openrouter": "k-openrouter"},
+        })
+        manager.catalog_registry = _CatalogRegistry({
+            "openrouter": [
+                _CatalogEntry(
+                    "openrouter", "text-only",
+                    raw={
+                        "architecture": {"input_modalities": ["text"]},
+                        "supported_parameters": ["max_tokens"],
+                    },
+                ),
+                _CatalogEntry(
+                    "openrouter", "image-no-tools",
+                    raw={
+                        "architecture": {"input_modalities": ["text", "image"]},
+                        "supported_parameters": ["max_tokens"],
+                    },
+                ),
+                _CatalogEntry(
+                    "openrouter", "tool-image",
+                    raw={
+                        "architecture": {"input_modalities": ["text", "image"]},
+                        "supported_parameters": ["max_tokens", "tools"],
+                    },
+                ),
+            ],
+        })
+
+        assert manager.select(
+            "code",
+            required_input_modalities={"image"},
+            requires_tools=True,
+        ) == ("openrouter", "tool-image")
 
 
 def test_xiaomi_catalog_auto_adds_only_nonheavy_chat_models_to_code():

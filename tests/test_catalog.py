@@ -26,6 +26,8 @@ from tusker_gateway.catalog import (
     OpenRouterCatalog,
     XiaomiCatalog,
     _parse_cost_field,
+    advertised_input_modalities,
+    advertised_tool_support,
     catalog_refresh_loop,
 )
 
@@ -53,6 +55,30 @@ def test_parse_cost_field_none_or_invalid():
     assert _parse_cost_field("not-a-number / 1M") is None
     assert _parse_cost_field([]) is None
     assert _parse_cost_field({}) is None
+
+
+def test_catalog_capability_helpers_read_openrouter_shape():
+    entry = CatalogEntry(
+        provider="openrouter",
+        model="nvidia/test",
+        raw={
+            "architecture": {
+                "input_modalities": ["text", "image"],
+                "modality": "text+image->text",
+            },
+            "supported_parameters": ["max_tokens", "tools", "tool_choice"],
+        },
+    )
+    assert advertised_input_modalities(entry) == frozenset({"text", "image"})
+    assert advertised_tool_support(entry) is True
+
+    no_tools = CatalogEntry(
+        provider="openrouter",
+        model="nvidia/no-tools",
+        raw={"supported_parameters": ["max_tokens", "temperature"]},
+    )
+    assert advertised_tool_support(no_tools) is False
+    assert advertised_tool_support(CatalogEntry(provider="x", model="unknown")) is None
 
 
 # ---------------------------------------------------------------------------

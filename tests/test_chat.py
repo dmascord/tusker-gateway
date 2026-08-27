@@ -53,6 +53,37 @@ async def test_chat_completions_pool_dispatch(client):
 
 
 @pytest.mark.asyncio
+async def test_chat_pool_requires_tool_capability_and_forwards_tool_choice(app, client):
+    pool_manager = MagicMock()
+    pool_manager.select.return_value = ("openrouter", "tool-model")
+    app["pool_manager"] = pool_manager
+
+    with patch("tusker_gateway.endpoints.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
+        mock_chat.return_value = {
+            "choices": [{"message": {"role": "assistant", "content": ""}, "finish_reason": "tool_calls"}],
+        }
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-code",
+                "messages": [{"role": "user", "content": "run it"}],
+                "tools": [{"type": "function", "function": {"name": "bash"}}],
+                "tool_choice": "required",
+            },
+            headers=HEADERS_AUTH,
+        )
+
+    assert resp.status == 200
+    pool_manager.select.assert_called_once_with(
+        "code",
+        excluded=set(),
+        required_input_modalities=None,
+        requires_tools=True,
+    )
+    assert mock_chat.call_args.kwargs["tool_choice"] == "required"
+
+
+@pytest.mark.asyncio
 async def test_chat_pool_image_requirement_is_preserved_across_fallbacks(app, client):
     pool_manager = MagicMock()
     pool_manager.select.side_effect = [

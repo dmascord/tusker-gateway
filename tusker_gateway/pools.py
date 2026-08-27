@@ -10,6 +10,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from tusker_gateway.catalog import advertised_input_modalities, advertised_tool_support
 from tusker_gateway.config import DEFAULT_PROVIDER_REGISTRY, PoolConfig
 from tusker_gateway.cooldown import CooldownTracker, global_tracker
 from tusker_gateway.heavyweight import is_heavyweight
@@ -275,8 +276,9 @@ class PoolManager:
                     }
                     if mode == "xiaomi":
                         model_data["heavyweight"] = heavyweight
-                        if entry.input_modalities is not None:
-                            model_data["input_modalities"] = sorted(entry.input_modalities)
+                    modalities = advertised_input_modalities(entry)
+                    if modalities is not None:
+                        model_data["input_modalities"] = sorted(modalities)
                     eligible[(entry.provider, entry.model)] = model_data
 
             desired_auto = set(eligible) - static_pairs
@@ -328,6 +330,46 @@ class PoolManager:
             self.unkeyed[name] = unkeyed
             self.models[name] = usable
 
+    def _catalog_entry_for(self, spec: ModelSpec) -> Any | None:
+        """Return the cached catalog row for a model, when available."""
+        registry = self.catalog_registry
+        if registry is None:
+            return None
+        entries_for = getattr(registry, "entries_for", None)
+        if not callable(entries_for):
+            return None
+        try:
+            entries = entries_for(spec.provider)
+        except Exception:
+            return None
+        if not entries:
+            return None
+        for entry in entries:
+            if (
+                getattr(entry, "provider", spec.provider) == spec.provider
+                and getattr(entry, "model", "") == spec.model
+            ):
+                return entry
+        return None
+
+    def _model_capabilities(
+        self,
+        spec: ModelSpec,
+        capability_cache: dict[tuple[str, str], tuple[frozenset[str] | None, bool | None]],
+    ) -> tuple[frozenset[str] | None, bool | None]:
+        """Resolve effective input/tool capabilities for a pool candidate."""
+        key = (spec.provider, spec.model)
+        cached = capability_cache.get(key)
+        if cached is not None:
+            return cached
+        entry = self._catalog_entry_for(spec)
+        modalities = spec.input_modalities
+        if modalities is None:
+            modalities = advertised_input_modalities(entry)
+        tool_support = advertised_tool_support(entry)
+        capability_cache[key] = (modalities, tool_support)
+        return modalities, tool_support
+
     def select(
         self,
         pool_name: str,
@@ -338,6 +380,7 @@ class PoolManager:
         heavyweight_ok: bool | None = None,
         excluded: set[tuple[str, str]] | None = None,
         required_input_modalities: set[str] | frozenset[str] | None = None,
+        requires_tools: bool = False,
     ) -> tuple[str, str] | None:
         """Select the best (provider, model) from a pool.
 
@@ -350,12 +393,19 @@ class PoolManager:
         ``required_input_modalities`` excludes models whose known input
         modalities do not cover the request. Models without modality metadata
         remain eligible for backward compatibility.
+
+        ``requires_tools`` applies the same rule to catalog-advertised tool
+        support. Models that explicitly lack tools are excluded; models with
+        unknown capability metadata remain eligible for compatibility.
         """
         excluded = excluded or set()
         required_modalities = frozenset(required_input_modalities or ())
         specs = self.models.get(pool_name, [])
         if not specs:
             return None
+        capability_cache: dict[
+            tuple[str, str], tuple[frozenset[str] | None, bool | None]
+        ] = {}
 
         # Resolve heavyweight gate from pool tier if not explicitly set.
         if heavyweight_ok is None:
@@ -375,10 +425,16 @@ class PoolManager:
                             # Context doesn't fit; clear stickiness
                             self._stickiness.pop(key, None)
                             break
+                        modalities, tool_support = self._model_capabilities(
+                            s, capability_cache
+                        )
                         if (
-                            s.input_modalities is not None
-                            and not required_modalities.issubset(s.input_modalities)
+                            modalities is not None
+                            and not required_modalities.issubset(modalities)
                         ):
+                            self._stickiness.pop(key, None)
+                            break
+                        if requires_tools and tool_support is False:
                             self._stickiness.pop(key, None)
                             break
                         # Don't return a sticky heavyweight if the pool
@@ -389,6 +445,8 @@ class PoolManager:
                         return prev
         # 2. Filter candidates by context window, cooldown, and request-level exclusions
         candidates: list[ModelSpec] = []
+        filtered_tool_models: list[str] = []
+        filtered_modality_models: list[str] = []
         for s in specs:
             if (s.provider, s.model) in excluded:
                 continue
@@ -399,10 +457,12 @@ class PoolManager:
                 continue
             if not heavyweight_ok and s.heavyweight:
                 continue
-            if (
-                s.input_modalities is not None
-                and not required_modalities.issubset(s.input_modalities)
-            ):
+            modalities, tool_support = self._model_capabilities(s, capability_cache)
+            if modalities is not None and not required_modalities.issubset(modalities):
+                filtered_modality_models.append(f"{s.provider}/{s.model}")
+                continue
+            if requires_tools and tool_support is False:
+                filtered_tool_models.append(f"{s.provider}/{s.model}")
                 continue
             if self._cooldowns.is_cooldown(s.provider, s.model):
                 continue
@@ -412,6 +472,22 @@ class PoolManager:
                 if s.provider in self.config.get("excluded_providers", []):
                     continue
             candidates.append(s)
+
+        if requires_tools and filtered_tool_models:
+            logger.info(
+                "pool '%s' capability filter tools=true filtered=%d models=%s",
+                pool_name,
+                len(filtered_tool_models),
+                ",".join(filtered_tool_models[:12]),
+            )
+        if required_modalities and filtered_modality_models:
+            logger.info(
+                "pool '%s' capability filter input_modalities=%s filtered=%d models=%s",
+                pool_name,
+                "+".join(sorted(required_modalities)),
+                len(filtered_modality_models),
+                ",".join(filtered_modality_models[:12]),
+            )
 
         if not candidates:
             return None

@@ -275,28 +275,33 @@ async def _call_with_pool_fallback_anthropic(
         excluded: set[tuple[str, str]] = set()
         last_error: Exception | None = None
         required_input_modalities = _required_input_modalities(body.get("messages"))
+        requires_tools = bool(tools)
         pool_mgr = (
             request.app.get("pool_manager") or PoolManager(config)
             if request is not None
             else PoolManager(config)
         )
         while True:
-            selected = pool_mgr.select(
-                pool_name,
-                excluded=set(excluded),
-                required_input_modalities=required_input_modalities,
-            )
+            select_kwargs: dict[str, Any] = {
+                "excluded": set(excluded),
+                "required_input_modalities": required_input_modalities,
+            }
+            if requires_tools:
+                select_kwargs["requires_tools"] = True
+            selected = pool_mgr.select(pool_name, **select_kwargs)
             if breaker is not None and selected is not None:
                 while selected is not None:
                     decision = breaker.check(selected[0], selected[1])
                     if decision.allowed:
                         break
                     excluded.add(selected)
-                    selected = pool_mgr.select(
-                        pool_name,
-                        excluded=set(excluded),
-                        required_input_modalities=required_input_modalities,
-                    )
+                    select_kwargs = {
+                        "excluded": set(excluded),
+                        "required_input_modalities": required_input_modalities,
+                    }
+                    if requires_tools:
+                        select_kwargs["requires_tools"] = True
+                    selected = pool_mgr.select(pool_name, **select_kwargs)
             if not selected:
                 if last_error is not None:
                     raise last_error
@@ -304,7 +309,8 @@ async def _call_with_pool_fallback_anthropic(
             prov, mdl = selected
             try:
                 result = await client.chat(prov, mdl, body["messages"],
-                                          stream=bool(body.get("stream")), tools=tools)
+                                          stream=bool(body.get("stream")), tools=tools,
+                                          tool_choice=body.get("tool_choice"))
                 if isinstance(result, dict):
                     result = normalize_response_tool_calls(
                         result,
@@ -337,7 +343,8 @@ async def _call_with_pool_fallback_anthropic(
             )
         try:
             result = await client.chat(route.provider, route.model, body["messages"],
-                                      stream=bool(body.get("stream")), tools=tools)
+                                      stream=bool(body.get("stream")), tools=tools,
+                                      tool_choice=body.get("tool_choice"))
             if isinstance(result, dict):
                 result = normalize_response_tool_calls(
                     result,

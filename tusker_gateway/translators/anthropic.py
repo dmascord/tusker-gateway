@@ -178,6 +178,19 @@ def request_anthropic_to_openai(body: dict[str, Any]) -> dict[str, Any]:
     # Tool definitions (Anthropic → OpenAI format).
     if "tools" in body:
         openai["tools"] = _convert_anthropic_tools(body["tools"])
+    if "tool_choice" in body:
+        choice = body["tool_choice"]
+        if isinstance(choice, dict):
+            choice_type = choice.get("type")
+            if choice_type == "auto":
+                openai["tool_choice"] = "auto"
+            elif choice_type == "any":
+                openai["tool_choice"] = "required"
+            elif choice_type == "tool" and isinstance(choice.get("name"), str):
+                openai["tool_choice"] = {
+                    "type": "function",
+                    "function": {"name": choice["name"]},
+                }
 
     return openai
 

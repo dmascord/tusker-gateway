@@ -73,6 +73,107 @@ class CatalogEntry:
     input_modalities: frozenset[str] | None = None
 
 
+def _capability_values(value: Any) -> frozenset[str] | None:
+    """Normalize a catalog capability list without trusting arbitrary values."""
+    if not isinstance(value, (list, tuple, set, frozenset)):
+        return None
+    values = {
+        str(item).strip().lower().replace("-", "_")
+        for item in value
+        if isinstance(item, str) and item.strip()
+    }
+    return frozenset(values)
+
+
+def advertised_input_modalities(entry: Any) -> frozenset[str] | None:
+    """Return input modalities advertised by a catalog entry, if known.
+
+    OpenRouter puts this in ``architecture.input_modalities`` while a few
+    OpenAI-compatible catalogs expose it at the top level. Keep the helper
+    permissive so a stale or provider-specific catalog shape leaves the model
+    eligible rather than causing a routing failure.
+    """
+    explicit = getattr(entry, "input_modalities", None)
+    if explicit is not None:
+        values = _capability_values(explicit)
+        if values is not None:
+            return values
+
+    raw = getattr(entry, "raw", None)
+    if not isinstance(raw, dict):
+        return None
+    sources = [raw]
+    for key in ("architecture", "capabilities"):
+        nested = raw.get(key)
+        if isinstance(nested, dict):
+            sources.append(nested)
+    for source in sources:
+        for key in ("input_modalities", "inputModalities"):
+            values = _capability_values(source.get(key))
+            if values is not None:
+                return values
+
+        # Some catalogs only expose the compact form, e.g. text+image->text.
+        modality = source.get("modality")
+        if isinstance(modality, str) and "->" in modality:
+            input_part = modality.split("->", 1)[0]
+            values = frozenset(
+                piece.strip().lower()
+                for piece in input_part.replace(",", "+").split("+")
+                if piece.strip()
+            )
+            if values:
+                return values
+    return None
+
+
+def advertised_tool_support(entry: Any) -> bool | None:
+    """Return whether a catalog entry explicitly advertises tool support.
+
+    ``None`` means unknown. An explicit ``supported_parameters`` list is
+    authoritative: a model without ``tools`` in that list must not receive a
+    tool-bearing request. This avoids sending requests to models that then
+    fail with provider-router errors such as "no endpoints support tool use".
+    """
+    raw = getattr(entry, "raw", None)
+    if not isinstance(raw, dict):
+        return None
+
+    sources = [raw]
+    for key in ("capabilities", "architecture"):
+        nested = raw.get(key)
+        if isinstance(nested, dict):
+            sources.append(nested)
+
+    boolean_keys = (
+        "supports_tools",
+        "supports_tool_use",
+        "tool_support",
+        "tool_use",
+        "function_calling",
+    )
+    parameter_keys = ("supported_parameters", "supportedParameters")
+    tool_values = frozenset({
+        "tools",
+        "functions",
+        "function_calling",
+        "functioncalling",
+        "tool_use",
+        "tooluse",
+    })
+
+    for source in sources:
+        for key in boolean_keys:
+            value = source.get(key)
+            if isinstance(value, bool):
+                return value
+        for key in parameter_keys:
+            values = _capability_values(source.get(key))
+            if values is not None:
+                return bool(values & tool_values)
+    return None
+
+
 @dataclass
 class Catalog:
     """A snapshot of one provider's catalog."""

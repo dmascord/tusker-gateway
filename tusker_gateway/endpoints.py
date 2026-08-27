@@ -700,6 +700,7 @@ async def _normalize_stream(
     saw_finish_reason = False
     saw_done = False
     saw_tool_call = False
+    emitted_finish_reason: str | None = None
 
     def finish_frame(reason: str) -> bytes:
         return sse_frame(format_openai_chunk(finish_reason=reason, model=model))
@@ -746,10 +747,13 @@ async def _normalize_stream(
                 continue
             if stripped == b"data: [DONE]":
                 tool_stripper.flush()
-                if not saw_finish_reason:
-                    yield finish_frame("tool_calls" if saw_tool_call else "stop")
+                if emitted_finish_reason is None:
+                    emitted_finish_reason = "tool_calls" if saw_tool_call else "stop"
+                    yield finish_frame(emitted_finish_reason)
                 saw_done = True
-                yield frame
+                # The HTTP handler owns the client-facing [DONE] sentinel.
+                # Upstreams commonly send one or more of their own, and
+                # forwarding those would produce duplicate sentinels.
                 continue
             try:
                 obj = json.loads(stripped[len(b"data: "):])
@@ -768,9 +772,17 @@ async def _normalize_stream(
                 yield frame
                 continue
             delta = dict(choice.get("delta") or {})
-            fr = choice.get("finish_reason")
-            if fr:
+            upstream_finish_reason = choice.get("finish_reason")
+            if upstream_finish_reason:
                 saw_finish_reason = True
+            # A few OpenRouter providers emit a second terminal event (often
+            # the usage-bearing event) with the same finish reason. Preserve
+            # any useful payload, but never expose a second terminal chunk.
+            fr = (
+                upstream_finish_reason
+                if emitted_finish_reason is None
+                else None
+            )
 
             raw_content = delta.get("content")
             reasoning_content = delta.get("reasoning_content")
@@ -811,7 +823,7 @@ async def _normalize_stream(
                 else:
                     delta.pop("content", None)
 
-            new_choice = {**choice, "delta": delta}
+            new_choice = {**choice, "delta": delta, "finish_reason": fr}
             new_obj = {**obj, "choices": [new_choice, *choices[1:]]}
 
             pending_tool_frames: list[bytes] = []
@@ -898,7 +910,9 @@ async def _normalize_stream(
                 for tool_frame in pending_tool_frames:
                     yield tool_frame
                 reason = "tool_calls" if saw_tool_call else fr
-                yield f"data: {json.dumps({**new_obj, 'choices': [{**new_choice, 'delta': {}, 'finish_reason': reason}]}, ensure_ascii=False)}\n\n".encode()
+                if emitted_finish_reason is None:
+                    emitted_finish_reason = reason
+                    yield f"data: {json.dumps({**new_obj, 'choices': [{**new_choice, 'delta': {}, 'finish_reason': reason}]}, ensure_ascii=False)}\n\n".encode()
             elif has_promoted_tools:
                 if has_delta_content:
                     content_delta = {
@@ -912,7 +926,9 @@ async def _normalize_stream(
                 for tool_frame in pending_tool_frames:
                     yield tool_frame
             else:
-                if has_delta_content or has_tools or delta:
+                if has_delta_content or has_tools or delta or (
+                    upstream_finish_reason and obj.get("usage") is not None
+                ):
                     yield f"data: {json.dumps(new_obj, ensure_ascii=False)}\n\n".encode()
                 for prose_frame in pending_prose_frames:
                     yield prose_frame
@@ -925,8 +941,9 @@ async def _normalize_stream(
             request_id or "unknown",
             len(buffer),
         )
-    if not saw_finish_reason and not saw_done:
-        yield finish_frame("tool_calls" if saw_tool_call else "stop")
+    if emitted_finish_reason is None:
+        emitted_finish_reason = "tool_calls" if saw_tool_call else "stop"
+        yield finish_frame(emitted_finish_reason)
 
 
 def _pool_name(body: dict[str, Any]) -> str | None:
@@ -1070,6 +1087,7 @@ async def _call_with_pool_fallback(
     """
     extra_body = _build_extra_body(body)
     required_input_modalities = _required_input_modalities(body.get("messages"))
+    requires_tools = bool(tools)
     pool_name = _pool_name(body)
     if pool_name is None:
         provider, model = _route_target(config, body)
@@ -1084,6 +1102,7 @@ async def _call_with_pool_fallback(
                 provider, model, body["messages"],
                 stream=bool(body.get("stream")),
                 tools=tools,
+                tool_choice=body.get("tool_choice"),
                 extra_body=extra_body or None,
                 metrics_registry=metrics_registry,
             )
@@ -1120,22 +1139,26 @@ async def _call_with_pool_fallback(
     while True:
         # Pool select() already filters out cooldown-blocked candidates;
         # additionally filter out breaker-open candidates here.
-        selected = pool_mgr.select(
-            pool_name,
-            excluded=set(excluded),
-            required_input_modalities=required_input_modalities,
-        )
+        select_kwargs: dict[str, Any] = {
+            "excluded": set(excluded),
+            "required_input_modalities": required_input_modalities,
+        }
+        if requires_tools:
+            select_kwargs["requires_tools"] = True
+        selected = pool_mgr.select(pool_name, **select_kwargs)
         if breaker is not None and selected is not None:
             while selected is not None:
                 decision = breaker.check(selected[0], selected[1])
                 if decision.allowed:
                     break
                 excluded.add(selected)
-                selected = pool_mgr.select(
-                    pool_name,
-                    excluded=set(excluded),
-                    required_input_modalities=required_input_modalities,
-                )
+                select_kwargs = {
+                    "excluded": set(excluded),
+                    "required_input_modalities": required_input_modalities,
+                }
+                if requires_tools:
+                    select_kwargs["requires_tools"] = True
+                selected = pool_mgr.select(pool_name, **select_kwargs)
         if not selected:
             if last_error is not None:
                 raise last_error
@@ -1146,6 +1169,7 @@ async def _call_with_pool_fallback(
                 provider, model, body["messages"],
                 stream=bool(body.get("stream")),
                 tools=tools,
+                tool_choice=body.get("tool_choice"),
                 extra_body=extra_body or None,
                 metrics_registry=metrics_registry,
             )
@@ -1480,6 +1504,25 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
             config = request.app["config"]
             client = PassthroughClient(config, QualityDB(config["quality_db_path"]), request.app["http_session"], catalog_registry=request.app.get("catalog_registry"))
             tools = body.get("tools") if isinstance(body.get("tools"), list) else None
+            if os.environ.get("TUSKER_TOOL_DIAGNOSTICS", "0").strip().lower() in {
+                "1", "true", "yes", "on"
+            }:
+                tool_choice = body.get("tool_choice")
+                if isinstance(tool_choice, dict):
+                    tool_choice_kind = str(tool_choice.get("type") or "object")
+                elif tool_choice is None:
+                    tool_choice_kind = "omitted"
+                else:
+                    tool_choice_kind = str(tool_choice)
+                logger.info(
+                    "tool diagnostics request rid=%s model=%s has_tools=%s tool_count=%d tool_choice=%s required_input_modalities=%s",
+                    request_id,
+                    body.get("model"),
+                    bool(tools),
+                    len(tools) if tools else 0,
+                    tool_choice_kind,
+                    "+".join(sorted(_required_input_modalities(body.get("messages")) or ())) or "none",
+                )
             pool_name = _pool_name(body) or "passthrough"
             bypass_cache = request.headers.get("X-Tusker-Cache", "").strip().lower() == "bypass"
 

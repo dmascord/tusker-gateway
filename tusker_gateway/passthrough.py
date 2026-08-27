@@ -343,6 +343,7 @@ class PassthroughClient:
         stream: bool = False,
         api_key: str | None = None,
         tools: list[dict[str, Any]] | None = None,
+        tool_choice: Any | None = None,
         extra_headers: dict[str, str] | None = None,
         extra_body: dict[str, Any] | None = None,
         upstream_gateway: str | None = None,
@@ -406,6 +407,7 @@ class PassthroughClient:
             return await self._chat_codex(
                 provider, model, messages,
                 stream=stream, api_key=api_key, tools=tools,
+                tool_choice=tool_choice,
                 extra_headers=extra_headers, extra_body=extra_body,
                 endpoint=endpoint,
             )
@@ -416,7 +418,7 @@ class PassthroughClient:
         headers, body = await self._build_request(
             provider, model, messages,
             stream=stream, api_key=(self._config["api_keys"][0] if upstream_gateway else api_key),
-            tools=tools,
+            tools=tools, tool_choice=tool_choice,
             extra_headers=extra_headers, extra_body=extra_body,
             endpoint=endpoint,
         )
@@ -526,6 +528,7 @@ class PassthroughClient:
         stream: bool,
         api_key: str | None,
         tools: list[dict[str, Any]] | None = None,
+        tool_choice: Any | None = None,
         extra_headers: dict[str, str] | None,
         extra_body: dict[str, Any] | None,
         endpoint: dict[str, Any],
@@ -555,6 +558,8 @@ class PassthroughClient:
         }
         if tools:
             body["tools"] = normalize_tools(tools)
+            if tool_choice is not None:
+                body["tool_choice"] = tool_choice
         if extra_body:
             body.update(extra_body)
         return headers, body
@@ -567,6 +572,7 @@ class PassthroughClient:
         stream: bool,
         api_key: str | None,
         tools: list[dict[str, Any]] | None = None,
+        tool_choice: Any | None = None,
         extra_headers: dict[str, str] | None = None,
         extra_body: dict[str, Any] | None = None,
         endpoint: dict[str, Any] | None = None,
@@ -634,7 +640,7 @@ class PassthroughClient:
                  "parameters": t["function"].get("parameters", {"type": "object", "properties": {}})}
                 for t in normalize_tools(tools)
             ]
-            body["tool_choice"] = "auto"
+            body["tool_choice"] = tool_choice if tool_choice is not None else "auto"
             body["parallel_tool_calls"] = True
         if extra_body:
             # Forward everything from extra_body upstream except the

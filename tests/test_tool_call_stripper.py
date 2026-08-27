@@ -507,6 +507,43 @@ async def test_stream_normalizer_deduplicates_native_call_and_finishes_as_tool_c
 
 
 @pytest.mark.asyncio
+async def test_stream_normalizer_deduplicates_provider_terminal_frames():
+    """Provider duplicate finish/DONE events must not confuse OMP."""
+    import json
+
+    async def stream():
+        yield b'data: {"choices":[{"delta":{"content":"hello"}}]}\n\n'
+        yield b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+        # OpenRouter can emit a second usage-bearing terminal event and
+        # another sentinel after the normal terminal event.
+        yield b'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"total_tokens":1}}\n\n'
+        yield b"data: [DONE]\n\n"
+        yield b"data: [DONE]\n\n"
+
+    from tusker_gateway.endpoints import _normalize_stream
+
+    frames = []
+    async for raw in _normalize_stream(stream(), provider="test", model="m"):
+        stripped = raw.strip()
+        if not stripped.startswith(b"data: "):
+            continue
+        if stripped == b"data: [DONE]":
+            frames.append("done")
+            continue
+        frames.append(json.loads(stripped[len(b"data: "):]))
+
+    finish_reasons = [
+        choice.get("finish_reason")
+        for frame in frames
+        if isinstance(frame, dict)
+        for choice in frame.get("choices", [])
+        if choice.get("finish_reason")
+    ]
+    assert finish_reasons == ["stop"]
+    assert "done" not in frames
+
+
+@pytest.mark.asyncio
 async def test_stream_normalizer_buffers_split_json_tool_wrapper():
     """A JSON wrapper must not emit its payload before the closing tag."""
     import json
