@@ -24,9 +24,9 @@ At ~05:27 UTC on 2026-08-26, the Samsung Portable SSD T5 attached to visor's USB
 
 ## Root cause
 
-The `/var/lib/containerd` and Longhorn replica storage **both lived on a Samsung Portable SSD T5 connected via USB on `visor`**. The USB connection flapped three times in four seconds, ext4 aborted its journal on both LVs (which auto-remounted read-only), containerd crashed, kubelet went NotReady, and the RWO Longhorn replica on that single node became unattachable.
+The `/var/lib/containerd` and Longhorn replica storage **both lived on a Samsung Portable SSD T5 connected via USB on `visor`**. The USB connection flapped three times in four seconds — most likely from a physical bump of the USB cable or the drive itself (operator confirmed post-incident: the drive only blips when physically disturbed; otherwise it has been stable for years). ext4 aborted its journal on both LVs (which auto-remounted read-only), containerd crashed, kubelet went NotReady, and the RWO Longhorn replica on that single node became unattachable.
 
-The disk is now stable (it was stable during the reboot and recovery), but **the underlying cause isn't fixed** — a consumer-grade USB SSD is still our storage. Recovery actions in this commit mitigate this; full removal of the USB SSD as runtime state is future work.
+**Caveat**: the USB drive is not actively failing on its own — it was disturbed. The postmortem actions below protect against the next disturbance, not against an underlying hardware fault. The proper long-term fix is to physically unplug the drive from visor's USB bus (currently still attached but no longer used for critical state).
 
 ## Storage topology — before vs after
 
@@ -57,17 +57,27 @@ The `containerd-data` and `longhorn-ssd` LVs were both on the USB drive. A USB f
 
 ## Lessons
 
-1. **Don't put containerd runtime state on a removable USB drive.** USB cables flap. ext4 doesn't survive mid-write USB drops cleanly.
+1. **Don't put containerd runtime state on a removable USB drive.** Even if the drive is "usually stable," a single USB bump takes down the node. ext4 doesn't survive mid-write USB drops cleanly.
 2. **Don't put RWO Longhorn replica storage on a removable USB drive.** With `numberOfReplicas=1` (the Longhorn default) there's no failover. A USB flap on the only replica host = outage.
-3. **Consumer-grade portable SSDs are not server-grade.** The T5 is meant for backup use, not sustained 24/7 I/O. Its write cache + USB connection combine badly.
-4. **Watch `dmesg` for USB flap events before the kernel does.** We had no early warning when the disk started flapping. The new monitor catches flap cycles in <60s.
+3. **The USB T5 itself is not at fault.** It was disturbed. The hardware is fine; the topology was fragile. Fixing the topology (removing the USB drive from the critical path) is the durable fix.
+4. **Watch `dmesg` for USB flap events before the kernel does.** Even if the flap is "operator-caused", an early alert lets us check that the node is still healthy and that the drive's mount is back.
 
 ## Preventive follow-ups
 
-1. **Move all critical state off the USB drive.** The USB T5 is still attached to visor (just no longer used for our critical data). When convenient, physically unplug it.
-2. **Pre-deploy the engine image to every Longhorn node.** The replica #2 attempt stalled because wynk didn't have `docker.io/longhornio/longhorn-engine:v1.12.0` already pulled. Cluster-wide pre-pull would have made the bump work first try.
-3. **Longhorn default `numberOfReplicas=1`.** We rely on the engine on the host the pod is on, with no redundancy. Setting all critical volumes to `numberOfReplicas=2` (or 3) removes the SPOF.
-4. **Consider replacing the USB T5 with a proper SATA/NVMe SSD** if visor's internal storage is genuinely too tight. A 1 TB internal SSD is ~$80 and removes an entire class of failures.
+1. **Physically unplug the USB T5.** Since the drive is fine when left alone, simply removing the cable ends the fragility without losing data. The two non-tusker PVCs (`pvc-2afe302d`, `pvc-84387ebb`) on `longhorn-ssd` would need to be migrated off first; talk to the other app owners.
+2. **Pre-deploy the engine image to every Longhorn node.** The replica #2 attempt stalled because wynk didn't have `docker.io/longhornio/longhorn-engine:v1.12.0` already pulled. Cluster-wide pre-pull would have made the bump work first try. *(Note: when re-attempted on 2026-08-27, the image *was* on wynk, so this was no longer the blocker — the stuck replica is now a Longhorn controller bookkeeping issue.)*
+3. **Longhorn default `numberOfReplicas=1`.** We rely on the engine on the host the pod is on, with no redundancy. Setting all critical volumes to `numberOfReplicas=2` (or 3) removes the SPOF. *Re-attempted on 2026-08-27 and a stuck replica was created on wynk that the controllers won't reconcile — see the postmortem addendum below.*
+4. **Consider a proper internal SSD replacement** if visor's internal storage is genuinely too tight for a fresh install. A 1 TB SATA SSD is ~$80 and removes an entire class of failures — but this is **optional** given that the drive is fine when untouched.
+
+## Postmortem addendum (2026-08-27)
+
+Re-verified the diagnosis with the operator: the Samsung T5 only flaps when **physically touched** (cable bump, drive shift). It has been stable for years otherwise. This means the postmortem actions are sufficient protection — the USB drive no longer carries critical state, and the floppy cable is just one less thing in the critical path.
+
+Attempted to bump `tusker-home` to `numberOfReplicas=2` on 2026-08-27. The patch landed, but Longhorn created a replica on wynk that the controller would not reconcile (`stopped` for >17 hours, `Current Image: ""`, `Started: false`, not in the engine's `replicaAddressMap`). Annotation/patch/delete cycles don't transition the replica out of `stopped`. The single-replica configuration remains in place; gateway traffic is unaffected.
+
+When retrying this, the right path is to first do a Longhorn version-aligned snapshot and restore cycle on a fresh volume, OR accept that bumping replicas on this cluster requires Longhorn version upgrades that fix the controller reconciliation bug. Until then, the volume runs healthy on a single replica on visor's internal `var-longhorn` disk.
+
+The USB T5 is still attached to visor but no longer used for tusker-gateway data. When the other-app PVCs on it (`pvc-2afe302d`, `pvc-84387ebb`) are migrated off, the drive can be physically unplugged and the USB-flap monitor can be removed.
 
 ## References
 

@@ -4,29 +4,33 @@
 # Background
 # ----------
 # On 2026-08-26 the Samsung Portable SSD T5 attached to visor's USB bus
-# flapped three times in four seconds. ext4 aborted its journal on both
-# LVs (containerd-data, longhorn-ssd), the kernel remounted them read-only,
-# containerd crashed, kubelet went NotReady, and the only Longhorn replica
-# for tusker-home became unattachable. Every /v1/chat/completions request
-# returned 500 for ~1 hour until we rebooted visor.
+# flapped three times in four seconds — almost certainly from a physical
+# bump of the cable/drive (the drive is otherwise stable when left alone).
+# ext4 aborted its journal on both LVs (containerd-data, longhorn-ssd),
+# the kernel remounted them read-only, containerd crashed, kubelet went
+# NotReady, and the only Longhorn replica for tusker-home became
+# unattachable. Every /v1/chat/completions request returned 500 for ~1
+# hour until we rebooted visor.
 #
-# Goal
-# ----
-# Catch USB disconnect/reconnect cycles early so an operator can reboot the
-# node BEFORE containerd/LVM notice the journal errors.
+# Post-incident the runtime state was migrated off the USB drive (see
+# docs/incidents/2026-08-26-usb-ssd-flap.md), so even another flap won't
+# take down the gateway. This script is now a **smoke detector** — it
+# catches disturbances early so an operator can verify the node is still
+# healthy (kubelet reporting Ready, pods running) without waiting for a
+# user-visible 500.
 #
 # What it does
 # ------------
-# - Runs every minute (via systemd timer; see the unit file in this dir).
-# - Greps the last 60 s of dmesg for "USB disconnect" / "USB ... new ... device"
-#   entries targeting the visor USB bus.
-# - If two or more flap events are observed in the window, prints a single
-#   ALERT line on stdout and exits 0 (success: alert raised). The caller is
-#   expected to forward stdout to a notification channel (e.g. a cron job
-#   piped into a webhook, or a systemd NotifyType=alarm).
+# - Runs every minute (via systemd timer; see the unit files in this dir).
+# - Greps the last 60 s of dmesg for "USB disconnect" / "USB ... new ...
+#   device" / "rejected I/O to offline device" entries.
+# - If a flap is observed in the window, prints
+#   'ALERT usb-flap-detected ...' on stdout and exits 0. The caller (the
+#   systemd unit) is expected to forward stdout to a notification channel
+#   (e.g. a cron job piped into a webhook).
 #
-# This script is INTENTIONALLY dependency-free: it uses only bash, lsusb,
-# grep, awk, dmesg. It runs on visor only.
+# This script is INTENTIONALLY dependency-free: it uses only bash, dmesg,
+# awk, grep. It runs on visor only.
 #
 # Exit codes
 # ----------
@@ -40,6 +44,14 @@
 #        /etc/systemd/system/usb-flap-monitor.timer
 #   3. systemctl daemon-reload
 #   4. systemctl enable --now usb-flap-monitor.timer
+#
+# Tuning
+# ------
+# The drive is currently unused for critical state — see follow-ups in
+# docs/incidents/2026-08-26-usb-ssd-flap.md. Once it's physically
+# unplugged, this monitor is no longer useful and can be removed with:
+#   systemctl disable --now usb-flap-monitor.timer
+#   rm /etc/systemd/system/usb-flap-monitor.{service,timer}
 set -euo pipefail
 
 # Window to look back: 1 minute. systemd timer fires every minute so this

@@ -58,10 +58,16 @@ always fine.
 ## visor USB-flap monitor
 
 A systemd timer on visor (`usb-flap-monitor.timer`) runs every minute and
-calls `tusker_gateway/tools/usb-flap-monitor.sh`. On a USB disconnect/reconnect
-cycle the script writes an `ALERT usb-flap-detected ...` line to the journal;
-forward that to your alerting channel. Defined here so future operators don't
-move critical state onto the visor USB T5 again.
+calls `tusker_gateway/tools/usb-flap-monitor.sh`. On a USB disconnect /
+new-device / rejected-I/O event in the last 60s of dmesg the script writes
+an `ALERT usb-flap-detected ...` line to the journal; forward that to your
+alerting channel. This is now a **smoke detector** — the Samsung T5 attached
+to visor's USB bus is currently unused for critical state, but it was the
+root cause of the 2026-08-26 outage when it was bumped and flapped. The
+monitor lets us catch the next disturbance early. When the drive is
+physically unplugged (follow-up in
+`docs/incidents/2026-08-26-usb-ssd-flap.md`), the timer + script can be
+removed (`systemctl disable --now usb-flap-monitor.timer`).
 
 ## Memory
 
