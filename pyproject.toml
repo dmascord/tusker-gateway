@@ -15,6 +15,7 @@ semantic-cache = ["chromadb==1.5.9", "sentence-transformers==6.0.0"]
 [project.scripts]
 tusker-gateway = "tusker_gateway.__main__:main"
 tusker-gateway-auth = "tusker_gateway.cli:main"
+tusker-gateway-score-omp = "tusker_gateway.omp_scoring:main"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
