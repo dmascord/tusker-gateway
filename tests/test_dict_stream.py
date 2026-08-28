@@ -7,7 +7,7 @@ streaming chunks so clients (OMP) receive content via text deltas.
 from __future__ import annotations
 
 import json
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from .conftest import HEADERS_AUTH
@@ -72,6 +72,85 @@ async def test_streaming_dict_response_with_tool_calls(client):
     assert b'"function": {"name": "run_code"' in content
     assert b'"finish_reason": "tool_calls"' in content
     assert b"data: [DONE]" in content
+
+
+@pytest.mark.asyncio
+async def test_streaming_dict_response_missing_required_tool_args_falls_back(app, client):
+    """Codex-style complete responses must not send ``read {}`` to OMP."""
+    pool_manager = MagicMock()
+    pool_manager.select.side_effect = [
+        ("openai-codex", "gpt-5.6-luna-bad"),
+        ("openrouter", "tool-capable-fallback"),
+    ]
+    app["pool_manager"] = pool_manager
+
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "read",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
+        },
+    }]
+    invalid_response = {
+        "id": "chatcmpl-invalid-tool-args",
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call-invalid-tool-args",
+                    "type": "function",
+                    "function": {"name": "read", "arguments": ""},
+                }],
+            },
+            "finish_reason": "tool_calls",
+        }],
+    }
+    valid_response = {
+        "id": "chatcmpl-valid-tool-args",
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call-valid-tool-args",
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "arguments": '{"path":"/tmp"}',
+                    },
+                }],
+            },
+            "finish_reason": "tool_calls",
+        }],
+    }
+    with patch("tusker_gateway.endpoints.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
+        mock_chat.side_effect = [invalid_response, valid_response]
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-code",
+                "messages": [{"role": "user", "content": "read it"}],
+                "tools": tools,
+                "stream": True,
+            },
+            headers=HEADERS_AUTH,
+        )
+        content = await resp.read()
+
+    assert resp.status == 200
+    assert b'"name": "read"' in content
+    assert b'\\"path\\":\\"/tmp\\"' in content
+    assert mock_chat.call_count == 2
+    assert pool_manager.select.call_count == 2
 
 
 @pytest.mark.asyncio

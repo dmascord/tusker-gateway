@@ -472,6 +472,99 @@ async def test_chat_stream_reasoning_only_response_falls_back_before_client_resp
 
 
 @pytest.mark.asyncio
+async def test_chat_stream_rejects_empty_native_tool_args_and_accepts_fragments(app, client):
+    """An empty Codex-style call falls back, while valid fragments are assembled."""
+    pool_manager = MagicMock()
+    pool_manager.select.side_effect = [
+        ("openai-codex", "gpt-5.6-luna-empty-args"),
+        ("openrouter", "fragmented-tool-fallback"),
+    ]
+    app["pool_manager"] = pool_manager
+
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "read",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
+        },
+    }]
+
+    async def empty_args_stream(*args, **kwargs):
+        payload = {
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call-empty-args",
+                        "type": "function",
+                        "function": {"name": "read", "arguments": ""},
+                    }],
+                },
+                "finish_reason": "tool_calls",
+            }],
+        }
+        yield f"data: {json.dumps(payload)}\n\n".encode()
+
+    async def fragmented_stream(*args, **kwargs):
+        first = {
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call-fragmented",
+                        "type": "function",
+                        "function": {"name": "read", "arguments": ""},
+                    }],
+                },
+                "finish_reason": None,
+            }],
+        }
+        second = {
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "function": {"arguments": '{"path":"/tmp"}'},
+                    }],
+                },
+                "finish_reason": "tool_calls",
+            }],
+        }
+        yield f"data: {json.dumps(first)}\n\n".encode()
+        yield f"data: {json.dumps(second)}\n\n".encode()
+
+    with patch("tusker_gateway.endpoints.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
+        mock_chat.side_effect = [empty_args_stream(), fragmented_stream()]
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-code",
+                "messages": [{"role": "user", "content": "read it"}],
+                "tools": tools,
+                # OMP normally omits tool_choice; the schema still defines
+                # which arguments a structured call must contain.
+                "stream": True,
+            },
+            headers=HEADERS_AUTH,
+        )
+        content = await resp.read()
+
+    assert resp.status == 200
+    assert b"call-empty-args" not in content
+    assert b"call-fragmented" in content
+    assert b'\\"path\\":\\"/tmp\\"' in content
+    assert mock_chat.call_count == 2
+    assert pool_manager.select.call_count == 2
+
+
+@pytest.mark.asyncio
 async def test_chat_pool_input_image_requires_image_after_breaker_skip(app, client):
     pool_manager = MagicMock()
     pool_manager.select.side_effect = [

@@ -86,6 +86,35 @@ class MalformedToolCallError(ProviderError):
         self.marker_types = marker_types
 
 
+class InvalidToolCallArgumentsError(ProviderError):
+    """An upstream tool call did not satisfy the requested tool schema."""
+
+    def __init__(
+        self,
+        *,
+        tool_name: str,
+        reason: str,
+        missing: tuple[str, ...] = (),
+        argument_chars: int = 0,
+    ) -> None:
+        super().__init__(
+            "Provider emitted invalid tool-call arguments",
+            code="invalid_tool_call_arguments",
+        )
+        # Keep operational details bounded and free of argument values. Tool
+        # arguments can contain paths, prompts, credentials, or source code.
+        missing_text = ",".join(missing) or "none"
+        self.upstream_status = 502
+        self.upstream_body = (
+            f"invalid tool-call arguments: tool={tool_name}; reason={reason}; "
+            f"missing={missing_text}; argument_chars={max(0, argument_chars)}"
+        )
+        self.tool_name = tool_name
+        self.reason = reason
+        self.missing = missing
+        self.argument_chars = max(0, argument_chars)
+
+
 class RequiredToolCallError(ProviderError):
     """An upstream model ended without honoring ``tool_choice=required``."""
 

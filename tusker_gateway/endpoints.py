@@ -20,6 +20,7 @@ from tusker_gateway.circuit_breaker import CircuitBreaker, BreakerDecision
 from tusker_gateway.errors import (
     BadRequestError,
     GatewayError,
+    InvalidToolCallArgumentsError,
     MalformedToolCallError,
     ProviderCapacityError,
     RateLimitError,
@@ -1208,6 +1209,230 @@ def _stream_frame_signal(frame: bytes) -> tuple[bool, bool]:
     return False, False
 
 
+def _tool_required_arguments(tools: Any) -> dict[str, tuple[str, ...]]:
+    """Return top-level required argument names from OpenAI tool schemas."""
+    from tusker_gateway.tool_formats import normalize_tools
+
+    required: dict[str, tuple[str, ...]] = {}
+    for tool in normalize_tools(tools):
+        function = tool.get("function") or {}
+        name = str(function.get("name") or "").strip()
+        parameters = function.get("parameters")
+        if not name or not isinstance(parameters, dict):
+            continue
+        names = parameters.get("required")
+        if isinstance(names, list):
+            required[name] = tuple(
+                str(value).strip()
+                for value in names
+                if str(value).strip()
+            )
+    return required
+
+
+def _tool_argument_text(value: Any) -> str:
+    """Convert a tool argument fragment to text without exposing its value."""
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _tool_call_signature(calls: list[dict[str, Any]]) -> str:
+    """Return bounded tool name/argument-length diagnostics."""
+    signature: list[str] = []
+    for call in calls:
+        function = call.get("function") or {}
+        name = str(function.get("name") or "unknown")[:80]
+        args = _tool_argument_text(function.get("arguments"))
+        signature.append(f"{name}:{len(args)}")
+    return ",".join(signature) or "none"
+
+
+def _validate_tool_call_arguments(
+    calls: list[dict[str, Any]],
+    tools: Any,
+    *,
+    provider: str,
+    model: str,
+    request_id: str | None,
+) -> None:
+    """Reject tool calls that are not complete JSON objects or miss required keys."""
+    required_by_name = _tool_required_arguments(tools)
+    if not required_by_name and not calls:
+        return
+
+    for call in calls:
+        function = call.get("function") or {}
+        name = str(function.get("name") or "").strip()
+        argument_text = _tool_argument_text(function.get("arguments"))
+        argument_chars = len(argument_text)
+        try:
+            arguments = json.loads(argument_text or "{}")
+        except (TypeError, json.JSONDecodeError):
+            reason = "invalid_json"
+            missing: tuple[str, ...] = ()
+        else:
+            if not isinstance(arguments, dict):
+                reason = "arguments_not_object"
+                missing = ()
+            else:
+                missing = tuple(
+                    key for key in required_by_name.get(name, ())
+                    if key not in arguments
+                )
+                reason = "missing_required" if missing else ""
+
+        if not reason:
+            continue
+        logger.warning(
+            "invalid tool arguments rejected provider=%s model=%s request_id=%s "
+            "tool=%s reason=%s missing=%s argument_chars=%d calls=%s",
+            provider or "unknown",
+            model or "unknown",
+            request_id or "unknown",
+            name or "unknown",
+            reason,
+            ",".join(missing) or "none",
+            argument_chars,
+            _tool_call_signature(calls),
+        )
+        raise InvalidToolCallArgumentsError(
+            tool_name=name or "unknown",
+            reason=reason,
+            missing=missing,
+            argument_chars=argument_chars,
+        )
+
+
+def _assemble_stream_tool_calls(frames: list[bytes]) -> list[dict[str, Any]]:
+    """Assemble native streamed argument fragments into complete calls."""
+    assembled: dict[tuple[int, int], dict[str, Any]] = {}
+    order: list[tuple[int, int]] = []
+    for frame in frames:
+        stripped = frame.strip()
+        if not stripped.startswith(b"data: "):
+            continue
+        try:
+            obj = json.loads(stripped[len(b"data: "):])
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        choices = obj.get("choices")
+        if not isinstance(choices, list):
+            continue
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            choice_index = choice.get("index", 0)
+            try:
+                choice_index = int(choice_index)
+            except (TypeError, ValueError):
+                choice_index = 0
+            delta = choice.get("delta") or {}
+            if not isinstance(delta, dict):
+                continue
+            tool_calls = delta.get("tool_calls")
+            if not isinstance(tool_calls, list):
+                continue
+            for position, raw_call in enumerate(tool_calls):
+                if not isinstance(raw_call, dict):
+                    continue
+                raw_index = raw_call.get("index", position)
+                try:
+                    call_index = int(raw_index)
+                except (TypeError, ValueError):
+                    call_index = position
+                key = (choice_index, call_index)
+                if key not in assembled:
+                    assembled[key] = {
+                        "id": raw_call.get("id"),
+                        "type": raw_call.get("type", "function"),
+                        "function": {"name": "", "arguments": ""},
+                    }
+                    order.append(key)
+                current = assembled[key]
+                if raw_call.get("id") and not current.get("id"):
+                    current["id"] = raw_call["id"]
+                function = raw_call.get("function") or {}
+                if not isinstance(function, dict):
+                    continue
+                if function.get("name"):
+                    current["function"]["name"] = str(function["name"])
+                if "arguments" in function:
+                    current["function"]["arguments"] += _tool_argument_text(
+                        function.get("arguments")
+                    )
+    return [assembled[key] for key in order]
+
+
+def _response_tool_calls(response: dict[str, Any]) -> list[dict[str, Any]]:
+    """Extract complete tool calls from a normalized chat response."""
+    from tusker_gateway.tool_formats import normalize_tool_calls
+
+    calls: list[dict[str, Any]] = []
+    choices = response.get("choices")
+    if not isinstance(choices, list):
+        return calls
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        message = choice.get("message") or {}
+        if isinstance(message, dict):
+            calls.extend(normalize_tool_calls(message.get("tool_calls")))
+    return calls
+
+
+def _response_has_visible_content(response: dict[str, Any]) -> bool:
+    """Return whether a complete response contains client-visible text."""
+    choices = response.get("choices")
+    if not isinstance(choices, list):
+        return False
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        message = choice.get("message") or {}
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
+            return True
+    return False
+
+
+def _validate_complete_tool_response(
+    response: dict[str, Any],
+    tools: Any,
+    *,
+    provider: str,
+    model: str,
+    request_id: str | None,
+    require_tool_call: bool,
+    reject_empty: bool,
+) -> dict[str, Any]:
+    """Validate a complete provider response before it can reach the client."""
+    calls = _response_tool_calls(response)
+    if calls:
+        _validate_tool_call_arguments(
+            calls,
+            tools,
+            provider=provider,
+            model=model,
+            request_id=request_id,
+        )
+    if reject_empty and require_tool_call and not calls:
+        raise RequiredToolCallError()
+    if reject_empty and not calls and not _response_has_visible_content(response):
+        raise UnusableToolResponseError(
+            reason="reasoning_only_or_empty",
+            reasoning_chars=0,
+        )
+    return response
+
+
 async def _close_async_iterator(iterator: Any) -> None:
     """Close an async generator when stream preflight rejects a candidate."""
     close = getattr(iterator, "aclose", None)
@@ -1225,6 +1450,7 @@ async def _prepare_stream_result(
     model: str,
     request_id: str | None,
     tools_requested: bool,
+    tools: list[dict[str, Any]] | None = None,
     require_tool_call: bool = False,
 ) -> Any:
     """Preflight a tool stream before committing a client response.
@@ -1237,6 +1463,23 @@ async def _prepare_stream_result(
     committed, then replay the buffered stream so successful streams retain
     their output.
     """
+    if isinstance(result, dict) and tools:
+        from tusker_gateway.tool_formats import normalize_response_tool_calls
+
+        normalized = normalize_response_tool_calls(
+            result,
+            source=f"{provider}/{model}",
+        )
+        return _validate_complete_tool_response(
+            normalized,
+            tools,
+            provider=provider,
+            model=model,
+            request_id=request_id,
+            require_tool_call=require_tool_call,
+            reject_empty=tools_requested,
+        )
+
     if not tools_requested or not hasattr(result, "__aiter__"):
         return result
 
@@ -1264,6 +1507,15 @@ async def _prepare_stream_result(
     except Exception:
         await _close_async_iterator(normalized)
         raise
+    assembled_calls = _assemble_stream_tool_calls(buffered)
+    if assembled_calls:
+        _validate_tool_call_arguments(
+            assembled_calls,
+            tools,
+            provider=provider,
+            model=model,
+            request_id=request_id,
+        )
     preflight_decision = (
         "tool_call"
         if saw_tool_call
@@ -1272,13 +1524,15 @@ async def _prepare_stream_result(
         else "eof"
     )
     logger.info(
-        "tool stream preflight provider=%s model=%s request_id=%s decision=%s frames=%d bytes=%d",
+        "tool stream preflight provider=%s model=%s request_id=%s decision=%s "
+        "frames=%d bytes=%d calls=%s",
         provider,
         model,
         request_id or "unknown",
         preflight_decision,
         len(buffered),
         buffered_bytes,
+        _tool_call_signature(assembled_calls),
     )
     return _PreparedStream(_prepend_stream(buffered, normalized))
 
@@ -1510,7 +1764,12 @@ def _quarantine_tool_response_failure(
     """Temporarily exclude a model that emitted an unusable tool response."""
     if not isinstance(
         exc,
-        (MalformedToolCallError, RequiredToolCallError, UnusableToolResponseError),
+        (
+            InvalidToolCallArgumentsError,
+            MalformedToolCallError,
+            RequiredToolCallError,
+            UnusableToolResponseError,
+        ),
     ):
         return
     seconds = _tool_response_failure_cooldown_secs()
@@ -1651,6 +1910,7 @@ async def _call_with_pool_fallback(
                 model=model,
                 request_id=request_id,
                 tools_requested=bool(tools) and bool(body.get("stream")),
+                tools=tools,
                 require_tool_call=_tool_choice_requires_call(body.get("tool_choice")),
             )
             if breaker is not None:
@@ -1745,6 +2005,7 @@ async def _call_with_pool_fallback(
                 model=model,
                 request_id=request_id,
                 tools_requested=bool(tools) and bool(body.get("stream")),
+                tools=tools,
                 require_tool_call=_tool_choice_requires_call(body.get("tool_choice")),
             )
             if breaker is not None:
