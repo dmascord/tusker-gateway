@@ -368,6 +368,15 @@ def test_config_maps_manifest_provider_key_aliases():
     assert cfg["provider_api_keys"]["zai"] == "zai-key"
 
 
+def test_business_copilot_can_be_enabled_for_privacy_pool(monkeypatch):
+    """Business Copilot credentials may opt into the privacy provider policy."""
+    monkeypatch.setenv("TUSKER_COPILOT_BUSINESS", "true")
+    monkeypatch.delenv("PROVIDER_REGISTRY_JSON", raising=False)
+    cfg = load_config()
+
+    assert cfg["providers"]["github-copilot"].zdr_ok is True
+
+
 def test_config_keeps_empty_auto_free_pool_for_catalog_discovery(monkeypatch):
     """An auto-configured pool may start empty and wait for its catalog."""
     monkeypatch.setenv(

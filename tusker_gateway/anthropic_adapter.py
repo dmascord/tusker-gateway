@@ -281,6 +281,12 @@ async def _call_with_pool_fallback_anthropic(
             if request is not None
             else PoolManager(config)
         )
+        configured_fallbacks = pool_mgr.fallback_pools(pool_name)
+        if not isinstance(configured_fallbacks, (list, tuple)):
+            configured_fallbacks = ()
+        pool_names = [pool_name, *configured_fallbacks]
+        pool_index = 0
+        active_pool = pool_names[pool_index]
         while True:
             select_kwargs: dict[str, Any] = {
                 "excluded": set(excluded),
@@ -288,7 +294,7 @@ async def _call_with_pool_fallback_anthropic(
             }
             if requires_tools:
                 select_kwargs["requires_tools"] = True
-            selected = pool_mgr.select(pool_name, **select_kwargs)
+            selected = pool_mgr.select(active_pool, **select_kwargs)
             if breaker is not None and selected is not None:
                 while selected is not None:
                     decision = breaker.check(selected[0], selected[1])
@@ -301,8 +307,20 @@ async def _call_with_pool_fallback_anthropic(
                     }
                     if requires_tools:
                         select_kwargs["requires_tools"] = True
-                    selected = pool_mgr.select(pool_name, **select_kwargs)
+                    selected = pool_mgr.select(active_pool, **select_kwargs)
             if not selected:
+                if pool_index + 1 < len(pool_names):
+                    previous_pool = active_pool
+                    pool_index += 1
+                    active_pool = pool_names[pool_index]
+                    logger.warning(
+                        "anthropic pool exhausted requested_pool=%s exhausted_pool=%s "
+                        "fallback_pool=%s",
+                        pool_name,
+                        previous_pool,
+                        active_pool,
+                    )
+                    continue
                 if last_error is not None:
                     raise last_error
                 raise NoHealthyModelsError(pool=pool_name)

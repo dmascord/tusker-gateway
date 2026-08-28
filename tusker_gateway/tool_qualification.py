@@ -348,6 +348,18 @@ def _needs_probe(
         return True
     if record.probe_version != TOOL_CAPABILITY_PROBE_VERSION:
         return True
+    if record.level == ToolCapabilityLevel.UNAVAILABLE:
+        try:
+            retry_after = max(
+                60.0,
+                float(os.environ.get(
+                    "TUSKER_TOOL_QUALIFICATION_UNAVAILABLE_RETRY_SECS",
+                    "900",
+                )),
+            )
+        except (TypeError, ValueError):
+            retry_after = 900.0
+        return (time.time() - record.checked_at) >= retry_after
     return (time.time() - record.checked_at) >= max_age_secs
 
 

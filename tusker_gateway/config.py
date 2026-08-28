@@ -5,7 +5,7 @@ import json
 import os
 import secrets
 from typing import Any
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
 import logging
@@ -43,6 +43,7 @@ class PoolConfig:
         zdr: bool = False,
         provider_warmup_secs: int = 300,
         auto_free: bool = False,
+        fallback_pools: list[str] | tuple[str, ...] = (),
     ):
         self.name = name
         self.models = models
@@ -50,6 +51,15 @@ class PoolConfig:
         self.zdr = zdr
         self.provider_warmup_secs = provider_warmup_secs
         self.auto_free = auto_free
+        if isinstance(fallback_pools, str):
+            fallback_pools = tuple(fallback_pools.split(","))
+        elif not isinstance(fallback_pools, (list, tuple)):
+            fallback_pools = ()
+        self.fallback_pools = tuple(
+            str(pool).strip().lower().replace("_", "-")
+            for pool in fallback_pools
+            if str(pool).strip()
+        )
 
     def __repr__(self) -> str:
         return f"PoolConfig(name={self.name!r}, models={len(self.models)})"
@@ -227,31 +237,41 @@ def _load_providers() -> dict[str, ProviderConfig]:
 def _provider_registry_from_env() -> dict[str, ProviderConfig]:
     registry = dict(DEFAULT_PROVIDER_REGISTRY)
     raw = os.environ.get("PROVIDER_REGISTRY_JSON", "").strip()
-    if not raw:
-        return registry
-    try:
-        data = json.loads(raw)
-    except (TypeError, ValueError):
-        return registry
-    if not isinstance(data, dict):
-        return registry
-    for name, value in data.items():
-        if not isinstance(value, dict):
-            continue
-        merged = {
-            "name": str(name).lower(),
-            "kind": value.get("kind", value.get("auth_type", "bearer")),
-            "base_url": value["base_url"],
-            "chat_path": value.get("chat_path", "/v1/chat/completions"),
-            "auth_env": value.get("auth_env"),
-            "pool_env": value.get("pool_env"),
-            "model_header": value.get("model_header"),
-            "auth_type": value.get("auth_type", value.get("kind", "bearer")),
-            "zdr_ok": bool(value.get("zdr_ok", False)),
-            "heavyweight": bool(value.get("heavyweight", False)),
-            "models_path": value.get("models_path", value.get("catalog_path")),
-        }
-        registry[str(name).lower()] = ProviderConfig(**merged)
+    if raw:
+        try:
+            data = json.loads(raw)
+        except (TypeError, ValueError):
+            data = None
+        if isinstance(data, dict):
+            for name, value in data.items():
+                if not isinstance(value, dict):
+                    continue
+                merged = {
+                    "name": str(name).lower(),
+                    "kind": value.get("kind", value.get("auth_type", "bearer")),
+                    "base_url": value["base_url"],
+                    "chat_path": value.get("chat_path", "/v1/chat/completions"),
+                    "auth_env": value.get("auth_env"),
+                    "pool_env": value.get("pool_env"),
+                    "model_header": value.get("model_header"),
+                    "auth_type": value.get("auth_type", value.get("kind", "bearer")),
+                    "zdr_ok": bool(value.get("zdr_ok", False)),
+                    "heavyweight": bool(value.get("heavyweight", False)),
+                    "models_path": value.get("models_path", value.get("catalog_path")),
+                }
+                registry[str(name).lower()] = ProviderConfig(**merged)
+
+    # The deployment uses a Copilot Business account. Keep this opt-in
+    # explicit because the public Copilot endpoint can also be used by
+    # individual accounts with different data-handling terms.
+    business_copilot = os.environ.get("TUSKER_COPILOT_BUSINESS", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+    if business_copilot and "github-copilot" in registry:
+        registry["github-copilot"] = replace(
+            registry["github-copilot"],
+            zdr_ok=True,
+        )
     return registry
 
 
@@ -286,31 +306,37 @@ DEFAULT_PROVIDER_REGISTRY: dict[str, ProviderConfig] = {
 def _provider_registry_from_env() -> dict[str, ProviderConfig]:
     registry = dict(DEFAULT_PROVIDER_REGISTRY)
     raw = os.environ.get("PROVIDER_REGISTRY_JSON", "").strip()
-    if not raw:
-        return registry
-    try:
-        data = json.loads(raw)
-    except (TypeError, ValueError):
-        return registry
-    if not isinstance(data, dict):
-        return registry
-    for name, value in data.items():
-        if not isinstance(value, dict):
-            continue
-        merged = {
-            "name": str(name).lower(),
-            "kind": value.get("kind", value.get("auth_type", "bearer")),
-            "base_url": value["base_url"],
-            "chat_path": value.get("chat_path", "/v1/chat/completions"),
-            "auth_env": value.get("auth_env"),
-            "pool_env": value.get("pool_env"),
-            "model_header": value.get("model_header"),
-            "auth_type": value.get("auth_type", value.get("kind", "bearer")),
-            "zdr_ok": bool(value.get("zdr_ok", False)),
-            "heavyweight": bool(value.get("heavyweight", False)),
-            "models_path": value.get("models_path", value.get("catalog_path")),
-        }
-        registry[str(name).lower()] = ProviderConfig(**merged)
+    if raw:
+        try:
+            data = json.loads(raw)
+        except (TypeError, ValueError):
+            data = None
+        if isinstance(data, dict):
+            for name, value in data.items():
+                if not isinstance(value, dict):
+                    continue
+                merged = {
+                    "name": str(name).lower(),
+                    "kind": value.get("kind", value.get("auth_type", "bearer")),
+                    "base_url": value["base_url"],
+                    "chat_path": value.get("chat_path", "/v1/chat/completions"),
+                    "auth_env": value.get("auth_env"),
+                    "pool_env": value.get("pool_env"),
+                    "model_header": value.get("model_header"),
+                    "auth_type": value.get("auth_type", value.get("kind", "bearer")),
+                    "zdr_ok": bool(value.get("zdr_ok", False)),
+                    "heavyweight": bool(value.get("heavyweight", False)),
+                    "models_path": value.get("models_path", value.get("catalog_path")),
+                }
+                registry[str(name).lower()] = ProviderConfig(**merged)
+    business_copilot = os.environ.get("TUSKER_COPILOT_BUSINESS", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+    if business_copilot and "github-copilot" in registry:
+        registry["github-copilot"] = replace(
+            registry["github-copilot"],
+            zdr_ok=True,
+        )
     return registry
 
 def _load_pools() -> dict[str, PoolConfig]:
@@ -323,7 +349,8 @@ def _load_pools() -> dict[str, PoolConfig]:
             {"provider": "openai-codex", "model": "gpt-5.6-sol", "heavyweight": true}
         ],
         "context_window": 128000,
-        "zdr": false
+        "zdr": false,
+        "fallback_pools": ["premium", "swarm"]
     }
     """
     pools: dict[str, PoolConfig] = {}
@@ -347,6 +374,7 @@ def _load_pools() -> dict[str, PoolConfig]:
                 context_window=data.get("context_window", 128_000),
                 zdr=data.get("zdr", False),
                 auto_free=bool(data.get("auto_free", False)),
+                fallback_pools=data.get("fallback_pools", ()),
             )
         except (json.JSONDecodeError, TypeError):
             continue
@@ -358,12 +386,17 @@ def _load_pools() -> dict[str, PoolConfig]:
             models=[
                 # Mix of free/cheap models (kept) and heavyweight slugs (dropped
                 # automatically by the heavyweight gate in pools.py).
+                {"provider": "minimax", "model": "MiniMax-M3", "input_modalities": ["text"]},
+                {"provider": "minimax", "model": "MiniMax-M2.7-highspeed", "input_modalities": ["text"]},
+                {"provider": "synthetic", "model": "syn:large:text", "input_modalities": ["text"]},
+                {"provider": "synthetic", "model": "syn:large:vision", "input_modalities": ["text", "image"]},
                 {"provider": "github-copilot", "model": "gpt-5.5"},
                 {"provider": "github-copilot", "model": "claude-sonnet-4.6"},
                 {"provider": "openai-codex", "model": "gpt-5.6-luna"},
                 {"provider": "openai-codex", "model": "gpt-5.4-mini"},
                 {"provider": "openrouter", "model": "openai/gpt-oss-20b:free"},
             ],
+            fallback_pools=("premium", "swarm"),
         )
     if "privacy" not in pools:
         pools["privacy"] = PoolConfig(
@@ -380,6 +413,9 @@ def _load_pools() -> dict[str, PoolConfig]:
             models=[
                 {"provider": "openai-codex", "model": "gpt-5.6-sol"},
                 {"provider": "openai-codex", "model": "gpt-5.6-terra"},
+                {"provider": "synthetic", "model": "syn:large:text", "input_modalities": ["text"]},
+                {"provider": "synthetic", "model": "syn:large:vision", "input_modalities": ["text", "image"]},
+                {"provider": "minimax", "model": "MiniMax-M2.7-highspeed", "input_modalities": ["text"]},
             ],
         )
     if "swarm" not in pools:

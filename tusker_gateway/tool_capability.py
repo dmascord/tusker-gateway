@@ -63,10 +63,21 @@ class ToolCapability:
         """Whether the result is safe for a streaming tool-bearing request."""
         return self.probe_version == TOOL_CAPABILITY_PROBE_VERSION and self.level in QUALIFIED_TOOL_LEVELS
 
+    @property
+    def transient_for_tools(self) -> bool:
+        """Whether this result describes availability rather than behavior.
+
+        A provider quota, overload, or transport failure must not permanently
+        disqualify a model from the tool pool. The normal provider/model
+        cooldown still prevents an immediate retry.
+        """
+        return self.level == ToolCapabilityLevel.UNAVAILABLE
+
     def to_dict(self) -> dict[str, object]:
         data = asdict(self)
         data["level"] = self.level_name
         data["qualified_for_tools"] = self.qualified_for_tools
+        data["transient_for_tools"] = self.transient_for_tools
         return data
 
 
@@ -279,6 +290,7 @@ class ToolCapabilityDB:
             "probe_version": TOOL_CAPABILITY_PROBE_VERSION,
             "total_models": len(records),
             "qualified_models": sum(record.qualified_for_tools for record in records),
+            "transient_models": sum(record.transient_for_tools for record in records),
             "levels": levels,
         }
 

@@ -111,6 +111,27 @@ def test_cooldown_tracker():
     assert tracker.is_cooldown("p1", "other")
 
 
+def test_pool_fallbacks_are_explicit_and_ignore_unknown_or_self_references():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = PoolManager({
+            "pools": {
+                "code": PoolConfig(
+                    name="code",
+                    models=[{"provider": "openai-codex", "model": "code-model"}],
+                    fallback_pools=["premium", "missing", "code"],
+                ),
+                "premium": PoolConfig(
+                    name="premium",
+                    models=[{"provider": "openai-codex", "model": "premium-model"}],
+                ),
+            },
+            "quality_db_path": os.path.join(tmpdir, "quality.db"),
+            "excluded_providers": [],
+        })
+
+        assert manager.fallback_pools("code") == ("premium",)
+
+
 class _CatalogEntry:
     def __init__(
         self,

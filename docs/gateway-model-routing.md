@@ -9,7 +9,7 @@ The gateway has four pools, each with a different tier of models:
 
 | Pool | Tier | Heavyweight allowed? | ZDR enforced? |
 |---|---|---|---|
-| `code` | Cheap (free / OpenRouter free tier / opencode-zen free) | No (dropped) | No |
+| `code` | Cheap baseline with explicitly configured paid fallbacks | No (dropped) | No |
 | `privacy` | ZDR-safe cheap tier | No (dropped) | Yes |
 | `premium` | Paid tier | Yes (kept) | No |
 | `swarm` | Local / self-hosted | Yes (kept) | No |
@@ -68,6 +68,13 @@ For each request to `hermes-code`/`hermes-privacy`/etc:
    use an adaptive floor (median - 20.0 clamped to 20.0).
 4. **Pick the top-ranked candidate** and remember it for the session.
 
+If a pool has `fallback_pools` configured, the same request requirements are
+applied to each fallback pool after the current pool has no eligible
+candidates. This is explicit in configuration so `hermes-code` can fall back
+to paid or self-hosted capacity without changing the privacy pool's routing
+policy. The gateway still returns a retryable 503 when every configured pool
+is unavailable; no routing policy can bypass an upstream quota or outage.
+
 ## Dynamic catalog refresh
 
 The gateway pulls live model catalogs from upstream providers at runtime to
@@ -112,7 +119,14 @@ The privacy pool applies the provider policy before catalog pricing. The
 default registry currently allows local `local-llm`, Ollama Cloud, OpenCode
 Go, OpenAI Codex, and GitHub Copilot Enterprise. Public GitHub Copilot,
 OpenRouter, NVIDIA trial endpoints, and other direct providers remain outside
-the privacy pool.
+the privacy pool unless an explicit deployment policy enables them.
+
+The deployment sets `TUSKER_COPILOT_BUSINESS=true` because its public Copilot
+credentials belong to a Copilot Business account. That opt-in marks the public
+Copilot route privacy-eligible as well; individual-account deployments should
+leave it unset. GitHub documents that Copilot Business and Enterprise customer
+data is not used to train AI models, but this gateway policy does not remove
+GitHub's service-side processing or content-filtering behavior.
 
 GitHub Copilot Enterprise entries added from the live catalog are marked
 `auto_discovered`; they must pass behavioral tool qualification before a
@@ -144,6 +158,13 @@ pass 2: stealth/ox-alpha is now paid
 The original static config (from the operator's `TUSKER_POOL_*` JSON) is
 frozen at `PoolManager.__post_init__` time so this pruning can never touch
 operator-curated entries.
+
+The deployment's static `hermes-code` baseline includes MiniMax M-series text
+aliases plus Synthetic `syn:large:text`, `syn:small:text`,
+`syn:large:vision`, and `syn:small:vision`. MiniMax Token Plan M-series
+models are text-only, so they are not candidates for image-bearing requests;
+the Synthetic vision aliases and Xiaomi `mimo-v2.5` provide multimodal
+capacity.
 
 
 ## Migration history

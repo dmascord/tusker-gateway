@@ -14,6 +14,7 @@ from tusker_gateway.tool_qualification import (
     PROBE_PATH,
     PROBE_TOOL_NAME,
     _classify_http_failure,
+    _needs_probe,
     _result_from_stream,
 )
 
@@ -119,6 +120,69 @@ def test_failed_probe_keeps_auto_discovered_model_out_of_tool_pool(tmp_path):
     )
 
     assert manager.select("code", requires_tools=True) is None
+
+
+def test_unavailable_probe_does_not_permanently_block_curated_model(tmp_path):
+    """Provider quota/transport failures must recover after cooldown."""
+    manager = PoolManager(
+        {
+            "pools": {
+                "code": PoolConfig(
+                    name="code",
+                    models=[{"provider": "openrouter", "model": "curated-model"}],
+                ),
+            },
+            "quality_db_path": os.path.join(tmp_path, "quality.db"),
+            "tool_capability_db_path": os.path.join(tmp_path, "capability.db"),
+            "excluded_providers": [],
+            "provider_api_keys": {"openrouter": "test-key"},
+        }
+    )
+    manager._tool_capabilities.record(
+        provider="openrouter",
+        model="curated-model",
+        level=ToolCapabilityLevel.UNAVAILABLE,
+        status="unavailable",
+        http_status=429,
+        failure_class="rate_limited",
+    )
+
+    assert manager.select("code", requires_tools=True) == (
+        "openrouter",
+        "curated-model",
+    )
+
+
+def test_unavailable_probe_keeps_auto_discovered_model_held_back(tmp_path):
+    """An auto-discovered model still needs a successful qualification."""
+    manager = _manager(str(tmp_path))
+    manager.catalog_registry = _Registry()
+    manager.extend_pools_with_free_catalog()
+    manager._tool_capabilities.record(
+        provider="openrouter",
+        model="new-model:free",
+        level=ToolCapabilityLevel.UNAVAILABLE,
+        status="unavailable",
+        http_status=502,
+        failure_class="upstream_error",
+    )
+
+    assert manager.select("code", requires_tools=True) is None
+
+
+def test_unavailable_probe_is_retried_before_normal_probe_ttl(monkeypatch, tmp_path):
+    db = ToolCapabilityDB(str(tmp_path / "capability.db"))
+    monkeypatch.setattr("tusker_gateway.tool_qualification.time.time", lambda: 1_000.0)
+    record = db.record(
+        provider="openrouter",
+        model="temporarily-down",
+        level=ToolCapabilityLevel.UNAVAILABLE,
+        status="unavailable",
+        failure_class="rate_limited",
+        checked_at=0.0,
+    )
+
+    assert _needs_probe(record, force=False, max_age_secs=86_400.0) is True
 
 
 def test_strict_probe_result_requires_exact_tool_contract():

@@ -101,6 +101,33 @@ async def test_empty_pool_selection_is_retryable_and_includes_retry_after(app, c
 
 
 @pytest.mark.asyncio
+async def test_code_pool_uses_configured_fallback_pool_when_exhausted(app, client):
+    pool_manager = MagicMock()
+    pool_manager.fallback_pools.return_value = ("premium",)
+    pool_manager.select.side_effect = [None, ("openai-codex", "premium-model")]
+    app["pool_manager"] = pool_manager
+
+    with patch("tusker_gateway.endpoints.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
+        mock_chat.return_value = {
+            "choices": [{"message": {"role": "assistant", "content": "fallback"}}],
+        }
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-code",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            headers=HEADERS_AUTH,
+        )
+
+    assert resp.status == 200
+    assert pool_manager.select.call_args_list == [
+        call("code", excluded=set(), required_input_modalities=None),
+        call("premium", excluded=set(), required_input_modalities=None),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_chat_pool_requires_tool_capability_and_forwards_tool_choice(app, client):
     pool_manager = MagicMock()
     pool_manager.select.return_value = ("openrouter", "tool-model")

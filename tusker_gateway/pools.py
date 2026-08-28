@@ -19,6 +19,7 @@ from tusker_gateway.heavyweight import is_heavyweight
 from tusker_gateway.quality import QualityDB
 from tusker_gateway.tool_capability import (
     ToolCapabilityDB,
+    ToolCapabilityLevel,
     default_tool_capability_db_path,
 )
 
@@ -278,6 +279,22 @@ class PoolManager:
         """
         return pool_name in PREMIUM_POOLS
 
+    def fallback_pools(self, pool_name: str) -> tuple[str, ...]:
+        """Return configured, existing pools to try after ``pool_name``.
+
+        Fallbacks are an explicit pool-level policy so a cheap alias does not
+        silently become a paid route. Unknown names and self-references are
+        ignored at selection time.
+        """
+        pool = self.pools.get(pool_name)
+        if pool is None:
+            return ()
+        return tuple(
+            fallback
+            for fallback in getattr(pool, "fallback_pools", ())
+            if fallback in self.pools and fallback != pool_name
+        )
+
     def static_allowlist(self, pool_name: str) -> set[tuple[str, str]]:
         """Return the set of (provider, model) pairs explicitly listed in
         the static pool config for ``pool_name``.
@@ -532,8 +549,9 @@ class PoolManager:
         Operator-curated static entries remain compatible with the historical
         fail-open behavior when they have never been probed. Newly discovered
         catalog entries are held back until the qualification runner records a
-        passing streaming tool contract. Any explicit failed qualification is
-        excluded for both static and dynamic entries.
+        passing streaming tool contract. Explicit behavioral failures remain
+        excluded, while transient availability results are retried after their
+        provider/model cooldown instead of becoming permanent exclusions.
         """
         mode = os.environ.get("TUSKER_TOOL_CAPABILITY_GATE", "auto").strip().lower()
         if mode in {"0", "false", "no", "off", "disabled"}:
@@ -542,7 +560,15 @@ class PoolManager:
             return not spec.auto_discovered or mode != "strict"
         result = self._tool_capabilities.get(spec.provider, spec.model)
         if result is not None:
-            return result.qualified_for_tools
+            if result.qualified_for_tools:
+                return True
+            # Strict mode intentionally requires a fresh passing qualification
+            # for every model. Auto mode may retry an operator-curated model
+            # after an unavailable probe; catalog-discovered models stay held
+            # until they pass so an outage cannot turn into tool-call leakage.
+            if result.level == ToolCapabilityLevel.UNAVAILABLE:
+                return mode != "strict" and not spec.auto_discovered
+            return False
         if mode == "strict":
             return False
         return not spec.auto_discovered

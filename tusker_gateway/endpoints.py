@@ -1945,15 +1945,23 @@ async def _call_with_pool_fallback(
         pool_mgr = request.app.get("pool_manager") or PoolManager(config)
     else:
         pool_mgr = PoolManager(config)
+    configured_fallbacks = pool_mgr.fallback_pools(pool_name)
+    if not isinstance(configured_fallbacks, (list, tuple)):
+        configured_fallbacks = ()
+    pool_names = [pool_name, *configured_fallbacks]
+    pool_index = 0
+    active_pool = pool_names[pool_index]
     pending_selection = initial_selection
     attempts = 0
     max_attempts = _max_pool_provider_attempts()
     while True:
         if attempts >= max_attempts:
             logger.warning(
-                "pool fallback attempt limit reached rid=%s pool=%s attempts=%d last_error=%s",
+                "pool fallback attempt limit reached rid=%s requested_pool=%s active_pool=%s "
+                "attempts=%d last_error=%s",
                 request_id or "unknown",
                 pool_name,
+                active_pool,
                 attempts,
                 _pool_failure_summary(last_error) if last_error is not None else "none",
             )
@@ -1972,8 +1980,21 @@ async def _call_with_pool_fallback(
             }
             if requires_tools:
                 select_kwargs["requires_tools"] = True
-            selected = pool_mgr.select(pool_name, **select_kwargs)
+            selected = pool_mgr.select(active_pool, **select_kwargs)
         if not selected:
+            if pool_index + 1 < len(pool_names):
+                previous_pool = active_pool
+                pool_index += 1
+                active_pool = pool_names[pool_index]
+                logger.warning(
+                    "pool exhausted rid=%s requested_pool=%s exhausted_pool=%s "
+                    "fallback_pool=%s",
+                    request_id or "unknown",
+                    pool_name,
+                    previous_pool,
+                    active_pool,
+                )
+                continue
             if last_error is not None:
                 raise last_error
             raise NoHealthyModelsError(pool=pool_name)
@@ -1983,9 +2004,11 @@ async def _call_with_pool_fallback(
         provider, model = selected
         attempts += 1
         logger.info(
-            "pool fallback attempt rid=%s pool=%s candidate=%s/%s attempt=%d/%d",
+            "pool fallback attempt rid=%s requested_pool=%s active_pool=%s "
+            "candidate=%s/%s attempt=%d/%d",
             request_id or "unknown",
             pool_name,
+            active_pool,
             provider,
             model,
             attempts,
@@ -2023,9 +2046,11 @@ async def _call_with_pool_fallback(
             last_error = exc
             excluded.add(selected)
             logger.warning(
-                "pool candidate failed rid=%s pool=%s candidate=%s/%s attempt=%d/%d status=%s body=%s",
+                "pool candidate failed rid=%s requested_pool=%s active_pool=%s "
+                "candidate=%s/%s attempt=%d/%d status=%s body=%s",
                 request_id or "unknown",
                 pool_name,
+                active_pool,
                 provider,
                 model,
                 attempts,
@@ -2045,9 +2070,11 @@ async def _call_with_pool_fallback(
             last_error = exc
             excluded.add(selected)
             logger.warning(
-                "pool candidate failed rid=%s pool=%s candidate=%s/%s attempt=%d/%d status=%s body=%s",
+                "pool candidate failed rid=%s requested_pool=%s active_pool=%s "
+                "candidate=%s/%s attempt=%d/%d status=%s body=%s",
                 request_id or "unknown",
                 pool_name,
+                active_pool,
                 provider,
                 model,
                 attempts,
