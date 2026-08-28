@@ -22,6 +22,7 @@ from tusker_gateway.errors import (
     GatewayError,
     InvalidToolCallArgumentsError,
     MalformedToolCallError,
+    NoHealthyModelsError,
     ProviderCapacityError,
     RateLimitError,
     RequiredToolCallError,
@@ -1958,7 +1959,7 @@ async def _call_with_pool_fallback(
             )
             if last_error is not None:
                 raise last_error
-            raise BadRequestError("No healthy models in pool", code="no_healthy_models")
+            raise NoHealthyModelsError(pool=pool_name)
         # A semantic-cache lookup resolves a concrete candidate first so the
         # cached response cannot be returned for a different provider/model.
         if pending_selection is not None:
@@ -1975,7 +1976,7 @@ async def _call_with_pool_fallback(
         if not selected:
             if last_error is not None:
                 raise last_error
-            raise BadRequestError("No healthy models in pool", code="no_healthy_models")
+            raise NoHealthyModelsError(pool=pool_name)
         if breaker is not None and not breaker.check(selected[0], selected[1]).allowed:
             excluded.add(selected)
             continue
@@ -2244,7 +2245,7 @@ def _route_target(config: dict[str, Any], body: dict[str, Any]) -> tuple[str, st
             required_input_modalities=_required_input_modalities(body.get("messages")),
         )
         if not selected:
-            raise BadRequestError("No healthy models in pool", code="no_healthy_models")
+            raise NoHealthyModelsError(pool=route.pool_name or "code")
         return selected
     if route.kind == "passthrough" and route.provider and route.model:
         return route.provider, route.model
@@ -2757,7 +2758,11 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
         except BadRequestError as exc:
             status = exc.code or "bad_request"
             _emit(status)
-            return web.json_response(openai_error(exc.message, code=exc.code, error_type=exc.error_type), status=exc.status)
+            return web.json_response(
+                openai_error(exc.message, code=exc.code, error_type=exc.error_type),
+                status=exc.status,
+                headers=getattr(exc, "headers", None),
+            )
         except Exception as exc:
             logger.warning(
                 'chat request failed rid=%s summary=%s',
@@ -2803,7 +2808,11 @@ async def responses_handler(request: web.Request) -> web.Response | web.StreamRe
         resp_obj = {"id": f"resp_{uuid.uuid4().hex}", "object": "response", "created_at": int(time.time()), "model": body.get("model") or config["model_name"], "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]}], "status": "completed"}
         return web.json_response(resp_obj)
     except BadRequestError as exc:
-        return web.json_response(openai_error(exc.message, code=exc.code, error_type=exc.error_type), status=exc.status)
+        return web.json_response(
+            openai_error(exc.message, code=exc.code, error_type=exc.error_type),
+            status=exc.status,
+            headers=getattr(exc, "headers", None),
+        )
     except Exception as exc:
         logger.warning(
             "responses request failed summary=%s",

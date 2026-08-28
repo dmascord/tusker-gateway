@@ -72,6 +72,35 @@ async def test_chat_completions_pool_dispatch(client):
 
 
 @pytest.mark.asyncio
+async def test_empty_pool_selection_is_retryable_and_includes_retry_after(app, client, monkeypatch):
+    """Transient pool exhaustion must be a retryable service response."""
+    pool_manager = MagicMock()
+    pool_manager.select.return_value = None
+    app["pool_manager"] = pool_manager
+    monkeypatch.setenv("TUSKER_PROVIDER_RETRY_AFTER_SECS", "7")
+
+    with patch("tusker_gateway.endpoints.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-code",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            headers=HEADERS_AUTH,
+        )
+        data = await resp.json()
+
+    assert resp.status == 503
+    assert resp.headers["Retry-After"] == "7"
+    assert data["error"] == {
+        "type": "server_error",
+        "message": "No healthy upstream model is currently available; retry shortly.",
+        "code": "no_healthy_models",
+    }
+    mock_chat.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_chat_pool_requires_tool_capability_and_forwards_tool_choice(app, client):
     pool_manager = MagicMock()
     pool_manager.select.return_value = ("openrouter", "tool-model")

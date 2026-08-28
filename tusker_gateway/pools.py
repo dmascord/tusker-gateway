@@ -544,6 +544,7 @@ class PoolManager:
         required_modalities = frozenset(required_input_modalities or ())
         specs = self.models.get(pool_name, [])
         if not specs:
+            logger.warning("pool '%s' has no configured candidates", pool_name)
             return None
         capability_cache: dict[
             tuple[str, str], tuple[frozenset[str] | None, bool | None]
@@ -597,35 +598,60 @@ class PoolManager:
         filtered_tool_models: list[str] = []
         filtered_tool_capability_models: list[str] = []
         filtered_modality_models: list[str] = []
+        filtered_cooldown_models: list[str] = []
+        filter_counts = {
+            "request_excluded": 0,
+            "unregistered_provider": 0,
+            "special_purpose": 0,
+            "context_window": 0,
+            "heavyweight": 0,
+            "input_modalities": 0,
+            "advertised_tools": 0,
+            "behavioral_tools": 0,
+            "cooldown": 0,
+            "zdr_provider": 0,
+        }
         for s in specs:
             if (s.provider, s.model) in excluded:
+                filter_counts["request_excluded"] += 1
                 continue
             # Skip providers that are not in the registry — avoids ProviderError cascade
             if s.provider not in self._providers:
+                filter_counts["unregistered_provider"] += 1
                 continue
             if not is_general_chat_model(s.provider, s.model):
+                filter_counts["special_purpose"] += 1
                 filtered_special_models.append(f"{s.provider}/{s.model}")
                 continue
             if context_tokens > 0 and s.context_window < context_tokens:
+                filter_counts["context_window"] += 1
                 continue
             if not heavyweight_ok and s.heavyweight:
+                filter_counts["heavyweight"] += 1
                 continue
             modalities, tool_support = self._model_capabilities(s, capability_cache)
             if modalities is not None and not required_modalities.issubset(modalities):
+                filter_counts["input_modalities"] += 1
                 filtered_modality_models.append(f"{s.provider}/{s.model}")
                 continue
             if requires_tools and tool_support is False:
+                filter_counts["advertised_tools"] += 1
                 filtered_tool_models.append(f"{s.provider}/{s.model}")
                 continue
             if requires_tools and not self._tool_capability_allowed(s):
+                filter_counts["behavioral_tools"] += 1
                 filtered_tool_capability_models.append(f"{s.provider}/{s.model}")
                 continue
             if self._cooldowns.is_cooldown(s.provider, s.model):
+                filter_counts["cooldown"] += 1
+                if len(filtered_cooldown_models) < 12:
+                    filtered_cooldown_models.append(f"{s.provider}/{s.model}")
                 continue
             # ZDR: exclude providers in exclusion list
             pool_config = self.pools.get(pool_name)
             if pool_config and pool_config.zdr:
                 if s.provider in self.config.get("excluded_providers", []):
+                    filter_counts["zdr_provider"] += 1
                     continue
             candidates.append(s)
 
@@ -660,6 +686,22 @@ class PoolManager:
             )
 
         if not candidates:
+            filters = ",".join(
+                f"{name}={count}"
+                for name, count in filter_counts.items()
+                if count
+            ) or "none"
+            logger.warning(
+                "pool '%s' has no eligible candidates configured=%d requires_tools=%s "
+                "input_modalities=%s context_tokens=%d filters=%s cooldown_models=%s",
+                pool_name,
+                len(specs),
+                requires_tools,
+                "+".join(sorted(required_modalities)) or "none",
+                context_tokens,
+                filters,
+                ",".join(filtered_cooldown_models) or "none",
+            )
             return None
 
         # 3. Rank by quality and pick top

@@ -739,3 +739,35 @@ async def test_messages_provider_error(client):
         assert data["type"] == "error"
         assert data["error"]["type"] == "api_error"
         assert "upstream timeout" in data["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_messages_empty_pool_selection_is_retryable(app, client, monkeypatch):
+    """Anthropic clients receive the same retryable pool-exhaustion signal."""
+    pool_manager = MagicMock()
+    pool_manager.select.return_value = None
+    app["pool_manager"] = pool_manager
+    monkeypatch.setenv("TUSKER_PROVIDER_RETRY_AFTER_SECS", "6")
+
+    with patch("tusker_gateway.anthropic_adapter.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
+        resp = await client.post(
+            "/v1/messages",
+            json={
+                "model": "hermes-code",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "Hi"}],
+            },
+            headers=HEADERS_AUTH,
+        )
+        data = await resp.json()
+
+    assert resp.status == 503
+    assert resp.headers["Retry-After"] == "6"
+    assert data == {
+        "type": "error",
+        "error": {
+            "type": "server_error",
+            "message": "No healthy upstream model is currently available; retry shortly.",
+        },
+    }
+    mock_chat.assert_not_called()

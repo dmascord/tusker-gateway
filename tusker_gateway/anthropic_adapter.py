@@ -30,7 +30,7 @@ from aiohttp import web
 from tusker_gateway import translators
 from tusker_gateway.budget import BudgetTracker
 from tusker_gateway.circuit_breaker import CircuitBreaker, BreakerDecision
-from tusker_gateway.errors import BadRequestError
+from tusker_gateway.errors import BadRequestError, NoHealthyModelsError
 from tusker_gateway.endpoints import _normalize_stream, _required_input_modalities
 from tusker_gateway.metrics import MetricsRegistry
 from tusker_gateway.passthrough import PassthroughClient
@@ -305,7 +305,7 @@ async def _call_with_pool_fallback_anthropic(
             if not selected:
                 if last_error is not None:
                     raise last_error
-                raise BadRequestError("No healthy models in pool", code="no_healthy_models")
+                raise NoHealthyModelsError(pool=pool_name)
             prov, mdl = selected
             try:
                 result = await client.chat(prov, mdl, body["messages"],
@@ -541,6 +541,7 @@ async def anthropic_messages_handler(request: web.Request) -> web.Response | web
             return web.json_response(
                 _anthropic_error(exc.message, type=exc.error_type),
                 status=exc.status,
+                headers=getattr(exc, "headers", None),
             )
         except Exception as exc:
             logger.warning("anthropic request failed: %s", exc)

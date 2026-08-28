@@ -1,6 +1,7 @@
 """Error types and OpenAI-compatible error responses."""
 from __future__ import annotations
 
+import os
 from typing import Any
 
 
@@ -27,6 +28,34 @@ class AuthenticationError(GatewayError):
 class BadRequestError(GatewayError):
     status = 400
     error_type = "invalid_request_error"
+
+
+class NoHealthyModelsError(BadRequestError):
+    """A pool has no currently eligible upstream candidate.
+
+    This is usually a transient availability condition caused by provider or
+    model cooldowns, request capabilities, or breaker state. Keep it as a
+    ``BadRequestError`` subclass so existing handler plumbing catches it, but
+    report it as a retryable service condition rather than a client error.
+    """
+
+    status = 503
+    error_type = "server_error"
+
+    def __init__(self, *, pool: str | None = None) -> None:
+        super().__init__(
+            "No healthy upstream model is currently available; retry shortly.",
+            code="no_healthy_models",
+        )
+        self.pool = pool
+        try:
+            retry_after = max(
+                1,
+                int(float(os.environ.get("TUSKER_PROVIDER_RETRY_AFTER_SECS", "5"))),
+            )
+        except (TypeError, ValueError):
+            retry_after = 5
+        self.headers = {"Retry-After": str(retry_after)}
 
 
 class NotFoundError(GatewayError):
