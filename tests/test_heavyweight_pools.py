@@ -126,6 +126,23 @@ def test_privacy_pool_drops_heavyweights():
     assert selected == ("openai-codex", "gpt-5.6-luna")
 
 
+def test_privacy_pool_drops_provider_without_zdr_policy():
+    """Privacy routing must not use a provider merely because it is keyed."""
+    pm = _make_pool_manager("privacy", [
+        {"provider": "github-copilot", "model": "gpt-5.6-luna"},
+        {"provider": "github-copilot-enterprise", "model": "gpt-5-mini"},
+    ], zdr=True)
+    selected = pm.select("privacy")
+    assert selected == ("github-copilot-enterprise", "gpt-5-mini")
+
+
+def test_privacy_pool_keeps_provider_with_zdr_policy():
+    pm = _make_pool_manager("privacy", [
+        {"provider": "github-copilot-enterprise", "model": "gpt-5-mini"},
+    ], zdr=True)
+    assert pm.models["privacy"][0].zdr_ok is True
+
+
 def test_premium_pool_keeps_heavyweights():
     """Premium pool = paid tier. Heavy slugs ARE allowed."""
     cfg = {

@@ -267,13 +267,19 @@ DEFAULT_PROVIDER_REGISTRY: dict[str, ProviderConfig] = {
     "cohere": ProviderConfig("cohere", "bearer", "https://api.cohere.com/compatibility", "/v1/chat/completions", auth_env="COHERE_API_KEY", models_path="https://api.cohere.com/v1/models?page_size=1000"),
     "minimax": ProviderConfig("minimax", "bearer", "https://api.minimax.io", "/v1/chat/completions", auth_env="MINIMAX_API_KEY", models_path="/v1/models"),
     "synthetic": ProviderConfig("synthetic", "bearer", "https://api.synthetic.new", "/v1/chat/completions", auth_env="SYNTHETIC_API_KEY", models_path="/v1/models"),
-    "ollama-cloud": ProviderConfig("ollama-cloud", "bearer", "https://ollama.com", "/v1/chat/completions", auth_env="OLLAMA_API_KEY", models_path="/v1/models"),
+    # Ollama states that cloud prompts/completions are transient, not logged,
+    # and not used for training. Local-llm is private by locality; both are
+    # therefore eligible for the privacy pool when explicitly configured.
+    "ollama-cloud": ProviderConfig("ollama-cloud", "bearer", "https://ollama.com", "/v1/chat/completions", auth_env="OLLAMA_API_KEY", models_path="/v1/models", zdr_ok=True),
     "opencode-go": ProviderConfig("opencode-go", "bearer", "https://opencode.ai/zen/go/v1", "/chat/completions", auth_env="OPENCODE_GO_API_KEY", zdr_ok=True),
     "opencode-zen": ProviderConfig("opencode-zen", "bearer", "https://opencode.ai/zen", "/v1/chat/completions", auth_env="OPENCODE_ZEN_API_KEY"),
     "openai-codex": ProviderConfig("openai-codex", "codex", "https://chatgpt.com/backend-api/codex", "/responses", pool_env="opencode_codex_credentials", auth_type="codex", model_header="x-openai-gpt-model", zdr_ok=True),
     "github-copilot": ProviderConfig("github-copilot", "oauth", "https://api.githubcopilot.com", "/chat/completions", pool_env="GITHUB_COPILOT_CREDENTIALS", auth_type="oauth", model_header="x-github-gpt-model"),
-    "github-copilot-enterprise": ProviderConfig("github-copilot-enterprise", "oauth", "https://copilot-api.sita.ghe.com", "/chat/completions", pool_env="GITHUB_COPILOT_ENTERPRISE_CREDENTIALS", auth_type="oauth", model_header="x-github-gpt-model"),
-    "local-llm": ProviderConfig("local-llm", "local", "http://localhost:11434", "/v1/chat/completions", models_path="/api/tags"),
+    # This is deliberately separate from public Copilot. Enterprise/business
+    # Copilot has provider no-training/ZDR commitments; public individual
+    # plans do not provide the same privacy boundary.
+    "github-copilot-enterprise": ProviderConfig("github-copilot-enterprise", "oauth", "https://copilot-api.sita.ghe.com", "/chat/completions", pool_env="GITHUB_COPILOT_ENTERPRISE_CREDENTIALS", auth_type="oauth", model_header="x-github-gpt-model", zdr_ok=True),
+    "local-llm": ProviderConfig("local-llm", "local", "http://localhost:11434", "/v1/chat/completions", models_path="/api/tags", zdr_ok=True),
     "nvidia": ProviderConfig("nvidia", "bearer", "https://integrate.api.nvidia.com", "/v1/chat/completions", auth_env="NVIDIA_API_KEY", models_path="/v1/models"),
 }
 

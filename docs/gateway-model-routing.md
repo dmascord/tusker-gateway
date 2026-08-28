@@ -60,6 +60,7 @@ For each request to `hermes-code`/`hermes-privacy`/etc:
    - Provider not in registry (skip — avoids ProviderError cascade)
    - Context window too small for the request
    - **Heavyweight filter** (cheap-tier pools drop heavyweight entries)
+   - **Privacy provider policy** (`zdr_ok`) for the privacy pool
    - Cooldown active for this (provider, model)
    - Required input modalities (for example, image requests skip known text-only models)
    - ZDR + EXCLUDED_PROVIDERS env var (privacy pool only)
@@ -106,6 +107,17 @@ free into the pool's allowlist. Discovery differs per upstream:
 | `opencode-go` | All entries returned by `/zen/go/v1/models` (same key-filter) |
 | `xiaomi` | Authenticated Token Plan catalog; proven chat models only, cheap non-ZDR pools only, heavyweight entries excluded |
 | provider-native catalogs | Both catalog/model.dev prices must resolve to exactly zero; unpriced or paid models stay out of free pools |
+
+The privacy pool applies the provider policy before catalog pricing. The
+default registry currently allows local `local-llm`, Ollama Cloud, OpenCode
+Go, OpenAI Codex, and GitHub Copilot Enterprise. Public GitHub Copilot,
+OpenRouter, NVIDIA trial endpoints, and other direct providers remain outside
+the privacy pool.
+
+GitHub Copilot Enterprise entries added from the live catalog are marked
+`auto_discovered`; they must pass behavioral tool qualification before a
+tool-bearing request can use them. This keeps catalog metadata from
+reintroducing malformed or empty tool calls.
 
 Xiaomi's catalog does not publish modality metadata. The gateway enriches the
 verified current models: `mimo-v2.5` accepts text and image input;

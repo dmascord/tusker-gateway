@@ -130,7 +130,13 @@ class ModelSpec:
     auto_discovered: bool = False
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any], default_window: int = 128_000, zdr: bool = False) -> "ModelSpec":
+    def from_dict(
+        cls,
+        data: dict[str, Any],
+        default_window: int = 128_000,
+        zdr: bool = False,
+        provider_zdr_ok: bool | None = None,
+    ) -> "ModelSpec":
         provider = data["provider"]
         model = data["model"]
         ctx = int(data.get("context_window", default_window))
@@ -143,12 +149,16 @@ class ModelSpec:
         else:
             hw = bool(hw)
         modalities = data.get("input_modalities")
+        # ``provider_zdr_ok`` is optional for backwards-compatible direct
+        # callers. PoolManager always supplies it so privacy policy is based
+        # on the provider registry rather than only on the pool flag.
+        provider_allowed = provider_zdr_ok if provider_zdr_ok is not None else True
         return cls(
             provider=provider,
             model=model,
             context_window=ctx,
             heavyweight=hw,
-            zdr_ok=zdr and not hw,  # exclude heavyweights in ZDR
+            zdr_ok=zdr and not hw and provider_allowed,
             input_modalities=(
                 frozenset(str(modality) for modality in modalities)
                 if modalities is not None
@@ -188,6 +198,16 @@ class PoolManager:
     _original_static: dict[str, frozenset[tuple[str, str]]] = field(default_factory=dict)
     _stickiness: dict[tuple[str, str], tuple[str, str]] = field(default_factory=dict)
     STICKINESS_TTL = 3600.0  # 1 hour
+
+    def _provider_zdr_ok(self, provider: str) -> bool:
+        """Return the configured privacy/ZDR policy for one provider."""
+        endpoint = self._providers.get(provider)
+        if endpoint is None:
+            return False
+        if isinstance(endpoint, dict):
+            return bool(endpoint.get("zdr_ok", False))
+        return bool(getattr(endpoint, "zdr_ok", False))
+
     def __post_init__(self):
         self.pools = dict(self.config.get("pools", {}))
         self._providers = _provider_registry(self.config)
@@ -227,7 +247,12 @@ class PoolManager:
                 for m in pool.models
             )
             specs = [
-                ModelSpec.from_dict(m, default_window=pool.context_window, zdr=pool.zdr)
+                ModelSpec.from_dict(
+                    m,
+                    default_window=pool.context_window,
+                    zdr=pool.zdr,
+                    provider_zdr_ok=self._provider_zdr_ok(m.get("provider", "")),
+                )
                 for m in pool.models
             ]
             usable, unkeyed = _split_unkeyed(
@@ -335,6 +360,11 @@ class PoolManager:
                 if provider == "models.dev":
                     # models.dev is a pricing source, not an inference route.
                     continue
+                if pool.zdr and not self._provider_zdr_ok(provider):
+                    # A free catalog entry is not automatically privacy-safe.
+                    # Keep privacy discovery constrained to providers whose
+                    # policy was explicitly reviewed in the registry.
+                    continue
                 if provider in {"opencode-zen", "opencode-go"}:
                     mode = "all"
                 elif provider == "xiaomi":
@@ -435,7 +465,12 @@ class PoolManager:
         """
         for name, pool in self.pools.items():
             specs = [
-                ModelSpec.from_dict(m, default_window=pool.context_window, zdr=pool.zdr)
+                ModelSpec.from_dict(
+                    m,
+                    default_window=pool.context_window,
+                    zdr=pool.zdr,
+                    provider_zdr_ok=self._provider_zdr_ok(m.get("provider", "")),
+                )
                 for m in pool.models
             ]
             usable, unkeyed = _split_unkeyed(
@@ -567,6 +602,10 @@ class PoolManager:
                         if not is_general_chat_model(s.provider, s.model):
                             self._stickiness.pop(key, None)
                             break
+                        pool_config = self.pools.get(pool_name)
+                        if pool_config and pool_config.zdr and not s.zdr_ok:
+                            self._stickiness.pop(key, None)
+                            break
                         if context_tokens > 0 and s.context_window < context_tokens:
                             # Context doesn't fit; clear stickiness
                             self._stickiness.pop(key, None)
@@ -609,8 +648,9 @@ class PoolManager:
             "advertised_tools": 0,
             "behavioral_tools": 0,
             "cooldown": 0,
-            "zdr_provider": 0,
+            "zdr_policy": 0,
         }
+        filtered_zdr_models: list[str] = []
         for s in specs:
             if (s.provider, s.model) in excluded:
                 filter_counts["request_excluded"] += 1
@@ -622,6 +662,12 @@ class PoolManager:
             if not is_general_chat_model(s.provider, s.model):
                 filter_counts["special_purpose"] += 1
                 filtered_special_models.append(f"{s.provider}/{s.model}")
+                continue
+            pool_config = self.pools.get(pool_name)
+            if pool_config and pool_config.zdr and not s.zdr_ok:
+                filter_counts["zdr_policy"] += 1
+                if len(filtered_zdr_models) < 12:
+                    filtered_zdr_models.append(f"{s.provider}/{s.model}")
                 continue
             if context_tokens > 0 and s.context_window < context_tokens:
                 filter_counts["context_window"] += 1
@@ -647,11 +693,12 @@ class PoolManager:
                 if len(filtered_cooldown_models) < 12:
                     filtered_cooldown_models.append(f"{s.provider}/{s.model}")
                 continue
-            # ZDR: exclude providers in exclusion list
-            pool_config = self.pools.get(pool_name)
+            # ZDR: operator exclusions remain an additional deny-list.
             if pool_config and pool_config.zdr:
                 if s.provider in self.config.get("excluded_providers", []):
-                    filter_counts["zdr_provider"] += 1
+                    filter_counts["zdr_policy"] += 1
+                    if len(filtered_zdr_models) < 12:
+                        filtered_zdr_models.append(f"{s.provider}/{s.model}")
                     continue
             candidates.append(s)
 
@@ -675,6 +722,13 @@ class PoolManager:
                 pool_name,
                 len(filtered_special_models),
                 ",".join(filtered_special_models[:12]),
+            )
+        if filtered_zdr_models:
+            logger.info(
+                "pool '%s' privacy policy filter filtered=%d models=%s",
+                pool_name,
+                len(filtered_zdr_models),
+                ",".join(filtered_zdr_models[:12]),
             )
         if required_modalities and filtered_modality_models:
             logger.info(

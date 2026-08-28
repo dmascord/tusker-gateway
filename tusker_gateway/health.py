@@ -62,15 +62,29 @@ def ready_handler(request: web.Request) -> web.Response:
         candidates = []
         for m in pool.models:
             try:
-                spec = ModelSpec.from_dict(m, default_window=pool.context_window, zdr=pool.zdr)
+                endpoint = provider_registry.get(m.get("provider", ""))
+                if isinstance(endpoint, dict):
+                    provider_zdr_ok = bool(endpoint.get("zdr_ok", False))
+                else:
+                    provider_zdr_ok = bool(
+                        getattr(endpoint, "zdr_ok", False)
+                    ) if endpoint is not None else False
+                spec = ModelSpec.from_dict(
+                    m,
+                    default_window=pool.context_window,
+                    zdr=pool.zdr,
+                    provider_zdr_ok=provider_zdr_ok,
+                )
                 candidates.append(spec)
             except Exception as exc:
                 pool_health.setdefault(name, {"errors": []})["errors"].append(str(exc))
         valid = [s for s in candidates if s.provider in provider_registry]
+        policy_eligible = [s for s in valid if not pool.zdr or s.zdr_ok]
         invalid_count = len(candidates) - len(valid)
         pool_health[name] = {
             "total": len(candidates),
             "valid": len(valid),
+            "policy_eligible": len(policy_eligible),
             "invalid": invalid_count,
             "invalid_entries": [
                 {"provider": s.provider, "model": s.model}
@@ -78,7 +92,7 @@ def ready_handler(request: web.Request) -> web.Response:
                 if s.provider not in provider_registry
             ],
         }
-        if not valid:
+        if not policy_eligible:
             empty_pools.append(name)
 
     if empty_pools:
@@ -86,7 +100,7 @@ def ready_handler(request: web.Request) -> web.Response:
         return web.json_response(
             {
                 "status": "error",
-                "reason": "pools with no valid candidates",
+                "reason": "pools with no eligible candidates",
                 "empty_pools": empty_pools,
                 "pools": pool_health,
             },

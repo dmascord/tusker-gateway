@@ -912,6 +912,41 @@ def test_poolmanager_auto_free_adds_explicitly_free_generic_provider_models():
     }
 
 
+def test_poolmanager_auto_free_does_not_add_non_zdr_catalog_to_privacy():
+    """Free pricing is not sufficient to cross the privacy boundary."""
+    from tusker_gateway.config import PoolConfig
+    from tusker_gateway.pools import PoolManager
+
+    cfg = {
+        "pools": {
+            "privacy": PoolConfig(
+                name="privacy", models=[], zdr=True, auto_free=True,
+            ),
+        },
+        "excluded_providers": [],
+        "provider_api_keys": {"openrouter": "k-openrouter"},
+        "quality_db_path": "/tmp/_unused.db",
+    }
+    pm = PoolManager(cfg)
+    registry = CatalogRegistry()
+    client = OpenRouterCatalog()
+    client._entries = [
+        CatalogEntry(
+            provider="openrouter",
+            model="openai/gpt-oss-20b:free",
+            cost_input=0.0,
+            cost_output=0.0,
+        ),
+    ]
+    registry.register("openrouter", client)
+    pm.catalog_registry = registry
+
+    pm.extend_pools_with_free_catalog()
+
+    assert pm.pools["privacy"].models == []
+    assert pm.models["privacy"] == []
+
+
 def test_poolmanager_auto_free_includes_opencode_zen_and_go():
     """auto_free treats the entire OpenCode Zen/Go catalog as free-for-key,
     since /v1/models is key-filtered (no per-model pricing field)."""
