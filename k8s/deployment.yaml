@@ -93,12 +93,6 @@ spec:
               optional: true
               name: tusker-env-vault
               key: GITHUB_COPILOT_ENTERPRISE_TOKEN
-        - name: OPENAI_CODEX_CREDENTIALS
-          valueFrom:
-            secretKeyRef:
-              optional: true
-              name: tusker-env-vault
-              key: OPENAI_CODEX_CREDENTIALS
         - name: GITHUB_COPILOT_CREDENTIALS
           valueFrom:
             secretKeyRef:
