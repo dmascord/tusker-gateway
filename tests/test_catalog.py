@@ -780,6 +780,12 @@ def test_poolmanager_auto_free_adds_openrouter_zero_pricing():
                      cost_input=-1.0, cost_output=-1.0),
         CatalogEntry(provider="openrouter", model="openrouter/partial-sentinel",
                      cost_input=0.0, cost_output=-1.0),
+        # Free catalog entries that are valid upstream products but not
+        # general chat backends must not enter a normal chat pool.
+        CatalogEntry(provider="openrouter", model="nvidia/nemotron-3.5-content-safety:free",
+                     cost_input=0.0, cost_output=0.0),
+        CatalogEntry(provider="openrouter", model="openrouter/free",
+                     cost_input=0.0, cost_output=0.0),
         # Already-static entry — should stay put, not be re-added.
         CatalogEntry(provider="openai-codex", model="gpt-5.6-luna"),
     ]
@@ -794,6 +800,8 @@ def test_poolmanager_auto_free_adds_openrouter_zero_pricing():
     assert ("openrouter", "anthropic/claude-sonnet-4.6") not in pool_models  # paid excluded
     assert ("openrouter", "openrouter/pareto-code") not in pool_models
     assert ("openrouter", "openrouter/partial-sentinel") not in pool_models
+    assert ("openrouter", "nvidia/nemotron-3.5-content-safety:free") not in pool_models
+    assert ("openrouter", "openrouter/free") not in pool_models
 
     # The runtime model list (self.models) must also reflect the addition
     # so PoolManager.select() can pick it.

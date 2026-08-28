@@ -6,6 +6,7 @@ role alias (hermes-code, hermes-privacy, hermes-premium, hermes-swarm).
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -23,6 +24,35 @@ logger = logging.getLogger(__name__)
 # kept for these (mirrors hermes-agent's `hermes-premium` semantics).
 # Cheap-tier pools (`hermes-code`, `hermes-privacy`) drop heavyweights.
 PREMIUM_POOLS: frozenset[str] = frozenset({"premium", "swarm"})
+
+# Provider catalogs also expose models that are not response-generating chat
+# models. Sending those through a general chat pool can return classifier prose
+# (for example, "User Safety: safe") or route a request nondeterministically.
+_SPECIAL_PURPOSE_MODEL_RE = re.compile(
+    r"(?:^|[/._:-])(?:content[-_.]?safety|moderation|toxicity|"
+    r"safety[-_.]?classifier|guard(?:rail)?)(?:$|[/._:-])",
+    re.IGNORECASE,
+)
+_PROVIDER_ROUTER_MODELS: frozenset[tuple[str, str]] = frozenset({
+    ("openrouter", "openrouter/free"),
+    ("openrouter", "openrouter/auto"),
+    ("openrouter", "free"),
+    ("openrouter", "auto"),
+})
+
+
+def is_general_chat_model(provider: str, model: str) -> bool:
+    """Return whether a model is suitable for a normal chat pool.
+
+    This is deliberately conservative for catalog-discovered candidates:
+    safety/moderation classifiers and provider-level routers are valid
+    upstream products, but they are not valid general assistant backends.
+    """
+    normalized_provider = str(provider).strip().lower()
+    normalized_model = str(model).strip().lower()
+    if (normalized_provider, normalized_model) in _PROVIDER_ROUTER_MODELS:
+        return False
+    return _SPECIAL_PURPOSE_MODEL_RE.search(normalized_model) is None
 
 
 def _validate_providers(specs: list["ModelSpec"]) -> list[str]:
@@ -232,6 +262,7 @@ class PoolManager:
 
             static_pairs = set(self._original_static.get(pool_name, frozenset()))
             eligible: dict[tuple[str, str], dict[str, Any]] = {}
+            excluded_special_models: list[str] = []
 
             for provider, mode in (
                 ("openrouter", "pricing"),
@@ -248,6 +279,11 @@ class PoolManager:
                     continue
 
                 for entry in entries:
+                    if not is_general_chat_model(entry.provider, entry.model):
+                        excluded_special_models.append(
+                            f"{entry.provider}/{entry.model}"
+                        )
+                        continue
                     # Skip models that have permanently failed (401/403:
                     # WAF-blocked, agentic-harness-only, wrong-tier). They
                     # would otherwise be re-added and fail on every refresh.
@@ -296,6 +332,13 @@ class PoolManager:
                     "auto_free pool '%s': %d eligible catalog entries",
                     pool_name,
                     len(desired_auto),
+                )
+            if excluded_special_models:
+                logger.info(
+                    "auto_free pool '%s': excluded %d special-purpose models=%s",
+                    pool_name,
+                    len(excluded_special_models),
+                    ",".join(sorted(excluded_special_models)[:12]),
                 )
             self.auto_added[pool_name] = desired_auto
 
@@ -421,6 +464,9 @@ class PoolManager:
                         if (s.provider, s.model) in excluded:
                             self._stickiness.pop(key, None)
                             break
+                        if not is_general_chat_model(s.provider, s.model):
+                            self._stickiness.pop(key, None)
+                            break
                         if context_tokens > 0 and s.context_window < context_tokens:
                             # Context doesn't fit; clear stickiness
                             self._stickiness.pop(key, None)
@@ -445,6 +491,7 @@ class PoolManager:
                         return prev
         # 2. Filter candidates by context window, cooldown, and request-level exclusions
         candidates: list[ModelSpec] = []
+        filtered_special_models: list[str] = []
         filtered_tool_models: list[str] = []
         filtered_modality_models: list[str] = []
         for s in specs:
@@ -452,6 +499,9 @@ class PoolManager:
                 continue
             # Skip providers that are not in the registry — avoids ProviderError cascade
             if s.provider not in DEFAULT_PROVIDER_REGISTRY:
+                continue
+            if not is_general_chat_model(s.provider, s.model):
+                filtered_special_models.append(f"{s.provider}/{s.model}")
                 continue
             if context_tokens > 0 and s.context_window < context_tokens:
                 continue
@@ -479,6 +529,13 @@ class PoolManager:
                 pool_name,
                 len(filtered_tool_models),
                 ",".join(filtered_tool_models[:12]),
+            )
+        if filtered_special_models:
+            logger.info(
+                "pool '%s' special-purpose filter filtered=%d models=%s",
+                pool_name,
+                len(filtered_special_models),
+                ",".join(filtered_special_models[:12]),
             )
         if required_modalities and filtered_modality_models:
             logger.info(

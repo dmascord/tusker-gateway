@@ -199,6 +199,30 @@ def test_unknown_modalities_remain_eligible_for_existing_providers():
         ) == ("local-llm", "legacy")
 
 
+def test_selection_excludes_special_purpose_and_provider_router_models():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = PoolManager({
+            "pools": {
+                "code": PoolConfig(name="code", models=[
+                    {
+                        "provider": "openrouter",
+                        "model": "nvidia/nemotron-3.5-content-safety:free",
+                    },
+                    {"provider": "openrouter", "model": "openrouter/free"},
+                    {"provider": "openrouter", "model": "openrouter/auto"},
+                    {"provider": "openrouter", "model": "openai/gpt-oss-20b:free"},
+                ]),
+            },
+            "quality_db_path": os.path.join(tmpdir, "quality.db"),
+            "excluded_providers": [],
+            "provider_api_keys": {"openrouter": "k-openrouter"},
+        })
+
+        assert manager.select("code") == (
+            "openrouter", "openai/gpt-oss-20b:free",
+        )
+
+
 def test_selection_filters_catalog_models_without_tools_or_images():
     with tempfile.TemporaryDirectory() as tmpdir:
         manager = PoolManager({
