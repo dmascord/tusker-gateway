@@ -282,6 +282,30 @@ async def test_stream_normalizer_rejects_unparseable_reasoning_tool_markup():
 
 
 @pytest.mark.asyncio
+async def test_stream_normalizer_rejects_repeated_reasoning_cycle():
+    """A reasoning loop must be rejected before it can occupy the stream."""
+    import json as _json
+
+    from tusker_gateway.errors import UnusableToolResponseError
+    from tusker_gateway.endpoints import _normalize_stream
+
+    cycle = "Repeated reasoning cycle: choose a tool, inspect context, and continue planning. "
+
+    async def repeated_stream():
+        payload = {"choices": [{"delta": {"reasoning": cycle * 5}}]}
+        yield f"data: {_json.dumps(payload)}\n\n".encode()
+
+    with pytest.raises(UnusableToolResponseError):
+        async for _ in _normalize_stream(
+            repeated_stream(),
+            provider="openrouter",
+            model="dots-studio/dots-3-note-preview:free",
+            tools_requested=True,
+        ):
+            pass
+
+
+@pytest.mark.asyncio
 async def test_stream_normalizer_emits_tool_calls_for_bare_function_blocks(client):
     """Models that emit bare <function=name>...</function> (no <​tool_call> wrapper)
     across multiple SSE deltas must not leak the XML into content and must

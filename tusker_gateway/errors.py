@@ -98,6 +98,22 @@ class RequiredToolCallError(ProviderError):
         self.upstream_body = "required tool call missing"
 
 
+class UnusableToolResponseError(ProviderError):
+    """An upstream model produced no client-visible answer for a tool turn."""
+
+    def __init__(self, *, reason: str, reasoning_chars: int = 0) -> None:
+        super().__init__(
+            "Provider returned no usable assistant response",
+            code="unusable_tool_response",
+        )
+        self.upstream_status = 502
+        self.upstream_body = (
+            f"unusable tool response: {reason}; reasoning_chars={max(0, reasoning_chars)}"
+        )
+        self.reason = reason
+        self.reasoning_chars = max(0, reasoning_chars)
+
+
 class RateLimitError(GatewayError):
     """A rate-limit / cooldown hit on a provider pool."""
 

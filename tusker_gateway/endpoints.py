@@ -24,10 +24,15 @@ from tusker_gateway.errors import (
     ProviderCapacityError,
     RateLimitError,
     RequiredToolCallError,
+    UnusableToolResponseError,
     openai_error,
 )
 from tusker_gateway.metrics import MetricsRegistry
-from tusker_gateway.passthrough import PassthroughClient, _safe_upstream_body
+from tusker_gateway.passthrough import (
+    PassthroughClient,
+    _persist_cooldown,
+    _safe_upstream_body,
+)
 from tusker_gateway.pools import PoolManager
 from tusker_gateway.provider_usage import is_capacity_error
 from tusker_gateway.quality import QualityDB
@@ -165,6 +170,10 @@ _TOOL_MARKUP_HINT_RE = re.compile(
     r"\bTOOL_CALL\s*:\s*[\w.-]+\s*\(|<\s*(?:/?(?:tool_call|function_call|tool_calls|function_calls|tool_use|tool_invocation|dots_function_call|dots_tool_call|function|parameter|invoke|tool|arg_key|arg_value|tool_sep)|(?:dsml|mimoml):)",
     re.IGNORECASE,
 )
+_REASONING_CYCLE_MIN_CHARS = 32
+_REASONING_CYCLE_MAX_CHARS = 1024
+_REASONING_CYCLE_MIN_TOTAL_CHARS = 256
+_REASONING_WINDOW_CHARS = 8192
 
 
 def _reasoning_details_text(value: Any) -> str:
@@ -176,6 +185,32 @@ def _reasoning_details_text(value: Any) -> str:
         if isinstance(item, dict) and isinstance(item.get("text"), str):
             parts.append(item["text"])
     return "".join(parts)
+
+
+def _repeated_text_cycle(text: str) -> tuple[int, int] | None:
+    """Return ``(cycle_chars, repeats)`` for a repeated trailing cycle.
+
+    Reasoning loops are harmful before they become client-visible: OMP waits
+    for the stream and eventually aborts it, while the gateway's tool
+    preflight can otherwise buffer megabytes before returning HTTP 200.
+    Inspect only a bounded suffix and require enough repeated material to
+    avoid treating short, intentional phrases as a loop.
+    """
+    if len(text) < _REASONING_CYCLE_MIN_TOTAL_CHARS:
+        return None
+    max_cycle = min(_REASONING_CYCLE_MAX_CHARS, len(text) // 3)
+    for cycle_chars in range(_REASONING_CYCLE_MIN_CHARS, max_cycle + 1):
+        cycle = text[-cycle_chars:]
+        repeats = 1
+        while repeats < 20:
+            start = len(text) - (repeats + 1) * cycle_chars
+            end = len(text) - repeats * cycle_chars
+            if start < 0 or text[start:end] != cycle:
+                break
+            repeats += 1
+        if repeats >= 3 and repeats * cycle_chars >= _REASONING_CYCLE_MIN_TOTAL_CHARS:
+            return cycle_chars, repeats
+    return None
 
 
 def _extract_inner_prose(block: str) -> str:
@@ -727,6 +762,9 @@ async def _normalize_stream(
     saw_done = False
     saw_tool_call = False
     saw_tool_markup = False
+    saw_visible_content = False
+    reasoning_window = ""
+    reasoning_chars = 0
     emitted_finish_reason: str | None = None
 
     def malformed_tool_error() -> MalformedToolCallError:
@@ -748,6 +786,20 @@ async def _normalize_stream(
             request_id or "unknown",
         )
         return RequiredToolCallError()
+
+    def unusable_tool_error(reason: str) -> UnusableToolResponseError:
+        logger.warning(
+            "unusable tool response rejected provider=%s model=%s request_id=%s reason=%s reasoning_chars=%d",
+            provider or "unknown",
+            model or "unknown",
+            request_id or "unknown",
+            reason,
+            reasoning_chars,
+        )
+        return UnusableToolResponseError(
+            reason=reason,
+            reasoning_chars=reasoning_chars,
+        )
 
     tool_markup_seen: set[str] = set()
 
@@ -800,6 +852,8 @@ async def _normalize_stream(
                     raise required_tool_error()
                 if tools_requested and saw_tool_markup and not saw_tool_call:
                     raise malformed_tool_error()
+                if tools_requested and not saw_tool_call and not saw_visible_content:
+                    raise unusable_tool_error("reasoning_only_or_empty")
                 if emitted_finish_reason is None:
                     emitted_finish_reason = "tool_calls" if saw_tool_call else "stop"
                     yield finish_frame(emitted_finish_reason)
@@ -908,11 +962,18 @@ async def _normalize_stream(
                 cleaned_content = clean_text(raw_content)
                 if cleaned_content:
                     delta["content"] = cleaned_content
+                    if cleaned_content.strip():
+                        saw_visible_content = True
                 else:
                     delta.pop("content", None)
             for field, value in auxiliary_sources:
                 cleaned = clean_text(value)
                 cleaned_auxiliary[field] = cleaned
+                reasoning_chars += len(value)
+                if field != "reasoning_details" and cleaned:
+                    reasoning_window = (
+                        reasoning_window + cleaned
+                    )[-_REASONING_WINDOW_CHARS:]
                 if field == "reasoning_details":
                     continue
                 if cleaned:
@@ -983,6 +1044,7 @@ async def _normalize_stream(
                         prose = _extract_inner_prose(block) or strip_tool_text(block)
                         if prose:
                             pending_prose_frames.append(_content_frame(prose, new_obj))
+                            saw_visible_content = True
                 elif not eligible:
                     if require_tool_call and not has_tools and not saw_tool_call:
                         raise required_tool_error()
@@ -991,6 +1053,23 @@ async def _normalize_stream(
                     prose = _extract_inner_prose(block)
                     if prose:
                         pending_prose_frames.append(_content_frame(prose, new_obj))
+                        saw_visible_content = True
+
+            # Do this after draining complete blocks so a tool call that ends
+            # the reasoning stream wins over the loop detector.
+            if (
+                tools_requested
+                and not has_tools
+                and not saw_tool_call
+                and not pending_tool_frames
+                and not saw_visible_content
+            ):
+                cycle = _repeated_text_cycle(reasoning_window)
+                if cycle is not None:
+                    cycle_chars, repeats = cycle
+                    raise unusable_tool_error(
+                        f"repeated_reasoning_cycle:{cycle_chars}x{repeats}"
+                    )
 
             if tool_diagnostics_enabled() and (
                 raw_marker_types
@@ -1024,6 +1103,10 @@ async def _normalize_stream(
             if fr:
                 # Finish is always last. In particular, a same-event text
                 # function block must be promoted before this frame.
+                if tools_requested and saw_tool_markup and not saw_tool_call:
+                    raise malformed_tool_error()
+                if tools_requested and not saw_tool_call and not saw_visible_content:
+                    raise unusable_tool_error("reasoning_only_or_empty")
                 if has_delta_text:
                     content_delta = {
                         key: value for key, value in delta.items()
@@ -1073,6 +1156,8 @@ async def _normalize_stream(
         raise required_tool_error()
     if tools_requested and saw_tool_markup and not saw_tool_call:
         raise malformed_tool_error()
+    if tools_requested and not saw_tool_call and not saw_visible_content:
+        raise unusable_tool_error("reasoning_only_or_empty")
     if emitted_finish_reason is None:
         emitted_finish_reason = "tool_calls" if saw_tool_call else "stop"
         yield finish_frame(emitted_finish_reason)
@@ -1405,6 +1490,43 @@ def _max_pool_provider_attempts() -> int:
         return 6
 
 
+def _tool_response_failure_cooldown_secs() -> float:
+    """Return the quarantine window for a model that violates the tool contract."""
+    try:
+        return max(
+            1.0,
+            float(os.environ.get("TUSKER_TOOL_FAILURE_COOLDOWN_SECS", "300")),
+        )
+    except (TypeError, ValueError):
+        return 300.0
+
+
+def _quarantine_tool_response_failure(
+    config: dict[str, Any],
+    provider: str,
+    model: str,
+    exc: BaseException,
+) -> None:
+    """Temporarily exclude a model that emitted an unusable tool response."""
+    if not isinstance(
+        exc,
+        (MalformedToolCallError, RequiredToolCallError, UnusableToolResponseError),
+    ):
+        return
+    seconds = _tool_response_failure_cooldown_secs()
+    from tusker_gateway.cooldown import global_tracker
+
+    global_tracker().cooldown(provider, model, seconds)
+    _persist_cooldown(config, provider, model, seconds)
+    logger.warning(
+        "tool response quarantine provider=%s model=%s seconds=%.0f reason=%s",
+        provider,
+        model,
+        seconds,
+        getattr(exc, "reason", getattr(exc, "code", type(exc).__name__)),
+    )
+
+
 def _pool_failure_summary(exc: BaseException) -> str:
     """Return a bounded, redacted provider failure for operational logs."""
     body = getattr(exc, "upstream_body", None) or getattr(exc, "body", None) or str(exc)
@@ -1544,6 +1666,7 @@ async def _call_with_pool_fallback(
                 )
             raise
         except Exception as exc:
+            _quarantine_tool_response_failure(config, provider, model, exc)
             if breaker is not None:
                 breaker.record_failure(
                     provider,
@@ -1649,6 +1772,7 @@ async def _call_with_pool_fallback(
                 _pool_failure_summary(exc),
             )
         except Exception as exc:
+            _quarantine_tool_response_failure(config, provider, model, exc)
             if breaker is not None:
                 breaker.record_failure(
                     provider,

@@ -414,6 +414,64 @@ async def test_chat_stream_required_tool_call_falls_back_on_clean_stop(app, clie
 
 
 @pytest.mark.asyncio
+async def test_chat_stream_reasoning_only_response_falls_back_before_client_response(app, client):
+    """Reasoning-only optional-tool turns must not become blank OMP stops."""
+    pool_manager = MagicMock()
+    pool_manager.select.side_effect = [
+        ("openrouter", "dots/reasoning-only"),
+        ("openai", "tool-capable-fallback"),
+    ]
+    app["pool_manager"] = pool_manager
+
+    async def reasoning_only_stream(*args, **kwargs):
+        for value in ("I will inspect the available tools.", "Still planning the call."):
+            payload = {"choices": [{"delta": {"role": "assistant", "reasoning": value}}]}
+            yield f"data: {json.dumps(payload)}\n\n".encode()
+        yield b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+
+    async def valid_stream(*args, **kwargs):
+        payload = {
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "id": "call-reasoning-fallback",
+                        "type": "function",
+                        "function": {
+                            "name": "read",
+                            "arguments": '{"path":"/tmp"}',
+                        },
+                    }],
+                },
+                "finish_reason": "tool_calls",
+            }],
+        }
+        yield f"data: {json.dumps(payload)}\n\n".encode()
+
+    with patch("tusker_gateway.endpoints.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
+        mock_chat.side_effect = [reasoning_only_stream(), valid_stream()]
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-code",
+                "messages": [{"role": "user", "content": "inspect"}],
+                "tools": [{"type": "function", "function": {"name": "read"}}],
+                # tool_choice intentionally omitted: this matches OMP.
+                "stream": True,
+            },
+            headers=HEADERS_AUTH,
+        )
+        body = await resp.read()
+
+    assert resp.status == 200
+    assert b'"name": "read"' in body
+    assert b"reasoning-only" not in body
+    assert pool_manager.select.call_count == 2
+    from tusker_gateway.cooldown import global_tracker
+    assert global_tracker().is_cooldown("openrouter", "dots/reasoning-only")
+
+
+@pytest.mark.asyncio
 async def test_chat_pool_input_image_requires_image_after_breaker_skip(app, client):
     pool_manager = MagicMock()
     pool_manager.select.side_effect = [
