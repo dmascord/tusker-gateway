@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import os
+from typing import Any
 
 import aiohttp
 from aiohttp import web
@@ -225,6 +226,7 @@ def create_app() -> web.Application:
                     registry, config.get("provider_api_keys", {}),
                     codex_rotator=app.get("codex_rotator"),
                     credential_rotators=app.get("credential_rotators"),
+                    provider_registry=config.get("providers"),
                 )
                 # Wire into PoolManager so extend_pools_with_catalog() can read.
                 pool_manager = app.get("pool_manager")
@@ -429,6 +431,7 @@ def _wire_catalog_api_keys(
     provider_keys: dict[str, str | None],
     codex_rotator: "CodexTokenRotator | None" = None,
     credential_rotators: dict[str, "CodexTokenRotator"] | None = None,
+    provider_registry: dict[str, Any] | None = None,
 ) -> None:
     """Inject configured bearer keys into authenticated catalog clients.
 
@@ -439,6 +442,11 @@ def _wire_catalog_api_keys(
     Copilot) on each fetch — matching the chat-path auth strategy.
     """
     startup_log = logging.getLogger("tusker_gateway.startup")
+    provider_keys = {
+        str(provider).lower(): value
+        for provider, value in (provider_keys or {}).items()
+    }
+    provider_registry = provider_registry or {}
     # Wire OAuth token sources for Codex and Copilot providers
     # (must come before API key injection to ensure proper order)
     
@@ -490,28 +498,39 @@ def _wire_catalog_api_keys(
     if copilot_ent_client is not None:
         copilot_ent_client.set_token_source(_copilot_ent_token_source)
 
-    # Inject API keys for all configured providers to their catalog clients
-    provider_keys = provider_keys or {}
+    # Inject API keys for all configured providers to their catalog clients.
     for provider in provider_keys:
         client = registry.get_client(provider)
         if client is not None:
             client.set_api_key(provider_keys.get(provider))
 
-    # Ensure all catalog clients have either API key or token source configured
+    # Report only providers whose configured auth mode actually requires a
+    # credential. models.dev and local catalogs are intentionally public or
+    # local and should not create misleading 401/403 warnings.
     for provider in registry._clients:
         client = registry.get_client(provider)
         if client is None:
             continue
-        
-        has_api_key = provider_keys.get(provider) is not None
-        has_token_source = client._token_source is not None if hasattr(client, '_token_source') else False
-        
+
+        if provider == "models.dev":
+            continue
+        config = provider_registry.get(provider)
+        if isinstance(config, dict):
+            kind = config.get("kind", config.get("auth_type"))
+        else:
+            kind = getattr(config, "kind", None)
+            if kind is None:
+                kind = getattr(config, "auth_type", None)
+        if str(kind or "").lower() in {"local", "none", "public"}:
+            continue
+
+        has_api_key = bool(provider_keys.get(provider))
+        has_token_source = bool(getattr(client, "_token_source", None))
         if not has_api_key and not has_token_source:
-            # Log warning for providers without authentication
             startup_log.warning(
-                "Provider %s catalog client has no authentication configured. "
-                "Catalog refresh will fail with 401/403 errors.",
-                provider
+                "provider %s catalog has no authentication configured; "
+                "refresh may return 401/403",
+                provider,
             )
 
 def _secrets_compare(a: str, b: str) -> bool:
