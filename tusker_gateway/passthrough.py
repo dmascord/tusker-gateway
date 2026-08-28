@@ -18,8 +18,19 @@ import aiohttp
 from tusker_gateway.cooldown import global_tracker
 from tusker_gateway.errors import (
     GatewayError,
+    ProviderCapacityError,
     ProviderError,
     RateLimitError,
+)
+from tusker_gateway.provider_usage import (
+    CapacityLease,
+    capacity_busy_cooldown_seconds,
+    capacity_controller,
+    capacity_cooldown_seconds,
+    capacity_group_for_route,
+    default_provider_usage_db_path,
+    is_capacity_error,
+    ProviderUsageDB,
 )
 from tusker_gateway.quality import QualityDB
 
@@ -127,7 +138,17 @@ def _stream_error_from_frame(
     if not isinstance(message, str):
         message = str(message)
     message = message[:500]
-    exc = ProviderError(message, code=str(code) if code is not None else "provider_error")
+    if is_capacity_error(message) or is_capacity_error(payload.decode("utf-8", errors="replace")):
+        group = capacity_group_for_route(provider, model, payload.decode("utf-8", errors="replace"))
+        if group is not None:
+            exc: ProviderError = ProviderCapacityError(group=group, detail=message)
+        else:
+            exc = ProviderError(
+                message,
+                code=str(code) if code is not None else "provider_error",
+            )
+    else:
+        exc = ProviderError(message, code=str(code) if code is not None else "provider_error")
     exc.upstream_status = status or 502
     exc.upstream_body = payload.decode("utf-8", errors="replace")[:2000]
     logger.warning(
@@ -211,6 +232,66 @@ def _persist_cooldown(
         PersistentCooldownStore(db_path=db_path).record(provider, model, seconds)
     except Exception:
         pass
+
+
+def _persist_capacity_group_cooldown(
+    config: dict[str, Any],
+    group: str,
+    seconds: float,
+) -> None:
+    """Persist a shared capacity quarantine without affecting the request."""
+    try:
+        from pathlib import Path
+
+        from tusker_gateway.persistent_cooldown import PersistentCooldownStore
+
+        db_path = Path(
+            config.get("quality_db_path", "data/quality.db")
+        ).parent / "cooldowns.db"
+        PersistentCooldownStore(db_path=db_path).record_group(group, seconds)
+    except Exception:
+        pass
+
+
+def _capacity_failure_group(
+    provider: str,
+    model: str,
+    exc: BaseException,
+) -> str | None:
+    """Return a capacity group for an upstream, but not local, failure."""
+    if getattr(exc, "capacity_rejected", False):
+        return None
+    detail = getattr(exc, "upstream_body", None) or str(exc)
+    if not is_capacity_error(detail) and not getattr(exc, "capacity_group", None):
+        return None
+    return (
+        getattr(exc, "capacity_group", None)
+        or capacity_group_for_route(provider, model, detail)
+    )
+
+
+def _quarantine_capacity_failure(
+    config: dict[str, Any],
+    provider: str,
+    model: str,
+    exc: BaseException,
+) -> str | None:
+    """Quarantine all routes sharing a provider capacity pool."""
+    group = _capacity_failure_group(provider, model, exc)
+    if group is None:
+        return None
+    seconds = capacity_cooldown_seconds(getattr(exc, "upstream_body", None))
+    tracker = global_tracker()
+    tracker.cooldown_group(group, seconds)
+    _persist_capacity_group_cooldown(config, group, seconds)
+    logger.warning(
+        "provider capacity quarantine group=%s seconds=%.0f provider=%s model=%s",
+        group,
+        seconds,
+        provider,
+        model,
+    )
+    return group
 
 
 # Per-read timeout for upstream SSE streams. The `total` budget below is the
@@ -469,6 +550,11 @@ class PassthroughClient:
         self._quality = quality_db
         self._http = http_client
         self._catalog_registry = catalog_registry
+        self._usage = ProviderUsageDB(
+            default_provider_usage_db_path(
+                config.get("quality_db_path", "data/quality.db")
+            )
+        )
         auth_file = config.get("auth_file")
         if not auth_file:
             import os
@@ -510,6 +596,90 @@ class PassthroughClient:
                 http_client=http_client,
             )
 
+    def _record_usage(
+        self,
+        provider: str,
+        model: str,
+        *,
+        success: bool,
+        capacity_rejected: bool = False,
+        result: dict[str, Any] | None = None,
+        group: str | None = None,
+    ) -> None:
+        """Persist bounded provider usage counters; never affect a request."""
+        try:
+            usage = result.get("usage") if isinstance(result, dict) else None
+            usage = usage if isinstance(usage, dict) else {}
+            prompt_tokens = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+            completion_tokens = int(
+                usage.get("completion_tokens") or usage.get("output_tokens") or 0
+            )
+            self._usage.record(
+                provider=provider,
+                model=model,
+                group=group or capacity_group_for_route(provider, model),
+                success=success,
+                capacity_rejected=capacity_rejected,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+            )
+        except Exception:
+            logger.debug(
+                "provider usage record failed provider=%s model=%s",
+                provider,
+                model,
+                exc_info=True,
+            )
+
+    def _reserve_capacity(
+        self,
+        provider: str,
+        model: str,
+    ) -> tuple[str | None, CapacityLease | None]:
+        """Reserve a local slot or fail fast for a saturated provider group."""
+        group = capacity_group_for_route(provider, model)
+        if group is None:
+            return None, None
+        tracker = global_tracker()
+        if tracker.is_group_cooldown(group):
+            error = ProviderCapacityError(
+                group=group,
+                capacity_rejected=True,
+            )
+            self._record_usage(
+                provider,
+                model,
+                success=False,
+                capacity_rejected=True,
+                group=group,
+            )
+            raise error
+        lease = capacity_controller().acquire(group)
+        if lease is None:
+            # This is a local admission decision, not an upstream request.
+            # Quarantine the group briefly so pool fallback moves directly to
+            # another provider instead of trying every sibling Nvidia model.
+            busy_window = capacity_busy_cooldown_seconds()
+            tracker.cooldown_group(group, busy_window)
+            error = ProviderCapacityError(
+                group=group,
+                capacity_rejected=True,
+            )
+            self._record_usage(
+                provider,
+                model,
+                success=False,
+                capacity_rejected=True,
+                group=group,
+            )
+            raise error
+        return group, lease
+
+    @staticmethod
+    def _release_capacity(lease: CapacityLease | None) -> None:
+        if lease is not None:
+            lease.release()
+
     def _rotator_for(self, provider: str) -> CodexTokenRotator | None:
         """Return the provider-specific credential rotator when configured."""
         provider_key = provider.lower()
@@ -534,6 +704,17 @@ class PassthroughClient:
         latency_ms = (time.monotonic() - started) * 1000
         await self._record_quality(provider, model, False, latency_ms)
 
+        body = getattr(exc, "upstream_body", None) or str(exc)
+        capacity_group = _quarantine_capacity_failure(
+            self._config, provider, model, exc
+        )
+        self._record_usage(
+            provider,
+            model,
+            success=False,
+            group=capacity_group,
+        )
+
         seconds = _upstream_failure_cooldown_seconds(exc)
         if seconds is not None:
             tracker = global_tracker()
@@ -544,7 +725,6 @@ class PassthroughClient:
                 tracker.cooldown(provider, "", provider_seconds)
                 _persist_cooldown(self._config, provider, "", provider_seconds)
 
-        body = getattr(exc, "upstream_body", None) or str(exc)
         logger.warning(
             "provider stream setup failed provider=%s model=%s status=%s cooldown=%s body=%s",
             provider,
@@ -643,23 +823,25 @@ class PassthroughClient:
             endpoint=endpoint,
         )
 
+        capacity_group, capacity_lease = self._reserve_capacity(provider, model)
         start = time.monotonic()
         if stream:
-            resp = await self._http.request(
-                "POST", url, headers=headers, json=body,
-                timeout=aiohttp.ClientTimeout(
-                    total=120,
-                    # Cap the *gap* between SSE bytes. If the provider goes
-                    # silent for this long, aiohttp raises a clean asyncio
-                    # TimeoutError instead of letting the socket hang until
-                    # the 120s `total` fires. The error then surfaces to the
-                    # caller as a normal exception (which the endpoint layer
-                    # already logs + refunds) — never as the opaque
-                    # "socket connection was closed unexpectedly" that
-                    # appears when the underlying TCP gets reaped first.
-                    sock_read=_UPSTREAM_STREAM_SOCK_READ_SECS,
-                ),
-            )
+            try:
+                resp = await self._http.request(
+                    "POST", url, headers=headers, json=body,
+                    timeout=aiohttp.ClientTimeout(
+                        total=120,
+                        # Cap the *gap* between SSE bytes. If the provider goes
+                        # silent for this long, aiohttp raises a clean
+                        # asyncio.TimeoutError instead of letting the socket
+                        # hang until the 120s `total` fires.
+                        sock_read=_UPSTREAM_STREAM_SOCK_READ_SECS,
+                    ),
+                )
+            except Exception as exc:
+                self._release_capacity(capacity_lease)
+                await self._record_stream_failure(provider, model, exc, start)
+                raise
             try:
                 await self._check_response(resp, provider=provider, model=model)
                 prefetched_chunks, upstream_iterator = await self._prefetch_stream(
@@ -674,6 +856,14 @@ class PassthroughClient:
                 seconds = _cooldown_seconds_for_429({"body": body_text, "headers": dict(resp.headers)})
                 logger.warning('429 from %s/%s, cooldown=%.0fs', provider, model, seconds)
                 tracker.cooldown(provider, model, seconds)
+                self._record_usage(
+                    provider,
+                    model,
+                    success=False,
+                    group=capacity_group,
+                )
+                self._release_capacity(capacity_lease)
+                resp.release()
                 try:
                     from tusker_gateway.persistent_cooldown import PersistentCooldownStore
                     from pathlib import Path
@@ -685,12 +875,19 @@ class PassthroughClient:
                 raise
             except Exception as exc:
                 await self._record_stream_failure(provider, model, exc, start)
+                self._release_capacity(capacity_lease)
                 resp.release()
                 raise
             # Record quality on streaming success
             try:
                 latency_ms = (time.monotonic() - start) * 1000
                 await self._record_quality(provider, model, True, latency_ms)
+                self._record_usage(
+                    provider,
+                    model,
+                    success=True,
+                    group=capacity_group,
+                )
                 global_tracker().clear_failures(provider)
             except Exception:
                 pass
@@ -700,6 +897,7 @@ class PassthroughClient:
                 model=model,
                 initial_chunks=prefetched_chunks,
                 stream_iterator=upstream_iterator,
+                capacity_lease=capacity_lease,
             )
         try:
             async with self._http.request(
@@ -713,6 +911,13 @@ class PassthroughClient:
                     result,
                     source=f"{provider}/{model}",
                 )
+                self._record_usage(
+                    provider,
+                    model,
+                    success=True,
+                    result=result,
+                    group=capacity_group,
+                )
                 latency_ms = (time.monotonic() - start) * 1000
                 await self._record_quality(provider, model, True, latency_ms)
                 logger.debug('quality recorded %s/%s success=True', provider, model)
@@ -725,6 +930,12 @@ class PassthroughClient:
             seconds = _cooldown_seconds_for_429({"body": body_text, "headers": exc.headers})
             logger.warning('429 from %s/%s, cooldown=%.0fs', provider, model, seconds)
             tracker.cooldown(provider, model, seconds)
+            self._record_usage(
+                provider,
+                model,
+                success=False,
+                group=capacity_group,
+            )
             try:
                 from tusker_gateway.persistent_cooldown import PersistentCooldownStore
                 from pathlib import Path
@@ -737,6 +948,13 @@ class PassthroughClient:
         except Exception as exc:
             latency_ms = (time.monotonic() - start) * 1000
             await self._record_quality(provider, model, False, latency_ms)
+            _quarantine_capacity_failure(self._config, provider, model, exc)
+            self._record_usage(
+                provider,
+                model,
+                success=False,
+                group=capacity_group,
+            )
             logger.debug('quality recorded %s/%s success=False', provider, model)
             tracker = global_tracker()
             if tracker.record_failure(provider):
@@ -753,6 +971,8 @@ class PassthroughClient:
             if isinstance(exc, ProviderError):
                 raise
             raise ProviderError(str(exc)) from exc
+        finally:
+            self._release_capacity(capacity_lease)
 
     async def _prefetch_stream(
         self,
@@ -1105,6 +1325,16 @@ class PassthroughClient:
             resp.status,
             _safe_upstream_body(body),
         )
+        if is_capacity_error(body):
+            group = capacity_group_for_route(provider or "", model or "", body)
+            if group is not None:
+                capacity_error = ProviderCapacityError(
+                    group=group,
+                    detail=_safe_upstream_body(body, limit=500),
+                )
+                capacity_error.upstream_status = resp.status
+                capacity_error.upstream_body = body
+                raise capacity_error
         if resp.status == 429:
             raise RateLimitError(body=body, headers=dict(resp.headers))
         if resp.status == 401:
@@ -1129,6 +1359,7 @@ class PassthroughClient:
         model: str | None = None,
         initial_chunks: list[bytes] | None = None,
         stream_iterator: AsyncIterator[bytes] | None = None,
+        capacity_lease: CapacityLease | None = None,
     ) -> AsyncIterator[bytes]:
         """Pump an upstream SSE response byte-for-byte to the gateway caller.
 
@@ -1178,6 +1409,7 @@ class PassthroughClient:
             )
         finally:
             resp.release()
+            self._release_capacity(capacity_lease)
 
     async def _record_quality(
         self, provider: str, model: str, success: bool, latency_ms: float

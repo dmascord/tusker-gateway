@@ -21,6 +21,7 @@ from tusker_gateway.errors import (
     BadRequestError,
     GatewayError,
     MalformedToolCallError,
+    ProviderCapacityError,
     RateLimitError,
     RequiredToolCallError,
     openai_error,
@@ -28,6 +29,7 @@ from tusker_gateway.errors import (
 from tusker_gateway.metrics import MetricsRegistry
 from tusker_gateway.passthrough import PassthroughClient, _safe_upstream_body
 from tusker_gateway.pools import PoolManager
+from tusker_gateway.provider_usage import is_capacity_error
 from tusker_gateway.quality import QualityDB
 from tusker_gateway.rate_limit import RateLimiter
 from tusker_gateway.routing import resolve_route
@@ -1327,6 +1329,40 @@ def _pool_failure_summary(exc: BaseException) -> str:
     body = getattr(exc, "upstream_body", None) or getattr(exc, "body", None) or str(exc)
     return _safe_upstream_body(str(body), limit=300)
 
+
+def _public_provider_failure_response(exc: BaseException) -> web.Response:
+    """Hide provider capacity details without changing other error semantics."""
+    detail = " ".join(
+        str(value)
+        for value in (
+            getattr(exc, "upstream_body", None),
+            getattr(exc, "message", None),
+            str(exc),
+        )
+        if value
+    )
+    if not isinstance(exc, ProviderCapacityError) and not is_capacity_error(detail):
+        return web.json_response(
+            openai_error(str(exc), code="provider_error", error_type="provider_error"),
+            status=502,
+        )
+    try:
+        retry_after = max(
+            1,
+            int(float(os.environ.get("TUSKER_PROVIDER_RETRY_AFTER_SECS", "5"))),
+        )
+    except (TypeError, ValueError):
+        retry_after = 5
+    return web.json_response(
+        openai_error(
+            "No healthy upstream model is currently available; retry shortly.",
+            code="service_unavailable",
+            error_type="server_error",
+        ),
+        status=503,
+        headers={"Retry-After": str(retry_after)},
+    )
+
 def _mark_permanently_failed(
     exc: Exception,
     provider: str,
@@ -2257,12 +2293,16 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
             _emit(status)
             return web.json_response(openai_error(exc.message, code=exc.code, error_type=exc.error_type), status=exc.status)
         except Exception as exc:
-            logger.warning('chat request failed rid=%s: %s', request_id, exc)
-            status = "provider_error"
+            logger.warning(
+                'chat request failed rid=%s summary=%s',
+                request_id,
+                _pool_failure_summary(exc),
+            )
+            status = "provider_unavailable"
             _emit(status)
             if budget is not None and api_key and body is not None:
                 budget.refund(api_key, pool_name, _estimated_tokens(body["messages"]))
-            return web.json_response(openai_error(str(exc), code="provider_error", error_type="provider_error"), status=502)
+            return _public_provider_failure_response(exc)
 
 
 async def responses_handler(request: web.Request) -> web.Response | web.StreamResponse:
@@ -2299,7 +2339,11 @@ async def responses_handler(request: web.Request) -> web.Response | web.StreamRe
     except BadRequestError as exc:
         return web.json_response(openai_error(exc.message, code=exc.code, error_type=exc.error_type), status=exc.status)
     except Exception as exc:
-        return web.json_response(openai_error(str(exc), code="provider_error", error_type="provider_error"), status=502)
+        logger.warning(
+            "responses request failed summary=%s",
+            _pool_failure_summary(exc),
+        )
+        return _public_provider_failure_response(exc)
 
 
 class _NoOpCM:

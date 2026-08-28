@@ -43,13 +43,17 @@ def reset_cooldown_tracker():
     tracker = global_tracker()
     tracker._cooldowns.clear()
     tracker._provider_default.clear()
+    tracker._group_cooldowns.clear()
     tracker._recent_failures.clear()
     tracker._global = None
     yield
     tracker._cooldowns.clear()
     tracker._provider_default.clear()
+    tracker._group_cooldowns.clear()
     tracker._recent_failures.clear()
     tracker._global = None
+    from tusker_gateway.provider_usage import capacity_controller
+    capacity_controller().reset()
 
 
 @pytest.fixture(autouse=True)

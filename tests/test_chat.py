@@ -188,6 +188,41 @@ async def test_chat_stream_provider_502_falls_back_before_client_response(app, c
 
 
 @pytest.mark.asyncio
+async def test_terminal_provider_capacity_error_is_not_returned_to_client(app, client):
+    """Exhausted fallback must not expose an upstream provider error body."""
+    pool_manager = MagicMock()
+    pool_manager.select.side_effect = [
+        ("openrouter", "nvidia/saturated-model"),
+        None,
+    ]
+    app["pool_manager"] = pool_manager
+
+    failure = ProviderError(
+        "Upstream error from Nvidia: ResourceExhausted: Worker local total request limit reached (16/16)",
+        code="provider_error",
+    )
+    failure.upstream_status = 502
+    failure.upstream_body = '{"error":{"code":502}}'
+
+    with patch("tusker_gateway.endpoints.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
+        mock_chat.side_effect = [failure]
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-code",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            headers=HEADERS_AUTH,
+        )
+        data = await resp.json()
+
+    assert resp.status == 503
+    assert data["error"]["code"] == "service_unavailable"
+    assert "ResourceExhausted" not in json.dumps(data)
+    assert "Nvidia" not in json.dumps(data)
+
+
+@pytest.mark.asyncio
 async def test_chat_stream_malformed_tool_markup_falls_back_before_client_response(app, client):
     """Malformed tool text must not become a successful OMP stop."""
     pool_manager = MagicMock()

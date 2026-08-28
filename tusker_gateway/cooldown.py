@@ -84,6 +84,7 @@ class Cooldown:
 class CooldownTracker:
     _cooldowns: dict[tuple[str, str], Cooldown] = field(default_factory=dict)
     _provider_default: dict[str, Cooldown] = field(default_factory=dict)
+    _group_cooldowns: dict[str, Cooldown] = field(default_factory=dict)
     _global: Cooldown | None = None
     _recent_failures: dict[str, int] = field(default_factory=dict)
 
@@ -124,10 +125,43 @@ class CooldownTracker:
             if current is None or current.until < until:
                 self._provider_default[provider] = Cooldown(until=until)
         logger.info('cooldown set %s/%s for %.0fs', provider, model, seconds)
+
+    def cooldown_group(self, group: str, seconds: float) -> None:
+        """Quarantine a shared upstream capacity group."""
+        if not group or seconds <= 0:
+            return
+        seconds = min(seconds, MAX_COOLDOWN_SECS)
+        until = time.monotonic() + seconds
+        current = self._group_cooldowns.get(group)
+        if current is None or current.until < until:
+            self._group_cooldowns[group] = Cooldown(until=until)
+        logger.info('capacity cooldown group=%s for %.0fs', group, seconds)
+
+    def is_group_cooldown(self, group: str) -> bool:
+        """Return True when a shared upstream capacity group is quarantined."""
+        cooldown = self._group_cooldowns.get(group)
+        return cooldown is not None and cooldown.is_active()
+
     def is_cooldown(self, provider: str, model: str) -> bool:
         """Return True if (provider, model) is in cooldown."""
         if self._global is not None and self._global.is_active():
             logger.debug('cooldown check %s/%s: active (global)', provider, model)
+            return True
+        # Import lazily to keep the low-level cooldown module independent of
+        # the usage ledger during application import and test collection.
+        try:
+            from tusker_gateway.provider_usage import capacity_group_for_route
+
+            group = capacity_group_for_route(provider, model)
+        except Exception:
+            group = None
+        if group and self.is_group_cooldown(group):
+            logger.debug(
+                'cooldown check %s/%s: active (capacity group=%s)',
+                provider,
+                model,
+                group,
+            )
             return True
         key = (provider, model)
         if key in self._cooldowns and self._cooldowns[key].is_active():

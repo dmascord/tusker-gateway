@@ -41,6 +41,31 @@ class ProviderError(GatewayError):
     error_type = "provider_error"
 
 
+class ProviderCapacityError(ProviderError):
+    """A provider worker-pool capacity failure handled by pool fallback."""
+
+    status = 503
+    error_type = "server_error"
+
+    def __init__(
+        self,
+        *,
+        group: str,
+        detail: str | None = None,
+        capacity_rejected: bool = False,
+    ) -> None:
+        # ``detail`` is retained for redacted operational logs. Endpoint
+        # handlers must use the generic public message below instead.
+        super().__init__(
+            detail or "Upstream provider capacity is temporarily unavailable",
+            code="provider_capacity",
+        )
+        self.capacity_group = group
+        self.capacity_rejected = capacity_rejected
+        self.upstream_status = 503
+        self.upstream_body = detail or "provider capacity unavailable"
+
+
 class MalformedToolCallError(ProviderError):
     """An upstream model emitted tool markup that could not be parsed safely."""
 

@@ -6,6 +6,7 @@ role alias (hermes-code, hermes-privacy, hermes-premium, hermes-swarm).
 from __future__ import annotations
 
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -16,6 +17,10 @@ from tusker_gateway.config import DEFAULT_PROVIDER_REGISTRY, PoolConfig
 from tusker_gateway.cooldown import CooldownTracker, global_tracker
 from tusker_gateway.heavyweight import is_heavyweight
 from tusker_gateway.quality import QualityDB
+from tusker_gateway.tool_capability import (
+    ToolCapabilityDB,
+    default_tool_capability_db_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +106,7 @@ class ModelSpec:
     heavyweight: bool
     zdr_ok: bool  # allowed in ZDR (privacy) pools
     input_modalities: frozenset[str] | None = None
+    auto_discovered: bool = False
 
     @classmethod
     def from_dict(cls, data: dict[str, Any], default_window: int = 128_000, zdr: bool = False) -> "ModelSpec":
@@ -127,6 +133,7 @@ class ModelSpec:
                 if modalities is not None
                 else None
             ),
+            auto_discovered=bool(data.get("auto_discovered", False)),
         )
 
 
@@ -141,6 +148,7 @@ class PoolManager:
     # Kept for /status visibility; never eligible for selection.
     unkeyed: dict[str, list[tuple[ModelSpec, str]]] = field(default_factory=dict)
     _quality: QualityDB | None = None
+    _tool_capabilities: ToolCapabilityDB | None = None
     _cooldowns: CooldownTracker | None = None
     # Optional catalog registry — when set, PoolManager.extend_pools_with_catalog()
     # merges catalog-known models into the allowlist. See catalog.py.
@@ -162,7 +170,32 @@ class PoolManager:
     def __post_init__(self):
         self.pools = dict(self.config.get("pools", {}))
         self._quality = QualityDB(self.config["quality_db_path"])
+        self._tool_capabilities = ToolCapabilityDB(
+            self.config.get("tool_capability_db_path")
+            or default_tool_capability_db_path(self.config["quality_db_path"])
+        )
         self._cooldowns = global_tracker()
+        quality_path = self.config["quality_db_path"]
+        if quality_path != ":memory:":
+            try:
+                from pathlib import Path
+
+                from tusker_gateway.persistent_cooldown import PersistentCooldownStore
+
+                cooldown_path = Path(quality_path).parent / "cooldowns.db"
+                loaded_groups = PersistentCooldownStore(
+                    db_path=cooldown_path
+                ).hydrate_groups(self._cooldowns)
+                if loaded_groups:
+                    logger.info(
+                        "pool manager hydrated %d provider capacity quarantines",
+                        loaded_groups,
+                    )
+            except Exception:
+                logger.debug(
+                    "provider capacity quarantine hydration unavailable",
+                    exc_info=True,
+                )
         # Build model lists from pool configs
         for name, pool in self.pools.items():
             # Snapshot the operator-curated entries BEFORE any catalog
@@ -309,6 +342,7 @@ class PoolManager:
                     model_data: dict[str, Any] = {
                         "provider": entry.provider,
                         "model": entry.model,
+                        "auto_discovered": True,
                     }
                     if mode == "xiaomi":
                         model_data["heavyweight"] = heavyweight
@@ -413,6 +447,27 @@ class PoolManager:
         capability_cache[key] = (modalities, tool_support)
         return modalities, tool_support
 
+    def _tool_capability_allowed(self, spec: ModelSpec) -> bool:
+        """Return whether ``spec`` may receive a tool-bearing request.
+
+        Operator-curated static entries remain compatible with the historical
+        fail-open behavior when they have never been probed. Newly discovered
+        catalog entries are held back until the qualification runner records a
+        passing streaming tool contract. Any explicit failed qualification is
+        excluded for both static and dynamic entries.
+        """
+        mode = os.environ.get("TUSKER_TOOL_CAPABILITY_GATE", "auto").strip().lower()
+        if mode in {"0", "false", "no", "off", "disabled"}:
+            return True
+        if self._tool_capabilities is None:
+            return not spec.auto_discovered or mode != "strict"
+        result = self._tool_capabilities.get(spec.provider, spec.model)
+        if result is not None:
+            return result.qualified_for_tools
+        if mode == "strict":
+            return False
+        return not spec.auto_discovered
+
     def select(
         self,
         pool_name: str,
@@ -483,6 +538,9 @@ class PoolManager:
                         if requires_tools and tool_support is False:
                             self._stickiness.pop(key, None)
                             break
+                        if requires_tools and not self._tool_capability_allowed(s):
+                            self._stickiness.pop(key, None)
+                            break
                         # Don't return a sticky heavyweight if the pool
                         # no longer allows it (config changed mid-session).
                         if not heavyweight_ok and s.heavyweight:
@@ -493,6 +551,7 @@ class PoolManager:
         candidates: list[ModelSpec] = []
         filtered_special_models: list[str] = []
         filtered_tool_models: list[str] = []
+        filtered_tool_capability_models: list[str] = []
         filtered_modality_models: list[str] = []
         for s in specs:
             if (s.provider, s.model) in excluded:
@@ -514,6 +573,9 @@ class PoolManager:
             if requires_tools and tool_support is False:
                 filtered_tool_models.append(f"{s.provider}/{s.model}")
                 continue
+            if requires_tools and not self._tool_capability_allowed(s):
+                filtered_tool_capability_models.append(f"{s.provider}/{s.model}")
+                continue
             if self._cooldowns.is_cooldown(s.provider, s.model):
                 continue
             # ZDR: exclude providers in exclusion list
@@ -529,6 +591,13 @@ class PoolManager:
                 pool_name,
                 len(filtered_tool_models),
                 ",".join(filtered_tool_models[:12]),
+            )
+        if requires_tools and filtered_tool_capability_models:
+            logger.info(
+                "pool '%s' behavioral tool-capability filter filtered=%d models=%s",
+                pool_name,
+                len(filtered_tool_capability_models),
+                ",".join(filtered_tool_capability_models[:12]),
             )
         if filtered_special_models:
             logger.info(
@@ -589,7 +658,18 @@ class PoolManager:
                     for s, reason in self.unkeyed.get(name, [])
                 ],
                 "candidates": [
-                    {"provider": s.provider, "model": s.model, "context_window": s.context_window}
+                    {
+                        "provider": s.provider,
+                        "model": s.model,
+                        "context_window": s.context_window,
+                        "auto_discovered": s.auto_discovered,
+                        "tool_capability": (
+                            self._tool_capabilities.get(s.provider, s.model).to_dict()
+                            if self._tool_capabilities is not None
+                            and self._tool_capabilities.get(s.provider, s.model) is not None
+                            else None
+                        ),
+                    }
                     for s in valid
                 ],
             }

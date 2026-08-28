@@ -51,6 +51,15 @@ class PersistentCooldownStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS capacity_group_cooldowns (
+                    group_name TEXT PRIMARY KEY,
+                    until_epoch REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                )
+                """
+            )
             conn.commit()
 
     def _connect(self) -> sqlite3.Connection:
@@ -113,6 +122,42 @@ class PersistentCooldownStore:
             self._upsert_provider(conn, provider, until_epoch, now)
             conn.commit()
 
+    def record_group(self, group: str, seconds: float) -> None:
+        """Persist a shared provider-capacity quarantine window."""
+        if not group or seconds <= 0:
+            return
+        seconds = min(seconds, MAX_COOLDOWN_SECS)
+        now = time.time()
+        until_epoch = now + seconds
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO capacity_group_cooldowns (group_name, until_epoch, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(group_name) DO UPDATE SET
+                    until_epoch = MAX(capacity_group_cooldowns.until_epoch, excluded.until_epoch),
+                    updated_at = excluded.updated_at
+                """,
+                (group, until_epoch, now),
+            )
+            conn.commit()
+
+    def hydrate_groups(self, tracker: CooldownTracker) -> int:
+        """Load active capacity-group quarantines into memory."""
+        now_wall = time.time()
+        loaded = 0
+        with self._connect() as conn:
+            for group, until_epoch, _updated in conn.execute(
+                "SELECT group_name, until_epoch, updated_at FROM capacity_group_cooldowns"
+            ):
+                remaining = until_epoch - now_wall
+                if remaining <= 0:
+                    continue
+                tracker.cooldown_group(group, remaining)
+                loaded += 1
+        logger.info('hydrated %d capacity group cooldowns from store', loaded)
+        return loaded
+
     def is_provider_active(self, provider: str) -> bool:
         """Return True if provider cooldown is still active."""
         with self._connect() as conn:
@@ -156,8 +201,12 @@ class PersistentCooldownStore:
             cur = conn.execute(
                 "DELETE FROM cooldowns WHERE until_epoch <= ?", (time.time(),)
             )
+            group_cur = conn.execute(
+                "DELETE FROM capacity_group_cooldowns WHERE until_epoch <= ?",
+                (time.time(),),
+            )
             conn.commit()
-        count = cur.rowcount
+        count = cur.rowcount + group_cur.rowcount
         logger.info('purged %d expired cooldowns', count)
         return count
 
@@ -195,6 +244,9 @@ class PersistentCooldownStore:
             rows = conn.execute(
                 "SELECT provider, model, until_epoch FROM cooldowns ORDER BY until_epoch DESC"
             ).fetchall()
+            group_rows = conn.execute(
+                "SELECT group_name, until_epoch FROM capacity_group_cooldowns ORDER BY until_epoch DESC"
+            ).fetchall()
         return {
             "active_count": len(rows),
             "entries": [
@@ -205,5 +257,13 @@ class PersistentCooldownStore:
                     "seconds_remaining": max(0.0, u - time.time()),
                 }
                 for p, m, u in rows
+            ],
+            "capacity_groups": [
+                {
+                    "group": group,
+                    "until_epoch": until_epoch,
+                    "seconds_remaining": max(0.0, until_epoch - time.time()),
+                }
+                for group, until_epoch in group_rows
             ],
         }

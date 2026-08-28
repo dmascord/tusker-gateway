@@ -95,12 +95,20 @@ def ready_handler(request: web.Request) -> web.Response:
 def status_handler(request: web.Request) -> web.Response:
     """GET /status — detailed runtime status."""
     from tusker_gateway.config import load_config
+    from tusker_gateway.provider_usage import (
+        ProviderUsageDB,
+        capacity_controller,
+        default_provider_usage_db_path,
+    )
     from tusker_gateway.quality import QualityDB
     from tusker_gateway.pools import PoolManager
     from tusker_gateway.rtk import is_enabled
 
     config = load_config()
     quality = QualityDB(config["quality_db_path"])
+    provider_usage = ProviderUsageDB(
+        default_provider_usage_db_path(config["quality_db_path"])
+    )
     pools = PoolManager(config)
 
     try:
@@ -117,6 +125,8 @@ def status_handler(request: web.Request) -> web.Response:
         "version": "0.1.0",
         "pools": pools.status(),
         "quality": quality.status(),
+        "provider_usage": provider_usage.status(),
+        "provider_capacity": capacity_controller().snapshot(),
         "purged_cooldowns": purged,
         "rtk_enabled": request.app.get("rtk_enabled", is_enabled()),
     }
