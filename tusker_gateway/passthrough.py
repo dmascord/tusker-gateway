@@ -337,6 +337,40 @@ def _init_provider_endpoints() -> dict[str, dict[str, Any]]:
 PROVIDER_ENDPOINTS: dict[str, dict[str, Any]] = _init_provider_endpoints()
 
 
+def _configured_endpoint(config: dict[str, Any], provider: str) -> dict[str, Any] | None:
+    """Build an endpoint for a provider supplied through runtime config."""
+    registry = config.get("providers")
+    if not isinstance(registry, dict):
+        return None
+    provider_config = registry.get(provider.lower())
+    if provider_config is None:
+        return None
+    if isinstance(provider_config, dict):
+        base_url = provider_config.get("base_url")
+        chat_path = provider_config.get("chat_path")
+        auth_type = provider_config.get("auth_type", provider_config.get("kind", "bearer"))
+        model_header = provider_config.get("model_header")
+    else:
+        base_url = getattr(provider_config, "base_url", None)
+        chat_path = getattr(provider_config, "chat_path", None)
+        auth_type = getattr(
+            provider_config,
+            "auth_type",
+            getattr(provider_config, "kind", "bearer"),
+        )
+        model_header = getattr(provider_config, "model_header", None)
+    if not base_url or not chat_path:
+        return None
+    endpoint: dict[str, Any] = {
+        "base_url": str(base_url).rstrip("/"),
+        "chat_path": str(chat_path),
+        "auth_type": str(auth_type or "bearer"),
+    }
+    if model_header:
+        endpoint["model_header"] = str(model_header)
+    return endpoint
+
+
 # Provider names whose endpoints use OAuth or Codex-style token-based auth.
 # Exposed for test assertions and downstream code that needs to know which
 # providers require credential pools.
@@ -768,6 +802,8 @@ class PassthroughClient:
             endpoint = {"base_url": upstream_gateway.rstrip("/"), "chat_path": "/v1/chat/completions", "auth_type": "bearer"}
         else:
             endpoint = PROVIDER_ENDPOINTS.get(provider)
+            if endpoint is None:
+                endpoint = _configured_endpoint(self._config, provider)
             if not endpoint:
                 raise ProviderError(f"Unknown provider: {provider}")
 

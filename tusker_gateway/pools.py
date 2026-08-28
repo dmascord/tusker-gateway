@@ -35,7 +35,11 @@ PREMIUM_POOLS: frozenset[str] = frozenset({"premium", "swarm"})
 # (for example, "User Safety: safe") or route a request nondeterministically.
 _SPECIAL_PURPOSE_MODEL_RE = re.compile(
     r"(?:^|[/._:-])(?:content[-_.]?safety|moderation|toxicity|"
-    r"safety[-_.]?classifier|guard(?:rail)?)(?:$|[/._:-])",
+    r"safety[-_.]?classifier|guard(?:rail)?|embed(?:ding)?s?|"
+    r"rerank(?:er)?|whisper|transcrib(?:e|er|ing)?|tts|asr|"
+    r"speech[-_.]?to[-_.]?text|text[-_.]?to[-_.]?speech|"
+    r"image[-_.]?(?:generation|gen)|text[-_.]?to[-_.]?image|"
+    r"stable[-_.]?diffusion|dall[-_.]?e|imagen)(?:$|[/._:-])",
     re.IGNORECASE,
 )
 _PROVIDER_ROUTER_MODELS: frozenset[tuple[str, str]] = frozenset({
@@ -44,6 +48,14 @@ _PROVIDER_ROUTER_MODELS: frozenset[tuple[str, str]] = frozenset({
     ("openrouter", "free"),
     ("openrouter", "auto"),
 })
+
+
+def _provider_registry(config: dict[str, Any]) -> dict[str, Any]:
+    """Return the runtime provider registry, with the legacy default fallback."""
+    configured = config.get("providers")
+    if isinstance(configured, dict) and configured:
+        return configured
+    return DEFAULT_PROVIDER_REGISTRY
 
 
 def is_general_chat_model(provider: str, model: str) -> bool:
@@ -60,14 +72,18 @@ def is_general_chat_model(provider: str, model: str) -> bool:
     return _SPECIAL_PURPOSE_MODEL_RE.search(normalized_model) is None
 
 
-def _validate_providers(specs: list["ModelSpec"]) -> list[str]:
+def _validate_providers(
+    specs: list["ModelSpec"],
+    provider_registry: dict[str, Any] | None = None,
+) -> list[str]:
     """Return warnings for any model whose provider is not in the registry.
 
     Logging happens once per (provider, model) pair to avoid duplicate spam.
     """
+    known = provider_registry or DEFAULT_PROVIDER_REGISTRY
     warnings: list[str] = []
     for s in specs:
-        if s.provider not in DEFAULT_PROVIDER_REGISTRY:
+        if s.provider not in known:
             warnings.append(f"unknown provider '{s.provider}' for model '{s.model}'")
     return warnings
 
@@ -75,6 +91,7 @@ def _validate_providers(specs: list["ModelSpec"]) -> list[str]:
 def _split_unkeyed(
     specs: list[ModelSpec],
     provider_keys: dict[str, str],
+    provider_registry: dict[str, Any] | None = None,
 ) -> tuple[list[ModelSpec], list[tuple[ModelSpec, str]]]:
     """Soft-fail models whose provider has no usable credential.
 
@@ -87,11 +104,15 @@ def _split_unkeyed(
     Returns ``(usable, skipped)`` where each skipped item is paired with
     a human-readable reason.
     """
+    known = provider_registry or DEFAULT_PROVIDER_REGISTRY
     usable: list[ModelSpec] = []
     skipped: list[tuple[ModelSpec, str]] = []
     for s in specs:
-        endpoint = DEFAULT_PROVIDER_REGISTRY.get(s.provider)
-        if endpoint is not None and endpoint.kind == "bearer" and not provider_keys.get(s.provider.lower()):
+        endpoint = known.get(s.provider)
+        kind = getattr(endpoint, "kind", None)
+        if isinstance(endpoint, dict):
+            kind = endpoint.get("kind", endpoint.get("auth_type"))
+        if endpoint is not None and kind == "bearer" and not provider_keys.get(s.provider.lower()):
             skipped.append((s, f"no API key configured for provider '{s.provider}'"))
             continue
         usable.append(s)
@@ -169,6 +190,7 @@ class PoolManager:
     STICKINESS_TTL = 3600.0  # 1 hour
     def __post_init__(self):
         self.pools = dict(self.config.get("pools", {}))
+        self._providers = _provider_registry(self.config)
         self._quality = QualityDB(self.config["quality_db_path"])
         self._tool_capabilities = ToolCapabilityDB(
             self.config.get("tool_capability_db_path")
@@ -208,7 +230,11 @@ class PoolManager:
                 ModelSpec.from_dict(m, default_window=pool.context_window, zdr=pool.zdr)
                 for m in pool.models
             ]
-            usable, unkeyed = _split_unkeyed(specs, self.config.get("provider_api_keys", {}))
+            usable, unkeyed = _split_unkeyed(
+                specs,
+                self.config.get("provider_api_keys", {}),
+                self._providers,
+            )
             for s, reason in unkeyed:
                 logger.warning(
                     "pool '%s': dropping %s '%s' — %s (add the key to the provider secret to enable)",
@@ -217,7 +243,7 @@ class PoolManager:
             self.unkeyed[name] = unkeyed
             self.models[name] = usable
             # Warn about unknown providers once at startup
-            for w in _validate_providers(specs):
+            for w in _validate_providers(specs, self._providers):
                 logger.warning("pool '%s': %s — will be skipped during selection", name, w)
     def pool_keeps_heavyweight(self, pool_name: str) -> bool:
         """Return True if the named pool should keep heavyweight candidates.
@@ -275,11 +301,12 @@ class PoolManager:
     def extend_pools_with_free_catalog(self) -> dict[str, list[str]]:
         """Auto-promote eligible catalog models into ``auto_free`` pools.
 
-        OpenRouter contributes models whose input and output pricing is zero.
-        OpenCode Zen/Go catalogs are key-filtered, so all advertised models are
-        eligible. Xiaomi's authenticated catalog is also key-filtered, but its
-        models are only added to non-ZDR cheap pools and pricing/slug-based
-        heavyweights are excluded.
+        OpenRouter and provider-native catalogs contribute models whose input
+        and output pricing is explicitly zero. OpenCode Zen/Go catalogs are
+        key-filtered, so all advertised models are eligible. Xiaomi's
+        authenticated catalog is also key-filtered, but its models are only
+        added to non-ZDR cheap pools and pricing/slug-based heavyweights are
+        excluded.
 
         Auto-added entries are tracked separately from operator-curated static
         entries so refreshes can add and prune models without disturbing the
@@ -297,12 +324,25 @@ class PoolManager:
             eligible: dict[tuple[str, str], dict[str, Any]] = {}
             excluded_special_models: list[str] = []
 
-            for provider, mode in (
-                ("openrouter", "pricing"),
-                ("opencode-zen", "all"),
-                ("opencode-go", "all"),
-                ("xiaomi", "xiaomi"),
-            ):
+            providers = getattr(self.catalog_registry, "providers", None)
+            catalog_providers = (
+                tuple(providers())
+                if callable(providers)
+                else tuple(getattr(self.catalog_registry, "_clients", {}))
+                or ("openrouter", "opencode-zen", "opencode-go", "xiaomi")
+            )
+            for provider in catalog_providers:
+                if provider == "models.dev":
+                    # models.dev is a pricing source, not an inference route.
+                    continue
+                if provider in {"opencode-zen", "opencode-go"}:
+                    mode = "all"
+                elif provider == "xiaomi":
+                    mode = "xiaomi"
+                else:
+                    # Generic provider catalogs may only auto-enter a cheap
+                    # pool when both prices are explicitly zero.
+                    mode = "pricing"
                 if mode == "xiaomi" and (
                     pool.zdr or self.pool_keeps_heavyweight(pool_name)
                 ):
@@ -398,7 +438,11 @@ class PoolManager:
                 ModelSpec.from_dict(m, default_window=pool.context_window, zdr=pool.zdr)
                 for m in pool.models
             ]
-            usable, unkeyed = _split_unkeyed(specs, self.config.get("provider_api_keys", {}))
+            usable, unkeyed = _split_unkeyed(
+                specs,
+                self.config.get("provider_api_keys", {}),
+                self._providers,
+            )
             for s, reason in unkeyed:
                 logger.warning(
                     "pool '%s': dropping %s '%s' — %s (add the key to the provider secret to enable)",
@@ -557,7 +601,7 @@ class PoolManager:
             if (s.provider, s.model) in excluded:
                 continue
             # Skip providers that are not in the registry — avoids ProviderError cascade
-            if s.provider not in DEFAULT_PROVIDER_REGISTRY:
+            if s.provider not in self._providers:
                 continue
             if not is_general_chat_model(s.provider, s.model):
                 filtered_special_models.append(f"{s.provider}/{s.model}")
@@ -643,8 +687,8 @@ class PoolManager:
         """Return pool status for /status endpoint."""
         result = {}
         for name, specs in self.models.items():
-            valid = [s for s in specs if s.provider in DEFAULT_PROVIDER_REGISTRY]
-            invalid = [s for s in specs if s.provider not in DEFAULT_PROVIDER_REGISTRY]
+            valid = [s for s in specs if s.provider in self._providers]
+            invalid = [s for s in specs if s.provider not in self._providers]
             result[name] = {
                 "models": len(specs),
                 "valid_candidates": len(valid),

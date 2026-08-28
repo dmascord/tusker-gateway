@@ -26,6 +26,9 @@ class ProviderConfig:
     auth_type: str = "bearer"
     zdr_ok: bool = False
     heavyweight: bool = False
+    # Optional provider-native model-list endpoint. Absolute URLs are allowed
+    # for providers whose catalog lives outside the chat API base URL.
+    models_path: str | None = None
 
 
 class PoolConfig:
@@ -246,31 +249,32 @@ def _provider_registry_from_env() -> dict[str, ProviderConfig]:
             "auth_type": value.get("auth_type", value.get("kind", "bearer")),
             "zdr_ok": bool(value.get("zdr_ok", False)),
             "heavyweight": bool(value.get("heavyweight", False)),
+            "models_path": value.get("models_path", value.get("catalog_path")),
         }
         registry[str(name).lower()] = ProviderConfig(**merged)
     return registry
 
 
 DEFAULT_PROVIDER_REGISTRY: dict[str, ProviderConfig] = {
-    "openai": ProviderConfig("openai", "bearer", "https://api.openai.com", "/v1/chat/completions", auth_env="OPENAI_API_KEY"),
-    "openrouter": ProviderConfig("openrouter", "bearer", "https://openrouter.ai/api/v1", "/chat/completions", auth_env="OPENROUTER_API_KEY"),
-    "groq": ProviderConfig("groq", "bearer", "https://api.groq.com/openai", "/v1/chat/completions", auth_env="GROQ_API_KEY"),
-    "zai": ProviderConfig("zai", "bearer", "https://api.z.ai/api/coding/paas", "/v4/chat/completions", auth_env="GLM_API_KEY"),
+    "openai": ProviderConfig("openai", "bearer", "https://api.openai.com", "/v1/chat/completions", auth_env="OPENAI_API_KEY", models_path="/v1/models"),
+    "openrouter": ProviderConfig("openrouter", "bearer", "https://openrouter.ai/api/v1", "/chat/completions", auth_env="OPENROUTER_API_KEY", models_path="/models"),
+    "groq": ProviderConfig("groq", "bearer", "https://api.groq.com/openai", "/v1/chat/completions", auth_env="GROQ_API_KEY", models_path="/v1/models"),
+    "zai": ProviderConfig("zai", "bearer", "https://api.z.ai/api/coding/paas", "/v4/chat/completions", auth_env="GLM_API_KEY", models_path="/v4/models"),
     "xiaomi": ProviderConfig("xiaomi", "bearer", "https://token-plan-sgp.xiaomimimo.com", "/v1/chat/completions", auth_env="XIAOMI_MIMO_API_KEY"),
-    "arliai": ProviderConfig("arliai", "bearer", "https://api.arliai.com", "/v1/chat/completions", auth_env="ARLIAI_API_KEY"),
-    "google": ProviderConfig("google", "bearer", "https://generativelanguage.googleapis.com", "/v1beta/openai/chat/completions", auth_env="GEMINI_API_KEY"),
-    "cerebras": ProviderConfig("cerebras", "bearer", "https://api.cerebras.ai", "/v1/chat/completions", auth_env="CEREBRAS_API_KEY"),
-    "cohere": ProviderConfig("cohere", "bearer", "https://api.cohere.com/compatibility", "/v1/chat/completions", auth_env="COHERE_API_KEY"),
-    "minimax": ProviderConfig("minimax", "bearer", "https://api.minimax.io", "/v1/chat/completions", auth_env="MINIMAX_API_KEY"),
-    "synthetic": ProviderConfig("synthetic", "bearer", "https://api.synthetic.new", "/v1/chat/completions", auth_env="SYNTHETIC_API_KEY"),
-    "ollama-cloud": ProviderConfig("ollama-cloud", "bearer", "https://ollama.com", "/v1/chat/completions", auth_env="OLLAMA_API_KEY"),
+    "arliai": ProviderConfig("arliai", "bearer", "https://api.arliai.com", "/v1/chat/completions", auth_env="ARLIAI_API_KEY", models_path="/v1/models"),
+    "google": ProviderConfig("google", "bearer", "https://generativelanguage.googleapis.com", "/v1beta/openai/chat/completions", auth_env="GEMINI_API_KEY", models_path="/v1beta/openai/models"),
+    "cerebras": ProviderConfig("cerebras", "bearer", "https://api.cerebras.ai", "/v1/chat/completions", auth_env="CEREBRAS_API_KEY", models_path="/v1/models"),
+    "cohere": ProviderConfig("cohere", "bearer", "https://api.cohere.com/compatibility", "/v1/chat/completions", auth_env="COHERE_API_KEY", models_path="https://api.cohere.com/v1/models?page_size=1000"),
+    "minimax": ProviderConfig("minimax", "bearer", "https://api.minimax.io", "/v1/chat/completions", auth_env="MINIMAX_API_KEY", models_path="/v1/models"),
+    "synthetic": ProviderConfig("synthetic", "bearer", "https://api.synthetic.new", "/v1/chat/completions", auth_env="SYNTHETIC_API_KEY", models_path="/v1/models"),
+    "ollama-cloud": ProviderConfig("ollama-cloud", "bearer", "https://ollama.com", "/v1/chat/completions", auth_env="OLLAMA_API_KEY", models_path="/v1/models"),
     "opencode-go": ProviderConfig("opencode-go", "bearer", "https://opencode.ai/zen/go/v1", "/chat/completions", auth_env="OPENCODE_GO_API_KEY", zdr_ok=True),
     "opencode-zen": ProviderConfig("opencode-zen", "bearer", "https://opencode.ai/zen", "/v1/chat/completions", auth_env="OPENCODE_ZEN_API_KEY"),
     "openai-codex": ProviderConfig("openai-codex", "codex", "https://chatgpt.com/backend-api/codex", "/responses", pool_env="opencode_codex_credentials", auth_type="codex", model_header="x-openai-gpt-model", zdr_ok=True),
     "github-copilot": ProviderConfig("github-copilot", "oauth", "https://api.githubcopilot.com", "/chat/completions", pool_env="GITHUB_COPILOT_CREDENTIALS", auth_type="oauth", model_header="x-github-gpt-model"),
     "github-copilot-enterprise": ProviderConfig("github-copilot-enterprise", "oauth", "https://copilot-api.sita.ghe.com", "/chat/completions", pool_env="GITHUB_COPILOT_ENTERPRISE_CREDENTIALS", auth_type="oauth", model_header="x-github-gpt-model"),
-    "local-llm": ProviderConfig("local-llm", "local", "http://localhost:11434", "/v1/chat/completions"),
-    "nvidia": ProviderConfig("nvidia", "bearer", "https://integrate.api.nvidia.com", "/v1/chat/completions", auth_env="NVIDIA_API_KEY"),
+    "local-llm": ProviderConfig("local-llm", "local", "http://localhost:11434", "/v1/chat/completions", models_path="/api/tags"),
+    "nvidia": ProviderConfig("nvidia", "bearer", "https://integrate.api.nvidia.com", "/v1/chat/completions", auth_env="NVIDIA_API_KEY", models_path="/v1/models"),
 }
 
 def _provider_registry_from_env() -> dict[str, ProviderConfig]:
@@ -298,6 +302,7 @@ def _provider_registry_from_env() -> dict[str, ProviderConfig]:
             "auth_type": value.get("auth_type", value.get("kind", "bearer")),
             "zdr_ok": bool(value.get("zdr_ok", False)),
             "heavyweight": bool(value.get("heavyweight", False)),
+            "models_path": value.get("models_path", value.get("catalog_path")),
         }
         registry[str(name).lower()] = ProviderConfig(**merged)
     return registry
@@ -325,8 +330,10 @@ def _load_pools() -> dict[str, PoolConfig]:
             continue
         try:
             data = json.loads(value)
+            if not isinstance(data, dict):
+                continue
             models = data.get("models", [])
-            if not models:
+            if not models and not data.get("auto_free", False):
                 continue
             pools[pool_name] = PoolConfig(
                 name=pool_name,

@@ -77,6 +77,7 @@ surface eligible models without requiring a config edit:
 | Codex | `https://chatgpt.com/backend-api/codex/models?client_version=0.0.0` | 60 min |
 | GitHub Copilot | `https://api.githubcopilot.com/models` | 5 min |
 | OpenRouter | `https://openrouter.ai/api/v1/models` | 60 min |
+| OpenAI-compatible providers | Provider-configured `models_path` (for example `/v1/models`) | 60 min |
 | models.dev | `https://models.dev/api.json` (pricing DB) | 60 min |
 | Xiaomi MiMo | `https://token-plan-sgp.xiaomimimo.com/v1/models` | 60 min |
 
@@ -104,6 +105,7 @@ free into the pool's allowlist. Discovery differs per upstream:
 | `opencode-zen` | All entries returned by `/zen/v1/models` (the upstream key-filters paid models) |
 | `opencode-go` | All entries returned by `/zen/go/v1/models` (same key-filter) |
 | `xiaomi` | Authenticated Token Plan catalog; proven chat models only, cheap non-ZDR pools only, heavyweight entries excluded |
+| provider-native catalogs | Both catalog/model.dev prices must resolve to exactly zero; unpriced or paid models stay out of free pools |
 
 Xiaomi's catalog does not publish modality metadata. The gateway enriches the
 verified current models: `mimo-v2.5` accepts text and image input;

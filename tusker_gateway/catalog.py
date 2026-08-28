@@ -10,6 +10,7 @@ Architecture:
         ├── CodexCatalog      (chatgpt.com/backend-api/codex/models)
         ├── CopilotCatalog    (api.githubcopilot.com/models)
         ├── OpenRouterCatalog (openrouter.ai/api/v1/models)
+        ├── ProviderModelsCatalog (provider-native OpenAI-compatible /models)
         ├── XiaomiCatalog     (token-plan-sgp.xiaomimimo.com/v1/models)
         └── ModelsDevCatalog  (models.dev/api.json, pricing DB)
 
@@ -465,6 +466,87 @@ class OpenRouterCatalog(CatalogClient):
 
 
 # ---------------------------------------------------------------------------
+class ProviderModelsCatalog(CatalogClient):
+    """Authenticated catalog for providers exposing an OpenAI-style list.
+
+    A number of providers implement ``GET /models`` but do not need a
+    bespoke catalog parser. The endpoint is configured on the normalized
+    provider registry so custom providers can opt in without code changes.
+    """
+
+    def __init__(
+        self,
+        *,
+        provider: str,
+        endpoint: str,
+        ttl_secs: float = 3600.0,
+    ) -> None:
+        super().__init__()
+        self.provider = provider
+        self.endpoint = endpoint
+        self.ttl_secs = ttl_secs
+
+    async def fetch(self, session: aiohttp.ClientSession) -> list[CatalogEntry]:
+        headers = {
+            "User-Agent": "tusker-gateway/1.0 (catalog-refresh)",
+            "accept": "application/json",
+        }
+        token = await self._resolve_token()
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        async with session.get(self.endpoint, headers=headers) as resp:
+            if resp.status != 200:
+                raise CatalogError(f"{self.provider} models HTTP {resp.status}")
+            data = await resp.json()
+
+        rows: list[tuple[str | None, Any]] = []
+        if isinstance(data, list):
+            rows = [(None, row) for row in data]
+        elif isinstance(data, dict):
+            collection: Any = None
+            for key in ("data", "models", "items"):
+                if key in data:
+                    collection = data[key]
+                    break
+            if isinstance(collection, list):
+                rows = [(None, row) for row in collection]
+            elif isinstance(collection, dict):
+                rows = [(str(name), row) for name, row in collection.items()]
+
+        out: list[CatalogEntry] = []
+        for fallback_name, row in rows:
+            if isinstance(row, str):
+                slug = row.strip()
+                raw: dict[str, Any] = {"id": slug}
+            elif isinstance(row, dict):
+                raw = row
+                slug = next(
+                    (
+                        row.get(key)
+                        for key in ("id", "slug", "model", "name", "model_name")
+                        if isinstance(row.get(key), str) and row.get(key).strip()
+                    ),
+                    fallback_name,
+                )
+                slug = slug.strip() if isinstance(slug, str) else ""
+            else:
+                continue
+            if not slug:
+                continue
+            if slug.startswith("models/"):
+                slug = slug[len("models/") :]
+            cost_input, cost_output = _extract_catalog_pricing(raw)
+            out.append(CatalogEntry(
+                provider=self.provider,
+                model=slug,
+                raw=raw,
+                cost_input=cost_input,
+                cost_output=cost_output,
+            ))
+        return out
+
+
+# ---------------------------------------------------------------------------
 class OpenCodeCatalog(CatalogClient):
     """OpenCode Zen / Go catalog from opencode.ai/zen/v1/models and /go/v1/models.
 
@@ -666,6 +748,22 @@ def _extract_openrouter_pricing(model_info: dict[str, Any]) -> tuple[float | Non
         _parse_cost_field(pricing.get("completion")),
     )
 
+
+def _extract_catalog_pricing(model_info: dict[str, Any]) -> tuple[float | None, float | None]:
+    """Extract pricing from common provider catalog shapes."""
+    prompt_cost, completion_cost = _extract_openrouter_pricing(model_info)
+    if prompt_cost is not None or completion_cost is not None:
+        return prompt_cost, completion_cost
+    cost = model_info.get("cost")
+    if not isinstance(cost, dict):
+        cost = model_info.get("pricing")
+    if not isinstance(cost, dict):
+        return None, None
+    return (
+        _parse_cost_field(cost.get("input", cost.get("prompt"))),
+        _parse_cost_field(cost.get("output", cost.get("completion"))),
+    )
+
 def is_free_openrouter_model(model_info: dict[str, Any]) -> bool:
     """Return whether OpenRouter explicitly prices both token directions at zero."""
     prompt_cost, completion_cost = _extract_openrouter_pricing(model_info)
@@ -717,6 +815,26 @@ class CatalogRegistry:
                 return entry.cost_input, entry.cost_output
         return None, None
 
+    def providers(self) -> tuple[str, ...]:
+        """Return registered provider keys in stable insertion order."""
+        return tuple(self._clients)
+
+    def _enrich_pricing(self) -> None:
+        """Fill provider catalog prices from models.dev when available."""
+        for client in self._clients.values():
+            if isinstance(client, ModelsDevCatalog):
+                continue
+            for entry in client._entries:
+                if entry.cost_input is not None and entry.cost_output is not None:
+                    continue
+                cost_input, cost_output = self._pricing_lookup(
+                    entry.provider, entry.model
+                )
+                if entry.cost_input is None:
+                    entry.cost_input = cost_input
+                if entry.cost_output is None:
+                    entry.cost_output = cost_output
+
     async def refresh_all(self, session: aiohttp.ClientSession) -> None:
         """Refresh every client concurrently."""
         results = await asyncio.gather(
@@ -726,6 +844,7 @@ class CatalogRegistry:
         for client, res in zip(self._clients.values(), results):
             if isinstance(res, Exception):
                 logger.warning("%s catalog refresh raised: %s", client.provider, res)
+        self._enrich_pricing()
 
     def get_client(self, provider: str) -> CatalogClient | None:
         return self._clients.get(provider)
@@ -767,24 +886,78 @@ class CatalogRegistry:
         return list(client._entries)
 
     @classmethod
-    def default(cls) -> "CatalogRegistry":
-        """Build the default registry covering Codex, Copilot, OpenRouter,
-        OpenCode Zen/Go, Xiaomi, and models.dev."""
+    def default(
+        cls,
+        provider_registry: dict[str, Any] | None = None,
+    ) -> "CatalogRegistry":
+        """Build catalogs for every configured provider with a model endpoint.
+
+        Provider-specific clients handle non-standard authentication or
+        response shapes. Other providers use their configured native
+        ``models_path`` and the generic OpenAI-compatible parser.
+        """
+        if provider_registry is None:
+            from tusker_gateway.config import DEFAULT_PROVIDER_REGISTRY
+
+            provider_registry = DEFAULT_PROVIDER_REGISTRY
         reg = cls()
-        reg.register("openai-codex", CodexCatalog())
-        reg.register("github-copilot", CopilotCatalog(provider="github-copilot"))
-        reg.register(
+        if "openai-codex" in provider_registry:
+            reg.register("openai-codex", CodexCatalog())
+        if "github-copilot" in provider_registry:
+            reg.register("github-copilot", CopilotCatalog(provider="github-copilot"))
+        if "github-copilot-enterprise" in provider_registry:
+            reg.register(
+                "github-copilot-enterprise",
+                CopilotCatalog(
+                    provider="github-copilot-enterprise",
+                    endpoint_base="https://copilot-api.sita.ghe.com",
+                    endpoint="https://copilot-api.sita.ghe.com/models",
+                ),
+            )
+        if "openrouter" in provider_registry:
+            reg.register("openrouter", OpenRouterCatalog())
+        if "opencode-zen" in provider_registry:
+            reg.register("opencode-zen", OpenCodeCatalog())
+        if "opencode-go" in provider_registry:
+            reg.register("opencode-go", OpenCodeGoCatalog())
+        if "xiaomi" in provider_registry:
+            reg.register("xiaomi", XiaomiCatalog())
+
+        special = {
+            "openai-codex",
+            "github-copilot",
             "github-copilot-enterprise",
-            CopilotCatalog(
-                provider="github-copilot-enterprise",
-                endpoint_base="https://copilot-api.sita.ghe.com",
-                endpoint="https://copilot-api.sita.ghe.com/models",
-            ),
-        )
-        reg.register("openrouter", OpenRouterCatalog())
-        reg.register("opencode-zen", OpenCodeCatalog())
-        reg.register("opencode-go", OpenCodeGoCatalog())
-        reg.register("xiaomi", XiaomiCatalog())
+            "openrouter",
+            "opencode-zen",
+            "opencode-go",
+            "xiaomi",
+            "models.dev",
+        }
+        for provider, config in provider_registry.items():
+            provider = str(provider).lower()
+            if provider in special:
+                continue
+            if isinstance(config, dict):
+                models_path = config.get("models_path", config.get("catalog_path"))
+                base_url = str(config.get("base_url", "")).strip()
+            else:
+                models_path = getattr(config, "models_path", None)
+                base_url = str(getattr(config, "base_url", "")).strip()
+            if not models_path:
+                continue
+            if not base_url:
+                continue
+            endpoint = str(models_path).strip()
+            if not endpoint.startswith(("http://", "https://")):
+                endpoint = f"{base_url.rstrip('/')}/{endpoint.lstrip('/')}"
+            reg.register(
+                provider,
+                ProviderModelsCatalog(
+                    provider=provider,
+                    endpoint=endpoint,
+                    ttl_secs=DEFAULT_TTLS.get(provider, 3600.0),
+                ),
+            )
         reg.register("models.dev", ModelsDevCatalog())
         return reg
 

@@ -207,8 +207,9 @@ def create_app() -> web.Application:
                 "semantic cache initialization complete enabled=%s",
                 sem_cache.enabled,
             )
-        # Dynamic model catalog refresh (Codex, Copilot, OpenRouter,
-        # OpenCode, Xiaomi, models.dev). Initial refresh is synchronous so
+        # Dynamic model catalog refresh (provider-native catalogs plus
+        # Codex/Copilot/OpenRouter/OpenCode/Xiaomi and models.dev). Initial
+        # refresh is synchronous so
         # the pool has data on the first request; the background loop keeps it fresh.
         catalog_enabled = os.environ.get("TUSKER_CATALOG_ENABLED", "1").strip().lower()
         if catalog_enabled not in {"0", "false", "no", "off"}:
@@ -218,7 +219,7 @@ def create_app() -> web.Application:
                     catalog_refresh_loop,
                 )
                 interval_secs = float(os.environ.get("TUSKER_CATALOG_REFRESH_SECS", "300"))
-                registry = CatalogRegistry.default()
+                registry = CatalogRegistry.default(config.get("providers"))
                 # Wire API keys into catalog clients that need them.
                 _wire_catalog_api_keys(
                     registry, config.get("provider_api_keys", {}),
@@ -259,7 +260,14 @@ def create_app() -> web.Application:
                     startup_log.info(
                         "catalog confirmed %d pool entries; auto_free pools: %s",
                         sum(catalog_counts.values()),
-                        {k: len(v) for k, v in auto_free.items() if any("openrouter/" in s or "opencode-" in s.split("/")[0] for s in v)},
+                        {k: len(v) for k, v in auto_free.items()},
+                    )
+                    startup_log.info(
+                        "catalog inventory providers=%s",
+                        {
+                            client.provider: len(client._entries)
+                            for client in registry._clients.values()
+                        },
                     )
                 app["catalog_task"] = asyncio.create_task(
                     catalog_refresh_loop(
@@ -430,11 +438,10 @@ def _wire_catalog_api_keys(
     resolves the current rotator token (or the raw GitHub token, for
     Copilot) on each fetch — matching the chat-path auth strategy.
     """
-    for provider in ("openrouter", "opencode-zen", "opencode-go", "xiaomi"):
-        client = registry.get_client(provider)
-        if client is not None:
-            client.set_api_key(provider_keys.get(provider))
-
+    startup_log = logging.getLogger("tusker_gateway.startup")
+    # Wire OAuth token sources for Codex and Copilot providers
+    # (must come before API key injection to ensure proper order)
+    
     def _rotator_for(provider: str):
         if credential_rotators is None:
             return codex_rotator
@@ -483,6 +490,29 @@ def _wire_catalog_api_keys(
     if copilot_ent_client is not None:
         copilot_ent_client.set_token_source(_copilot_ent_token_source)
 
+    # Inject API keys for all configured providers to their catalog clients
+    provider_keys = provider_keys or {}
+    for provider in provider_keys:
+        client = registry.get_client(provider)
+        if client is not None:
+            client.set_api_key(provider_keys.get(provider))
+
+    # Ensure all catalog clients have either API key or token source configured
+    for provider in registry._clients:
+        client = registry.get_client(provider)
+        if client is None:
+            continue
+        
+        has_api_key = provider_keys.get(provider) is not None
+        has_token_source = client._token_source is not None if hasattr(client, '_token_source') else False
+        
+        if not has_api_key and not has_token_source:
+            # Log warning for providers without authentication
+            startup_log.warning(
+                "Provider %s catalog client has no authentication configured. "
+                "Catalog refresh will fail with 401/403 errors.",
+                provider
+            )
 
 def _secrets_compare(a: str, b: str) -> bool:
     import secrets

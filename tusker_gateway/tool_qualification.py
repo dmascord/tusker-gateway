@@ -22,15 +22,9 @@ from typing import Any
 
 import aiohttp
 
-from tusker_gateway.catalog import (
-    CatalogRegistry,
-    OpenCodeCatalog,
-    OpenCodeGoCatalog,
-    OpenRouterCatalog,
-    XiaomiCatalog,
-)
+from tusker_gateway.catalog import CatalogRegistry
 from tusker_gateway.config import load_config
-from tusker_gateway.pools import PoolManager
+from tusker_gateway.pools import PoolManager, is_general_chat_model
 from tusker_gateway.tool_capability import (
     TOOL_CAPABILITY_PROBE_VERSION,
     ToolCapabilityDB,
@@ -59,18 +53,34 @@ PROBE_TOOL: dict[str, Any] = {
 
 
 def _catalog_registry(config: dict[str, Any]) -> CatalogRegistry:
-    """Build the subset of catalogs used by ``auto_free`` pool discovery."""
-    registry = CatalogRegistry()
-    providers = (
-        ("openrouter", OpenRouterCatalog()),
-        ("opencode-zen", OpenCodeCatalog()),
-        ("opencode-go", OpenCodeGoCatalog()),
-        ("xiaomi", XiaomiCatalog()),
-    )
+    """Build and authenticate catalogs for every configured provider."""
+    registry = CatalogRegistry.default(config.get("providers"))
     keys = config.get("provider_api_keys", {})
-    for provider, client in providers:
-        client.set_api_key(keys.get(provider) if isinstance(keys, dict) else None)
-        registry.register(provider, client)
+    if not isinstance(keys, dict):
+        keys = {}
+    for provider, client in registry._clients.items():
+        client.set_api_key(keys.get(provider))
+
+    # Codex and Copilot model catalogs use short-lived OAuth credentials. The
+    # gateway process wires full rotators; the standalone qualification job
+    # only needs a read-only token source for catalog enumeration.
+    credential_pools = config.get("credential_pools", {})
+    if isinstance(credential_pools, dict):
+        from tusker_gateway.passthrough import CodexTokenRotator
+
+        for provider in (
+            "openai-codex",
+            "github-copilot",
+            "github-copilot-enterprise",
+        ):
+            client = registry.get_client(provider)
+            if client is None or keys.get(provider):
+                continue
+            credentials = credential_pools.get(provider)
+            if not isinstance(credentials, list) or not credentials:
+                continue
+            rotator = CodexTokenRotator(credentials)
+            client.set_token_source(rotator.get_token)
     return registry
 
 
@@ -351,7 +361,7 @@ async def run_qualification(
     force: bool = False,
     limit: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Discover and qualify auto-added models for one pool."""
+    """Qualify static and auto-discovered chat models for one pool."""
     config = load_config()
     api_key = os.environ.get("API_KEYS", "").split(",", 1)[0].strip()
     if not api_key:
@@ -368,7 +378,13 @@ async def run_qualification(
         manager = PoolManager(config)
         manager.catalog_registry = registry
         manager.extend_pools_with_free_catalog()
-        pairs = sorted(manager.auto_added.get(pool_name, set()))
+        pairs = sorted(
+            {
+                (spec.provider, spec.model)
+                for spec in manager.models.get(pool_name, [])
+                if is_general_chat_model(spec.provider, spec.model)
+            }
+        )
         pairs = [
             pair for pair in pairs
             if _needs_probe(
@@ -422,7 +438,11 @@ def _print_results(results: list[dict[str, Any]], *, pool_name: str) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--pool", default="code", help="pool whose auto-added models should be tested")
+    parser.add_argument(
+        "--pool",
+        default="code",
+        help="pool whose static and auto-discovered chat models should be tested",
+    )
     parser.add_argument(
         "--base-url",
         default=os.environ.get("TUSKER_TOOL_QUALIFICATION_BASE_URL", "http://127.0.0.1:8642"),

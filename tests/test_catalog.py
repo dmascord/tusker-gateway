@@ -24,6 +24,7 @@ from tusker_gateway.catalog import (
     OpenCodeCatalog,
     OpenCodeGoCatalog,
     OpenRouterCatalog,
+    ProviderModelsCatalog,
     XiaomiCatalog,
     _parse_cost_field,
     advertised_input_modalities,
@@ -175,6 +176,59 @@ async def test_copilot_catalog_emits_single_provider_entries():
     assert ("github-copilot", "gpt-5.5") in providers
     assert ("github-copilot", "claude-sonnet-4.6") in providers
     assert all(e.provider == "github-copilot" for e in entries)
+
+
+@pytest.mark.asyncio
+async def test_provider_models_catalog_parses_standard_and_ollama_shapes():
+    session = _CapturingSession(FakeResponse(200, {
+        "models": [
+            {"id": "provider-model", "pricing": {"input": "0", "output": "0"}},
+            {"name": "second-model"},
+            {"id": ""},
+        ],
+    }))
+    catalog = ProviderModelsCatalog(
+        provider="cerebras",
+        endpoint="https://api.example.test/v1/models",
+    )
+    catalog.set_api_key("provider-key")
+
+    entries = await catalog.fetch(session)
+
+    assert [(entry.provider, entry.model) for entry in entries] == [
+        ("cerebras", "provider-model"),
+        ("cerebras", "second-model"),
+    ]
+    assert entries[0].cost_input == 0.0
+    assert entries[0].cost_output == 0.0
+    assert session.captured["headers"]["Authorization"] == "Bearer provider-key"
+
+
+def test_registry_default_includes_provider_native_catalogs():
+    registry = CatalogRegistry.default()
+
+    for provider in (
+        "openai", "groq", "zai", "arliai", "google", "cerebras",
+        "cohere", "minimax", "synthetic", "ollama-cloud", "local-llm",
+        "nvidia",
+    ):
+        client = registry.get_client(provider)
+        assert isinstance(client, ProviderModelsCatalog)
+        assert client.endpoint
+
+
+def test_registry_default_honors_custom_provider_model_endpoint():
+    registry = CatalogRegistry.default({
+        "custom": {
+            "base_url": "https://provider.example.test/v1",
+            "chat_path": "/chat/completions",
+            "models_path": "/models",
+        },
+    })
+
+    client = registry.get_client("custom")
+    assert isinstance(client, ProviderModelsCatalog)
+    assert client.endpoint == "https://provider.example.test/v1/models"
 
 class _CapturingSession:
     """Minimal aiohttp-like session that records the headers of each GET."""
@@ -807,6 +861,55 @@ def test_poolmanager_auto_free_adds_openrouter_zero_pricing():
     # so PoolManager.select() can pick it.
     runtime = {(s.provider, s.model) for s in pm.models["code"]}
     assert ("openrouter", "stealth/ox-alpha") in runtime
+
+
+def test_poolmanager_auto_free_adds_explicitly_free_generic_provider_models():
+    """Generic provider catalogs participate only with an explicit 0/0 price."""
+    from tusker_gateway.config import PoolConfig
+    from tusker_gateway.pools import PoolManager
+
+    cfg = {
+        "pools": {
+            "code": PoolConfig(name="code", models=[], auto_free=True),
+        },
+        "excluded_providers": [],
+        "provider_api_keys": {"cerebras": "k-cerebras"},
+        "quality_db_path": "/tmp/_unused.db",
+    }
+    pm = PoolManager(cfg)
+    registry = CatalogRegistry()
+    client = ProviderModelsCatalog(
+        provider="cerebras",
+        endpoint="https://api.example.test/v1/models",
+    )
+    client._entries = [
+        CatalogEntry(
+            provider="cerebras",
+            model="free-chat",
+            cost_input=0.0,
+            cost_output=0.0,
+        ),
+        CatalogEntry(
+            provider="cerebras",
+            model="text-embedding-3-small",
+            cost_input=0.0,
+            cost_output=0.0,
+        ),
+        CatalogEntry(
+            provider="cerebras",
+            model="paid-chat",
+            cost_input=0.1,
+            cost_output=0.2,
+        ),
+    ]
+    registry.register("cerebras", client)
+    pm.catalog_registry = registry
+
+    pm.extend_pools_with_free_catalog()
+
+    assert {(m["provider"], m["model"]) for m in pm.pools["code"].models} == {
+        ("cerebras", "free-chat"),
+    }
 
 
 def test_poolmanager_auto_free_includes_opencode_zen_and_go():

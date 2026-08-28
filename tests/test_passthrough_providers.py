@@ -368,6 +368,20 @@ def test_config_maps_manifest_provider_key_aliases():
     assert cfg["provider_api_keys"]["zai"] == "zai-key"
 
 
+def test_config_keeps_empty_auto_free_pool_for_catalog_discovery(monkeypatch):
+    """An auto-configured pool may start empty and wait for its catalog."""
+    monkeypatch.setenv(
+        "TUSKER_POOL_CATALOG_TEST",
+        json.dumps({"models": [], "auto_free": True}),
+    )
+    monkeypatch.setenv("API_KEYS", "k1")
+
+    cfg = load_config()
+
+    assert cfg["pools"]["catalog-test"].models == []
+    assert cfg["pools"]["catalog-test"].auto_free is True
+
+
 # ---------------------------------------------------------------------------
 # All PROVIDER_ENDPOINTS entries have required fields
 # ---------------------------------------------------------------------------

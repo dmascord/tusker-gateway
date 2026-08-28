@@ -52,6 +52,10 @@ def ready_handler(request: web.Request) -> web.Response:
     from tusker_gateway.config import DEFAULT_PROVIDER_REGISTRY
     from tusker_gateway.pools import ModelSpec
 
+    provider_registry = cfg.get("providers")
+    if not isinstance(provider_registry, dict) or not provider_registry:
+        provider_registry = DEFAULT_PROVIDER_REGISTRY
+
     pool_health: dict[str, Any] = {}
     empty_pools: list[str] = []
     for name, pool in pools.items():
@@ -62,7 +66,7 @@ def ready_handler(request: web.Request) -> web.Response:
                 candidates.append(spec)
             except Exception as exc:
                 pool_health.setdefault(name, {"errors": []})["errors"].append(str(exc))
-        valid = [s for s in candidates if s.provider in DEFAULT_PROVIDER_REGISTRY]
+        valid = [s for s in candidates if s.provider in provider_registry]
         invalid_count = len(candidates) - len(valid)
         pool_health[name] = {
             "total": len(candidates),
@@ -71,7 +75,7 @@ def ready_handler(request: web.Request) -> web.Response:
             "invalid_entries": [
                 {"provider": s.provider, "model": s.model}
                 for s in candidates
-                if s.provider not in DEFAULT_PROVIDER_REGISTRY
+                if s.provider not in provider_registry
             ],
         }
         if not valid:
