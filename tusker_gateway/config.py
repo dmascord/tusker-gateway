@@ -386,7 +386,7 @@ def _load_pools() -> dict[str, PoolConfig]:
             models=[
                 # Mix of free/cheap models (kept) and heavyweight slugs (dropped
                 # automatically by the heavyweight gate in pools.py).
-                {"provider": "minimax", "model": "MiniMax-M3", "input_modalities": ["text"]},
+                {"provider": "minimax", "model": "MiniMax-M3", "input_modalities": ["text", "image"]},
                 {"provider": "minimax", "model": "MiniMax-M2.7-highspeed", "input_modalities": ["text"]},
                 {"provider": "synthetic", "model": "syn:large:text", "input_modalities": ["text"]},
                 {"provider": "synthetic", "model": "syn:large:vision", "input_modalities": ["text", "image"]},

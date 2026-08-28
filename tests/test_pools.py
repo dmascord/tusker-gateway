@@ -203,6 +203,35 @@ def test_selection_filters_known_modalities_and_invalidates_stickiness():
         )
 
 
+def test_minimax_m3_can_cover_image_tool_requests():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = PoolManager({
+            "pools": {
+                "code": PoolConfig(name="code", models=[
+                    {
+                        "provider": "minimax",
+                        "model": "MiniMax-M3",
+                        "input_modalities": ["text", "image"],
+                    },
+                    {
+                        "provider": "minimax",
+                        "model": "MiniMax-M2.7",
+                        "input_modalities": ["text"],
+                    },
+                ]),
+            },
+            "quality_db_path": os.path.join(tmpdir, "quality.db"),
+            "excluded_providers": [],
+            "provider_api_keys": {"minimax": "k-minimax"},
+        })
+
+        assert manager.select(
+            "code",
+            required_input_modalities={"image"},
+            requires_tools=True,
+        ) == ("minimax", "MiniMax-M3")
+
+
 def test_unknown_modalities_remain_eligible_for_existing_providers():
     with tempfile.TemporaryDirectory() as tmpdir:
         manager = PoolManager({

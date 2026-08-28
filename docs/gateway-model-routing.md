@@ -159,12 +159,11 @@ The original static config (from the operator's `TUSKER_POOL_*` JSON) is
 frozen at `PoolManager.__post_init__` time so this pruning can never touch
 operator-curated entries.
 
-The deployment's static `hermes-code` baseline includes MiniMax M-series text
+The deployment's static `hermes-code` baseline includes MiniMax M-series
 aliases plus Synthetic `syn:large:text`, `syn:small:text`,
-`syn:large:vision`, and `syn:small:vision`. MiniMax Token Plan M-series
-models are text-only, so they are not candidates for image-bearing requests;
-the Synthetic vision aliases and Xiaomi `mimo-v2.5` provide multimodal
-capacity.
+`syn:large:vision`, and `syn:small:vision`. MiniMax M2.x models are text-only;
+the current MiniMax M3 API supports image input and tool use. The Synthetic
+vision aliases, Xiaomi `mimo-v2.5`, and MiniMax M3 provide multimodal capacity.
 
 
 ## Migration history
