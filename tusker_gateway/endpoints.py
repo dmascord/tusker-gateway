@@ -160,6 +160,23 @@ _TOOL_OPENERS = (
     "<tool",
 )
 
+_AUXILIARY_TEXT_FIELDS = ("reasoning", "thinking", "analysis")
+_TOOL_MARKUP_HINT_RE = re.compile(
+    r"\bTOOL_CALL\s*:\s*[\w.-]+\s*\(|<\s*(?:/?(?:tool_call|function_call|tool_calls|function_calls|tool_use|tool_invocation|dots_function_call|dots_tool_call|function|parameter|invoke|tool|arg_key|arg_value|tool_sep)|(?:dsml|mimoml):)",
+    re.IGNORECASE,
+)
+
+
+def _reasoning_details_text(value: Any) -> str:
+    """Return textual reasoning from OpenRouter's details array."""
+    if not isinstance(value, list):
+        return ""
+    parts: list[str] = []
+    for item in value:
+        if isinstance(item, dict) and isinstance(item.get("text"), str):
+            parts.append(item["text"])
+    return "".join(parts)
+
 
 def _extract_inner_prose(block: str) -> str:
     """Extract the prose between a bare ``<function=name>`` opener and its
@@ -822,45 +839,104 @@ async def _normalize_stream(
 
             raw_content = delta.get("content")
             reasoning_content = delta.get("reasoning_content")
-            if raw_content is None and reasoning_content is not None:
+            # OpenRouter's newer reasoning stream uses `reasoning` (and often
+            # duplicates it in `reasoning_details`) rather than the older
+            # `reasoning_content` field. OMP renders that field as a thinking
+            # block, so tool markup there bypassed the content-only stripper
+            # and arrived as visible, unstructured text.
+            if (
+                (raw_content is None or raw_content == "")
+                and isinstance(reasoning_content, str)
+            ):
                 raw_content = reasoning_content
                 delta["content"] = reasoning_content
                 delta.pop("reasoning_content", None)
+                reasoning_content = None
+
+            auxiliary_sources: list[tuple[str, str]] = []
+            if isinstance(reasoning_content, str) and reasoning_content:
+                auxiliary_sources.append(("reasoning_content", reasoning_content))
+            for field in _AUXILIARY_TEXT_FIELDS:
+                value = delta.get(field)
+                if isinstance(value, str) and value:
+                    auxiliary_sources.append((field, value))
+
+            details_text = _reasoning_details_text(delta.get("reasoning_details"))
+            if details_text:
+                # OpenRouter normally duplicates `reasoning` in this array.
+                # Remove the duplicate from the client-facing delta so an
+                # unsanitized copy cannot leak and OMP does not render it twice.
+                if not auxiliary_sources:
+                    auxiliary_sources.append(("reasoning", details_text))
+                elif details_text != "".join(value for _, value in auxiliary_sources):
+                    # If a provider puts additional text or the tool envelope
+                    # only in the details array, inspect that copy as well.
+                    # It is parsed for calls but never re-emitted as a second
+                    # reasoning field.
+                    auxiliary_sources.append(("reasoning_details", details_text))
+                delta.pop("reasoning_details", None)
 
             tc = delta.get("tool_calls")
             has_tools = isinstance(tc, list) and bool(tc)
-            raw_marker_types = tool_markup_kinds(raw_content)
+            raw_texts: list[tuple[str, str]] = []
+            if isinstance(raw_content, str) and raw_content:
+                raw_texts.append(("content", raw_content))
+            raw_texts.extend(auxiliary_sources)
+            raw_marker_types = tuple(sorted({
+                marker
+                for _, value in raw_texts
+                for marker in tool_markup_kinds(value)
+            }))
             if raw_marker_types:
                 saw_tool_markup = True
                 tool_markup_seen.update(raw_marker_types)
+
             cleaned_content = ""
+            cleaned_auxiliary: dict[str, str] = {}
+
+            def clean_text(value: str) -> str:
+                cleaned = tool_stripper.feed(value)
+                # `strip_tool_text` strips outer whitespace, so only apply it
+                # when the stateful pass left an actual markup hint. This
+                # preserves token-boundary spaces in ordinary reasoning.
+                if _TOOL_MARKUP_HINT_RE.search(cleaned):
+                    cleaned = strip_tool_text(cleaned)
+                return cleaned
+
             has_content = isinstance(raw_content, str) and bool(raw_content)
             if has_content:
-                cleaned_content = tool_stripper.feed(raw_content)
-                # ``strip_tool_text`` strips outer whitespace, so only apply
-                # it when the stateful pass left an actual markup hint. This
-                # preserves token-boundary spaces in ordinary prose.
-                if re.search(
-                    r"\bTOOL_CALL\s*:\s*[\w.-]+\s*\(|<\s*(?:/?(?:tool_call|function_call|tool_calls|function_calls|tool_use|tool_invocation|dots_function_call|dots_tool_call|function|parameter|invoke|tool|arg_key|arg_value|tool_sep)|(?:dsml|mimoml):)",
-                    cleaned_content,
-                    re.IGNORECASE,
-                ):
-                    cleaned_content = strip_tool_text(cleaned_content)
-                if cleaned_content != raw_content:
-                    logger.info(
-                        "assistant tool markup sanitized stream=true provider=%s model=%s request_id=%s marker_types=%s raw_chars=%d cleaned_chars=%d native_calls=%d",
-                        provider or "unknown",
-                        model or "unknown",
-                        request_id or "unknown",
-                        ",".join(raw_marker_types) or "unknown",
-                        len(raw_content),
-                        len(cleaned_content),
-                        len(tc) if isinstance(tc, list) else 0,
-                    )
+                cleaned_content = clean_text(raw_content)
                 if cleaned_content:
                     delta["content"] = cleaned_content
                 else:
                     delta.pop("content", None)
+            for field, value in auxiliary_sources:
+                cleaned = clean_text(value)
+                cleaned_auxiliary[field] = cleaned
+                if field == "reasoning_details":
+                    continue
+                if cleaned:
+                    delta[field] = cleaned
+                else:
+                    delta.pop(field, None)
+
+            auxiliary_changed = any(
+                cleaned_auxiliary.get(field, "") != value
+                for field, value in auxiliary_sources
+            )
+            content_changed = isinstance(raw_content, str) and cleaned_content != raw_content
+            if auxiliary_changed or content_changed:
+                logger.info(
+                    "assistant tool markup sanitized stream=true provider=%s model=%s request_id=%s marker_types=%s raw_chars=%d cleaned_chars=%d native_calls=%d fields=%s",
+                    provider or "unknown",
+                    model or "unknown",
+                    request_id or "unknown",
+                    ",".join(raw_marker_types) or "unknown",
+                    sum(len(value) for _, value in raw_texts),
+                    len(cleaned_content) + sum(len(value) for value in cleaned_auxiliary.values()),
+                    len(tc) if isinstance(tc, list) else 0,
+                    ",".join(field for field, _ in raw_texts) or "none",
+                )
 
             new_choice = {**choice, "delta": delta, "finish_reason": fr}
             new_obj = {**obj, "choices": [new_choice, *choices[1:]]}
@@ -872,20 +948,20 @@ async def _normalize_stream(
             # The stripper still removes the text representation, but does
             # not make the client execute the same call twice.
             if not has_tools:
-                direct_text_calls = (
-                    parse_text_tool_calls(raw_content)
-                    if isinstance(raw_content, str)
-                    and re.search(
-                        r"\bTOOL_CALL\s*:\s*[\w.-]+\s*\(",
-                        raw_content,
-                        re.IGNORECASE,
+                for _, raw_text in raw_texts:
+                    direct_text_calls = (
+                        parse_text_tool_calls(raw_text)
+                        if re.search(
+                            r"\bTOOL_CALL\s*:\s*[\w.-]+\s*\(",
+                            raw_text,
+                            re.IGNORECASE,
+                        )
+                        else []
                     )
-                    else []
-                )
-                direct_frame = tool_calls_frame(direct_text_calls, new_obj)
-                text_calls_detected += len(direct_text_calls)
-                if direct_frame is not None:
-                    pending_tool_frames.append(direct_frame)
+                    direct_frame = tool_calls_frame(direct_text_calls, new_obj)
+                    text_calls_detected += len(direct_text_calls)
+                    if direct_frame is not None:
+                        pending_tool_frames.append(direct_frame)
 
             for block, eligible in tool_stripper.drain_pending_blocks():
                 if eligible:
@@ -916,34 +992,39 @@ async def _normalize_stream(
                     if prose:
                         pending_prose_frames.append(_content_frame(prose, new_obj))
 
-            content_changed = isinstance(raw_content, str) and cleaned_content != raw_content
             if tool_diagnostics_enabled() and (
                 raw_marker_types
                 or content_changed
+                or auxiliary_changed
                 or text_calls_detected
                 or has_tools
             ):
                 logger.info(
-                    "tool diagnostics stream provider=%s model=%s request_id=%s marker_types=%s raw_chars=%d cleaned_chars=%d native_calls=%d text_calls=%d",
+                    "tool diagnostics stream provider=%s model=%s request_id=%s marker_types=%s raw_chars=%d cleaned_chars=%d native_calls=%d text_calls=%d fields=%s",
                     provider or "unknown",
                     model or "unknown",
                     request_id or "unknown",
                     ",".join(raw_marker_types) or "unknown",
-                    len(raw_content) if isinstance(raw_content, str) else 0,
-                    len(cleaned_content),
+                    sum(len(value) for _, value in raw_texts),
+                    len(cleaned_content) + sum(len(value) for value in cleaned_auxiliary.values()),
                     len(tc) if isinstance(tc, list) else 0,
                     text_calls_detected,
+                    ",".join(field for field, _ in raw_texts) or "none",
                 )
 
             if pending_tool_frames or has_tools:
                 saw_tool_call = True
             has_promoted_tools = bool(pending_tool_frames)
             has_delta_content = bool(delta.get("content"))
+            has_delta_text = has_delta_content or any(
+                bool(delta.get(field))
+                for field in (*_AUXILIARY_TEXT_FIELDS, "reasoning_content")
+            )
 
             if fr:
                 # Finish is always last. In particular, a same-event text
                 # function block must be promoted before this frame.
-                if has_delta_content:
+                if has_delta_text:
                     content_delta = {
                         key: value for key, value in delta.items()
                         if key not in ("role", "tool_calls")
@@ -961,7 +1042,7 @@ async def _normalize_stream(
                     emitted_finish_reason = reason
                     yield f"data: {json.dumps({**new_obj, 'choices': [{**new_choice, 'delta': {}, 'finish_reason': reason}]}, ensure_ascii=False)}\n\n".encode()
             elif has_promoted_tools:
-                if has_delta_content:
+                if has_delta_text:
                     content_delta = {
                         key: value for key, value in delta.items()
                         if key not in ("role", "tool_calls")
@@ -973,7 +1054,7 @@ async def _normalize_stream(
                 for tool_frame in pending_tool_frames:
                     yield tool_frame
             else:
-                if has_delta_content or has_tools or delta or (
+                if has_delta_text or has_tools or delta or (
                     upstream_finish_reason and obj.get("usage") is not None
                 ):
                     yield f"data: {json.dumps(new_obj, ensure_ascii=False)}\n\n".encode()

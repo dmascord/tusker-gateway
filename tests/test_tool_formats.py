@@ -104,6 +104,31 @@ def test_normalize_response_tool_calls_strips_duplicate_native_markup():
     assert message["tool_calls"][0]["id"] == "native-1"
 
 
+def test_normalize_response_tool_calls_reads_reasoning_markup():
+    """Reasoning-only provider responses still need structured tool calls."""
+    markup = (
+        '<dots_function_call><invoke name="bash">'
+        '<parameter name="command">ls</parameter>'
+        '</invoke></dots_function_call>'
+    )
+    resp = {
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "reasoning": markup,
+                "reasoning_details": [{"type": "reasoning.text", "text": markup}],
+            },
+            "finish_reason": "stop",
+        }],
+    }
+
+    message = normalize_response_tool_calls(resp)["choices"][0]["message"]
+    assert message["tool_calls"][0]["function"]["name"] == "bash"
+    assert json.loads(message["tool_calls"][0]["function"]["arguments"]) == {"command": "ls"}
+    assert "dots_function_call" not in str(message)
+
+
 def test_strip_tool_text_removes_json_and_namespaced_invocation_envelopes():
     text = (
         "before <tool_call>{\"name\":\"bash\",\"args\":{}}"

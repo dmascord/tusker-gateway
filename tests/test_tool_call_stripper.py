@@ -178,6 +178,110 @@ async def test_stream_normalizer_promotes_reasoning_content(client):
 
 
 @pytest.mark.asyncio
+async def test_stream_normalizer_promotes_tool_markup_from_reasoning_field(client):
+    """OpenRouter's ``reasoning`` field must not bypass tool normalization."""
+    import json as _json
+
+    async def reasoning_tool_stream(*args, **kwargs):
+        for part in (
+            "<dots_function_call>\n",
+            '<invoke name="bash">\n'
+            '<parameter name="command">ls</parameter>\n'
+            '</invoke>\n</dots_function_call>',
+        ):
+            payload = {
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning": part,
+                        "reasoning_details": [{"type": "reasoning.text", "text": part}],
+                    },
+                    "finish_reason": None,
+                }],
+            }
+            yield f"data: {_json.dumps(payload)}\n\n".encode()
+        yield b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+            },
+        },
+    }]
+    with patch("tusker_gateway.endpoints.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
+        mock_chat.return_value = reasoning_tool_stream()
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-code",
+                "messages": [{"role": "user", "content": "list files"}],
+                "tools": tools,
+                "stream": True,
+            },
+            headers=HEADERS_AUTH,
+        )
+        assert resp.status == 200
+        body = await resp.read()
+
+    text = body.decode("utf-8", errors="replace")
+    assert "dots_function_call" not in text
+    assert "<invoke" not in text
+    assert "<parameter" not in text
+    frames = [
+        _json.loads(line[len("data: "):])
+        for line in text.splitlines()
+        if line.startswith("data: ") and line.strip() != "data: [DONE]"
+    ]
+    calls = [
+        call
+        for frame in frames
+        for choice in frame.get("choices", [])
+        for call in (choice.get("delta", {}) or {}).get("tool_calls", [])
+    ]
+    assert calls
+    assert calls[0]["function"]["name"] == "bash"
+    assert _json.loads(calls[0]["function"]["arguments"]) == {"command": "ls"}
+    assert [
+        choice.get("finish_reason")
+        for frame in frames
+        for choice in frame.get("choices", [])
+        if choice.get("finish_reason")
+    ] == ["tool_calls"]
+
+
+@pytest.mark.asyncio
+async def test_stream_normalizer_rejects_unparseable_reasoning_tool_markup():
+    """An incomplete reasoning envelope must be eligible for pool fallback."""
+    import json as _json
+    from tusker_gateway.errors import MalformedToolCallError
+    from tusker_gateway.endpoints import _normalize_stream
+
+    async def malformed_stream():
+        for value in ("<dots_function_call>\n", '<invoke name="bash">\nnot closed'):
+            payload = {"choices": [{"delta": {"reasoning": value}}]}
+            yield f"data: {_json.dumps(payload)}\n\n".encode()
+        yield b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    with pytest.raises(MalformedToolCallError):
+        async for _ in _normalize_stream(
+            malformed_stream(),
+            provider="openrouter",
+            model="dots-studio/dots-3-note-preview:free",
+            tools_requested=True,
+        ):
+            pass
+
+
+@pytest.mark.asyncio
 async def test_stream_normalizer_emits_tool_calls_for_bare_function_blocks(client):
     """Models that emit bare <function=name>...</function> (no <​tool_call> wrapper)
     across multiple SSE deltas must not leak the XML into content and must

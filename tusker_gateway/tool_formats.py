@@ -61,6 +61,7 @@ _ID_SUFFIXED_TOOL_RE = re.compile(
     r"<\s*/?\s*(?:tool_calls?|arg_key|arg_value|tool_sep):",
     re.IGNORECASE,
 )
+_AUXILIARY_TEXT_FIELDS = ("reasoning_content", "reasoning", "thinking", "analysis")
 
 
 def tool_diagnostics_enabled() -> bool:
@@ -452,7 +453,31 @@ def normalize_response_tool_calls(
                 content = "\n\n".join(text_parts) if text_parts else None
 
         native_calls = normalize_tool_calls(message.get("tool_calls"))
-        text_calls = parse_text_tool_calls(content)
+        auxiliary_texts = [
+            (field, message[field])
+            for field in _AUXILIARY_TEXT_FIELDS
+            if isinstance(message.get(field), str) and message[field]
+        ]
+        details = message.get("reasoning_details")
+        details_text = "".join(
+            item["text"]
+            for item in details
+            if isinstance(item, dict) and isinstance(item.get("text"), str)
+        ) if isinstance(details, list) else ""
+        if details_text and not auxiliary_texts:
+            auxiliary_texts.append(("reasoning_details", details_text))
+        elif details_text and details_text != "".join(value for _, value in auxiliary_texts):
+            auxiliary_texts.append(("reasoning_details", details_text))
+
+        text_calls: list[dict[str, Any]] = []
+        seen_text_calls: set[tuple[str, str]] = set()
+        for candidate in [content, *(value for _, value in auxiliary_texts)]:
+            for call in parse_text_tool_calls(candidate):
+                fn = call.get("function") or {}
+                key = (str(fn.get("name") or ""), str(fn.get("arguments") or ""))
+                if key not in seen_text_calls:
+                    seen_text_calls.add(key)
+                    text_calls.append(call)
         calls = native_calls or text_calls
 
         # Sanitize assistant text even when the provider returned native calls.
@@ -471,6 +496,47 @@ def normalize_response_tool_calls(
                     len(text_calls),
                 )
             content = cleaned
+
+        for field, value in auxiliary_texts:
+            cleaned = strip_tool_text(value)
+            if cleaned != value:
+                logger.info(
+                    "assistant reasoning tool markup sanitized source=%s field=%s marker_types=%s raw_chars=%d cleaned_chars=%d",
+                    source or "unknown",
+                    field,
+                    ",".join(tool_markup_kinds(value)) or "unknown",
+                    len(value),
+                    len(cleaned),
+                )
+            if field == "reasoning_details":
+                # Details-only responses have no canonical reasoning string;
+                # their textual portions are rewritten below as one sequence.
+                pass
+            elif cleaned:
+                message[field] = cleaned
+            elif tool_markup_kinds(value):
+                message.pop(field, None)
+
+        if details_text and isinstance(details, list):
+            if any(field != "reasoning_details" for field, _ in auxiliary_texts):
+                # The canonical reasoning field is already sanitized. The
+                # details array is a duplicate wire representation, so remove
+                # it rather than risk forwarding a second unsanitized copy.
+                message.pop("reasoning_details", None)
+            else:
+                cleaned_details = strip_tool_text(details_text)
+                remaining = cleaned_details
+                new_details = []
+                for item in details:
+                    if not isinstance(item, dict):
+                        continue
+                    item_copy = dict(item)
+                    if isinstance(item_copy.get("text"), str):
+                        length = len(item_copy["text"])
+                        item_copy["text"] = remaining[:length]
+                        remaining = remaining[length:]
+                    new_details.append(item_copy)
+                message["reasoning_details"] = new_details
 
         if calls:
             message["tool_calls"] = calls

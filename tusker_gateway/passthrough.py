@@ -190,7 +190,16 @@ def _stream_frame_is_ready(frame: bytes) -> bool:
         delta = choice.get("delta") or {}
         if isinstance(delta, dict) and any(
             delta.get(key)
-            for key in ("content", "reasoning_content", "tool_calls", "function_call")
+            for key in (
+                "content",
+                "reasoning_content",
+                "reasoning",
+                "thinking",
+                "analysis",
+                "reasoning_details",
+                "tool_calls",
+                "function_call",
+            )
         ):
             return True
     return False
