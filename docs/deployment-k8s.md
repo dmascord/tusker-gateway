@@ -43,7 +43,8 @@ IMAGE=registry.tusker.net.au:5000/tusker-gateway:$TAG
 buildah bud -f Dockerfile -t "$IMAGE" .
 buildah push "$IMAGE"
 
-# Apply manifests (config.yaml carries TUSKER_POOL_* env vars)
+# Apply manifests. The current pool JSON is inline in deployment.yaml;
+# config.yaml currently only ensures the namespace exists.
 kubectl -n hermes apply -f k8s/pvc.yaml
 kubectl -n hermes apply -f k8s/config.yaml
 kubectl -n hermes apply -f k8s/service.yaml
@@ -77,24 +78,43 @@ edge with Hermes — no DNS work needed for it.
 
 ## 5. Configuration
 
-Tusker Gateway uses the **same `hermes-env-vault` secret** as Hermes. All
-provider keys are inherited automatically. Pool definitions are loaded from
-`k8s/config.yaml` (mounted as env vars `TUSKER_POOL_CODE`, `TUSKER_POOL_PRIVACY`,
-`TUSKER_POOL_PREMIUM`, `TUSKER_POOL_SWARM`).
+Tusker Gateway uses the isolated `tusker-env-vault` secret. The deployment
+imports its provider keys with `envFrom` and declares the pool JSON inline in
+`k8s/deployment.yaml` as `TUSKER_POOL_CODE`, `TUSKER_POOL_PRIVACY`,
+`TUSKER_POOL_PREMIUM`, and `TUSKER_POOL_SWARM`.
+
+OAuth credentials are separate pools: Codex uses `CODEX_CREDENTIALS` (or the
+provider-specific `OPENCODE_CODEX_CREDENTIALS`), public Copilot uses
+`GITHUB_COPILOT_CREDENTIALS`, and Enterprise Copilot uses
+`GITHUB_COPILOT_ENTERPRISE_CREDENTIALS`. Keep these keys in
+`tusker-env-vault`; a bearer API key alone does not populate an OAuth pool.
 
 The gateway reads provider keys for every provider named in those pools:
 - `OPENROUTER_API_KEY`
 - `MINIMAX_API_KEY` (and similar for `minimax` typo alias, if any)
 - `OLLAMA_API_KEY` / `OLLAMA_MAC_API_KEY` (for `ollama-cloud`)
 - `OPENCODE_GO_API_KEY`
-- `GITHUB_COPILOT_*` (token file paths)
+- `GROQ_API_KEY`
+- `ARCEEAI_API_KEY`
+- `GITHUB_COPILOT_*` (OAuth credential pools)
 - `CEREBRAS_API_KEY`
-- `GOOGLE_API_KEY`
+- `GEMINI_API_KEY`
+- `COHERE_API_KEY`
+- `ZAI_API_KEY`
+- `XIAOMI_API_KEY`
+- `NVIDIA_API_KEY` (retained in the isolated secret, but direct NVIDIA
+  catalog discovery is disabled while its upstream capacity is saturated)
 - `SYNTHETIC_API_KEY`
 
 Always verify pool providers exist in `tusker_gateway/config.py:DEFAULT_PROVIDER_REGISTRY`
 before adding them — unknown providers raise `ProviderError("Unknown provider: ...")`
 which becomes HTTP 502 and exhausts the agent retry budget.
+
+When checking OMP routing, use the standalone provider configured as
+`tusker-gateway` with `https://ai.tusker.net.au/v1`. The older
+`hermes-gateway` provider points at `https://hermes.tusker.net.au/v1` and uses
+the Hermes service's separate fallback implementation; changes to this
+deployment's `TUSKER_POOL_CODE` do not change that legacy service.
 
 ## 6. Rollback
 
@@ -119,7 +139,7 @@ kubectl -n hermes delete pvc tusker-home
 | Image | `hermes-agent` | `tusker-gateway` |
 | Host | `hermes.tusker.net.au` | `ai.tusker.net.au` |
 | PVC | `hermes-home` | `tusker-home` |
-| Config | `hermes-env-vault` | `hermes-env-vault` (shared) |
+| Config | `hermes-env-vault` | `tusker-env-vault` (isolated) |
 
 ## Migration history
 

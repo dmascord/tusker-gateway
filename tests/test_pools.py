@@ -4,9 +4,35 @@ from __future__ import annotations
 import os
 import tempfile
 
-from tusker_gateway.config import PoolConfig
+from tusker_gateway.config import PoolConfig, _load_pools, load_config
 from tusker_gateway.cooldown import CooldownTracker, _cooldown_seconds_for_429
 from tusker_gateway.pools import PoolManager
+
+
+def test_default_code_pool_includes_current_provider_routes(monkeypatch):
+    for key in tuple(os.environ):
+        if key.startswith("TUSKER_POOL_"):
+            monkeypatch.delenv(key, raising=False)
+
+    models = _load_pools()["code"].models
+    routes = {
+        (model["provider"], model["model"])
+        for model in models
+    }
+
+    assert {
+        ("groq", "openai/gpt-oss-120b"),
+        ("groq", "openai/gpt-oss-20b"),
+        ("groq", "qwen/qwen3.6-27b"),
+        ("arcee", "trinity-mini"),
+    } <= routes
+
+
+def test_load_config_normalizes_auto_free_provider_exclusions(monkeypatch):
+    monkeypatch.setenv("TUSKER_AUTO_FREE_EXCLUDED_PROVIDERS", "NVIDIA, open_router")
+    config = load_config()
+
+    assert config["auto_free_excluded_providers"] == ["nvidia", "open-router"]
 
 
 def test_pool_selection_logic():
@@ -109,6 +135,75 @@ def test_cooldown_tracker():
     tracker.cooldown("p1", "m1", 10)
     assert tracker.is_cooldown("p1", "m1")
     assert tracker.is_cooldown("p1", "other")
+
+
+def test_cooldown_probe_ignores_model_cooldown_but_keeps_capacity_quarantine():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = PoolManager({
+            "pools": {
+                "test": PoolConfig(
+                    name="test",
+                    models=[{"provider": "openai-codex", "model": "m1"}],
+                ),
+            },
+            "quality_db_path": os.path.join(tmpdir, "quality.db"),
+            "excluded_providers": [],
+        })
+        manager._cooldowns.cooldown("openai-codex", "m1", 30)
+
+        assert manager.select("test") is None
+        assert manager.select("test", allow_cooldown_probe=True) == (
+            "openai-codex",
+            "m1",
+        )
+
+
+def test_empty_pool_selection_logs_filter_breakdown(caplog):
+    """An exhausted pool must emit a usable diagnostic, not a logging error."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = PoolManager({
+            "pools": {
+                "test": PoolConfig(
+                    name="test",
+                    models=[{"provider": "openai-codex", "model": "m1"}],
+                ),
+            },
+            "quality_db_path": os.path.join(tmpdir, "quality.db"),
+            "excluded_providers": [],
+        })
+        manager._cooldowns.cooldown("openai-codex", "m1", 30)
+
+        with caplog.at_level("WARNING", logger="tusker_gateway.pools"):
+            assert manager.select("test", requires_tools=True) is None
+
+    message = "\n".join(record.getMessage() for record in caplog.records)
+    assert "configured=1" in message
+    assert "requires_tools=True" in message
+    assert "filters=cooldown=1" in message
+
+
+def test_empty_pool_logs_unkeyed_candidates(caplog):
+    """Credential filtering must be visible when it empties a pool."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = PoolManager({
+            "pools": {
+                "test": PoolConfig(
+                    name="test",
+                    models=[{"provider": "groq", "model": "m1"}],
+                ),
+            },
+            "quality_db_path": os.path.join(tmpdir, "quality.db"),
+            "excluded_providers": [],
+            "provider_api_keys": {},
+        })
+
+        with caplog.at_level("WARNING", logger="tusker_gateway.pools"):
+            assert manager.select("test") is None
+
+    message = "\n".join(record.getMessage() for record in caplog.records)
+    assert "configured=1" in message
+    assert "usable=0" in message
+    assert "unkeyed=1" in message
 
 
 def test_pool_fallbacks_are_explicit_and_ignore_unknown_or_self_references():

@@ -358,6 +358,11 @@ class PoolManager:
             return {}
 
         changed = False
+        excluded_auto_free_providers = {
+            str(provider).strip().lower().replace("_", "-")
+            for provider in self.config.get("auto_free_excluded_providers", ())
+            if str(provider).strip()
+        }
         for pool_name, pool in self.pools.items():
             if not pool.auto_free:
                 continue
@@ -376,6 +381,13 @@ class PoolManager:
             for provider in catalog_providers:
                 if provider == "models.dev":
                     # models.dev is a pricing source, not an inference route.
+                    continue
+                if provider in excluded_auto_free_providers:
+                    logger.info(
+                        "auto_free pool '%s': excluded provider '%s'",
+                        pool_name,
+                        provider,
+                    )
                     continue
                 if pool.zdr and not self._provider_zdr_ok(provider):
                     # A free catalog entry is not automatically privacy-safe.
@@ -543,7 +555,14 @@ class PoolManager:
         capability_cache[key] = (modalities, tool_support)
         return modalities, tool_support
 
-    def _tool_capability_allowed(self, spec: ModelSpec) -> bool:
+    def _tool_capability_allowed(
+        self,
+        spec: ModelSpec,
+        *,
+        allow_unqualified_static_tools: bool = False,
+        allow_structured_tool_fallback: bool = False,
+        allow_tool_compatibility_fallback: bool = False,
+    ) -> bool:
         """Return whether ``spec`` may receive a tool-bearing request.
 
         Operator-curated static entries remain compatible with the historical
@@ -561,6 +580,27 @@ class PoolManager:
         result = self._tool_capabilities.get(spec.provider, spec.model)
         if result is not None:
             if result.qualified_for_tools:
+                return True
+            if (
+                (
+                    allow_unqualified_static_tools
+                    and not spec.auto_discovered
+                )
+                or allow_structured_tool_fallback
+            ) and result.level == ToolCapabilityLevel.STRUCTURED_STREAM:
+                # The runtime stream boundary validates arguments and removes
+                # duplicate/text-form tool markup before committing a response.
+                # A model that produced a structured call but failed the
+                # probe's stricter no-prose contract is therefore a useful
+                # bounded fallback when every strictly qualified route is
+                # unavailable. This does not admit unknown or no-call models.
+                return True
+            if allow_tool_compatibility_fallback and not spec.auto_discovered:
+                # A stale qualification record must not turn a curated pool
+                # into an empty pool. This is the final bounded fallback: the
+                # runtime response validator still rejects malformed calls,
+                # unknown tool names, invalid arguments, and required-call
+                # responses that contain no call.
                 return True
             # Strict mode intentionally requires a fresh passing qualification
             # for every model. Auto mode may retry an operator-curated model
@@ -584,6 +624,10 @@ class PoolManager:
         excluded: set[tuple[str, str]] | None = None,
         required_input_modalities: set[str] | frozenset[str] | None = None,
         requires_tools: bool = False,
+        allow_cooldown_probe: bool = False,
+        allow_unqualified_static_tools: bool = False,
+        allow_structured_tool_fallback: bool = False,
+        allow_tool_compatibility_fallback: bool = False,
     ) -> tuple[str, str] | None:
         """Select the best (provider, model) from a pool.
 
@@ -600,12 +644,36 @@ class PoolManager:
         ``requires_tools`` applies the same rule to catalog-advertised tool
         support. Models that explicitly lack tools are excluded; models with
         unknown capability metadata remain eligible for compatibility.
+
+        ``allow_cooldown_probe`` is reserved for the bounded request-level
+        recovery path. It ignores individual model/provider cooldowns while
+        retaining global and shared-capacity quarantines, so a stale transient
+        outage cannot make an otherwise configured fallback chain empty.
+
+        ``allow_unqualified_static_tools`` is a recovery-only escape hatch for
+        curated models with a structured but non-strict probe result.
+
+        ``allow_structured_tool_fallback`` extends that bounded recovery hatch
+        to auto-discovered models that have already emitted a structured call
+        during qualification. The response boundary still validates and
+        sanitizes every tool stream.
+
+        ``allow_tool_compatibility_fallback`` is the final recovery-only
+        escape hatch for curated models whose persisted probe says tools are
+        unsupported. It is used only after strict and structured candidates
+        are exhausted; auto-discovered models remain gated.
         """
         excluded = excluded or set()
         required_modalities = frozenset(required_input_modalities or ())
         specs = self.models.get(pool_name, [])
         if not specs:
-            logger.warning("pool '%s' has no configured candidates", pool_name)
+            unkeyed_count = len(self.unkeyed.get(pool_name, ()))
+            logger.warning(
+                "pool '%s' has no usable candidates configured=%d usable=0 unkeyed=%d",
+                pool_name,
+                unkeyed_count,
+                unkeyed_count,
+            )
             return None
         capability_cache: dict[
             tuple[str, str], tuple[frozenset[str] | None, bool | None]
@@ -645,10 +713,25 @@ class PoolManager:
                         ):
                             self._stickiness.pop(key, None)
                             break
-                        if requires_tools and tool_support is False:
+                        if requires_tools and tool_support is False and not (
+                            allow_tool_compatibility_fallback and not s.auto_discovered
+                        ):
                             self._stickiness.pop(key, None)
                             break
-                        if requires_tools and not self._tool_capability_allowed(s):
+                        if requires_tools and not self._tool_capability_allowed(
+                            s,
+                            allow_unqualified_static_tools=allow_unqualified_static_tools,
+                            allow_structured_tool_fallback=allow_structured_tool_fallback,
+                            allow_tool_compatibility_fallback=allow_tool_compatibility_fallback,
+                        ):
+                            self._stickiness.pop(key, None)
+                            break
+                        sticky_cooldown = (
+                            self._cooldowns.is_capacity_cooldown(s.provider, s.model)
+                            if allow_cooldown_probe
+                            else self._cooldowns.is_cooldown(s.provider, s.model)
+                        )
+                        if sticky_cooldown:
                             self._stickiness.pop(key, None)
                             break
                         # Don't return a sticky heavyweight if the pool
@@ -706,15 +789,27 @@ class PoolManager:
                 filter_counts["input_modalities"] += 1
                 filtered_modality_models.append(f"{s.provider}/{s.model}")
                 continue
-            if requires_tools and tool_support is False:
+            if requires_tools and tool_support is False and not (
+                allow_tool_compatibility_fallback and not s.auto_discovered
+            ):
                 filter_counts["advertised_tools"] += 1
                 filtered_tool_models.append(f"{s.provider}/{s.model}")
                 continue
-            if requires_tools and not self._tool_capability_allowed(s):
+            if requires_tools and not self._tool_capability_allowed(
+                s,
+                allow_unqualified_static_tools=allow_unqualified_static_tools,
+                allow_structured_tool_fallback=allow_structured_tool_fallback,
+                allow_tool_compatibility_fallback=allow_tool_compatibility_fallback,
+            ):
                 filter_counts["behavioral_tools"] += 1
                 filtered_tool_capability_models.append(f"{s.provider}/{s.model}")
                 continue
-            if self._cooldowns.is_cooldown(s.provider, s.model):
+            cooldown_active = (
+                self._cooldowns.is_capacity_cooldown(s.provider, s.model)
+                if allow_cooldown_probe
+                else self._cooldowns.is_cooldown(s.provider, s.model)
+            )
+            if cooldown_active:
                 filter_counts["cooldown"] += 1
                 if len(filtered_cooldown_models) < 12:
                     filtered_cooldown_models.append(f"{s.provider}/{s.model}")
@@ -773,7 +868,10 @@ class PoolManager:
             ) or "none"
             logger.warning(
                 "pool '%s' has no eligible candidates configured=%d requires_tools=%s "
-                "input_modalities=%s context_tokens=%d filters=%s cooldown_models=%s",
+                "input_modalities=%s context_tokens=%d filters=%s cooldown_models=%s "
+                "cooldown_probe=%s unqualified_static_tools=%s "
+                "structured_tool_fallback=%s tool_compatibility_fallback=%s "
+                "unkeyed=%d",
                 pool_name,
                 len(specs),
                 requires_tools,
@@ -781,6 +879,11 @@ class PoolManager:
                 context_tokens,
                 filters,
                 ",".join(filtered_cooldown_models) or "none",
+                allow_cooldown_probe,
+                allow_unqualified_static_tools,
+                allow_structured_tool_fallback,
+                allow_tool_compatibility_fallback,
+                len(self.unkeyed.get(pool_name, ())),
             )
             return None
 

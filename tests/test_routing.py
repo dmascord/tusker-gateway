@@ -36,3 +36,16 @@ def test_resolve_route():
     r5 = resolve_route(None, {})
     assert r5.kind == "pool"
     assert r5.pool_name == "code"
+
+
+def test_gateway_qualified_pool_aliases_resolve_to_pools():
+    for alias, pool in (
+        ("hermes-code", "code"),
+        ("hermes-privacy", "privacy"),
+        ("hermes-premium", "premium"),
+        ("hermes-swarm", "swarm"),
+    ):
+        for model in (f"tusker-gateway/{alias}", f"tusker-gateway::{alias}"):
+            route = resolve_route(model, {})
+            assert route.kind == "pool"
+            assert route.pool_name == pool

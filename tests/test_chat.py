@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 import pytest
 from tusker_gateway.budget import BudgetDecision
 from tusker_gateway.errors import ProviderError
+from tusker_gateway.endpoints import _call_with_pool_fallback
 from .conftest import HEADERS_AUTH, HEADERS_NO_AUTH
 
 
@@ -27,6 +28,100 @@ class _FakeSemanticCache:
 
     def stats_snapshot(self):
         return {"hits": 0, "misses": 0, "writes": 0, "evictions": 0}
+
+
+@pytest.mark.asyncio
+async def test_pool_fallback_recovery_probe_without_http_server():
+    """The bounded recovery pass works independently of aiohttp sockets."""
+    pool_manager = MagicMock()
+    pool_manager.fallback_pools.return_value = ()
+    pool_manager.select.side_effect = [
+        None,
+        ("openai-codex", "recovery-model"),
+    ]
+    upstream = MagicMock()
+    upstream.chat = AsyncMock(return_value={
+        "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+    })
+
+    provider, model, result = await _call_with_pool_fallback(
+        {"pools": {}},
+        {
+            "model": "hermes-code",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+        upstream,
+        request=SimpleNamespace(app={"pool_manager": pool_manager}),
+    )
+
+    assert (provider, model) == ("openai-codex", "recovery-model")
+    assert result["choices"][0]["message"]["content"] == "ok"
+    assert pool_manager.select.call_args_list == [
+        call("code", excluded=set(), required_input_modalities=None),
+        call(
+            "code",
+            excluded=set(),
+            required_input_modalities=None,
+            allow_cooldown_probe=True,
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_tool_pool_compatibility_probe_without_http_server():
+    """The final tool fallback is bounded and keeps the normal validator."""
+    pool_manager = MagicMock()
+    pool_manager.fallback_pools.return_value = ()
+    pool_manager.select.side_effect = [
+        None,
+        None,
+        ("openrouter", "compatibility-model"),
+    ]
+    upstream = MagicMock()
+    upstream.chat = AsyncMock(return_value={
+        "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+    })
+
+    provider, model, result = await _call_with_pool_fallback(
+        {"pools": {}},
+        {
+            "model": "hermes-code",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+        upstream,
+        tools=[{"type": "function", "function": {"name": "read"}}],
+        request=SimpleNamespace(app={"pool_manager": pool_manager}),
+    )
+
+    assert (provider, model) == ("openrouter", "compatibility-model")
+    assert result["choices"][0]["message"]["content"] == "ok"
+    assert pool_manager.select.call_args_list == [
+        call(
+            "code",
+            excluded=set(),
+            required_input_modalities=None,
+            requires_tools=True,
+        ),
+        call(
+            "code",
+            excluded=set(),
+            required_input_modalities=None,
+            requires_tools=True,
+            allow_cooldown_probe=True,
+            allow_unqualified_static_tools=True,
+            allow_structured_tool_fallback=True,
+        ),
+        call(
+            "code",
+            excluded=set(),
+            required_input_modalities=None,
+            requires_tools=True,
+            allow_cooldown_probe=True,
+            allow_unqualified_static_tools=True,
+            allow_structured_tool_fallback=True,
+            allow_tool_compatibility_fallback=True,
+        ),
+    ]
 
 
 @pytest.mark.asyncio
@@ -98,6 +193,87 @@ async def test_empty_pool_selection_is_retryable_and_includes_retry_after(app, c
         "code": "no_healthy_models",
     }
     mock_chat.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_empty_pool_enters_bounded_recovery_probe(app, client):
+    """Stale cooldowns must not make a configured pool permanently empty."""
+    pool_manager = MagicMock()
+    pool_manager.fallback_pools.return_value = ()
+    pool_manager.select.side_effect = [
+        None,
+        ("openai-codex", "recovery-model"),
+    ]
+    app["pool_manager"] = pool_manager
+
+    with patch("tusker_gateway.endpoints.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
+        mock_chat.return_value = {
+            "choices": [{"message": {"role": "assistant", "content": "recovered"}}],
+        }
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-code",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            headers=HEADERS_AUTH,
+        )
+
+    assert resp.status == 200
+    assert pool_manager.select.call_args_list == [
+        call("code", excluded=set(), required_input_modalities=None),
+        call(
+            "code",
+            excluded=set(),
+            required_input_modalities=None,
+            allow_cooldown_probe=True,
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_tool_pool_recovery_probe_enables_curated_fallback(app, client):
+    """Recovery preserves tool validation while admitting curated candidates."""
+    pool_manager = MagicMock()
+    pool_manager.fallback_pools.return_value = ()
+    pool_manager.select.side_effect = [
+        None,
+        ("openrouter", "recovery-tool-model"),
+    ]
+    app["pool_manager"] = pool_manager
+
+    with patch("tusker_gateway.endpoints.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
+        mock_chat.return_value = {
+            "choices": [{"message": {"role": "assistant", "content": "recovered"}}],
+        }
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-code",
+                "messages": [{"role": "user", "content": "inspect"}],
+                "tools": [{"type": "function", "function": {"name": "read"}}],
+            },
+            headers=HEADERS_AUTH,
+        )
+
+    assert resp.status == 200
+    assert pool_manager.select.call_args_list == [
+        call(
+            "code",
+            excluded=set(),
+            required_input_modalities=None,
+            requires_tools=True,
+        ),
+        call(
+            "code",
+            excluded=set(),
+            required_input_modalities=None,
+            requires_tools=True,
+            allow_cooldown_probe=True,
+            allow_unqualified_static_tools=True,
+            allow_structured_tool_fallback=True,
+        ),
+    ]
 
 
 @pytest.mark.asyncio

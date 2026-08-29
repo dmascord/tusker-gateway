@@ -121,13 +121,16 @@ def status_handler(request: web.Request) -> web.Response:
     from tusker_gateway.quality import QualityDB
     from tusker_gateway.pools import PoolManager
     from tusker_gateway.rtk import is_enabled
+    from tusker_gateway.cooldown import global_tracker
 
     config = load_config()
     quality = QualityDB(config["quality_db_path"])
     provider_usage = ProviderUsageDB(
         default_provider_usage_db_path(config["quality_db_path"])
     )
-    pools = PoolManager(config)
+    # Reuse the live manager so catalog additions, capability records, and
+    # pool rebuilds shown here match request-time selection.
+    pools = request.app.get("pool_manager") or PoolManager(config)
 
     try:
         from tusker_gateway.persistent_cooldown import PersistentCooldownStore
@@ -145,6 +148,7 @@ def status_handler(request: web.Request) -> web.Response:
         "quality": quality.status(),
         "provider_usage": provider_usage.status(),
         "provider_capacity": capacity_controller().snapshot(),
+        "cooldowns": global_tracker().snapshot(),
         "purged_cooldowns": purged,
         "rtk_enabled": request.app.get("rtk_enabled", is_enabled()),
     }

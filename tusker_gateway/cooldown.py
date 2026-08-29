@@ -142,25 +142,38 @@ class CooldownTracker:
         cooldown = self._group_cooldowns.get(group)
         return cooldown is not None and cooldown.is_active()
 
-    def is_cooldown(self, provider: str, model: str) -> bool:
-        """Return True if (provider, model) is in cooldown."""
+    def is_capacity_cooldown(self, provider: str, model: str) -> bool:
+        """Return whether a shared capacity or global circuit is active.
+
+        Pool recovery may probe a model whose individual transient cooldown is
+        stale, but it must never bypass a process-wide or shared-provider
+        capacity quarantine.
+        """
         if self._global is not None and self._global.is_active():
-            logger.debug('cooldown check %s/%s: active (global)', provider, model)
             return True
-        # Import lazily to keep the low-level cooldown module independent of
-        # the usage ledger during application import and test collection.
         try:
             from tusker_gateway.provider_usage import capacity_group_for_route
 
             group = capacity_group_for_route(provider, model)
         except Exception:
             group = None
-        if group and self.is_group_cooldown(group):
+        return bool(group and self.is_group_cooldown(group))
+
+    def is_cooldown(self, provider: str, model: str) -> bool:
+        """Return True if (provider, model) is in cooldown."""
+        if self.is_capacity_cooldown(provider, model):
+            group = None
+            try:
+                from tusker_gateway.provider_usage import capacity_group_for_route
+
+                group = capacity_group_for_route(provider, model)
+            except Exception:
+                pass
             logger.debug(
                 'cooldown check %s/%s: active (capacity group=%s)',
                 provider,
                 model,
-                group,
+                group or "global",
             )
             return True
         key = (provider, model)
@@ -174,6 +187,50 @@ class CooldownTracker:
                 return True
         logger.debug('cooldown check %s/%s: clear', provider, model)
         return False
+
+    def snapshot(self) -> dict[str, Any]:
+        """Return active cooldowns with bounded, secret-free diagnostics."""
+        model_entries = []
+        for (provider, model), cooldown in self._cooldowns.items():
+            remaining = cooldown.remaining()
+            if remaining > 0:
+                model_entries.append({
+                    "provider": provider,
+                    "model": model,
+                    "seconds_remaining": round(remaining, 1),
+                })
+        provider_entries = []
+        for provider, cooldown in self._provider_default.items():
+            remaining = cooldown.remaining()
+            if remaining > 0:
+                provider_entries.append({
+                    "provider": provider,
+                    "seconds_remaining": round(remaining, 1),
+                })
+        group_entries = []
+        for group, cooldown in self._group_cooldowns.items():
+            remaining = cooldown.remaining()
+            if remaining > 0:
+                group_entries.append({
+                    "group": group,
+                    "seconds_remaining": round(remaining, 1),
+                })
+        global_remaining = (
+            round(self._global.remaining(), 1)
+            if self._global is not None and self._global.is_active()
+            else 0.0
+        )
+        return {
+            "active_model_count": len(model_entries),
+            "active_provider_count": len(provider_entries),
+            "active_group_count": len(group_entries),
+            "global_seconds_remaining": global_remaining,
+            "models": sorted(model_entries, key=lambda item: (
+                item["provider"], item["model"],
+            )),
+            "providers": sorted(provider_entries, key=lambda item: item["provider"]),
+            "groups": sorted(group_entries, key=lambda item: item["group"]),
+        }
 
     def clear(self, provider: str, model: str) -> None:
         """Clear cooldown for (provider, model)."""

@@ -28,6 +28,7 @@ KEYS=(
     "COPILOT_GITHUB_TOKEN"
     "OPENROUTER_API_KEY"
     "GROQ_API_KEY"
+    "ARCEEAI_API_KEY"
     "GLM_API_KEY"
     "GEMINI_API_KEY"
     "CEREBRAS_API_KEY"
@@ -35,10 +36,19 @@ KEYS=(
     "MINIMAX_API_KEY"
     "SYNTHETIC_API_KEY"
     "OLLAMA_API_KEY"
+    "NVIDIA_API_KEY"
     "OPENCODE_GO_API_KEY"
     "OPENCODE_ZEN_API_KEY"
     "XIAOMI_API_KEY"
     "ZAI_API_KEY"
+    # Credential pools referenced by the deployment. These must remain
+    # separate so Codex, public Copilot, and Enterprise Copilot never share
+    # the wrong OAuth credential set.
+    "CODEX_CREDENTIALS"
+    "OPENCODE_CODEX_CREDENTIALS"
+    "GITHUB_COPILOT_CREDENTIALS"
+    "GITHUB_COPILOT_ENTERPRISE_CREDENTIALS"
+    "GITHUB_COPILOT_ENTERPRISE_TOKEN"
     # Hugging Face — used by sentence-transformers/all-MiniLM-L6-v2 to
     # silence the unauthenticated-Hub warning + lift rate limits.
     # Sourced from the repo .env (HF_TOKEN preferred, HF_API_KEY fallback).
@@ -123,7 +133,7 @@ echo
 echo "  1. Edit k8s/deployment.yaml:"
 echo "     - envFrom: secretRef: name: hermes-env-vault"
 echo "       →      envFrom: secretRef: name: tusker-env-vault"
-echo "     - All 13 secretKeyRef entries: name: hermes-env-vault"
+echo "     - All secretKeyRef entries: name: hermes-env-vault"
 echo "       →                          name: tusker-env-vault"
 echo "  2. Re-run ./k8s/deploy.sh"
 echo "  3. After the gateway is verified healthy, consider removing the"

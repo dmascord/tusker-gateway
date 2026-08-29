@@ -103,6 +103,11 @@ def load_config() -> dict[str, Any]:
     config["model_name"] = os.environ.get("MODEL_NAME", "tusker-gateway")
     config["pools"] = _load_pools()
     config["excluded_providers"] = [p.strip() for p in _parse_env_list("EXCLUDED_PROVIDERS") if p.strip()]
+    config["auto_free_excluded_providers"] = [
+        p.strip().lower().replace("_", "-")
+        for p in _parse_env_list("TUSKER_AUTO_FREE_EXCLUDED_PROVIDERS")
+        if p.strip()
+    ]
 
     # Normalized provider registry and API-key map.
     config["providers"] = _load_providers()
@@ -132,6 +137,7 @@ def load_config() -> dict[str, Any]:
     _ENV_KEY_ALIASES = {
         "openrouter": ["OPENROUTER_API_KEY"],
         "groq": ["GROQ_API_KEY"],
+        "arcee": ["ARCEEAI_API_KEY", "ARCEE_API_KEY"],
         "zai": ["ZAI_API_KEY", "GLM_API_KEY"],
         "xiaomi": ["XIAOMI_MIMO_API_KEY", "MIMO_API_KEY", "XIAOMI_API_KEY"],
         "arliai": ["ARLIAI_API_KEY"],
@@ -279,6 +285,7 @@ DEFAULT_PROVIDER_REGISTRY: dict[str, ProviderConfig] = {
     "openai": ProviderConfig("openai", "bearer", "https://api.openai.com", "/v1/chat/completions", auth_env="OPENAI_API_KEY", models_path="/v1/models"),
     "openrouter": ProviderConfig("openrouter", "bearer", "https://openrouter.ai/api/v1", "/chat/completions", auth_env="OPENROUTER_API_KEY", models_path="/models"),
     "groq": ProviderConfig("groq", "bearer", "https://api.groq.com/openai", "/v1/chat/completions", auth_env="GROQ_API_KEY", models_path="/v1/models"),
+    "arcee": ProviderConfig("arcee", "bearer", "https://api.arcee.ai/api/v1", "/chat/completions", auth_env="ARCEEAI_API_KEY", models_path="/models"),
     "zai": ProviderConfig("zai", "bearer", "https://api.z.ai/api/coding/paas", "/v4/chat/completions", auth_env="GLM_API_KEY", models_path="/v4/models"),
     "xiaomi": ProviderConfig("xiaomi", "bearer", "https://token-plan-sgp.xiaomimimo.com", "/v1/chat/completions", auth_env="XIAOMI_MIMO_API_KEY"),
     "arliai": ProviderConfig("arliai", "bearer", "https://api.arliai.com", "/v1/chat/completions", auth_env="ARLIAI_API_KEY", models_path="/v1/models"),
@@ -390,6 +397,10 @@ def _load_pools() -> dict[str, PoolConfig]:
                 {"provider": "minimax", "model": "MiniMax-M2.7-highspeed", "input_modalities": ["text"]},
                 {"provider": "synthetic", "model": "syn:large:text", "input_modalities": ["text"]},
                 {"provider": "synthetic", "model": "syn:large:vision", "input_modalities": ["text", "image"]},
+                {"provider": "groq", "model": "openai/gpt-oss-120b", "input_modalities": ["text"]},
+                {"provider": "groq", "model": "openai/gpt-oss-20b", "input_modalities": ["text"]},
+                {"provider": "groq", "model": "qwen/qwen3.6-27b", "input_modalities": ["text", "image"]},
+                {"provider": "arcee", "model": "trinity-mini", "input_modalities": ["text"]},
                 {"provider": "github-copilot", "model": "gpt-5.5"},
                 {"provider": "github-copilot", "model": "claude-sonnet-4.6"},
                 {"provider": "openai-codex", "model": "gpt-5.6-luna"},
@@ -416,6 +427,7 @@ def _load_pools() -> dict[str, PoolConfig]:
                 {"provider": "synthetic", "model": "syn:large:text", "input_modalities": ["text"]},
                 {"provider": "synthetic", "model": "syn:large:vision", "input_modalities": ["text", "image"]},
                 {"provider": "minimax", "model": "MiniMax-M2.7-highspeed", "input_modalities": ["text"]},
+                {"provider": "arcee", "model": "trinity-large-preview", "input_modalities": ["text"]},
             ],
         )
     if "swarm" not in pools:

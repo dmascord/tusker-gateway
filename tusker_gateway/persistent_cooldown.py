@@ -205,8 +205,12 @@ class PersistentCooldownStore:
                 "DELETE FROM capacity_group_cooldowns WHERE until_epoch <= ?",
                 (time.time(),),
             )
+            provider_cur = conn.execute(
+                "DELETE FROM provider_cooldowns WHERE until_epoch <= ?",
+                (time.time(),),
+            )
             conn.commit()
-        count = cur.rowcount + group_cur.rowcount
+        count = cur.rowcount + group_cur.rowcount + provider_cur.rowcount
         logger.info('purged %d expired cooldowns', count)
         return count
 

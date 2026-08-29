@@ -210,7 +210,7 @@ def test_registry_default_includes_provider_native_catalogs():
     for provider in (
         "openai", "groq", "zai", "arliai", "google", "cerebras",
         "cohere", "minimax", "synthetic", "ollama-cloud", "local-llm",
-        "nvidia",
+        "nvidia", "arcee",
     ):
         client = registry.get_client(provider)
         assert isinstance(client, ProviderModelsCatalog)
@@ -910,6 +910,43 @@ def test_poolmanager_auto_free_adds_explicitly_free_generic_provider_models():
     assert {(m["provider"], m["model"]) for m in pm.pools["code"].models} == {
         ("cerebras", "free-chat"),
     }
+
+
+def test_poolmanager_auto_free_excludes_configured_provider():
+    """An exhausted provider must not re-enter through dynamic discovery."""
+    from tusker_gateway.config import PoolConfig
+    from tusker_gateway.pools import PoolManager
+
+    cfg = {
+        "pools": {
+            "code": PoolConfig(name="code", models=[], auto_free=True),
+        },
+        "excluded_providers": [],
+        "auto_free_excluded_providers": ["NVIDIA"],
+        "provider_api_keys": {"nvidia": "k-nvidia"},
+        "quality_db_path": "/tmp/_unused.db",
+    }
+    pm = PoolManager(cfg)
+    registry = CatalogRegistry()
+    client = ProviderModelsCatalog(
+        provider="nvidia",
+        endpoint="https://api.example.test/v1/models",
+    )
+    client._entries = [
+        CatalogEntry(
+            provider="nvidia",
+            model="meta/llama-3.1-8b-instruct",
+            cost_input=0.0,
+            cost_output=0.0,
+        ),
+    ]
+    registry.register("nvidia", client)
+    pm.catalog_registry = registry
+
+    pm.extend_pools_with_free_catalog()
+
+    assert pm.pools["code"].models == []
+    assert pm.models["code"] == []
 
 
 def test_poolmanager_auto_free_does_not_add_non_zdr_catalog_to_privacy():

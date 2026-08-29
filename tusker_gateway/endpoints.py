@@ -1954,6 +1954,8 @@ async def _call_with_pool_fallback(
     pending_selection = initial_selection
     attempts = 0
     max_attempts = _max_pool_provider_attempts()
+    recovery_probe = False
+    tool_compatibility_probe = False
     while True:
         if attempts >= max_attempts:
             logger.warning(
@@ -1980,6 +1982,13 @@ async def _call_with_pool_fallback(
             }
             if requires_tools:
                 select_kwargs["requires_tools"] = True
+            if recovery_probe:
+                select_kwargs["allow_cooldown_probe"] = True
+                if requires_tools:
+                    select_kwargs["allow_unqualified_static_tools"] = True
+                    select_kwargs["allow_structured_tool_fallback"] = True
+                    if tool_compatibility_probe:
+                        select_kwargs["allow_tool_compatibility_fallback"] = True
             selected = pool_mgr.select(active_pool, **select_kwargs)
         if not selected:
             if pool_index + 1 < len(pool_names):
@@ -1995,6 +2004,56 @@ async def _call_with_pool_fallback(
                     active_pool,
                 )
                 continue
+            if not recovery_probe and attempts < max_attempts:
+                # A prior request can quarantine every currently ranked
+                # candidate. Probe the same configured fallback chain once,
+                # ignoring only individual transient cooldowns. Shared/global
+                # capacity quarantines, policy, modalities, and known lack of
+                # tool support remain enforced by PoolManager.select().
+                recovery_probe = True
+                pool_index = 0
+                active_pool = pool_names[pool_index]
+                logger.warning(
+                    "pool recovery probe starting rid=%s requested_pool=%s "
+                    "attempts=%d last_error=%s",
+                    request_id or "unknown",
+                    pool_name,
+                    attempts,
+                    _pool_failure_summary(last_error) if last_error is not None else "none",
+                )
+                continue
+            if (
+                requires_tools
+                and recovery_probe
+                and not tool_compatibility_probe
+                and attempts < max_attempts
+            ):
+                # A persisted capability probe can be stale or provider
+                # metadata can lag behind actual support. Try curated static
+                # routes once more before returning no_healthy_models; this
+                # still uses the response validator as the hard safety gate.
+                tool_compatibility_probe = True
+                pool_index = 0
+                active_pool = pool_names[pool_index]
+                logger.warning(
+                    "tool compatibility recovery probe starting rid=%s "
+                    "requested_pool=%s attempts=%d",
+                    request_id or "unknown",
+                    pool_name,
+                    attempts,
+                )
+                continue
+            logger.warning(
+                "pool fallback exhausted without an eligible candidate "
+                "rid=%s requested_pool=%s pools=%s attempts=%d recovery_probe=%s "
+                "tool_compatibility_probe=%s",
+                request_id or "unknown",
+                pool_name,
+                ",".join(pool_names),
+                attempts,
+                recovery_probe,
+                tool_compatibility_probe,
+            )
             if last_error is not None:
                 raise last_error
             raise NoHealthyModelsError(pool=pool_name)

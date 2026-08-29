@@ -165,6 +165,7 @@ async def test_oauth_provider_request_shape(oauth_client, provider):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("provider,key_env,expected_key", [
     ("groq", "groq", "sk-groq-test"),
+    ("arcee", "arcee", "sk-arcee-test"),
     ("local-llm", "local-llm", "sk-local-test"),
     ("xiaomi", "xiaomi", "sk-mimo-test"),
     ("zai", "zai", "sk-zai-test"),
@@ -193,7 +194,7 @@ async def test_apikey_provider_request_shape(mock_http, quality_db, provider, ke
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("provider", ["openai", "openrouter", "groq", "local-llm", "zai"])
+@pytest.mark.parametrize("provider", ["openai", "openrouter", "groq", "arcee", "local-llm", "zai"])
 async def test_no_key_no_auth_header(bearer_client, provider):
     """When no provider key and no api_key, no Authorization header is set."""
     endpoint = PROVIDER_ENDPOINTS[provider]

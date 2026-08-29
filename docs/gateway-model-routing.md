@@ -75,6 +75,21 @@ to paid or self-hosted capacity without changing the privacy pool's routing
 policy. The gateway still returns a retryable 503 when every configured pool
 is unavailable; no routing policy can bypass an upstream quota or outage.
 
+When all candidates are temporarily excluded by individual model/provider
+cooldowns, request fallback performs one bounded recovery probe. It keeps
+provider registration, privacy policy, input modalities, known advertised tool
+support, and shared/global capacity quarantines enforced, while allowing a
+stale transient cooldown to be retried. Tool requests may also use a curated
+model with a structured but non-strict qualification result during this probe;
+the stream boundary still validates and sanitizes the complete tool response
+before sending it to the client. If that probe still has no tool route, a second
+bounded compatibility probe may try curated static models whose persisted
+capability result is stale or says tools are unsupported; auto-discovered
+models remain gated. This is a last-resort availability measure, not a
+capability claim: the response validator remains the hard boundary and failed
+calls are quarantined normally. `/status` exposes the active cooldown scopes
+and pool state for diagnosing the remaining cases, including missing keys.
+
 ## Dynamic catalog refresh
 
 The gateway pulls live model catalogs from upstream providers at runtime to
@@ -110,14 +125,24 @@ free into the pool's allowlist. Discovery differs per upstream:
 | Upstream | Free-tier signal |
 |---|---|
 | `openrouter` | `pricing.prompt == "0" AND pricing.completion == "0"` |
+| `arcee` | Provider-native model catalog; static code route uses `trinity-mini` |
 | `opencode-zen` | All entries returned by `/zen/v1/models` (the upstream key-filters paid models) |
 | `opencode-go` | All entries returned by `/zen/go/v1/models` (same key-filter) |
 | `xiaomi` | Authenticated Token Plan catalog; proven chat models only, cheap non-ZDR pools only, heavyweight entries excluded |
 | provider-native catalogs | Both catalog/model.dev prices must resolve to exactly zero; unpriced or paid models stay out of free pools |
 
+`TUSKER_AUTO_FREE_EXCLUDED_PROVIDERS` can block a provider from dynamic
+catalog discovery while leaving explicitly configured models untouched. The
+deployment sets it to `nvidia` while that provider's worker capacity is under
+investigation; this prevents a direct NVIDIA `/models` refresh from adding new
+routes automatically.
+
 The privacy pool applies the provider policy before catalog pricing. The
 default registry currently allows local `local-llm`, Ollama Cloud, OpenCode
-Go, OpenAI Codex, and GitHub Copilot Enterprise. Public GitHub Copilot,
+Go, OpenAI Codex, and GitHub Copilot Enterprise. The `local-llm` entry points
+at `localhost` inside the gateway pod; it is not the Orin Nano. An Orin route
+requires an explicit provider override with the Orin's reachable address.
+Public GitHub Copilot,
 OpenRouter, NVIDIA trial endpoints, and other direct providers remain outside
 the privacy pool unless an explicit deployment policy enables them.
 
@@ -161,7 +186,9 @@ operator-curated entries.
 
 The deployment's static `hermes-code` baseline includes MiniMax M-series
 aliases plus Synthetic `syn:large:text`, `syn:small:text`,
-`syn:large:vision`, and `syn:small:vision`. MiniMax M2.x models are text-only;
+`syn:large:vision`, and `syn:small:vision`, plus Groq's current GPT-OSS 20B,
+GPT-OSS 120B, and Qwen 3.6 27B routes, plus Arcee `trinity-mini`.
+MiniMax M2.x models are text-only;
 the current MiniMax M3 API supports image input and tool use. The Synthetic
 vision aliases, Xiaomi `mimo-v2.5`, and MiniMax M3 provide multimodal capacity.
 

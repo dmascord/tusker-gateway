@@ -30,6 +30,7 @@ POOL_ALIASES = {
 
 # Explicit provider prefix marker (e.g. "github-copilot::gpt-5.5").
 PROVIDER_PREFIX = "::"
+GATEWAY_PROVIDER = "tusker-gateway"
 
 # Models sent directly to their provider (passthrough) with no pool
 # selection. Identified by a slash (provider/model) or an explicit
@@ -73,15 +74,27 @@ def resolve_route(model: str | None, body: dict[str, Any]) -> Route:
     # Provider prefix passthrough
     provider, bare = split_model(model)
     if provider:
+        if provider.lower() == GATEWAY_PROVIDER and bare in POOL_ALIASES:
+            return Route(
+                kind="pool",
+                pool_name=POOL_ALIASES[bare],
+                role=bare,
+            )
         return Route(kind="passthrough", provider=provider, model=bare)
 
     # Slash-form provider/model
     if "/" in model:
+        provider, _, bare = model.partition("/")
+        if provider.lower() == GATEWAY_PROVIDER and bare in POOL_ALIASES:
+            return Route(
+                kind="pool",
+                pool_name=POOL_ALIASES[bare],
+                role=bare,
+            )
         # Swarm role markers are not passthrough
         for marker in SWARM_ROLE_MARKERS:
             if model.startswith(marker):
                 return Route(kind="swarm", model=model)
-        provider, _, bare = model.partition("/")
         return Route(kind="passthrough", provider=provider, model=bare)
 
     # Unknown bare model (no pool alias, no slash) → treat as provider/model

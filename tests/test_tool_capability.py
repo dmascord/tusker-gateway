@@ -122,6 +122,96 @@ def test_failed_probe_keeps_auto_discovered_model_out_of_tool_pool(tmp_path):
     assert manager.select("code", requires_tools=True) is None
 
 
+def test_recovery_probe_allows_curated_structured_model(tmp_path):
+    """A curated model with a non-strict probe may be a bounded fallback."""
+    manager = PoolManager(
+        {
+            "pools": {
+                "code": PoolConfig(
+                    name="code",
+                    models=[{"provider": "openrouter", "model": "new-model:free"}],
+                ),
+            },
+            "quality_db_path": os.path.join(tmp_path, "quality.db"),
+            "tool_capability_db_path": os.path.join(tmp_path, "capability.db"),
+            "excluded_providers": [],
+            "provider_api_keys": {"openrouter": "test-key"},
+        }
+    )
+    manager.catalog_registry = _Registry()
+    manager._tool_capabilities.record(
+        provider="openrouter",
+        model="new-model:free",
+        level=ToolCapabilityLevel.STRUCTURED_STREAM,
+        status="failed",
+        failure_class="non_strict_tool_contract",
+    )
+
+    assert manager.select("code", requires_tools=True) is None
+    assert manager.select(
+        "code",
+        requires_tools=True,
+        allow_unqualified_static_tools=True,
+    ) == ("openrouter", "new-model:free")
+
+
+def test_recovery_probe_allows_auto_discovered_structured_model(tmp_path):
+    """A tested catalog model can be used when strict routes are exhausted."""
+    manager = _manager(str(tmp_path))
+    manager.catalog_registry = _Registry()
+    manager.extend_pools_with_free_catalog()
+    manager._tool_capabilities.record(
+        provider="openrouter",
+        model="new-model:free",
+        level=ToolCapabilityLevel.STRUCTURED_STREAM,
+        status="failed",
+        failure_class="non_strict_tool_contract",
+    )
+
+    assert manager.select("code", requires_tools=True) is None
+    assert manager.select(
+        "code",
+        requires_tools=True,
+        allow_cooldown_probe=True,
+        allow_structured_tool_fallback=True,
+    ) == ("openrouter", "new-model:free")
+
+
+def test_compatibility_recovery_allows_curated_unsupported_model(tmp_path):
+    """The last recovery pass can try a curated model with stale metadata."""
+    manager = PoolManager(
+        {
+            "pools": {
+                "code": PoolConfig(
+                    name="code",
+                    models=[{"provider": "openrouter", "model": "curated-model"}],
+                ),
+            },
+            "quality_db_path": os.path.join(tmp_path, "quality.db"),
+            "tool_capability_db_path": os.path.join(tmp_path, "capability.db"),
+            "excluded_providers": [],
+            "provider_api_keys": {"openrouter": "test-key"},
+        }
+    )
+    manager._tool_capabilities.record(
+        provider="openrouter",
+        model="curated-model",
+        level=ToolCapabilityLevel.UNSUPPORTED,
+        status="failed",
+        failure_class="unsupported",
+    )
+
+    assert manager.select("code", requires_tools=True) is None
+    assert manager.select(
+        "code",
+        requires_tools=True,
+        allow_cooldown_probe=True,
+        allow_unqualified_static_tools=True,
+        allow_structured_tool_fallback=True,
+        allow_tool_compatibility_fallback=True,
+    ) == ("openrouter", "curated-model")
+
+
 def test_unavailable_probe_does_not_permanently_block_curated_model(tmp_path):
     """Provider quota/transport failures must recover after cooldown."""
     manager = PoolManager(
