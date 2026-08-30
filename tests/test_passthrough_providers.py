@@ -651,6 +651,68 @@ async def test_chat_codex_advances_rotator_on_rate_limit():
             api_key=None,
         )
 
+
+@pytest.mark.asyncio
+async def test_parse_codex_sse_assembles_item_id_argument_events():
+    """Responses argument events use item_id and publish a final done value."""
+    client = PassthroughClient.__new__(PassthroughClient)
+    arguments = '{"path":"/tmp"}'
+    events = [
+        {
+            "type": "response.output_item.added",
+            "item": {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "read",
+                "arguments": "",
+            },
+        },
+        {
+            "type": "response.function_call_arguments.delta",
+            "item_id": "fc_1",
+            "delta": '{"path":',
+        },
+        {
+            "type": "response.function_call_arguments.delta",
+            "item_id": "fc_1",
+            "delta": '"/tmp"}',
+        },
+        {
+            "type": "response.function_call_arguments.done",
+            "item_id": "fc_1",
+            "arguments": arguments,
+        },
+        {
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "read",
+                "arguments": arguments,
+            },
+        },
+        {
+            "type": "response.completed",
+            "response": {"usage": {"input_tokens": 1, "output_tokens": 1}},
+        },
+    ]
+    response = MagicMock()
+    response.content = _AsyncChunks(
+        [f"data: {json.dumps(event)}\n\n".encode() for event in events]
+    )
+
+    result = await client._parse_codex_sse_async(response)
+
+    message = result["choices"][0]["message"]
+    assert message["tool_calls"] == [{
+        "id": "call_1",
+        "type": "function",
+        "function": {"name": "read", "arguments": arguments},
+    }]
+    assert result["usage"] == {"input_tokens": 1, "output_tokens": 1}
+
 @pytest.mark.asyncio
 async def test_chat_codex_folds_reasoning_effort_into_reasoning_object():
     """_chat_codex must fold the chat-completions `reasoning_effort` top-level

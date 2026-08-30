@@ -1415,7 +1415,51 @@ class PassthroughClient:
         content_parts: list[str] = []
         tool_calls: dict[str, dict[str, Any]] = {}
         tool_order: list[str] = []
+        # Responses API argument events are keyed by ``item_id`` rather than
+        # ``call_id``. Keep both identifiers so the parser does not turn a
+        # valid function call into ``arguments: ""`` before the endpoint's
+        # schema validator sees it.
+        item_to_call: dict[str, str] = {}
         usage_obj: dict[str, Any] | None = None
+
+        def ensure_function_call(item: dict[str, Any]) -> str:
+            """Create/find a function call and merge metadata from an event."""
+            item_id = str(item.get("id") or "").strip()
+            call_id = str(item.get("call_id") or "").strip()
+            call_key = item_to_call.get(item_id) if item_id else None
+            if call_key is None and call_id in tool_calls:
+                call_key = call_id
+            if call_key is None:
+                call_key = call_id or item_id or f"call_{len(tool_order) + 1}"
+            if item_id:
+                item_to_call[item_id] = call_key
+            if call_key not in tool_calls:
+                tool_calls[call_key] = {
+                    "id": call_id or item_id or call_key,
+                    "type": "function",
+                    "function": {"name": "", "arguments": ""},
+                }
+                tool_order.append(call_key)
+            call = tool_calls[call_key]
+            if call_id:
+                call["id"] = call_id
+            if item.get("name"):
+                call["function"]["name"] = str(item["name"])
+            arguments = item.get("arguments")
+            if isinstance(arguments, str) and arguments:
+                call["function"]["arguments"] = arguments
+            return call_key
+
+        def call_key_for_event(event: dict[str, Any]) -> str:
+            """Resolve a function-call event's item/call identifier."""
+            item_id = str(event.get("item_id") or "").strip()
+            call_id = str(event.get("call_id") or "").strip()
+            if item_id and item_id in item_to_call:
+                return item_to_call[item_id]
+            if call_id and call_id in tool_calls:
+                return call_id
+            return ensure_function_call({"id": item_id, "call_id": call_id})
+
         async for raw_line in resp.content:
             line = raw_line.decode("utf-8", errors="replace").strip()
             if not line.startswith("data: "):
@@ -1432,16 +1476,32 @@ class PassthroughClient:
             elif etype == "response.output_item.added":
                 item = evt.get("item") or {}
                 if item.get("type") == "function_call":
-                    call_id = str(item.get("call_id") or f"call_{len(tool_order) + 1}")
-                    tool_calls[call_id] = {"id": call_id, "type": "function", "function": {"name": item.get("name", ""), "arguments": ""}}
-                    tool_order.append(call_id)
+                    ensure_function_call(item)
             elif etype == "response.function_call_arguments.delta":
-                call_id = str(evt.get("call_id") or "")
-                if call_id in tool_calls:
-                    tool_calls[call_id]["function"]["arguments"] += evt.get("delta") or ""
+                call_key = call_key_for_event(evt)
+                delta = evt.get("delta")
+                if isinstance(delta, str):
+                    tool_calls[call_key]["function"]["arguments"] += delta
+            elif etype == "response.function_call_arguments.done":
+                # ``arguments`` is the authoritative complete value. It may
+                # be present even when no delta events were emitted.
+                call_key = call_key_for_event(evt)
+                arguments = evt.get("arguments")
+                if isinstance(arguments, str):
+                    tool_calls[call_key]["function"]["arguments"] = arguments
+            elif etype == "response.output_item.done":
+                item = evt.get("item") or {}
+                if item.get("type") == "function_call":
+                    ensure_function_call(item)
             elif etype == "response.completed":
                 response = evt.get("response") or {}
                 usage_obj = response.get("usage")
+                # Some Responses deployments include the final output items
+                # only on response.completed. Use them as a final metadata /
+                # argument fallback.
+                for item in response.get("output") or []:
+                    if isinstance(item, dict) and item.get("type") == "function_call":
+                        ensure_function_call(item)
             elif etype == "response.failed":
                 err = evt.get("error") or {}
                 raise ProviderError(f"Codex response failed: {err.get('code','unknown')} {err.get('message','')[:200]}")
