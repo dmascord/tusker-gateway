@@ -1331,6 +1331,18 @@ class PassthroughClient:
                 "max_tokens",
                 "max_completion_tokens",
                 "max_output_tokens",
+                # The Codex Responses backend rejects chat-completions
+                # sampling controls instead of ignoring them. Responses uses
+                # its model defaults for these fields.
+                "temperature",
+                "top_p",
+                "presence_penalty",
+                "frequency_penalty",
+                "stop",
+                "seed",
+                "n",
+                "logprobs",
+                "top_logprobs",
                 # Codex Responses streams usage via `response.completed`
                 # events rather than chat-completions' stream_options;
                 # some Codex model deployments reject the latter as an

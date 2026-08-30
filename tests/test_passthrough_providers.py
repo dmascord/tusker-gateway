@@ -841,10 +841,10 @@ async def test_chat_codex_translates_chat_tool_choice_for_responses():
 
 @pytest.mark.asyncio
 async def test_chat_codex_drops_max_tokens_params():
-    """_chat_codex must drop every max-tokens flavour
-    (max_tokens / max_completion_tokens / max_output_tokens) from the
-    request body because the Codex backend for some models rejects them
-    as "Unsupported parameter: max_output_tokens".
+    """_chat_codex must drop chat-only fields rejected by Responses.
+
+    The Codex backend rejects max-token flavours and sampling controls rather
+    than ignoring them, so the adapter lets the Responses model use defaults.
     """
     from unittest.mock import AsyncMock, MagicMock
 
@@ -884,6 +884,14 @@ async def test_chat_codex_drops_max_tokens_params():
                 "max_output_tokens": 1024,
                 "stream_options": {"include_usage": True},
                 "temperature": 0.7,
+                "top_p": 0.9,
+                "presence_penalty": 0.1,
+                "frequency_penalty": 0.1,
+                "stop": ["DONE"],
+                "seed": 7,
+                "n": 1,
+                "logprobs": True,
+                "top_logprobs": 2,
             },
         )
 
@@ -894,8 +902,18 @@ async def test_chat_codex_drops_max_tokens_params():
     # stream_options is a chat-completions-only field that the Codex
     # Responses backend rejects as "Unknown parameter".
     assert "stream_options" not in body
-    # Other extra_body params still pass through.
-    assert body["temperature"] == 0.7
+    for field in (
+        "temperature",
+        "top_p",
+        "presence_penalty",
+        "frequency_penalty",
+        "stop",
+        "seed",
+        "n",
+        "logprobs",
+        "top_logprobs",
+    ):
+        assert field not in body
 
 
 # ---------------------------------------------------------------------------
