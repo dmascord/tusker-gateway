@@ -29,7 +29,11 @@ class ToolCapabilityLevel(IntEnum):
     STRICT_STRUCTURED_STREAM = 4
 
 
+# Ordinary assistant text may legally accompany an OpenAI tool call. Both
+# levels are therefore usable once the persisted contract fields confirm that
+# there was exactly one matching call with valid arguments.
 QUALIFIED_TOOL_LEVELS = frozenset({
+    ToolCapabilityLevel.STRUCTURED_STREAM,
     ToolCapabilityLevel.STRICT_STRUCTURED_STREAM,
 })
 
@@ -61,7 +65,16 @@ class ToolCapability:
     @property
     def qualified_for_tools(self) -> bool:
         """Whether the result is safe for a streaming tool-bearing request."""
-        return self.probe_version == TOOL_CAPABILITY_PROBE_VERSION and self.level in QUALIFIED_TOOL_LEVELS
+        return (
+            self.probe_version == TOOL_CAPABILITY_PROBE_VERSION
+            and self.level in QUALIFIED_TOOL_LEVELS
+            and self.http_status == 200
+            and self.tool_call_count == 1
+            and self.structured_stream
+            and self.arguments_valid
+            and self.arguments_match
+            and self.finish_reason == "tool_calls"
+        )
 
     @property
     def transient_for_tools(self) -> bool:

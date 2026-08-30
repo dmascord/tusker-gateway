@@ -188,22 +188,35 @@ def _result_from_stream(
         except (TypeError, json.JSONDecodeError):
             arguments = None
         arguments_valid = isinstance(arguments, dict)
-        arguments_match = arguments == {"path": PROBE_PATH}
+        arguments_match = (
+            function_name == PROBE_TOOL_NAME
+            and arguments == {"path": PROBE_PATH}
+        )
 
     structured = call_count > 0
-    strict = (
+    valid_tool_contract = (
         status_code == 200
         and call_count == 1
         and function_name == PROBE_TOOL_NAME
         and arguments_valid
         and arguments_match
         and finish_reason == "tool_calls"
+    )
+    strict = (
+        valid_tool_contract
         and not "".join(text_parts).strip()
     )
     if strict:
         level = ToolCapabilityLevel.STRICT_STRUCTURED_STREAM
         status = "passed"
         failure_class = None
+    elif valid_tool_contract:
+        # Text alongside a structured tool call is valid OpenAI chat output.
+        # Keep the distinction from the strict no-prose result for diagnostics
+        # without excluding the model from normal tool-bearing routing.
+        level = ToolCapabilityLevel.STRUCTURED_STREAM
+        status = "passed"
+        failure_class = "unexpected_text"
     elif structured:
         level = ToolCapabilityLevel.STRUCTURED_STREAM
         status = "failed"
@@ -380,8 +393,10 @@ async def run_qualification(
     max_age_secs: float = 86_400.0,
     force: bool = False,
     limit: int | None = None,
+    providers: set[str] | None = None,
+    model_pairs: set[tuple[str, str]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Qualify static and auto-discovered chat models for one pool."""
+    """Qualify selected static and auto-discovered chat models for one pool."""
     config = load_config()
     api_key = os.environ.get("API_KEYS", "").split(",", 1)[0].strip()
     if not api_key:
@@ -405,6 +420,23 @@ async def run_qualification(
                 if is_general_chat_model(spec.provider, spec.model)
             }
         )
+        provider_filter = {
+            str(provider).strip().lower().replace("_", "-")
+            for provider in (providers or set())
+            if str(provider).strip()
+        }
+        model_filter = {
+            (
+                str(provider).strip().lower().replace("_", "-"),
+                str(model),
+            )
+            for provider, model in (model_pairs or set())
+            if str(provider).strip() and str(model).strip()
+        }
+        if provider_filter:
+            pairs = [pair for pair in pairs if pair[0] in provider_filter]
+        if model_filter:
+            pairs = [pair for pair in pairs if pair in model_filter]
         pairs = [
             pair for pair in pairs
             if _needs_probe(
@@ -416,10 +448,12 @@ async def run_qualification(
         if limit is not None:
             pairs = pairs[:limit]
         logger.info(
-            "tool qualification pool=%s candidates=%d concurrency=%d",
+            "tool qualification pool=%s candidates=%d concurrency=%d providers=%s models=%s",
             pool_name,
             len(pairs),
             max_concurrency,
+            ",".join(sorted(provider_filter)) or "all",
+            len(model_filter) or "all",
         )
 
         semaphore = asyncio.Semaphore(max(1, max_concurrency))
@@ -464,6 +498,19 @@ def main(argv: list[str] | None = None) -> int:
         help="pool whose static and auto-discovered chat models should be tested",
     )
     parser.add_argument(
+        "--provider",
+        dest="providers",
+        action="append",
+        help="limit probes to this provider; repeat for multiple providers",
+    )
+    parser.add_argument(
+        "--model",
+        dest="models",
+        action="append",
+        metavar="PROVIDER/MODEL",
+        help="limit probes to an exact provider/model pair; repeat as needed",
+    )
+    parser.add_argument(
         "--base-url",
         default=os.environ.get("TUSKER_TOOL_QUALIFICATION_BASE_URL", "http://127.0.0.1:8642"),
     )
@@ -474,6 +521,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--limit", type=int)
     parser.add_argument("--json", action="store_true", help="emit result records as JSON")
     args = parser.parse_args(argv)
+    model_pairs: set[tuple[str, str]] = set()
+    for value in args.models or []:
+        provider, separator, model = value.partition("/")
+        if not separator or not provider.strip() or not model.strip():
+            parser.error(f"--model must use PROVIDER/MODEL syntax: {value!r}")
+        model_pairs.add((provider.strip(), model.strip()))
     logging.basicConfig(
         level=os.environ.get("TUSKER_LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
@@ -487,6 +540,8 @@ def main(argv: list[str] | None = None) -> int:
             max_age_secs=args.max_age_secs,
             force=args.force,
             limit=args.limit,
+            providers=set(args.providers or []),
+            model_pairs=model_pairs,
         )
     )
     if args.json:

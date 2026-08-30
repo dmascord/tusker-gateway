@@ -155,8 +155,12 @@ GitHub's service-side processing or content-filtering behavior.
 
 GitHub Copilot Enterprise entries added from the live catalog are marked
 `auto_discovered`; they must pass behavioral tool qualification before a
-tool-bearing request can use them. This keeps catalog metadata from
-reintroducing malformed or empty tool calls.
+tool-bearing request can use them. A pass requires exactly one matching
+function call, valid JSON arguments, and a `tool_calls` finish reason. Normal
+assistant text alongside that structured call is permitted; it is recorded as
+`structured_stream` rather than the stricter no-prose level. This keeps catalog
+metadata from reintroducing malformed or empty tool calls without rejecting
+otherwise valid models for harmless preambles.
 
 Xiaomi's catalog does not publish modality metadata. The gateway enriches the
 verified current models: `mimo-v2.5` accepts text and image input;

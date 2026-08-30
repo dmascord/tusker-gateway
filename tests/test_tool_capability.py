@@ -81,7 +81,7 @@ def test_tool_capability_db_round_trip_and_gate(tmp_path):
     assert db.is_qualified("openrouter", "bad") is False
 
 
-def test_auto_discovered_model_requires_strict_stream_probe(tmp_path):
+def test_auto_discovered_model_requires_qualified_stream_probe(tmp_path):
     manager = _manager(str(tmp_path))
     manager.catalog_registry = _Registry()
     manager.extend_pools_with_free_catalog()
@@ -298,7 +298,42 @@ def test_strict_probe_result_requires_exact_tool_contract():
         finish_reason="tool_calls",
     )
     assert prose["level"] == ToolCapabilityLevel.STRUCTURED_STREAM
-    assert prose["status"] == "failed"
+    assert prose["status"] == "passed"
+
+
+def test_valid_structured_probe_with_prose_is_qualified(tmp_path):
+    result = _result_from_stream(
+        provider="openrouter",
+        model="prose-but-structured",
+        status_code=200,
+        latency_ms=120.0,
+        calls={0: {"name": PROBE_TOOL_NAME, "arguments": '{"path":"' + PROBE_PATH + '"}'}},
+        text_parts=["I will call the tool."],
+        finish_reason="tool_calls",
+    )
+    db = ToolCapabilityDB(str(tmp_path / "capability.db"))
+    record = db.record(**result)
+
+    assert record.level == ToolCapabilityLevel.STRUCTURED_STREAM
+    assert record.qualified_for_tools is True
+
+
+def test_structured_probe_with_wrong_tool_is_not_qualified(tmp_path):
+    result = _result_from_stream(
+        provider="openrouter",
+        model="wrong-tool",
+        status_code=200,
+        latency_ms=120.0,
+        calls={0: {"name": "other_tool", "arguments": '{"path":"' + PROBE_PATH + '"}'}},
+        text_parts=[],
+        finish_reason="tool_calls",
+    )
+    db = ToolCapabilityDB(str(tmp_path / "capability.db"))
+    record = db.record(**result)
+
+    assert record.level == ToolCapabilityLevel.STRUCTURED_STREAM
+    assert record.arguments_match is False
+    assert record.qualified_for_tools is False
 
 
 def test_probe_transport_classification_is_bounded():
