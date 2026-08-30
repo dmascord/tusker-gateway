@@ -138,12 +138,14 @@ def create_app() -> web.Application:
             credential_rotators[provider] = CodexTokenRotator(
                 [credential for credential in credentials if isinstance(credential, dict)],
                 auth_file=(config.get("auth_file") if provider == "openai-codex" else None),
+                provider=provider,
             )
     codex_rotator = credential_rotators.get("openai-codex")
     if codex_rotator is None:
         codex_rotator = CodexTokenRotator(
             config.get("codex_credentials") or [],
             auth_file=config.get("auth_file"),
+            provider="openai-codex",
         )
         credential_rotators["openai-codex"] = codex_rotator
     app["credential_rotators"] = credential_rotators

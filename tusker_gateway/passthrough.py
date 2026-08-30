@@ -402,23 +402,28 @@ def _creds_refresh_token(cred: dict[str, Any]) -> str | None:
 def _creds_expires_at(cred: dict[str, Any]) -> float:
     """Return credential expiry as epoch seconds (handles expires_at & expires_at_ms)."""
     ms = cred.get("expires_at_ms")
-    if ms:
-        return float(ms) / 1000.0
-    return float(cred.get("expires_at", 0) or 0)
+    try:
+        if ms:
+            return float(ms) / 1000.0
+        return float(cred.get("expires_at", 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 class CodexTokenRotator:
-    """Rotates Codex OAuth tokens across a credential pool.
+    """Rotate OAuth tokens across one provider-specific credential pool.
 
     Supports Hermes-format credentials (access_token, refresh_token, expires_at_ms)
     and legacy format (token, refresh_token, expires_at).
 
-    When a token is near expiry, ``get_token()`` automatically attempts a
-    refresh via the Copilot token-exchange endpoint and persists the updated
-    credential back to the auth file if one is configured.
+    When a token is near expiry, ``get_token()`` refreshes it using the
+    provider's protocol.  OpenAI Codex uses ChatGPT OAuth, while Copilot uses
+    GitHub's token exchange.  Expired credentials are skipped after a failed
+    refresh so they cannot be sent upstream as known-invalid bearer tokens.
     """
 
     _JWT_REFRESH_MARGIN_SECONDS = 120
+    _DEFAULT_REFRESH_FAILURE_COOLDOWN_SECONDS = 60.0
 
     def __init__(
         self,
@@ -426,12 +431,15 @@ class CodexTokenRotator:
         *,
         auth_file: str | None = None,
         http_client: Any | None = None,
+        provider: str = "openai-codex",
     ):
         self._creds: list[dict[str, Any]] = list(credentials)
         self._index = 0
         self._lock = asyncio.Lock()
         self._auth_file = auth_file
-        self._http = http_client  # aiohttp.ClientSession for exchange
+        self._http = http_client  # aiohttp.ClientSession for OAuth calls
+        self._provider = str(provider or "openai-codex").lower()
+        self._refresh_failed_until: dict[int, float] = {}
 
     @property
     def size(self) -> int:
@@ -441,6 +449,7 @@ class CodexTokenRotator:
         """Reload the pool from external source (e.g. file)."""
         self._creds = list(credentials)
         self._index = min(self._index, max(len(self._creds) - 1, 0))
+        self._refresh_failed_until.clear()
 
     async def get_token(self) -> str | None:
         """Return the current active token, or None if no credentials.
@@ -450,18 +459,58 @@ class CodexTokenRotator:
         if not self._creds:
             return None
         async with self._lock:
-            idx = self._index % len(self._creds)
-            cred = self._creds[idx]
-            label = cred.get("label", cred.get("id", f"cred#{idx}"))
-            logger.debug("codex rotator: index=%d/%d label=%s", idx, len(self._creds), label)
-            if self._http and self._is_near_expiry(cred):
-                try:
-                    cred = await self._refresh_one(cred)
-                    self._creds[self._index % len(self._creds)] = cred
-                    self._persist()
-                except Exception:
-                    pass  # best-effort refresh
-            return _creds_access_token(cred)
+            count = len(self._creds)
+            start = self._index % count
+            now = time.time()
+            for offset in range(count):
+                idx = (start + offset) % count
+                cred = self._creds[idx]
+                token = _creds_access_token(cred)
+                label = cred.get("label", cred.get("id", f"cred#{idx}"))
+                logger.debug(
+                    "oauth rotator: provider=%s index=%d/%d label=%s",
+                    self._provider,
+                    idx,
+                    count,
+                    label,
+                )
+                if not token:
+                    continue
+
+                if self._http and self._is_near_expiry(cred):
+                    retry_at = self._refresh_failed_until.get(idx, 0.0)
+                    if retry_at <= now:
+                        try:
+                            refreshed = await self._refresh_one(cred)
+                        except Exception as exc:
+                            self._refresh_failed_until[idx] = (
+                                time.time() + self._refresh_failure_cooldown_seconds()
+                            )
+                            self._log_refresh_failure(idx, exc)
+                            if self._is_expired(cred):
+                                continue
+                        else:
+                            self._creds[idx] = refreshed
+                            self._refresh_failed_until.pop(idx, None)
+                            self._index = idx
+                            self._persist()
+                            token = _creds_access_token(refreshed)
+                            logger.info(
+                                "oauth refresh succeeded provider=%s credential_index=%d "
+                                "expires_in_s=%.0f",
+                                self._provider,
+                                idx,
+                                max(0.0, _creds_expires_at(refreshed) - time.time()),
+                            )
+                    elif self._is_expired(cred):
+                        # Do not retry a known-bad refresh on every request and
+                        # do not forward an access token that is already dead.
+                        continue
+
+                if token:
+                    self._index = idx
+                    return token
+            return None
 
     async def advance(self) -> None:
         """Move to the next credential in the pool."""
@@ -474,17 +523,38 @@ class CodexTokenRotator:
         if self._is_near_expiry(cred):
             try:
                 return await self._refresh_one(cred)
-            except Exception:
+            except Exception as exc:
+                self._log_refresh_failure(-1, exc)
                 return cred
         return cred
 
     async def _refresh_one(self, cred: dict[str, Any]) -> dict[str, Any]:
-        """Exchange the raw (refresh) token for a new API token."""
-        from tusker_gateway.copilot_exchange import exchange_copilot_token
-
+        """Refresh one credential using its provider's OAuth authority."""
         refresh = _creds_refresh_token(cred)
         if not refresh:
+            from tusker_gateway.codex_oauth import CodexOAuthError
+
+            raise CodexOAuthError(
+                "OAuth refresh token is missing",
+                code="missing_refresh_token",
+            )
+
+        if self._provider == "openai-codex":
+            from tusker_gateway.codex_oauth import refresh_codex_token
+
+            data, expires_at = await refresh_codex_token(refresh, http=self._http)
+            token = data["access_token"]
+            cred["access_token"] = token
+            rotated_refresh = data.get("refresh_token")
+            if isinstance(rotated_refresh, str) and rotated_refresh:
+                cred["refresh_token"] = rotated_refresh
+            id_token = data.get("id_token")
+            if isinstance(id_token, str) and id_token:
+                cred["id_token"] = id_token
+            cred["expires_at_ms"] = int(expires_at * 1000)
             return cred
+
+        from tusker_gateway.copilot_exchange import exchange_copilot_token
 
         # Use the credential's host (GHE) if set
         base_url = None
@@ -492,18 +562,51 @@ class CodexTokenRotator:
         if host and host not in ("github.com",):
             base_url = f"https://{host}/copilot"
 
+        token, expires_at = await exchange_copilot_token(
+            refresh,
+            base_url=base_url,
+            http=self._http,
+        )
+        cred["access_token"] = token
+        cred["expires_at_ms"] = int(expires_at * 1000)
+        return cred
+
+    @classmethod
+    def _refresh_failure_cooldown_seconds(cls) -> float:
         try:
-            token, expires_at = await exchange_copilot_token(refresh, base_url=base_url, http=self._http)
-            cred["access_token"] = token
-            cred["expires_at_ms"] = int(expires_at * 1000)
-            return cred
-        except ValueError:
-            return cred
+            return max(
+                1.0,
+                float(
+                    os.environ.get(
+                        "TUSKER_OAUTH_REFRESH_FAILURE_COOLDOWN_SECS",
+                        str(cls._DEFAULT_REFRESH_FAILURE_COOLDOWN_SECONDS),
+                    )
+                ),
+            )
+        except (TypeError, ValueError):
+            return cls._DEFAULT_REFRESH_FAILURE_COOLDOWN_SECONDS
+
+    def _log_refresh_failure(self, index: int, exc: BaseException) -> None:
+        """Log OAuth failure metadata without logging token-bearing details."""
+        logger.warning(
+            "oauth refresh failed provider=%s credential_index=%s status=%s code=%s "
+            "retryable=%s",
+            self._provider,
+            index,
+            getattr(exc, "status", None),
+            getattr(exc, "code", None),
+            getattr(exc, "retryable", None),
+        )
 
     @classmethod
     def _is_near_expiry(cls, cred: dict[str, Any]) -> bool:
         expires_at = _creds_expires_at(cred)
         return bool(expires_at and time.time() >= expires_at - cls._JWT_REFRESH_MARGIN_SECONDS)
+
+    @staticmethod
+    def _is_expired(cred: dict[str, Any]) -> bool:
+        expires_at = _creds_expires_at(cred)
+        return bool(expires_at and time.time() >= expires_at)
 
     def _persist(self) -> None:
         """Write the current pool back to the auth file (Hermes format)."""
@@ -629,6 +732,7 @@ class PassthroughClient:
                     [credential for credential in credentials if isinstance(credential, dict)],
                     auth_file=pool_auth_file,
                     http_client=http_client,
+                    provider=provider_key,
                 )
 
         self._codex_rotator = self._credential_rotators.get("openai-codex")
@@ -637,6 +741,7 @@ class PassthroughClient:
                 codex_creds,
                 auth_file=auth_file,
                 http_client=http_client,
+                provider="openai-codex",
             )
 
     def _record_usage(

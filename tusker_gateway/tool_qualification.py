@@ -52,7 +52,11 @@ PROBE_TOOL: dict[str, Any] = {
 }
 
 
-def _catalog_registry(config: dict[str, Any]) -> CatalogRegistry:
+def _catalog_registry(
+    config: dict[str, Any],
+    *,
+    http_client: aiohttp.ClientSession | None = None,
+) -> CatalogRegistry:
     """Build and authenticate catalogs for every configured provider."""
     registry = CatalogRegistry.default(config.get("providers"))
     keys = config.get("provider_api_keys", {})
@@ -79,7 +83,11 @@ def _catalog_registry(config: dict[str, Any]) -> CatalogRegistry:
             credentials = credential_pools.get(provider)
             if not isinstance(credentials, list) or not credentials:
                 continue
-            rotator = CodexTokenRotator(credentials)
+            rotator = CodexTokenRotator(
+                credentials,
+                http_client=http_client,
+                provider=provider,
+            )
             client.set_token_source(rotator.get_token)
     return registry
 
@@ -378,7 +386,6 @@ async def run_qualification(
     api_key = os.environ.get("API_KEYS", "").split(",", 1)[0].strip()
     if not api_key:
         raise RuntimeError("API_KEYS must contain the gateway caller key")
-    registry = _catalog_registry(config)
     quality_path = config.get("quality_db_path", "data/quality.db")
     capability_db = ToolCapabilityDB(
         config.get("tool_capability_db_path")
@@ -386,6 +393,7 @@ async def run_qualification(
     )
     timeout = aiohttp.ClientTimeout(total=timeout_secs, sock_read=timeout_secs)
     async with aiohttp.ClientSession(timeout=timeout) as session:
+        registry = _catalog_registry(config, http_client=session)
         await registry.refresh_all(session)
         manager = PoolManager(config)
         manager.catalog_registry = registry
