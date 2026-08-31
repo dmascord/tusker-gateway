@@ -348,7 +348,9 @@ class PoolManager:
         key-filtered, so all advertised models are eligible. Xiaomi's
         authenticated catalog is also key-filtered, but its models are only
         added to non-ZDR cheap pools and pricing/slug-based heavyweights are
-        excluded.
+        excluded. Operators can opt additional authenticated catalogs into a
+        pool with ``auto_catalog_providers``; those providers are still
+        subject to the pool's heavyweight, privacy, and tool-capability gates.
 
         Auto-added entries are tracked separately from operator-curated static
         entries so refreshes can add and prune models without disturbing the
@@ -366,6 +368,12 @@ class PoolManager:
         for pool_name, pool in self.pools.items():
             if not pool.auto_free:
                 continue
+
+            auto_catalog_providers = {
+                str(name).strip().lower().replace("_", "-")
+                for name in getattr(pool, "auto_catalog_providers", ())
+                if str(name).strip()
+            }
 
             static_pairs = set(self._original_static.get(pool_name, frozenset()))
             eligible: dict[tuple[str, str], dict[str, Any]] = {}
@@ -394,7 +402,13 @@ class PoolManager:
                     # Keep privacy discovery constrained to providers whose
                     # policy was explicitly reviewed in the registry.
                     continue
-                if provider in {"opencode-zen", "opencode-go"}:
+                if provider in auto_catalog_providers:
+                    # An explicitly opted-in authenticated catalog represents
+                    # the models available to this account, not a public
+                    # free-price catalogue. Tool-bearing requests still need
+                    # a passing behavioral qualification record.
+                    mode = "catalog"
+                elif provider in {"opencode-zen", "opencode-go"}:
                     mode = "all"
                 elif provider == "xiaomi":
                     mode = "xiaomi"
@@ -917,6 +931,9 @@ class PoolManager:
             result[name] = {
                 "models": len(specs),
                 "valid_candidates": len(valid),
+                "auto_catalog_providers": list(
+                    getattr(self.pools.get(name), "auto_catalog_providers", ())
+                ),
                 "invalid_candidates": len(invalid),
                 "invalid_entries": [
                     {"provider": s.provider, "model": s.model}

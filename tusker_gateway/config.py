@@ -43,6 +43,7 @@ class PoolConfig:
         zdr: bool = False,
         provider_warmup_secs: int = 300,
         auto_free: bool = False,
+        auto_catalog_providers: list[str] | tuple[str, ...] | str = (),
         fallback_pools: list[str] | tuple[str, ...] = (),
     ):
         self.name = name
@@ -51,6 +52,15 @@ class PoolConfig:
         self.zdr = zdr
         self.provider_warmup_secs = provider_warmup_secs
         self.auto_free = auto_free
+        if isinstance(auto_catalog_providers, str):
+            auto_catalog_providers = auto_catalog_providers.split(",")
+        elif not isinstance(auto_catalog_providers, (list, tuple)):
+            auto_catalog_providers = ()
+        self.auto_catalog_providers = tuple(
+            str(provider).strip().lower().replace("_", "-")
+            for provider in auto_catalog_providers
+            if str(provider).strip()
+        )
         if isinstance(fallback_pools, str):
             fallback_pools = tuple(fallback_pools.split(","))
         elif not isinstance(fallback_pools, (list, tuple)):
@@ -361,6 +371,9 @@ def _load_pools() -> dict[str, PoolConfig]:
     }
     """
     pools: dict[str, PoolConfig] = {}
+    default_auto_catalog_providers = _parse_env_list(
+        "TUSKER_AUTO_CATALOG_PROVIDERS"
+    )
 
     for key, value in os.environ.items():
         if not key.startswith("TUSKER_POOL_"):
@@ -381,6 +394,10 @@ def _load_pools() -> dict[str, PoolConfig]:
                 context_window=data.get("context_window", 128_000),
                 zdr=data.get("zdr", False),
                 auto_free=bool(data.get("auto_free", False)),
+                auto_catalog_providers=data.get(
+                    "auto_catalog_providers",
+                    default_auto_catalog_providers,
+                ),
                 fallback_pools=data.get("fallback_pools", ()),
             )
         except (json.JSONDecodeError, TypeError):
@@ -408,6 +425,21 @@ def _load_pools() -> dict[str, PoolConfig]:
                 {"provider": "openrouter", "model": "openai/gpt-oss-20b:free"},
             ],
             fallback_pools=("premium", "swarm"),
+            auto_catalog_providers=(
+                default_auto_catalog_providers
+                or (
+                    "minimax",
+                    "synthetic",
+                    "zai",
+                    "openai-codex",
+                    "github-copilot",
+                    "github-copilot-enterprise",
+                    "ollama-cloud",
+                    "groq",
+                    "google",
+                    "cerebras",
+                )
+            ),
         )
     if "privacy" not in pools:
         pools["privacy"] = PoolConfig(
@@ -417,6 +449,7 @@ def _load_pools() -> dict[str, PoolConfig]:
                 {"provider": "openai-codex", "model": "gpt-5.4-mini"},
             ],
             zdr=True,
+            auto_catalog_providers=default_auto_catalog_providers,
         )
     if "premium" not in pools:
         pools["premium"] = PoolConfig(
@@ -429,6 +462,7 @@ def _load_pools() -> dict[str, PoolConfig]:
                 {"provider": "minimax", "model": "MiniMax-M2.7-highspeed", "input_modalities": ["text"]},
                 {"provider": "arcee", "model": "trinity-large-preview", "input_modalities": ["text"]},
             ],
+            auto_catalog_providers=default_auto_catalog_providers,
         )
     if "swarm" not in pools:
         pools["swarm"] = PoolConfig(
@@ -437,6 +471,7 @@ def _load_pools() -> dict[str, PoolConfig]:
                 {"provider": "github-copilot", "model": "gpt-5.5"},
                 {"provider": "github-copilot", "model": "claude-sonnet-4.6"},
             ],
+            auto_catalog_providers=default_auto_catalog_providers,
         )
 
     return pools

@@ -35,6 +35,17 @@ def test_load_config_normalizes_auto_free_provider_exclusions(monkeypatch):
     assert config["auto_free_excluded_providers"] == ["nvidia", "open-router"]
 
 
+def test_pool_config_normalizes_auto_catalog_providers():
+    pool = PoolConfig(
+        name="code",
+        models=[],
+        auto_free=True,
+        auto_catalog_providers="GitHub_Copilot, ZAI",
+    )
+
+    assert pool.auto_catalog_providers == ("github-copilot", "zai")
+
+
 def test_pool_selection_logic():
     # Use real providers from DEFAULT_PROVIDER_REGISTRY (pools require known providers).
     with tempfile.TemporaryDirectory() as tmpdir:

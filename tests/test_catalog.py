@@ -912,6 +912,55 @@ def test_poolmanager_auto_free_adds_explicitly_free_generic_provider_models():
     }
 
 
+def test_poolmanager_auto_catalog_adds_opted_in_authenticated_models():
+    """An explicit account-backed provider opt-in bypasses price filtering."""
+    from tusker_gateway.config import PoolConfig
+    from tusker_gateway.pools import PoolManager
+
+    cfg = {
+        "pools": {
+            "code": PoolConfig(
+                name="code",
+                models=[],
+                auto_free=True,
+                auto_catalog_providers=["zai"],
+            ),
+        },
+        "excluded_providers": [],
+        "provider_api_keys": {"zai": "k-zai"},
+        "quality_db_path": "/tmp/_unused.db",
+    }
+    manager = PoolManager(cfg)
+    registry = CatalogRegistry()
+    zai = ProviderModelsCatalog(
+        provider="zai",
+        endpoint="https://api.example.test/v4/models",
+    )
+    zai._entries = [
+        CatalogEntry(provider="zai", model="glm-5.2"),
+        CatalogEntry(
+            provider="zai",
+            model="glm-4.7",
+            cost_input=2.0,
+            cost_output=10.0,
+        ),
+        CatalogEntry(provider="zai", model="text-embedding-3-small"),
+    ]
+    registry.register("zai", zai)
+    manager.catalog_registry = registry
+
+    manager.extend_pools_with_free_catalog()
+
+    pool_models = {
+        (model["provider"], model["model"])
+        for model in manager.pools["code"].models
+    }
+    assert ("zai", "glm-5.2") in pool_models
+    assert ("zai", "glm-4.7") in pool_models
+    assert ("zai", "text-embedding-3-small") not in pool_models
+    assert all(spec.auto_discovered for spec in manager.models["code"])
+
+
 def test_poolmanager_auto_free_excludes_configured_provider():
     """An exhausted provider must not re-enter through dynamic discovery."""
     from tusker_gateway.config import PoolConfig

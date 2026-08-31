@@ -118,6 +118,19 @@ Pools can opt in to **automatic free-tier discovery** by setting
 TUSKER_POOL_CODE='{"models": [], "auto_free": true}'
 ```
 
+Account-backed catalogs can be opted in explicitly with
+`auto_catalog_providers`. This is intended for subscription or credited
+providers whose catalog does not expose a meaningful zero-price signal:
+
+```json
+TUSKER_POOL_CODE='{"models": [], "auto_free": true, "auto_catalog_providers": ["openai-codex", "github-copilot", "github-copilot-enterprise", "zai", "synthetic"]}'
+```
+
+These entries are still filtered by heavyweight and privacy policy. A
+catalog entry is not eligible for a tool-bearing request until the bounded
+qualification runner records a passing structured stream; an unqualified
+entry may only be used by routes that do not request tools.
+
 When enabled, every catalog refresh (initial + 5-minute background loop)
 walks the registered catalogs and merges any model currently available for
 free into the pool's allowlist. Discovery differs per upstream:
@@ -130,6 +143,11 @@ free into the pool's allowlist. Discovery differs per upstream:
 | `opencode-go` | All entries returned by `/zen/go/v1/models` (same key-filter) |
 | `xiaomi` | Authenticated Token Plan catalog; proven chat models only, cheap non-ZDR pools only, heavyweight entries excluded |
 | provider-native catalogs | Both catalog/model.dev prices must resolve to exactly zero; unpriced or paid models stay out of free pools |
+
+Providers listed in `auto_catalog_providers` use their authenticated catalog
+as the account's allowlist rather than the zero-price test. This is the
+explicit path for Codex, Copilot, Z.AI, Synthetic, MiniMax, Ollama Cloud,
+Groq, Google, or Cerebras when their credentials provide model access.
 
 `TUSKER_AUTO_FREE_EXCLUDED_PROVIDERS` can block a provider from dynamic
 catalog discovery while leaving explicitly configured models untouched. The
