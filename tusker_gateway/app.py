@@ -359,13 +359,28 @@ def create_app() -> web.Application:
                 "capability refresh task started (interval=%.0fs)",
                 interval_secs,
             )
+        qualification_enabled = os.environ.get(
+            "TUSKER_QUALIFICATION_MAINTENANCE_ENABLED", "0"
+        ).strip().lower()
+        if qualification_enabled not in {"0", "false", "no", "off"}:
+            from tusker_gateway.maintenance import qualification_maintenance_loop
+
+            app["qualification_task"] = asyncio.create_task(
+                qualification_maintenance_loop(stop_event),
+                name="qualification-maintenance",
+            )
+            startup_log.info("qualification maintenance task started")
 
     async def on_cleanup(app):
         # Stop refresh tasks before closing the shared HTTP session.
         stop_event = app.get("refresh_stop_event")
         if stop_event is not None:
             stop_event.set()
-        for task_name in ("catalog_task", "capabilities_task"):
+        for task_name in (
+            "catalog_task",
+            "capabilities_task",
+            "qualification_task",
+        ):
             task = app.get(task_name)
             if task is None:
                 continue

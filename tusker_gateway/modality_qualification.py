@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import time
+from pathlib import Path
 from typing import Any
 
 import aiohttp
@@ -277,6 +278,31 @@ def _needs_probe(
     return (time.time() - record.checked_at) >= max_age_secs
 
 
+def _route_is_quarantined(
+    provider: str,
+    model: str,
+    cooldown_store: Any | None,
+) -> bool:
+    """Avoid probing a route while its provider/model quarantine is active."""
+    try:
+        from tusker_gateway.cooldown import global_tracker
+
+        if global_tracker().is_cooldown(provider, model):
+            return True
+    except Exception:
+        logger.debug("in-memory cooldown check failed", exc_info=True)
+    if cooldown_store is None:
+        return False
+    try:
+        return bool(
+            cooldown_store.is_active(provider, model)
+            or cooldown_store.is_provider_active(provider)
+        )
+    except Exception:
+        logger.debug("persistent cooldown check failed", exc_info=True)
+        return False
+
+
 async def run_qualification(
     *,
     pool_names: list[str] | None = None,
@@ -290,6 +316,7 @@ async def run_qualification(
     providers: set[str] | None = None,
     model_pairs: set[tuple[str, str]] | None = None,
     include_unadvertised: bool = False,
+    ignore_cooldowns: bool = False,
 ) -> list[dict[str, Any]]:
     """Qualify one input modality across selected pool candidates."""
     config = load_config()
@@ -301,6 +328,13 @@ async def run_qualification(
         config.get("model_capability_db_path")
         or default_model_capability_db_path(quality_path)
     )
+    cooldown_store = None
+    if not ignore_cooldowns and quality_path != ":memory:":
+        from tusker_gateway.persistent_cooldown import PersistentCooldownStore
+
+        cooldown_store = PersistentCooldownStore(
+            Path(quality_path).parent / "cooldowns.db"
+        )
     selected_pools = pool_names or ["code"]
     provider_filter = {
         str(provider).strip().lower().replace("_", "-")
@@ -342,6 +376,15 @@ async def run_qualification(
                 max_age_secs=max_age_secs,
             )
         ]
+        skipped_quarantine = 0
+        if not ignore_cooldowns:
+            unquarantined = []
+            for pair in pairs:
+                if _route_is_quarantined(pair[0], pair[1], cooldown_store):
+                    skipped_quarantine += 1
+                    continue
+                unquarantined.append(pair)
+            pairs = unquarantined
         if limit is not None:
             pairs = pairs[: max(0, limit)]
         logger.info(
@@ -353,6 +396,12 @@ async def run_qualification(
             max(1, max_concurrency),
             include_unadvertised,
         )
+        if skipped_quarantine:
+            logger.info(
+                "modality qualification modality=%s skipped_quarantined=%d",
+                input_modality,
+                skipped_quarantine,
+            )
         semaphore = asyncio.Semaphore(max(1, max_concurrency))
 
         async def one(pair: tuple[str, str]) -> dict[str, Any]:
@@ -434,6 +483,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--limit", type=int)
     parser.add_argument("--force", action="store_true")
     parser.add_argument(
+        "--ignore-cooldowns",
+        action="store_true",
+        help="probe quarantined routes explicitly (operator recovery test)",
+    )
+    parser.add_argument(
         "--include-unadvertised",
         action="store_true",
         help="probe models without catalog evidence for this modality",
@@ -464,6 +518,7 @@ def main(argv: list[str] | None = None) -> int:
             providers=set(args.provider),
             model_pairs=model_pairs,
             include_unadvertised=args.include_unadvertised,
+            ignore_cooldowns=args.ignore_cooldowns,
         )
     )
     _print_results(results, modality=args.input_modality)

@@ -203,6 +203,9 @@ class PoolManager:
     # stop being free).
     _original_static: dict[str, frozenset[tuple[str, str]]] = field(default_factory=dict)
     _stickiness: dict[tuple[str, str], tuple[str, str]] = field(default_factory=dict)
+    _disabled_providers: frozenset[str] = field(
+        init=False, default_factory=frozenset
+    )
     STICKINESS_TTL = 3600.0  # 1 hour
 
     def _provider_zdr_ok(self, provider: str) -> bool:
@@ -214,9 +217,18 @@ class PoolManager:
             return bool(endpoint.get("zdr_ok", False))
         return bool(getattr(endpoint, "zdr_ok", False))
 
+    def _provider_is_disabled(self, provider: str) -> bool:
+        """Return whether operator policy disables this provider for pools."""
+        return str(provider).strip().lower().replace("_", "-") in self._disabled_providers
+
     def __post_init__(self):
         self.pools = dict(self.config.get("pools", {}))
         self._providers = _provider_registry(self.config)
+        self._disabled_providers = frozenset(
+            str(provider).strip().lower().replace("_", "-")
+            for provider in self.config.get("disabled_providers", ())
+            if str(provider).strip()
+        )
         self._quality = QualityDB(self.config["quality_db_path"])
         self._tool_capabilities = ToolCapabilityDB(
             self.config.get("tool_capability_db_path")
@@ -258,6 +270,7 @@ class PoolManager:
             self._original_static[name] = frozenset(
                 (m.get("provider", ""), m.get("model", ""))
                 for m in pool.models
+                if not self._provider_is_disabled(m.get("provider", ""))
             )
             specs = [
                 ModelSpec.from_dict(
@@ -267,6 +280,7 @@ class PoolManager:
                     provider_zdr_ok=self._provider_zdr_ok(m.get("provider", "")),
                 )
                 for m in pool.models
+                if not self._provider_is_disabled(m.get("provider", ""))
             ]
             usable, unkeyed = _split_unkeyed(
                 specs,
@@ -320,6 +334,7 @@ class PoolManager:
         return {
             (m.get("provider", ""), m.get("model", ""))
             for m in pool.models
+            if not self._provider_is_disabled(m.get("provider", ""))
         }
 
     def extend_pools_with_catalog(self) -> dict[str, int]:
@@ -409,6 +424,13 @@ class PoolManager:
                         provider,
                     )
                     continue
+                if self._provider_is_disabled(provider):
+                    logger.info(
+                        "auto_free pool '%s': disabled provider '%s'",
+                        pool_name,
+                        provider,
+                    )
+                    continue
                 if pool.zdr and not self._provider_zdr_ok(provider):
                     # A free catalog entry is not automatically privacy-safe.
                     # Keep privacy discovery constrained to providers whose
@@ -479,7 +501,11 @@ class PoolManager:
             desired_auto = set(eligible) - static_pairs
             static_models = [
                 model for model in pool.models
-                if (model.get("provider", ""), model.get("model", "")) in static_pairs
+                if (
+                    not self._provider_is_disabled(model.get("provider", ""))
+                    and (model.get("provider", ""), model.get("model", ""))
+                    in static_pairs
+                )
             ]
             auto_models = [eligible[pair] for pair in sorted(desired_auto)]
             new_models = static_models + auto_models
@@ -527,6 +553,7 @@ class PoolManager:
                     provider_zdr_ok=self._provider_zdr_ok(m.get("provider", "")),
                 )
                 for m in pool.models
+                if not self._provider_is_disabled(m.get("provider", ""))
             ]
             usable, unkeyed = _split_unkeyed(
                 specs,

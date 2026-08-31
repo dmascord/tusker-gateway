@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import time
+from pathlib import Path
 from typing import Any
 
 import aiohttp
@@ -384,6 +385,31 @@ def _needs_probe(
     return (time.time() - record.checked_at) >= max_age_secs
 
 
+def _route_is_quarantined(
+    provider: str,
+    model: str,
+    cooldown_store: Any | None,
+) -> bool:
+    """Avoid sending maintenance probes into an active provider quarantine."""
+    try:
+        from tusker_gateway.cooldown import global_tracker
+
+        if global_tracker().is_cooldown(provider, model):
+            return True
+    except Exception:
+        logger.debug("in-memory cooldown check failed", exc_info=True)
+    if cooldown_store is None:
+        return False
+    try:
+        return bool(
+            cooldown_store.is_active(provider, model)
+            or cooldown_store.is_provider_active(provider)
+        )
+    except Exception:
+        logger.debug("persistent cooldown check failed", exc_info=True)
+        return False
+
+
 async def run_qualification(
     *,
     pool_name: str = "code",
@@ -395,6 +421,7 @@ async def run_qualification(
     limit: int | None = None,
     providers: set[str] | None = None,
     model_pairs: set[tuple[str, str]] | None = None,
+    ignore_cooldowns: bool = False,
 ) -> list[dict[str, Any]]:
     """Qualify selected static and auto-discovered chat models for one pool."""
     config = load_config()
@@ -406,6 +433,13 @@ async def run_qualification(
         config.get("tool_capability_db_path")
         or default_tool_capability_db_path(quality_path)
     )
+    cooldown_store = None
+    if not ignore_cooldowns and quality_path != ":memory:":
+        from tusker_gateway.persistent_cooldown import PersistentCooldownStore
+
+        cooldown_store = PersistentCooldownStore(
+            Path(quality_path).parent / "cooldowns.db"
+        )
     timeout = aiohttp.ClientTimeout(total=timeout_secs, sock_read=timeout_secs)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         registry = _catalog_registry(config, http_client=session)
@@ -445,6 +479,15 @@ async def run_qualification(
                 max_age_secs=max_age_secs,
             )
         ]
+        skipped_quarantine = 0
+        if not ignore_cooldowns:
+            unquarantined = []
+            for pair in pairs:
+                if _route_is_quarantined(pair[0], pair[1], cooldown_store):
+                    skipped_quarantine += 1
+                    continue
+                unquarantined.append(pair)
+            pairs = unquarantined
         if limit is not None:
             pairs = pairs[:limit]
         logger.info(
@@ -455,6 +498,12 @@ async def run_qualification(
             ",".join(sorted(provider_filter)) or "all",
             len(model_filter) or "all",
         )
+        if skipped_quarantine:
+            logger.info(
+                "tool qualification pool=%s skipped_quarantined=%d",
+                pool_name,
+                skipped_quarantine,
+            )
 
         semaphore = asyncio.Semaphore(max(1, max_concurrency))
 
@@ -518,6 +567,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--timeout-secs", type=float, default=45.0)
     parser.add_argument("--max-age-secs", type=float, default=86_400.0)
     parser.add_argument("--force", action="store_true", help="retest even a fresh record")
+    parser.add_argument(
+        "--ignore-cooldowns",
+        action="store_true",
+        help="probe quarantined routes explicitly (operator recovery test)",
+    )
     parser.add_argument("--limit", type=int)
     parser.add_argument("--json", action="store_true", help="emit result records as JSON")
     args = parser.parse_args(argv)
@@ -542,6 +596,7 @@ def main(argv: list[str] | None = None) -> int:
             limit=args.limit,
             providers=set(args.providers or []),
             model_pairs=model_pairs,
+            ignore_cooldowns=args.ignore_cooldowns,
         )
     )
     if args.json:

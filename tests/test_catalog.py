@@ -311,6 +311,23 @@ def test_registry_default_includes_provider_native_catalogs():
         assert client.endpoint
 
 
+def test_registry_default_honors_disabled_catalog_providers(monkeypatch):
+    monkeypatch.setenv(
+        "TUSKER_CATALOG_DISABLED_PROVIDERS",
+        "local-llm, openai, cohere",
+    )
+
+    registry = CatalogRegistry.default()
+
+    assert registry.get_client("local-llm") is None
+    assert registry.get_client("openai") is None
+    assert registry.get_client("cohere") is None
+    assert registry.get_client("groq") is not None
+    diagnostics = registry.diagnostics()
+    assert diagnostics["cohere"]["last_refresh_status"] == "disabled"
+    assert diagnostics["cohere"]["auth_source"] == "disabled"
+
+
 def test_registry_default_honors_custom_provider_model_endpoint():
     registry = CatalogRegistry.default({
         "custom": {

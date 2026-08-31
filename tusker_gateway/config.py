@@ -118,6 +118,14 @@ def load_config() -> dict[str, Any]:
         for p in _parse_env_list("TUSKER_AUTO_FREE_EXCLUDED_PROVIDERS")
         if p.strip()
     ]
+    # Provider routes can be disabled without removing their registry entry.
+    # This is useful while a provider is missing credentials or has an
+    # account-level outage; explicit provider requests remain diagnosable.
+    config["disabled_providers"] = [
+        p.strip().lower().replace("_", "-")
+        for p in _parse_env_list("TUSKER_DISABLED_PROVIDERS")
+        if p.strip()
+    ]
 
     # Normalized provider registry and API-key map.
     config["providers"] = _load_providers()

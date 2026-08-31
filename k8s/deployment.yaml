@@ -79,6 +79,15 @@ spec:
           value: "true"
         - name: TUSKER_AUTO_FREE_EXCLUDED_PROVIDERS
           value: nvidia
+        # Do not poll provider catalogs that are intentionally unavailable;
+        # direct routes remain diagnosable and can be re-enabled by removing
+        # the provider from this list after credentials/quota are repaired.
+        - name: TUSKER_CATALOG_DISABLED_PROVIDERS
+          value: arcee,arliai,cohere,local-llm,openai
+        # These providers currently have no usable pool route. Keeping them
+        # out of pool construction prevents repeated missing-key/quota noise.
+        - name: TUSKER_DISABLED_PROVIDERS
+          value: arcee,cohere
         - name: TUSKER_POOL_CODE
           value: '{"models":[{"provider":"minimax","model":"MiniMax-M3","input_modalities":["text","image"]},{"provider":"minimax","model":"MiniMax-M2.7","input_modalities":["text"]},{"provider":"minimax","model":"MiniMax-M2.7-highspeed","input_modalities":["text"]},{"provider":"minimax","model":"MiniMax-M2.5","input_modalities":["text"]},{"provider":"minimax","model":"MiniMax-M2.5-highspeed","input_modalities":["text"]},{"provider":"minimax","model":"MiniMax-M2.1","input_modalities":["text"]},{"provider":"minimax","model":"MiniMax-M2.1-highspeed","input_modalities":["text"]},{"provider":"minimax","model":"MiniMax-M2","input_modalities":["text"]},{"provider":"synthetic","model":"syn:large:text","input_modalities":["text"]},{"provider":"synthetic","model":"syn:small:text","input_modalities":["text"]},{"provider":"synthetic","model":"syn:large:vision","input_modalities":["text","image"]},{"provider":"synthetic","model":"syn:small:vision","input_modalities":["text","image"]},{"provider":"groq","model":"openai/gpt-oss-120b","input_modalities":["text"]},{"provider":"groq","model":"openai/gpt-oss-20b","input_modalities":["text"]},{"provider":"groq","model":"qwen/qwen3.6-27b","input_modalities":["text","image"]},{"provider":"arcee","model":"trinity-mini","input_modalities":["text"]},{"provider":"opencode-go","model":"deepseek-v4-flash"},{"provider":"xiaomi","model":"mimo-v2.5","input_modalities":["text","image"]},{"provider":"opencode-zen","model":"north-mini-code-free"},{"provider":"opencode-go","model":"qwen3.6-plus"},{"provider":"google","model":"gemini-3.1-flash-lite-preview"},{"provider":"cerebras","model":"gpt-oss-120b"},{"provider":"opencode-go","model":"deepseek-v4-pro"},{"provider":"opencode-zen","model":"big-pickle"},{"provider":"openrouter","model":"poolside/laguna-xs-2.1:free"},{"provider":"openrouter","model":"openai/gpt-oss-20b:free"},{"provider":"opencode-go","model":"minimax-m3"},{"provider":"opencode-go","model":"minimax-m2.7"},{"provider":"opencode-go","model":"qwen3.5-plus"},{"provider":"xiaomi","model":"mimo-v2.5-pro","input_modalities":["text"]},{"provider":"ollama-cloud","model":"glm-5.1"},{"provider":"ollama-cloud","model":"deepseek-v4-flash:preview"},{"provider":"ollama-cloud","model":"kimi-k2.6"},{"provider":"ollama-cloud","model":"gpt-oss:20b"},{"provider":"ollama-cloud","model":"minimax-m2.7"},{"provider":"opencode-zen","model":"deepseek-v4-flash-free"},{"provider":"opencode-zen","model":"mimo-v2.5-free"},{"provider":"opencode-zen","model":"hy3-free"},{"provider":"opencode-zen","model":"nemotron-3-ultra-free"},{"provider":"opencode-zen","model":"nemotron-3.5-lightning-free"},{"provider":"opencode-zen","model":"laguna-s-2.1-free"},{"provider":"opencode-zen","model":"gemini-3-flash"},{"provider":"opencode-zen","model":"minimax-m2.7"},{"provider":"opencode-zen","model":"minimax-m2.5-free"},{"provider":"openrouter","model":"nvidia/nemotron-3-ultra-550b-a55b:free"},{"provider":"openrouter","model":"nvidia/nemotron-3.5-lightning:free"},{"provider":"openrouter","model":"dots-studio/dots-3-note-preview:free"},{"provider":"openrouter","model":"google/gemma-4-31b-it:free"},{"provider":"openrouter","model":"google/gemma-4-26b-a4b-it:free"},{"provider":"openrouter","model":"cohere/north-mini-code:free"},{"provider":"openrouter","model":"openrouter/free"},{"provider":"zai","model":"glm-4.7"},{"provider":"cohere","model":"north-mini-code-1-0"},{"provider":"openai-codex","model":"gpt-5.6-luna"},{"provider":"openai-codex","model":"gpt-5.4-mini"},{"provider":"github-copilot","model":"gpt-5.6-luna"},{"provider":"github-copilot-enterprise","model":"gpt-5.6-luna"}],"auto_catalog_providers":["minimax","synthetic","zai","openai-codex","github-copilot","github-copilot-enterprise","opencode-go","ollama-cloud","groq","google","cerebras"],"context_window":128000,"zdr":false,"auto_free":true,"fallback_pools":["premium","swarm"]}'
         - name: TUSKER_POOL_PRIVACY
@@ -219,6 +228,18 @@ spec:
           value: /home/tusker/.hermes/model_capability.db
         - name: TUSKER_CAPABILITY_PROBE_GENERATION
           value: 'false'
+        - name: TUSKER_QUALIFICATION_MAINTENANCE_ENABLED
+          value: 'true'
+        - name: TUSKER_QUALIFICATION_MAINTENANCE_INITIAL_DELAY_SECS
+          value: '300'
+        - name: TUSKER_QUALIFICATION_MAINTENANCE_INTERVAL_SECS
+          value: '21600'
+        - name: TUSKER_QUALIFICATION_MAINTENANCE_LIMIT
+          value: '12'
+        - name: TUSKER_QUALIFICATION_MAINTENANCE_TIMEOUT_SECS
+          value: '30'
+        - name: TUSKER_QUALIFICATION_MAINTENANCE_MAX_AGE_SECS
+          value: '86400'
         - name: TUSKER_CATALOG_STARTUP_TIMEOUT_SECS
           value: '10'
         - name: TUSKER_UPSTREAM_SOCK_READ_SECS

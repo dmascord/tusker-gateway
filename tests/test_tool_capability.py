@@ -15,6 +15,7 @@ from tusker_gateway.tool_qualification import (
     PROBE_TOOL_NAME,
     _classify_http_failure,
     _needs_probe,
+    _route_is_quarantined,
     _result_from_stream,
 )
 
@@ -273,6 +274,16 @@ def test_unavailable_probe_is_retried_before_normal_probe_ttl(monkeypatch, tmp_p
     )
 
     assert _needs_probe(record, force=False, max_age_secs=86_400.0) is True
+
+
+def test_qualification_skips_persisted_route_quarantine(tmp_path):
+    from tusker_gateway.persistent_cooldown import PersistentCooldownStore
+
+    store = PersistentCooldownStore(tmp_path / "cooldowns.db")
+    store.record_provider("cohere", 60.0)
+
+    assert _route_is_quarantined("cohere", "command", store) is True
+    assert _route_is_quarantined("groq", "gpt-oss", store) is False
 
 
 def test_strict_probe_result_requires_exact_tool_contract():

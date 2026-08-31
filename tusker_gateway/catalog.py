@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -53,6 +54,15 @@ def _safe_catalog_error_summary(exc: Exception) -> str:
     if match:
         return f"http_{match.group(1)}"
     return type(exc).__name__
+
+
+def _normalize_provider_names(values: Iterable[str] | None) -> frozenset[str]:
+    """Normalize a provider-name collection used by catalog policy."""
+    return frozenset(
+        str(value).strip().lower().replace("_", "-")
+        for value in (values or ())
+        if str(value).strip()
+    )
 
 
 # Per-provider TTLs. Mirrors hermes-agent's `_COPILOT_CATALOG_CACHE_TTL=300`
@@ -899,8 +909,15 @@ class CatalogRegistry:
         self,
         clients: dict[str, CatalogClient] | None = None,
         model_capability_db: Any | None = None,
+        disabled_providers: Iterable[str] | None = None,
     ) -> None:
-        self._clients: dict[str, CatalogClient] = clients or {}
+        self.disabled_providers = _normalize_provider_names(disabled_providers)
+        self._clients: dict[str, CatalogClient] = {
+            str(provider).strip().lower().replace("_", "-"): client
+            for provider, client in (clients or {}).items()
+            if str(provider).strip().lower().replace("_", "-")
+            not in self.disabled_providers
+        }
         self._models_dev: ModelsDevCatalog | None = None
         self.model_capability_db = model_capability_db
         # Inject models.dev lookup into the other clients via attribute.
@@ -908,7 +925,10 @@ class CatalogRegistry:
             c._pricing_lookup = self._pricing_lookup  # type: ignore[attr-defined]
 
     def register(self, provider: str, client: CatalogClient) -> None:
-        self._clients[provider] = client
+        normalized_provider = str(provider).strip().lower().replace("_", "-")
+        if normalized_provider in self.disabled_providers:
+            return
+        self._clients[normalized_provider] = client
         client._pricing_lookup = self._pricing_lookup  # type: ignore[attr-defined]
         if isinstance(client, ModelsDevCatalog):
             self._models_dev = client
@@ -1021,16 +1041,34 @@ class CatalogRegistry:
 
     def diagnostics(self) -> dict[str, dict[str, Any]]:
         """Return credential-safe refresh state for every registered catalog."""
-        return {
+        diagnostics = {
             provider: client.diagnostics()
             for provider, client in self._clients.items()
         }
+        for provider in sorted(self.disabled_providers):
+            diagnostics.setdefault(
+                provider,
+                {
+                    "provider": provider,
+                    "endpoint": None,
+                    "auth_source": "disabled",
+                    "entries": 0,
+                    "stale": False,
+                    "last_refresh_status": "disabled",
+                    "last_refresh_at": None,
+                    "last_refresh_latency_ms": None,
+                    "last_error": "disabled_by_config",
+                    "last_error_class": None,
+                },
+            )
+        return diagnostics
 
     @classmethod
     def default(
         cls,
         provider_registry: dict[str, Any] | None = None,
         model_capability_db: Any | None = None,
+        disabled_providers: Iterable[str] | None = None,
     ) -> "CatalogRegistry":
         """Build catalogs for every configured provider with a model endpoint.
 
@@ -1042,7 +1080,14 @@ class CatalogRegistry:
             from tusker_gateway.config import DEFAULT_PROVIDER_REGISTRY
 
             provider_registry = DEFAULT_PROVIDER_REGISTRY
-        reg = cls(model_capability_db=model_capability_db)
+        if disabled_providers is None:
+            disabled_providers = os.environ.get(
+                "TUSKER_CATALOG_DISABLED_PROVIDERS", ""
+            ).split(",")
+        reg = cls(
+            model_capability_db=model_capability_db,
+            disabled_providers=disabled_providers,
+        )
         if "openai-codex" in provider_registry:
             reg.register("openai-codex", CodexCatalog())
         if "github-copilot" in provider_registry:

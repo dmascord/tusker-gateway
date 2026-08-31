@@ -162,6 +162,11 @@ def status_handler(request: web.Request) -> web.Response:
         "purged_cooldowns": purged,
         "rtk_enabled": request.app.get("rtk_enabled", is_enabled()),
     }
+    qualification_task = request.app.get("qualification_task")
+    status["qualification_maintenance"] = {
+        "enabled": qualification_task is not None,
+        "running": bool(qualification_task is not None and not qualification_task.done()),
+    }
     semantic_cache = request.app.get("semantic_cache")
     status["semantic_cache"] = {
         "enabled": bool(semantic_cache is not None and semantic_cache.enabled),

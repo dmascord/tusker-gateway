@@ -187,6 +187,28 @@ def test_unkeyed_bearer_provider_soft_fails():
         assert ("groq", "m1") in unkeyed
 
 
+def test_disabled_provider_is_removed_from_pool_candidates(tmp_path):
+    manager = PoolManager(
+        {
+            "pools": {
+                "code": PoolConfig(
+                    name="code",
+                    models=[
+                        {"provider": "arcee", "model": "trinity-mini"},
+                        {"provider": "groq", "model": "gpt-oss"},
+                    ],
+                ),
+            },
+            "quality_db_path": os.path.join(tmp_path, "quality.db"),
+            "provider_api_keys": {"groq": "k-groq"},
+            "disabled_providers": ["arcee"],
+        }
+    )
+
+    assert manager.select("code") == ("groq", "gpt-oss")
+    assert manager.status()["code"]["valid_candidates"] == 1
+
+
 def test_cooldown_parsing():
     assert _cooldown_seconds_for_429({"headers": {"Retry-After": "10"}}) == 10
     # "this week" → 7 days = 604800s (rate-limit windows are honored as written)
