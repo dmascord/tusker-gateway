@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 import pytest
 from tusker_gateway.budget import BudgetDecision
 from tusker_gateway.errors import ProviderError
-from tusker_gateway.endpoints import _call_with_pool_fallback
+from tusker_gateway.endpoints import _call_with_pool_fallback, _required_input_modalities
 from .conftest import HEADERS_AUTH, HEADERS_NO_AUTH
 
 
@@ -28,6 +28,19 @@ class _FakeSemanticCache:
 
     def stats_snapshot(self):
         return {"hits": 0, "misses": 0, "writes": 0, "evictions": 0}
+
+
+def test_required_input_modalities_collects_multiple_media_types():
+    assert _required_input_modalities([
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}},
+                {"type": "input_audio", "input_audio": {"data": "AA", "format": "wav"}},
+                {"type": "video_url", "video_url": {"url": "data:video/mp4;base64,AA"}},
+            ],
+        }
+    ]) == frozenset({"audio", "image", "video"})
 
 
 @pytest.mark.asyncio
@@ -158,12 +171,11 @@ async def test_chat_completions_pool_dispatch(client):
         data = await resp.json()
         assert data["choices"][0]["message"]["content"] == "hello"
 
-        # Verify provider selection. Unrated candidates now start at 100.0,
-        # so ranking preserves the first eligible candidate in the default
-        # pool. The first light candidate is openai-codex/gpt-5.6-luna.
+        # Verify the configured deterministic ordering. The current default
+        # code pool starts with the lightweight MiniMax route.
         args, kwargs = mock_chat.call_args
-        assert args[0] == "openai-codex"
-        assert args[1] == "gpt-5.6-luna"
+        assert args[0] == "minimax"
+        assert args[1] == "MiniMax-M3"
 
 
 @pytest.mark.asyncio

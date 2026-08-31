@@ -122,9 +122,13 @@ def status_handler(request: web.Request) -> web.Response:
     from tusker_gateway.pools import PoolManager
     from tusker_gateway.rtk import is_enabled
     from tusker_gateway.cooldown import global_tracker
+    from tusker_gateway.model_capability import ModelCapabilityDB
 
     config = load_config()
     quality = QualityDB(config["quality_db_path"])
+    model_capabilities = request.app.get("model_capabilities") or ModelCapabilityDB(
+        config.get("model_capability_db_path", "data/model_capability.db")
+    )
     provider_usage = ProviderUsageDB(
         default_provider_usage_db_path(config["quality_db_path"])
     )
@@ -145,7 +149,13 @@ def status_handler(request: web.Request) -> web.Response:
         "status": "ok",
         "version": "0.1.0",
         "pools": pools.status(),
+        "catalog": (
+            request.app["catalog_registry"].diagnostics()
+            if request.app.get("catalog_registry") is not None
+            else {}
+        ),
         "quality": quality.status(),
+        "model_capabilities": model_capabilities.status(),
         "provider_usage": provider_usage.status(),
         "provider_capacity": capacity_controller().snapshot(),
         "cooldowns": global_tracker().snapshot(),

@@ -44,6 +44,7 @@ from tusker_gateway.providers.capabilities import (
     CapabilitiesRegistry,
     capabilities_refresh_loop,
 )
+from tusker_gateway.model_capability import ModelCapabilityDB
 
 
 def create_app() -> web.Application:
@@ -59,6 +60,9 @@ def create_app() -> web.Application:
 
     app = web.Application(client_max_size=10 * 1024 * 1024)
     app["config"] = load_config()
+    app["model_capabilities"] = ModelCapabilityDB(
+        app["config"].get("model_capability_db_path", "data/model_capability.db")
+    )
 
     # Release 1 capabilities: cache, budget, metrics. All default-disabled
     # via env so existing deployments are unaffected.
@@ -153,6 +157,7 @@ def create_app() -> web.Application:
     capability_registry = CapabilitiesRegistry(
         provider_keys=config.get("provider_api_keys", {}),
         codex_rotator=codex_rotator,
+        model_capability_db=app["model_capabilities"],
     )
     app["capability_registry"] = capability_registry
     app["image_handler"] = ImageGenerationHandler(
@@ -222,7 +227,10 @@ def create_app() -> web.Application:
                     catalog_refresh_loop,
                 )
                 interval_secs = float(os.environ.get("TUSKER_CATALOG_REFRESH_SECS", "300"))
-                registry = CatalogRegistry.default(config.get("providers"))
+                registry = CatalogRegistry.default(
+                    config.get("providers"),
+                    model_capability_db=app["model_capabilities"],
+                )
                 # Wire API keys into catalog clients that need them.
                 _wire_catalog_api_keys(
                     registry, config.get("provider_api_keys", {}),

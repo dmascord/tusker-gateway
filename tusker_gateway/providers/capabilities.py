@@ -28,6 +28,10 @@ from typing import Any, Awaitable, Callable, Iterable
 
 import aiohttp
 from tusker_gateway.catalog import is_free_openrouter_model
+from tusker_gateway.model_capability import (
+    MODEL_CAPABILITY_PROBE_VERSION,
+    ModelCapabilityDB,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -93,9 +97,11 @@ class CapabilitiesRegistry:
         self,
         provider_keys: dict[str, str] | None = None,
         codex_rotator: Any | None = None,
+        model_capability_db: ModelCapabilityDB | None = None,
     ) -> None:
         self.provider_keys: dict[str, str] = dict(provider_keys or {})
         self.codex_rotator = codex_rotator
+        self.model_capability_db = model_capability_db
         self.snapshot = CapabilitySnapshot()
         self._lock = asyncio.Lock()
 
@@ -122,6 +128,15 @@ class CapabilitiesRegistry:
                     continue
                 for entry in entries:
                     merged.capabilities[entry.capability].append(entry)
+                    if self.model_capability_db is not None:
+                        self.model_capability_db.record(
+                            provider=entry.provider,
+                            model=entry.model,
+                            capability=entry.capability.value,
+                            status="discovered",
+                            source="capability_registry",
+                            probe_version=MODEL_CAPABILITY_PROBE_VERSION,
+                        )
 
             self.snapshot = merged
             total = sum(len(v) for v in merged.capabilities.values())
@@ -371,6 +386,15 @@ async def _discover_zai(api_key: str | None, session: aiohttp.ClientSession) -> 
     """Probe Z.AI's per-capability endpoints with their documented slugs."""
     if not api_key:
         return []
+    generation_probe_enabled = os.environ.get(
+        "TUSKER_CAPABILITY_PROBE_GENERATION", "0"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if not generation_probe_enabled:
+        logger.info(
+            "zai media capability probes disabled; set "
+            "TUSKER_CAPABILITY_PROBE_GENERATION=true for explicit live probes"
+        )
+        return []
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     out: list[CapabilityEntry] = []
 
@@ -592,4 +616,3 @@ def normalise_model_for_lookup(model: str) -> str:
     if "::" in model:
         return model.split("::", 1)[1]
     return model
-

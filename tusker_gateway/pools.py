@@ -12,7 +12,11 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from tusker_gateway.catalog import advertised_input_modalities, advertised_tool_support
+from tusker_gateway.catalog import (
+    advertised_input_modalities,
+    advertised_output_modalities,
+    advertised_tool_support,
+)
 from tusker_gateway.config import DEFAULT_PROVIDER_REGISTRY, PoolConfig
 from tusker_gateway.cooldown import CooldownTracker, global_tracker
 from tusker_gateway.heavyweight import is_heavyweight
@@ -181,6 +185,7 @@ class PoolManager:
     unkeyed: dict[str, list[tuple[ModelSpec, str]]] = field(default_factory=dict)
     _quality: QualityDB | None = None
     _tool_capabilities: ToolCapabilityDB | None = None
+    _model_capability_db: Any | None = None
     _cooldowns: CooldownTracker | None = None
     # Optional catalog registry — when set, PoolManager.extend_pools_with_catalog()
     # merges catalog-known models into the allowlist. See catalog.py.
@@ -216,6 +221,13 @@ class PoolManager:
         self._tool_capabilities = ToolCapabilityDB(
             self.config.get("tool_capability_db_path")
             or default_tool_capability_db_path(self.config["quality_db_path"])
+        )
+        from tusker_gateway.model_capability import ModelCapabilityDB
+        from tusker_gateway.model_capability import default_model_capability_db_path
+
+        self._model_capability_db = ModelCapabilityDB(
+            self.config.get("model_capability_db_path")
+            or default_model_capability_db_path(self.config["quality_db_path"])
         )
         self._cooldowns = global_tracker()
         quality_path = self.config["quality_db_path"]
@@ -569,6 +581,83 @@ class PoolManager:
         capability_cache[key] = (modalities, tool_support)
         return modalities, tool_support
 
+    def _input_modalities_allowed(
+        self,
+        spec: ModelSpec,
+        required_modalities: frozenset[str],
+        advertised_modalities: frozenset[str] | None,
+    ) -> bool:
+        """Apply verified modality evidence before catalog compatibility.
+
+        A passed/unsupported probe is authoritative for that one input
+        modality. Unavailable results are intentionally treated as unknown so
+        a provider outage does not permanently remove a model from rotation.
+        """
+        for modality in required_modalities:
+            capability = f"input_{modality}"
+            record = (
+                self._model_capability_db.get(spec.provider, spec.model, capability)
+                if self._model_capability_db is not None
+                else None
+            )
+            if record is not None:
+                if record.status == "passed":
+                    continue
+                if record.status == "unsupported":
+                    return False
+                # advertised/discovered/unavailable/unknown do not override
+                # the normal catalog result below.
+            if (
+                advertised_modalities is not None
+                and modality not in advertised_modalities
+            ):
+                return False
+        return True
+
+    def _effective_modalities_for_status(
+        self,
+        spec: ModelSpec,
+        capability_cache: dict[
+            tuple[str, str], tuple[frozenset[str] | None, bool | None]
+        ],
+    ) -> tuple[frozenset[str] | None, frozenset[str] | None]:
+        """Return current input/output modality evidence for diagnostics.
+
+        Catalog metadata is the baseline. An explicit live probe can add a
+        capability that stale metadata omitted, or remove one that the
+        catalog incorrectly advertised. ``None`` remains meaningful: it
+        means the gateway has no current claim for that direction.
+        """
+        input_modalities, _ = self._model_capabilities(spec, capability_cache)
+        output_modalities = advertised_output_modalities(self._catalog_entry_for(spec))
+        records = (
+            self._model_capability_db.for_model(spec.provider, spec.model)
+            if self._model_capability_db is not None
+            else []
+        )
+
+        def apply_evidence(
+            baseline: frozenset[str] | None,
+            prefix: str,
+        ) -> frozenset[str] | None:
+            effective = set(baseline) if baseline is not None else None
+            for record in records:
+                if not record.capability.startswith(prefix):
+                    continue
+                modality = record.capability[len(prefix):]
+                if record.status == "passed":
+                    if effective is None:
+                        effective = set()
+                    effective.add(modality)
+                elif record.status == "unsupported" and effective is not None:
+                    effective.discard(modality)
+            return frozenset(effective) if effective is not None else None
+
+        return (
+            apply_evidence(input_modalities, "input_"),
+            apply_evidence(output_modalities, "output_"),
+        )
+
     def _tool_capability_allowed(
         self,
         spec: ModelSpec,
@@ -721,9 +810,8 @@ class PoolManager:
                         modalities, tool_support = self._model_capabilities(
                             s, capability_cache
                         )
-                        if (
-                            modalities is not None
-                            and not required_modalities.issubset(modalities)
+                        if not self._input_modalities_allowed(
+                            s, required_modalities, modalities
                         ):
                             self._stickiness.pop(key, None)
                             break
@@ -799,7 +887,9 @@ class PoolManager:
                 filter_counts["heavyweight"] += 1
                 continue
             modalities, tool_support = self._model_capabilities(s, capability_cache)
-            if modalities is not None and not required_modalities.issubset(modalities):
+            if not self._input_modalities_allowed(
+                s, required_modalities, modalities
+            ):
                 filter_counts["input_modalities"] += 1
                 filtered_modality_models.append(f"{s.provider}/{s.model}")
                 continue
@@ -925,6 +1015,9 @@ class PoolManager:
     def status(self) -> dict[str, Any]:
         """Return pool status for /status endpoint."""
         result = {}
+        capability_cache: dict[
+            tuple[str, str], tuple[frozenset[str] | None, bool | None]
+        ] = {}
         for name, specs in self.models.items():
             valid = [s for s in specs if s.provider in self._providers]
             invalid = [s for s in specs if s.provider not in self._providers]
@@ -944,19 +1037,48 @@ class PoolManager:
                     for s, reason in self.unkeyed.get(name, [])
                 ],
                 "candidates": [
-                    {
-                        "provider": s.provider,
-                        "model": s.model,
-                        "context_window": s.context_window,
-                        "auto_discovered": s.auto_discovered,
-                        "tool_capability": (
-                            self._tool_capabilities.get(s.provider, s.model).to_dict()
-                            if self._tool_capabilities is not None
-                            and self._tool_capabilities.get(s.provider, s.model) is not None
-                            else None
-                        ),
-                    }
+                    self._status_candidate(s, capability_cache)
                     for s in valid
                 ],
             }
         return result
+
+    def _status_candidate(
+        self,
+        spec: ModelSpec,
+        capability_cache: dict[
+            tuple[str, str], tuple[frozenset[str] | None, bool | None]
+        ],
+    ) -> dict[str, Any]:
+        """Serialize one candidate with effective capability evidence."""
+        input_modalities, output_modalities = self._effective_modalities_for_status(
+            spec, capability_cache
+        )
+        return {
+            "provider": spec.provider,
+            "model": spec.model,
+            "context_window": spec.context_window,
+            "auto_discovered": spec.auto_discovered,
+            "input_modalities": (
+                sorted(input_modalities) if input_modalities is not None else None
+            ),
+            "output_modalities": (
+                sorted(output_modalities) if output_modalities is not None else None
+            ),
+            "tool_capability": (
+                self._tool_capabilities.get(spec.provider, spec.model).to_dict()
+                if self._tool_capabilities is not None
+                and self._tool_capabilities.get(spec.provider, spec.model) is not None
+                else None
+            ),
+            "model_capabilities": (
+                [
+                    record.to_dict()
+                    for record in self._model_capability_db.for_model(
+                        spec.provider, spec.model
+                    )
+                ]
+                if self._model_capability_db is not None
+                else []
+            ),
+        }

@@ -28,9 +28,11 @@ from tusker_gateway.catalog import (
     XiaomiCatalog,
     _parse_cost_field,
     advertised_input_modalities,
+    advertised_output_modalities,
     advertised_tool_support,
     catalog_refresh_loop,
 )
+from tusker_gateway.model_capability import ModelCapabilityDB
 
 
 # ---------------------------------------------------------------------------
@@ -71,6 +73,7 @@ def test_catalog_capability_helpers_read_openrouter_shape():
         },
     )
     assert advertised_input_modalities(entry) == frozenset({"text", "image"})
+    assert advertised_output_modalities(entry) == frozenset({"text"})
     assert advertised_tool_support(entry) is True
 
     no_tools = CatalogEntry(
@@ -202,6 +205,97 @@ async def test_provider_models_catalog_parses_standard_and_ollama_shapes():
     assert entries[0].cost_input == 0.0
     assert entries[0].cost_output == 0.0
     assert session.captured["headers"]["Authorization"] == "Bearer provider-key"
+
+
+@pytest.mark.asyncio
+async def test_provider_models_catalog_applies_default_modalities_only_when_unknown():
+    session = _CapturingSession(FakeResponse(200, {
+        "models": [
+            {"id": "text-model"},
+            {"id": "vision-model", "architecture": {
+                "input_modalities": ["text", "image"],
+            }},
+        ],
+    }))
+    catalog = ProviderModelsCatalog(
+        provider="ollama-cloud",
+        endpoint="https://api.example.test/v1/models",
+        default_input_modalities=frozenset({"text"}),
+        default_output_modalities=frozenset({"text"}),
+    )
+
+    entries = await catalog.fetch(session)
+
+    assert entries[0].input_modalities == frozenset({"text"})
+    assert entries[0].output_modalities == frozenset({"text"})
+    assert entries[1].input_modalities is None
+    assert advertised_input_modalities(entries[1]) == frozenset({"text", "image"})
+
+
+@pytest.mark.asyncio
+async def test_catalog_refresh_records_safe_diagnostics():
+    session = _CapturingSession(FakeResponse(200, {"models": [{"id": "m1"}]}))
+    catalog = ProviderModelsCatalog(
+        provider="cerebras",
+        endpoint="https://api.example.test/v1/models",
+    )
+    catalog.set_api_key("provider-key")
+
+    await catalog.refresh(session)
+
+    diagnostics = catalog.diagnostics()
+    assert diagnostics["provider"] == "cerebras"
+    assert diagnostics["endpoint"] == "https://api.example.test/v1/models"
+    assert diagnostics["auth_source"] == "api_key"
+    assert diagnostics["entries"] == 1
+    assert diagnostics["last_refresh_status"] == "ok"
+    assert diagnostics["last_error_class"] is None
+    assert "provider-key" not in str(diagnostics)
+
+
+@pytest.mark.asyncio
+async def test_catalog_refresh_summarizes_errors_without_returning_exception_text():
+    session = _CapturingSession(FakeResponse(401, {"error": "invalid api key"}))
+    catalog = ProviderModelsCatalog(
+        provider="groq",
+        endpoint="https://api.example.test/v1/models",
+    )
+    catalog.set_api_key("provider-key")
+
+    await catalog.refresh(session)
+
+    diagnostics = catalog.diagnostics()
+    assert diagnostics["last_refresh_status"] == "error"
+    assert diagnostics["last_error"] == "http_401"
+    assert diagnostics["last_error_class"] == "CatalogError"
+    assert "invalid api key" not in str(diagnostics)
+
+
+@pytest.mark.asyncio
+async def test_catalog_refresh_persists_explicit_modality_claims(tmp_path):
+    session = _CapturingSession(FakeResponse(200, {
+        "models": [{
+            "id": "vision-model",
+            "architecture": {
+                "input_modalities": ["text", "image"],
+                "output_modalities": ["text", "image"],
+            },
+        }],
+    }))
+    db = ModelCapabilityDB(str(tmp_path / "model-capability.db"))
+    catalog = ProviderModelsCatalog(
+        provider="openrouter",
+        endpoint="https://api.example.test/v1/models",
+    )
+    registry = CatalogRegistry(
+        {"openrouter": catalog},
+        model_capability_db=db,
+    )
+
+    await registry.refresh_all(session)
+
+    assert db.get("openrouter", "vision-model", "input_image").status == "advertised"
+    assert db.get("openrouter", "vision-model", "output_image").status == "advertised"
 
 
 def test_registry_default_includes_provider_native_catalogs():

@@ -41,6 +41,7 @@ from tusker_gateway.quality import QualityDB
 from tusker_gateway.rate_limit import RateLimiter
 from tusker_gateway.routing import resolve_route
 from tusker_gateway.semantic_cache import make_semantic_scope, response_contains_tool_calls
+from tusker_gateway.model_capability import MODEL_CAPABILITY_PROBE_VERSION
 from tusker_gateway.sse import (
     format_openai_chunk,
     sse_done,
@@ -1793,8 +1794,18 @@ def _pool_failure_summary(exc: BaseException) -> str:
     return _safe_upstream_body(str(body), limit=300)
 
 
-def _public_provider_failure_response(exc: BaseException) -> web.Response:
-    """Hide provider capacity details without changing other error semantics."""
+def _is_capacity_failure(exc: BaseException | None) -> bool:
+    """Return whether an exception represents provider/shared capacity.
+
+    Some tests and adapters surface a generic ``ProviderError`` with the
+    capacity marker only in ``message`` or ``str(exc)``. Keep the recovery
+    decision aligned with the public-response sanitizer instead of relying
+    only on the specialized exception class.
+    """
+    if exc is None:
+        return False
+    if isinstance(exc, ProviderCapacityError):
+        return True
     detail = " ".join(
         str(value)
         for value in (
@@ -1804,7 +1815,12 @@ def _public_provider_failure_response(exc: BaseException) -> web.Response:
         )
         if value
     )
-    if not isinstance(exc, ProviderCapacityError) and not is_capacity_error(detail):
+    return is_capacity_error(detail)
+
+
+def _public_provider_failure_response(exc: BaseException) -> web.Response:
+    """Hide provider capacity details without changing other error semantics."""
+    if not _is_capacity_failure(exc):
         return web.json_response(
             openai_error(str(exc), code="provider_error", error_type="provider_error"),
             status=502,
@@ -1849,22 +1865,25 @@ def _clear_permanently_failed(provider: str, model: str) -> None:
 
     clear_permanently_failed(provider, model)
 
-_IMAGE_INPUT_MODALITIES = frozenset({"image"})
-
-
 def _required_input_modalities(messages: Any) -> frozenset[str] | None:
     """Return pool capabilities required by OpenAI-format messages."""
     if not isinstance(messages, list):
         return None
+    required: set[str] = set()
     for message in messages:
         if not isinstance(message, dict) or not isinstance(message.get("content"), list):
             continue
-        if any(
-            isinstance(block, dict) and block.get("type") in {"image_url", "input_image"}
-            for block in message["content"]
-        ):
-            return _IMAGE_INPUT_MODALITIES
-    return None
+        for block in message["content"]:
+            if not isinstance(block, dict):
+                continue
+            block_type = str(block.get("type") or "").strip().lower()
+            if block_type in {"image_url", "input_image"}:
+                required.add("image")
+            elif block_type in {"audio_url", "input_audio", "audio"}:
+                required.add("audio")
+            elif block_type in {"video_url", "input_video", "video"}:
+                required.add("video")
+    return frozenset(required) or None
 
 
 async def _call_with_pool_fallback(
@@ -2004,7 +2023,11 @@ async def _call_with_pool_fallback(
                     active_pool,
                 )
                 continue
-            if not recovery_probe and attempts < max_attempts:
+            if (
+                not recovery_probe
+                and attempts < max_attempts
+                and not _is_capacity_failure(last_error)
+            ):
                 # A prior request can quarantine every currently ranked
                 # candidate. Probe the same configured fallback chain once,
                 # ignoring only individual transient cooldowns. Shared/global
@@ -2995,6 +3018,53 @@ def _record_media_budget(
         budget.record(api_key, "media", budget_units)
 
 
+def _record_media_capabilities(
+    request: web.Request,
+    *,
+    provider: str,
+    model: str,
+    capabilities: tuple[str, ...],
+    started: float,
+) -> None:
+    """Promote capabilities after a successful real media request.
+
+    This records only the route, result class, status, and latency. The
+    request body, response body, credentials, and generated media are never
+    written to the capability database.
+    """
+    capability_db = request.app.get("model_capabilities")
+    if capability_db is None:
+        return
+    normalized_provider = str(provider).strip().lower().replace("_", "-")
+    normalized_model = str(model).strip()
+    if "::" in normalized_model:
+        pinned_provider, _, upstream_model = normalized_model.partition("::")
+        if pinned_provider.strip().lower().replace("_", "-") == normalized_provider:
+            normalized_model = upstream_model.strip()
+    elif (
+        normalized_provider == "openrouter"
+        and normalized_model.lower().startswith("openrouter/")
+    ):
+        normalized_model = normalized_model.split("/", 1)[1]
+    if not normalized_provider or not normalized_model:
+        return
+    latency_ms = round((time.monotonic() - started) * 1000, 1)
+    try:
+        for capability in capabilities:
+            capability_db.record(
+                provider=normalized_provider,
+                model=normalized_model,
+                capability=capability,
+                status="passed",
+                source="live_request",
+                probe_version=MODEL_CAPABILITY_PROBE_VERSION,
+                http_status=200,
+                latency_ms=latency_ms,
+            )
+    except Exception:  # pragma: no cover - diagnostics must not break media
+        logger.debug("could not persist successful media capability", exc_info=True)
+
+
 async def images_handler(request: web.Request) -> web.Response:
     """POST /v1/images/generations, /v1/images/edits, /v1/images/variations.
 
@@ -3002,6 +3072,7 @@ async def images_handler(request: web.Request) -> web.Response:
     Delegates to the ImageGenerationHandler for routing and processing.
     """
     try:
+        started = time.monotonic()
         body = await request.json()
         budget_units = 4096
         blocked = await _media_preflight(request, body, budget_units=budget_units)
@@ -3029,6 +3100,17 @@ async def images_handler(request: web.Request) -> web.Response:
             api_key=api_key,
             codex_rotator=codex_rotator,
         )
+        image_capability = {
+            "/v1/images/edits": "image_edits",
+            "/v1/images/variations": "image_variations",
+        }.get(request.path, "image_generations")
+        _record_media_capabilities(
+            request,
+            provider=provider,
+            model=model,
+            capabilities=("output_image", image_capability),
+            started=started,
+        )
         _record_media_budget(request, budget_units=budget_units)
         return web.json_response(result)
 
@@ -3049,6 +3131,7 @@ async def images_handler(request: web.Request) -> web.Response:
 async def tts_handler(request: web.Request) -> web.Response:
     """POST /v1/audio/speech and return upstream-generated binary audio."""
     try:
+        started = time.monotonic()
         body = await request.json()
         model = body.get("model", "tts-1")
         tts = request.app.get("tts_handler")
@@ -3065,6 +3148,13 @@ async def tts_handler(request: web.Request) -> web.Response:
             model=model,
             body=body,
             api_key=api_key,
+        )
+        _record_media_capabilities(
+            request,
+            provider=provider,
+            model=model,
+            capabilities=("output_audio", "tts_speech"),
+            started=started,
         )
         return web.Response(body=audio_bytes, content_type=content_type)
     except Exception as exc:
@@ -3084,6 +3174,7 @@ async def video_handler(request: web.Request) -> web.Response:
     get the initial job object immediately.
     """
     try:
+        started = time.monotonic()
         body = await request.json()
         budget_units = 32768
         blocked = await _media_preflight(request, body, budget_units=budget_units)
@@ -3106,6 +3197,13 @@ async def video_handler(request: web.Request) -> web.Response:
             body=body,
             api_key=api_key,
             wait=wait,
+        )
+        _record_media_capabilities(
+            request,
+            provider=provider,
+            model=model,
+            capabilities=("video_generations",),
+            started=started,
         )
         _record_media_budget(request, budget_units=budget_units)
         return web.json_response(result)

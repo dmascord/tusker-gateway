@@ -123,7 +123,7 @@ Account-backed catalogs can be opted in explicitly with
 providers whose catalog does not expose a meaningful zero-price signal:
 
 ```json
-TUSKER_POOL_CODE='{"models": [], "auto_free": true, "auto_catalog_providers": ["openai-codex", "github-copilot", "github-copilot-enterprise", "zai", "synthetic"]}'
+TUSKER_POOL_CODE='{"models": [], "auto_free": true, "auto_catalog_providers": ["openai-codex", "github-copilot", "github-copilot-enterprise", "opencode-go", "zai", "synthetic"]}'
 ```
 
 These entries are still filtered by heavyweight and privacy policy. A
@@ -146,14 +146,29 @@ free into the pool's allowlist. Discovery differs per upstream:
 
 Providers listed in `auto_catalog_providers` use their authenticated catalog
 as the account's allowlist rather than the zero-price test. This is the
-explicit path for Codex, Copilot, Z.AI, Synthetic, MiniMax, Ollama Cloud,
-Groq, Google, or Cerebras when their credentials provide model access.
+explicit path for Codex, Copilot, OpenCode Go, Z.AI, Synthetic, MiniMax,
+Ollama Cloud, Groq, Google, or Cerebras when their credentials provide model
+access.
 
 `TUSKER_AUTO_FREE_EXCLUDED_PROVIDERS` can block a provider from dynamic
 catalog discovery while leaving explicitly configured models untouched. The
 deployment sets it to `nvidia` while that provider's worker capacity is under
 investigation; this prevents a direct NVIDIA `/models` refresh from adding new
 routes automatically.
+
+## Provider audit
+
+Run the read-only audit on the cluster build host after a deployment:
+
+```bash
+./k8s/audit-provider-pools.sh
+POOL=privacy ./k8s/audit-provider-pools.sh
+```
+
+It runs the low-concurrency streaming tool qualification against the selected
+providers inside the gateway pod and then prints the authenticated catalog
+diagnostics from `/status`. Results are written to the gateway's persistent
+tool-capability database; response bodies and credentials are not retained.
 
 The privacy pool applies the provider policy before catalog pricing. The
 default registry currently allows local `local-llm`, Ollama Cloud, OpenCode
@@ -213,6 +228,39 @@ GPT-OSS 120B, and Qwen 3.6 27B routes, plus Arcee `trinity-mini`.
 MiniMax M2.x models are text-only;
 the current MiniMax M3 API supports image input and tool use. The Synthetic
 vision aliases, Xiaomi `mimo-v2.5`, and MiniMax M3 provide multimodal capacity.
+
+## Modality evidence
+
+Tool-call qualification and modality qualification are separate. The gateway
+stores modality evidence in the persistent SQLite database configured by
+`TUSKER_MODEL_CAPABILITY_DB_PATH` (default:
+`model_capability.db` beside `model_quality.db`). Records are keyed by
+`provider/model/capability`, for example `input_image`, `output_image`, and
+`image_generations`, and contain only status, evidence source, HTTP status,
+latency, failure class, probe version, and timestamp. Response bodies and
+credentials are never stored.
+
+Catalog metadata is recorded as `advertised`; the existing media capability
+registry is recorded as `discovered`; an explicit live test is recorded as
+`passed`, `unsupported`, or `unavailable`. A live `unsupported` result can
+exclude that modality from pool selection, while `unavailable` remains
+retryable and does not permanently remove a model after a quota, auth, or
+transport incident.
+
+Run bounded input tests from the gateway build host or pod:
+
+```bash
+tusker-gateway-qualify-modalities --all-pools --input-modality image
+tusker-gateway-qualify-modalities --provider synthetic --include-unadvertised
+```
+
+Image, audio, and video generation are not probed automatically by the
+modality runner. Their endpoints may be billable or create asynchronous jobs,
+so those tests require a provider-specific, explicitly approved probe before
+they should be added. The pre-existing Z.AI media discovery is also disabled
+unless `TUSKER_CAPABILITY_PROBE_GENERATION=true` is explicitly set. Use
+`/status` to inspect the aggregate `model_capabilities` counts and each pool
+candidate's stored records.
 
 
 ## Migration history

@@ -11,10 +11,11 @@ from tusker_gateway.pools import PoolManager
 
 def test_default_code_pool_includes_current_provider_routes(monkeypatch):
     for key in tuple(os.environ):
-        if key.startswith("TUSKER_POOL_"):
+        if key.startswith("TUSKER_POOL_") or key == "TUSKER_AUTO_CATALOG_PROVIDERS":
             monkeypatch.delenv(key, raising=False)
 
-    models = _load_pools()["code"].models
+    pool = _load_pools()["code"]
+    models = pool.models
     routes = {
         (model["provider"], model["model"])
         for model in models
@@ -25,6 +26,27 @@ def test_default_code_pool_includes_current_provider_routes(monkeypatch):
         ("groq", "openai/gpt-oss-20b"),
         ("groq", "qwen/qwen3.6-27b"),
         ("arcee", "trinity-mini"),
+    } <= routes
+    assert "opencode-go" in pool.auto_catalog_providers
+
+
+def test_synthetic_is_eligible_for_privacy_pool(monkeypatch):
+    for key in tuple(os.environ):
+        if key.startswith("TUSKER_POOL_") or key == "TUSKER_AUTO_CATALOG_PROVIDERS":
+            monkeypatch.delenv(key, raising=False)
+
+    from tusker_gateway.config import DEFAULT_PROVIDER_REGISTRY
+
+    assert DEFAULT_PROVIDER_REGISTRY["synthetic"].zdr_ok is True
+    routes = {
+        (model["provider"], model["model"])
+        for model in _load_pools()["privacy"].models
+    }
+    assert {
+        ("synthetic", "syn:large:text"),
+        ("synthetic", "syn:small:text"),
+        ("synthetic", "syn:large:vision"),
+        ("synthetic", "syn:small:vision"),
     } <= routes
 
 
@@ -70,6 +92,43 @@ def test_pool_selection_logic():
         sel2 = mgr.select("test", session_id="s1")
         sel3 = mgr.select("test", session_id="s1")
         assert sel2 == sel3, f"stickiness broken: {sel2} vs {sel3}"
+
+
+def test_verified_modality_evidence_controls_pool_selection():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config = {
+            "pools": {
+                "test": PoolConfig(
+                    name="test",
+                    models=[{"provider": "groq", "model": "vision-candidate"}],
+                )
+            },
+            "quality_db_path": os.path.join(tmpdir, "quality.db"),
+            "model_capability_db_path": os.path.join(tmpdir, "model-capability.db"),
+            "excluded_providers": [],
+            "provider_api_keys": {"groq": "k-groq"},
+        }
+        manager = PoolManager(config)
+        manager._model_capability_db.record(
+            provider="groq",
+            model="vision-candidate",
+            capability="input_image",
+            status="unsupported",
+            source="modality_probe",
+        )
+        assert manager.select("test", required_input_modalities={"image"}) is None
+
+        manager._model_capability_db.record(
+            provider="groq",
+            model="vision-candidate",
+            capability="input_image",
+            status="passed",
+            source="modality_probe",
+        )
+        assert manager.select("test", required_input_modalities={"image"}) == (
+            "groq",
+            "vision-candidate",
+        )
 
 
 def test_unrated_model_does_not_outrank_measured_model():
@@ -424,6 +483,47 @@ def test_selection_filters_catalog_models_without_tools_or_images():
             required_input_modalities={"image"},
             requires_tools=True,
         ) == ("openrouter", "tool-image")
+
+
+def test_status_reports_catalog_and_live_modality_evidence():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = PoolManager({
+            "pools": {
+                "code": PoolConfig(name="code", models=[
+                    {"provider": "openrouter", "model": "vision-model"},
+                ]),
+            },
+            "quality_db_path": os.path.join(tmpdir, "quality.db"),
+            "model_capability_db_path": os.path.join(tmpdir, "model-capability.db"),
+            "excluded_providers": [],
+            "provider_api_keys": {"openrouter": "k-openrouter"},
+        })
+        manager.catalog_registry = _CatalogRegistry({
+            "openrouter": [
+                _CatalogEntry(
+                    "openrouter",
+                    "vision-model",
+                    raw={
+                        "architecture": {
+                            "input_modalities": ["text", "image"],
+                            "output_modalities": ["text"],
+                        },
+                    },
+                ),
+            ],
+        })
+        manager._model_capability_db.record(
+            provider="openrouter",
+            model="vision-model",
+            capability="input_image",
+            status="passed",
+            source="modality_probe",
+        )
+
+        candidate = manager.status()["code"]["candidates"][0]
+        assert candidate["input_modalities"] == ["image", "text"]
+        assert candidate["output_modalities"] == ["text"]
+        assert candidate["model_capabilities"][0]["status"] == "passed"
 
 
 def test_xiaomi_catalog_auto_adds_only_nonheavy_chat_models_to_code():

@@ -235,12 +235,22 @@ def load_config() -> dict[str, Any]:
     from pathlib import Path as _Path
     default_db = "/home/tusker/.hermes/model_quality.db" if _Path("/home/tusker").exists() else "/tmp/tusker-quality.db"
     config["quality_db_path"] = os.environ.get("QUALITY_DB_PATH", default_db)
+    default_capability_db = (
+        str(_Path(config["quality_db_path"]).with_name("model_capability.db"))
+        if config["quality_db_path"] != ":memory:"
+        else ":memory:"
+    )
+    config["model_capability_db_path"] = os.environ.get(
+        "TUSKER_MODEL_CAPABILITY_DB_PATH",
+        default_capability_db,
+    )
     logger.info(
-        'config loaded: %d providers, %d pools, credential_pools=%s, quality_db=%s',
+        'config loaded: %d providers, %d pools, credential_pools=%s, quality_db=%s, capability_db=%s',
         len(config.get("providers", {})),
         len(config.get("pools", {})),
         {provider: len(credentials) for provider, credentials in credential_pools.items()},
         config["quality_db_path"],
+        config["model_capability_db_path"],
     )
     return config
 
@@ -303,7 +313,10 @@ DEFAULT_PROVIDER_REGISTRY: dict[str, ProviderConfig] = {
     "cerebras": ProviderConfig("cerebras", "bearer", "https://api.cerebras.ai", "/v1/chat/completions", auth_env="CEREBRAS_API_KEY", models_path="/v1/models"),
     "cohere": ProviderConfig("cohere", "bearer", "https://api.cohere.com/compatibility", "/v1/chat/completions", auth_env="COHERE_API_KEY", models_path="https://api.cohere.com/v1/models?page_size=1000"),
     "minimax": ProviderConfig("minimax", "bearer", "https://api.minimax.io", "/v1/chat/completions", auth_env="MINIMAX_API_KEY", models_path="/v1/models"),
-    "synthetic": ProviderConfig("synthetic", "bearer", "https://api.synthetic.new", "/v1/chat/completions", auth_env="SYNTHETIC_API_KEY", models_path="/v1/models"),
+    # Synthetic's API policy states that prompts/completions are not retained
+    # or used for training, and requires the same posture from inference
+    # partners. Treat it as eligible for the privacy pool.
+    "synthetic": ProviderConfig("synthetic", "bearer", "https://api.synthetic.new", "/v1/chat/completions", auth_env="SYNTHETIC_API_KEY", models_path="/v1/models", zdr_ok=True),
     # Ollama states that cloud prompts/completions are transient, not logged,
     # and not used for training. Local-llm is private by locality; both are
     # therefore eligible for the privacy pool when explicitly configured.
@@ -434,6 +447,7 @@ def _load_pools() -> dict[str, PoolConfig]:
                     "openai-codex",
                     "github-copilot",
                     "github-copilot-enterprise",
+                    "opencode-go",
                     "ollama-cloud",
                     "groq",
                     "google",
@@ -445,6 +459,10 @@ def _load_pools() -> dict[str, PoolConfig]:
         pools["privacy"] = PoolConfig(
             name="privacy",
             models=[
+                {"provider": "synthetic", "model": "syn:large:text", "input_modalities": ["text"]},
+                {"provider": "synthetic", "model": "syn:small:text", "input_modalities": ["text"]},
+                {"provider": "synthetic", "model": "syn:large:vision", "input_modalities": ["text", "image"]},
+                {"provider": "synthetic", "model": "syn:small:vision", "input_modalities": ["text", "image"]},
                 {"provider": "openai-codex", "model": "gpt-5.6-luna"},
                 {"provider": "openai-codex", "model": "gpt-5.4-mini"},
             ],

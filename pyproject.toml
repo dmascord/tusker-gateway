@@ -17,6 +17,11 @@ tusker-gateway = "tusker_gateway.__main__:main"
 tusker-gateway-auth = "tusker_gateway.cli:main"
 tusker-gateway-score-omp = "tusker_gateway.omp_scoring:main"
 tusker-gateway-qualify-tools = "tusker_gateway.tool_qualification:main"
+tusker-gateway-qualify-modalities = "tusker_gateway.modality_qualification:main"
+
+[tool.setuptools.packages.find]
+include = ["tusker_gateway*"]
+exclude = ["tests*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Iterable
@@ -44,6 +45,14 @@ from typing import Any, Awaitable, Callable, Iterable
 import aiohttp
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_catalog_error_summary(exc: Exception) -> str:
+    """Reduce a catalog exception to a credential-safe diagnostic token."""
+    match = re.search(r"\bHTTP\s+(\d{3})\b", str(exc), re.IGNORECASE)
+    if match:
+        return f"http_{match.group(1)}"
+    return type(exc).__name__
 
 
 # Per-provider TTLs. Mirrors hermes-agent's `_COPILOT_CATALOG_CACHE_TTL=300`
@@ -72,6 +81,8 @@ class CatalogEntry:
     cost_output: float | None = None
     # Known input modalities. None means the catalog does not advertise them.
     input_modalities: frozenset[str] | None = None
+    # Known output modalities. None means the catalog does not advertise them.
+    output_modalities: frozenset[str] | None = None
 
 
 def _capability_values(value: Any) -> frozenset[str] | None:
@@ -86,15 +97,20 @@ def _capability_values(value: Any) -> frozenset[str] | None:
     return frozenset(values)
 
 
-def advertised_input_modalities(entry: Any) -> frozenset[str] | None:
-    """Return input modalities advertised by a catalog entry, if known.
+def _advertised_modalities(
+    entry: Any,
+    direction: str,
+) -> frozenset[str] | None:
+    """Return one direction of modalities advertised by a catalog entry.
 
-    OpenRouter puts this in ``architecture.input_modalities`` while a few
-    OpenAI-compatible catalogs expose it at the top level. Keep the helper
+    OpenRouter puts this in ``architecture.{direction}_modalities`` while a
+    few OpenAI-compatible catalogs expose it at the top level. Keep the helper
     permissive so a stale or provider-specific catalog shape leaves the model
     eligible rather than causing a routing failure.
     """
-    explicit = getattr(entry, "input_modalities", None)
+    if direction not in {"input", "output"}:
+        raise ValueError(f"unsupported modality direction: {direction}")
+    explicit = getattr(entry, f"{direction}_modalities", None)
     if explicit is not None:
         values = _capability_values(explicit)
         if values is not None:
@@ -108,8 +124,10 @@ def advertised_input_modalities(entry: Any) -> frozenset[str] | None:
         nested = raw.get(key)
         if isinstance(nested, dict):
             sources.append(nested)
+    field_name = f"{direction}_modalities"
+    camel_field_name = f"{direction}Modalities"
     for source in sources:
-        for key in ("input_modalities", "inputModalities"):
+        for key in (field_name, camel_field_name):
             values = _capability_values(source.get(key))
             if values is not None:
                 return values
@@ -117,15 +135,25 @@ def advertised_input_modalities(entry: Any) -> frozenset[str] | None:
         # Some catalogs only expose the compact form, e.g. text+image->text.
         modality = source.get("modality")
         if isinstance(modality, str) and "->" in modality:
-            input_part = modality.split("->", 1)[0]
+            modality_part = modality.split("->", 1)[0 if direction == "input" else 1]
             values = frozenset(
                 piece.strip().lower()
-                for piece in input_part.replace(",", "+").split("+")
+                for piece in modality_part.replace(",", "+").split("+")
                 if piece.strip()
             )
             if values:
                 return values
     return None
+
+
+def advertised_input_modalities(entry: Any) -> frozenset[str] | None:
+    """Return input modalities advertised by a catalog entry, if known."""
+    return _advertised_modalities(entry, "input")
+
+
+def advertised_output_modalities(entry: Any) -> frozenset[str] | None:
+    """Return output modalities advertised by a catalog entry, if known."""
+    return _advertised_modalities(entry, "output")
 
 
 def advertised_tool_support(entry: Any) -> bool | None:
@@ -204,6 +232,11 @@ class CatalogClient:
         self._entries: list[CatalogEntry] = []
         self._fetched_at: float = 0.0
         self._last_error: str | None = None
+        self._last_refresh_status = "never"
+        self._last_refresh_latency_ms: float | None = None
+        self._last_refresh_error_class: str | None = None
+        self._last_error_summary: str | None = None
+        self._last_refresh_at: float | None = None
         self._lock = asyncio.Lock()
         # Subclasses can set ``api_key`` or ``api_key_env`` to inject
         # an Authorization: Bearer header into fetch requests. Set
@@ -282,21 +315,73 @@ class CatalogClient:
     async def refresh(self, session: aiohttp.ClientSession) -> None:
         """Re-fetch and replace cached entries. On error, retain last good state."""
         async with self._lock:
+            started = time.monotonic()
             try:
                 entries = await self.fetch(session)
                 self._entries = entries
                 self._fetched_at = time.monotonic()
                 self._last_error = None
+                self._last_refresh_status = "ok"
+                self._last_refresh_error_class = None
+                self._last_error_summary = None
+                self._last_refresh_latency_ms = round(
+                    (time.monotonic() - started) * 1000, 1
+                )
+                self._last_refresh_at = time.time()
                 logger.info(
-                    "%s catalog refreshed: %d entries", self.provider, len(entries)
+                    "catalog refresh provider=%s status=ok entries=%d "
+                    "elapsed_ms=%.1f auth=%s",
+                    self.provider,
+                    len(entries),
+                    self._last_refresh_latency_ms,
+                    self.auth_source,
                 )
             except Exception as exc:
                 # Retain last good state; just stamp the error.
                 self._last_error = str(exc)
-                logger.warning(
-                    "%s catalog refresh failed (keeping %d cached entries): %s",
-                    self.provider, len(self._entries), exc,
+                self._last_refresh_status = "error"
+                self._last_refresh_error_class = type(exc).__name__
+                self._last_error_summary = _safe_catalog_error_summary(exc)
+                self._last_refresh_latency_ms = round(
+                    (time.monotonic() - started) * 1000, 1
                 )
+                self._last_refresh_at = time.time()
+                logger.warning(
+                    "catalog refresh provider=%s status=error "
+                    "cached_entries=%d elapsed_ms=%.1f auth=%s "
+                    "error_class=%s error=%s",
+                    self.provider,
+                    len(self._entries),
+                    self._last_refresh_latency_ms,
+                    self.auth_source,
+                    self._last_refresh_error_class,
+                    exc,
+                )
+
+    @property
+    def auth_source(self) -> str:
+        """Return a non-secret description of the configured auth source."""
+        if self._token_source is not None:
+            return "oauth"
+        if self._api_key:
+            return "api_key"
+        return "none"
+
+    def diagnostics(self) -> dict[str, Any]:
+        """Return credential-safe refresh state for the authenticated status API."""
+        endpoint = getattr(self, "endpoint", None) or getattr(self, "ENDPOINT", None)
+        return {
+            "provider": self.provider,
+            "endpoint": str(endpoint) if endpoint else None,
+            "auth_source": self.auth_source,
+            "entries": len(self._entries),
+            "stale": self._is_stale(),
+            "last_refresh_status": self._last_refresh_status,
+            "last_refresh_at": self._last_refresh_at,
+            "last_refresh_latency_ms": self._last_refresh_latency_ms,
+            "last_error": self._last_error_summary,
+            "last_error_class": self._last_refresh_error_class,
+        }
 
 class CodexCatalog(CatalogClient):
     """Codex catalog from chatgpt.com/backend-api/codex/models."""
@@ -480,11 +565,15 @@ class ProviderModelsCatalog(CatalogClient):
         provider: str,
         endpoint: str,
         ttl_secs: float = 3600.0,
+        default_input_modalities: frozenset[str] | None = None,
+        default_output_modalities: frozenset[str] | None = None,
     ) -> None:
         super().__init__()
         self.provider = provider
         self.endpoint = endpoint
         self.ttl_secs = ttl_secs
+        self.default_input_modalities = default_input_modalities
+        self.default_output_modalities = default_output_modalities
 
     async def fetch(self, session: aiohttp.ClientSession) -> list[CatalogEntry]:
         headers = {
@@ -536,13 +625,26 @@ class ProviderModelsCatalog(CatalogClient):
             if slug.startswith("models/"):
                 slug = slug[len("models/") :]
             cost_input, cost_output = _extract_catalog_pricing(raw)
-            out.append(CatalogEntry(
+            entry = CatalogEntry(
                 provider=self.provider,
                 model=slug,
                 raw=raw,
                 cost_input=cost_input,
                 cost_output=cost_output,
-            ))
+            )
+            if (
+                entry.input_modalities is None
+                and self.default_input_modalities is not None
+                and advertised_input_modalities(entry) is None
+            ):
+                entry.input_modalities = self.default_input_modalities
+            if (
+                entry.output_modalities is None
+                and self.default_output_modalities is not None
+                and advertised_output_modalities(entry) is None
+            ):
+                entry.output_modalities = self.default_output_modalities
+            out.append(entry)
         return out
 
 
@@ -793,9 +895,14 @@ def _parse_cost_field(value: Any) -> float | None:
 class CatalogRegistry:
     """Holds one client per provider and exposes catalog snapshots."""
 
-    def __init__(self, clients: dict[str, CatalogClient] | None = None) -> None:
+    def __init__(
+        self,
+        clients: dict[str, CatalogClient] | None = None,
+        model_capability_db: Any | None = None,
+    ) -> None:
         self._clients: dict[str, CatalogClient] = clients or {}
         self._models_dev: ModelsDevCatalog | None = None
+        self.model_capability_db = model_capability_db
         # Inject models.dev lookup into the other clients via attribute.
         for c in self._clients.values():
             c._pricing_lookup = self._pricing_lookup  # type: ignore[attr-defined]
@@ -835,6 +942,32 @@ class CatalogRegistry:
                 if entry.cost_output is None:
                     entry.cost_output = cost_output
 
+    def _record_catalog_capabilities(self) -> None:
+        """Persist explicit catalog modality claims without calling models."""
+        if self.model_capability_db is None:
+            return
+        from tusker_gateway.model_capability import MODEL_CAPABILITY_PROBE_VERSION
+
+        for client in self._clients.values():
+            for entry in client._entries:
+                for direction, modalities in (
+                    ("input", advertised_input_modalities(entry)),
+                    ("output", advertised_output_modalities(entry)),
+                ):
+                    if not modalities:
+                        continue
+                    for modality in modalities:
+                        if modality not in {"text", "image", "audio", "video"}:
+                            continue
+                        self.model_capability_db.record(
+                            provider=entry.provider,
+                            model=entry.model,
+                            capability=f"{direction}_{modality}",
+                            status="advertised",
+                            source="catalog",
+                            probe_version=MODEL_CAPABILITY_PROBE_VERSION,
+                        )
+
     async def refresh_all(self, session: aiohttp.ClientSession) -> None:
         """Refresh every client concurrently."""
         results = await asyncio.gather(
@@ -845,6 +978,7 @@ class CatalogRegistry:
             if isinstance(res, Exception):
                 logger.warning("%s catalog refresh raised: %s", client.provider, res)
         self._enrich_pricing()
+        self._record_catalog_capabilities()
 
     def get_client(self, provider: str) -> CatalogClient | None:
         return self._clients.get(provider)
@@ -885,10 +1019,18 @@ class CatalogRegistry:
             return None
         return list(client._entries)
 
+    def diagnostics(self) -> dict[str, dict[str, Any]]:
+        """Return credential-safe refresh state for every registered catalog."""
+        return {
+            provider: client.diagnostics()
+            for provider, client in self._clients.items()
+        }
+
     @classmethod
     def default(
         cls,
         provider_registry: dict[str, Any] | None = None,
+        model_capability_db: Any | None = None,
     ) -> "CatalogRegistry":
         """Build catalogs for every configured provider with a model endpoint.
 
@@ -900,7 +1042,7 @@ class CatalogRegistry:
             from tusker_gateway.config import DEFAULT_PROVIDER_REGISTRY
 
             provider_registry = DEFAULT_PROVIDER_REGISTRY
-        reg = cls()
+        reg = cls(model_capability_db=model_capability_db)
         if "openai-codex" in provider_registry:
             reg.register("openai-codex", CodexCatalog())
         if "github-copilot" in provider_registry:
@@ -956,6 +1098,16 @@ class CatalogRegistry:
                     provider=provider,
                     endpoint=endpoint,
                     ttl_secs=DEFAULT_TTLS.get(provider, 3600.0),
+                    default_input_modalities=(
+                        frozenset({"text"})
+                        if provider in {"ollama-cloud", "cerebras"}
+                        else None
+                    ),
+                    default_output_modalities=(
+                        frozenset({"text"})
+                        if provider in {"ollama-cloud", "cerebras"}
+                        else None
+                    ),
                 ),
             )
         reg.register("models.dev", ModelsDevCatalog())
