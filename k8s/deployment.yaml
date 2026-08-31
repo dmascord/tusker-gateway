@@ -23,7 +23,7 @@ spec:
       terminationGracePeriodSeconds: 90
       containers:
       - name: tusker-gateway
-        image: registry.tusker.net.au:5000/tusker-gateway:swarm-alpine-20260825090000
+        image: registry.tusker.net.au:5000/tusker-gateway:swarm-alpine-model-capability-20260831-aeaa8fc
         imagePullPolicy: Always
         envFrom:
         - secretRef:
@@ -31,6 +31,8 @@ spec:
         env:
         - name: MODEL_NAME
           value: tusker-gateway
+        - name: TUSKER_COMMIT
+          value: aeaa8fc
         - name: HOME
           value: /home/tusker
         - name: PYTHONUNBUFFERED
