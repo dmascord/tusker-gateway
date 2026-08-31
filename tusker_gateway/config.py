@@ -475,7 +475,10 @@ def _load_pools() -> dict[str, PoolConfig]:
                 {"provider": "openai-codex", "model": "gpt-5.4-mini"},
             ],
             zdr=True,
-            auto_catalog_providers=default_auto_catalog_providers,
+            auto_catalog_providers=(
+                default_auto_catalog_providers
+                or ("synthetic", "github-copilot")
+            ),
         )
     if "premium" not in pools:
         pools["premium"] = PoolConfig(

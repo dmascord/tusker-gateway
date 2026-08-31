@@ -50,6 +50,17 @@ def test_synthetic_is_eligible_for_privacy_pool(monkeypatch):
     } <= routes
 
 
+def test_business_copilot_is_available_to_privacy_catalog(monkeypatch):
+    for key in tuple(os.environ):
+        if key.startswith("TUSKER_POOL_") or key == "TUSKER_AUTO_CATALOG_PROVIDERS":
+            monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("TUSKER_COPILOT_BUSINESS", "true")
+
+    pool = _load_pools()["privacy"]
+
+    assert "github-copilot" in pool.auto_catalog_providers
+
+
 def test_load_config_normalizes_auto_free_provider_exclusions(monkeypatch):
     monkeypatch.setenv("TUSKER_AUTO_FREE_EXCLUDED_PROVIDERS", "NVIDIA, open_router")
     config = load_config()
