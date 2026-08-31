@@ -440,7 +440,12 @@ async def anthropic_messages_handler(request: web.Request) -> web.Response | web
             openai_body = _anthropic_to_openai(body)
 
             config = request.app["config"]
-            client = PassthroughClient(config, QualityDB(config["quality_db_path"]), request.app["http_session"])
+            client = PassthroughClient(
+                config,
+                QualityDB(config["quality_db_path"]),
+                request.app["http_session"],
+                credential_rotators=request.app.get("credential_rotators"),
+            )
             tools = openai_body.pop("tools", None)
             pool_name = _pool_name_for_anthropic(original_model)
 

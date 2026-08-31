@@ -416,10 +416,11 @@ class CodexTokenRotator:
     Supports Hermes-format credentials (access_token, refresh_token, expires_at_ms)
     and legacy format (token, refresh_token, expires_at).
 
-    When a token is near expiry, ``get_token()`` refreshes it using the
-    provider's protocol.  OpenAI Codex uses ChatGPT OAuth, while Copilot uses
-    GitHub's token exchange.  Expired credentials are skipped after a failed
-    refresh so they cannot be sent upstream as known-invalid bearer tokens.
+    ``get_token()`` selects credentials round-robin, refreshing the selected
+    credential when it is near expiry. OpenAI Codex uses ChatGPT OAuth, while
+    Copilot uses GitHub's token exchange. Expired credentials are skipped after
+    a failed refresh so they cannot be sent upstream as known-invalid bearer
+    tokens.
     """
 
     _JWT_REFRESH_MARGIN_SECONDS = 120
@@ -451,8 +452,17 @@ class CodexTokenRotator:
         self._index = min(self._index, max(len(self._creds) - 1, 0))
         self._refresh_failed_until.clear()
 
+    @staticmethod
+    def _credential_label(cred: dict[str, Any], index: int) -> str:
+        """Return a bounded, non-secret label for credential diagnostics."""
+        for key in ("label", "account_id", "email"):
+            value = cred.get(key)
+            if value:
+                return " ".join(str(value).split())[:80]
+        return f"cred#{index + 1}"
+
     async def get_token(self) -> str | None:
-        """Return the current active token, or None if no credentials.
+        """Return the next usable token in round-robin order.
 
         If the token is near expiry, attempts an automatic refresh.
         """
@@ -466,11 +476,11 @@ class CodexTokenRotator:
                 idx = (start + offset) % count
                 cred = self._creds[idx]
                 token = _creds_access_token(cred)
-                label = cred.get("label", cred.get("id", f"cred#{idx}"))
+                label = self._credential_label(cred, idx)
                 logger.debug(
-                    "oauth rotator: provider=%s index=%d/%d label=%s",
+                    "oauth rotator: provider=%s credential_index=%d/%d label=%s",
                     self._provider,
-                    idx,
+                    idx + 1,
                     count,
                     label,
                 )
@@ -492,14 +502,14 @@ class CodexTokenRotator:
                         else:
                             self._creds[idx] = refreshed
                             self._refresh_failed_until.pop(idx, None)
-                            self._index = idx
                             self._persist()
                             token = _creds_access_token(refreshed)
                             logger.info(
-                                "oauth refresh succeeded provider=%s credential_index=%d "
+                                "oauth refresh succeeded provider=%s credential_index=%d/%d "
                                 "expires_in_s=%.0f",
                                 self._provider,
-                                idx,
+                                idx + 1,
+                                count,
                                 max(0.0, _creds_expires_at(refreshed) - time.time()),
                             )
                     elif self._is_expired(cred):
@@ -508,12 +518,23 @@ class CodexTokenRotator:
                         continue
 
                 if token:
-                    self._index = idx
+                    # Reserve the next slot before releasing the lock. This
+                    # makes concurrent requests consume distinct credentials
+                    # without relying on request completion order.
+                    self._index = (idx + 1) % count
+                    logger.info(
+                        "oauth credential selected provider=%s credential_index=%d/%d "
+                        "label=%s rotation=round_robin",
+                        self._provider,
+                        idx + 1,
+                        count,
+                        label,
+                    )
                     return token
             return None
 
     async def advance(self) -> None:
-        """Move to the next credential in the pool."""
+        """Skip the next scheduled credential in the pool."""
         if len(self._creds) > 1:
             async with self._lock:
                 self._index = (self._index + 1) % len(self._creds)
@@ -592,7 +613,7 @@ class CodexTokenRotator:
             "oauth refresh failed provider=%s credential_index=%s status=%s code=%s "
             "retryable=%s",
             self._provider,
-            index,
+            index + 1 if index >= 0 else index,
             getattr(exc, "status", None),
             getattr(exc, "code", None),
             getattr(exc, "retryable", None),
@@ -691,6 +712,7 @@ class PassthroughClient:
         quality_db: QualityDB,
         http_client: aiohttp.ClientSession,
         catalog_registry: Any | None = None,
+        credential_rotators: dict[str, CodexTokenRotator] | None = None,
     ):
         self._config = config
         self._quality = quality_db
@@ -715,9 +737,26 @@ class PassthroughClient:
                 codex_creds = load_auth_file(auth_file)
             except Exception:
                 codex_creds = []
+        # Request handlers are short-lived, but credential cursors must be
+        # process-wide. Reuse the rotators assembled during app startup when
+        # available; otherwise retain the standalone/test fallback below.
         self._credential_rotators: dict[str, CodexTokenRotator] = {}
         configured_pools = config.get("credential_pools")
         self._credential_pools_configured = isinstance(configured_pools, dict)
+        if isinstance(credential_rotators, dict):
+            self._credential_rotators = credential_rotators
+            self._credential_pools_configured = True
+            self._codex_rotator = self._credential_rotators.get("openai-codex")
+            if self._codex_rotator is None:
+                self._codex_rotator = CodexTokenRotator(
+                    codex_creds,
+                    auth_file=auth_file,
+                    http_client=http_client,
+                    provider="openai-codex",
+                )
+                self._credential_rotators["openai-codex"] = self._codex_rotator
+            return
+
         if isinstance(configured_pools, dict):
             for provider_name, credentials in configured_pools.items():
                 if not isinstance(credentials, list):
@@ -1379,10 +1418,8 @@ class PassthroughClient:
                 PersistentCooldownStore(db_path=db_path).record(provider, model, seconds)
             except Exception:
                 pass
-            # Advance to next credential so the next request doesn't keep
-            # hammering a rate-limited account.
-            if rotator and rotator.size > 1:
-                await rotator.advance()
+            # get_token() already reserved the next credential before this
+            # request was sent, so advancing here would skip a credential.
             raise
         except Exception as exc:
             # Use the body/status attached by _check_response (raised above)
@@ -1407,10 +1444,8 @@ class PassthroughClient:
                     model, stream, body_text[:300],
                 )
             resp.release()
-            # Advance to next credential on any non-2xx so a sick account
-            # doesn't cause the breaker to trip after 5 consecutive failures.
-            if rotator and rotator.size > 1:
-                await rotator.advance()
+            # get_token() already reserved the next credential before this
+            # request was sent, so advancing here would skip a credential.
             raise
         result = await self._parse_codex_sse_async(resp)
         from tusker_gateway.tool_formats import normalize_response_tool_calls

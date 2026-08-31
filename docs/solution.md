@@ -101,9 +101,10 @@ Authentication is split from request orchestration in `auth_strategies.py`:
 - Hermes format: `access_token`, `refresh_token`, `expires_at_ms`.
 - Legacy format: `token`, `refresh_token`, `expires_at`.
 
-The rotator advances through credentials and refreshes near-expiry credentials.
-Updated credentials are persisted through `save_auth_file` in Hermes-compatible
-format. `copilot_enroll.py` implements GitHub device-code enrollment and stores
+The rotator selects credentials round-robin and refreshes near-expiry
+credentials; failed requests continue with the next scheduled slot. Updated
+credentials are persisted through `save_auth_file` in Hermes-compatible format.
+`copilot_enroll.py` implements GitHub device-code enrollment and stores
 provider, label, priority, source, refresh metadata, and request metadata.
 
 `Credential` in `models.py` normalizes legacy and Hermes fields while preserving

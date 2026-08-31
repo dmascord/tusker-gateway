@@ -454,15 +454,49 @@ def test_endpoint_urls_are_well_formed(provider):
     assert ep["chat_path"].startswith("/"), f"{provider} chat_path must start with /"
 
 # ---------------------------------------------------------------------------
-# OAuth rotator: get_token returns first token
+# OAuth rotator: get_token selects credentials round-robin
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_codex_rotator_get_token():
+async def test_codex_rotator_get_token_round_robin():
     from tusker_gateway.passthrough import CodexTokenRotator
-    creds = [{"token": "t1"}, {"token": "t2"}]
+    creds = [{"token": "t1"}, {"token": "t2"}, {"token": "t3"}]
     rotator = CodexTokenRotator(creds)
     assert await rotator.get_token() == "t1"
+    assert await rotator.get_token() == "t2"
+    assert await rotator.get_token() == "t3"
+    assert await rotator.get_token() == "t1"
+
+
+@pytest.mark.asyncio
+async def test_codex_rotator_logs_redacted_credential_slot(caplog):
+    from tusker_gateway.passthrough import CodexTokenRotator
+
+    rotator = CodexTokenRotator([
+        {"token": "secret-a", "label": "account-a"},
+        {"token": "secret-b", "label": "account-b"},
+    ])
+    with caplog.at_level("INFO", logger="tusker_gateway.passthrough"):
+        assert await rotator.get_token() == "secret-a"
+        assert await rotator.get_token() == "secret-b"
+
+    selected = [
+        record.getMessage()
+        for record in caplog.records
+        if "oauth credential selected" in record.getMessage()
+    ]
+    assert any(
+        "credential_index=1/2" in message and "label=account-a" in message
+        for message in selected
+    )
+    assert any(
+        "credential_index=2/2" in message and "label=account-b" in message
+        for message in selected
+    )
+    assert all(
+        "secret-a" not in message and "secret-b" not in message
+        for message in selected
+    )
 
 
 @pytest.mark.asyncio
@@ -474,23 +508,13 @@ async def test_codex_rotator_empty():
 
 @pytest.mark.asyncio
 async def test_codex_rotator_advance_moves_to_next():
-    """Advance() should move the rotator to the next credential.
-
-    This is the behaviour relied on by the error path in _chat_codex so
-    that a single sick account doesn't cause the breaker to trip after 5
-    consecutive failures.
-    """
+    """advance() should explicitly skip the next scheduled credential."""
     from tusker_gateway.passthrough import CodexTokenRotator
     creds = [{"token": "t1"}, {"token": "t2"}, {"token": "t3"}]
     rotator = CodexTokenRotator(creds)
     assert await rotator.get_token() == "t1"
     await rotator.advance()
-    assert await rotator.get_token() == "t2"
-    await rotator.advance()
     assert await rotator.get_token() == "t3"
-    await rotator.advance()
-    # Wraps back to the first credential.
-    assert await rotator.get_token() == "t1"
 
 
 @pytest.mark.asyncio
@@ -503,17 +527,16 @@ async def test_codex_rotator_advance_noop_for_single_credential():
 
 
 # ---------------------------------------------------------------------------
-# Codex error path: advance the rotator on non-2xx so a sick account doesn't
-# cause the circuit breaker to trip after 5 consecutive failures. Regression
-# test for the bug where CodexTokenRotator.advance() was defined but never
-# called from anywhere.
+# Codex error path: a non-2xx response must leave the round-robin cursor on
+# the next credential. The request already reserved the next slot, so the
+# error handler must not advance a second time and skip a credential.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_chat_codex_advances_rotator_on_4xx():
-    """_chat_codex must call rotator.advance() on any non-2xx upstream response."""
-    from unittest.mock import AsyncMock, MagicMock, patch
+async def test_chat_codex_uses_next_rotator_credential_after_4xx():
+    """A 4xx must leave the next round-robin credential ready for use."""
+    from unittest.mock import AsyncMock, MagicMock
 
     from tusker_gateway.passthrough import CodexTokenRotator, PassthroughClient
 
@@ -521,8 +544,6 @@ async def test_chat_codex_advances_rotator_on_4xx():
         {"access_token": "tok-a", "expires_at_ms": 9999999999999},
         {"access_token": "tok-b", "expires_at_ms": 9999999999999},
     ])
-    rotator.advance = AsyncMock()  # type: ignore[method-attr]
-
     client = PassthroughClient.__new__(PassthroughClient)  # bypass __init__
     client._codex_rotator = rotator
     client._config = {"quality_db_path": "/tmp/q.db"}
@@ -547,8 +568,7 @@ async def test_chat_codex_advances_rotator_on_4xx():
             stream=False,
             api_key=None,
         )
-    # Advance must have been called because of the 400.
-    assert rotator.advance.await_count >= 1
+    assert await rotator.get_token() == "tok-b"
 
 
 @pytest.mark.asyncio
@@ -613,8 +633,8 @@ async def test_stream_prefetch_preserves_successful_upstream_bytes(
 
 
 @pytest.mark.asyncio
-async def test_chat_codex_advances_rotator_on_rate_limit():
-    """_chat_codex must call rotator.advance() on RateLimitError (429)."""
+async def test_chat_codex_uses_next_rotator_credential_after_rate_limit():
+    """A 429 must leave the next round-robin credential ready for use."""
     from unittest.mock import AsyncMock, MagicMock
 
     from tusker_gateway.errors import RateLimitError
@@ -624,8 +644,6 @@ async def test_chat_codex_advances_rotator_on_rate_limit():
         {"access_token": "tok-a", "expires_at_ms": 9999999999999},
         {"access_token": "tok-b", "expires_at_ms": 9999999999999},
     ])
-    rotator.advance = AsyncMock()  # type: ignore[method-attr]
-
     client = PassthroughClient.__new__(PassthroughClient)
     client._codex_rotator = rotator
     client._config = {"quality_db_path": "/tmp/q.db"}
@@ -650,6 +668,30 @@ async def test_chat_codex_advances_rotator_on_rate_limit():
             stream=False,
             api_key=None,
         )
+    assert await rotator.get_token() == "tok-b"
+
+
+@pytest.mark.asyncio
+async def test_passthrough_client_reuses_shared_rotator(mock_http, quality_db):
+    """Short-lived request clients must share the app-level credential cursor."""
+    from tusker_gateway.passthrough import CodexTokenRotator
+
+    shared = CodexTokenRotator([
+        {"token": "t1"},
+        {"token": "t2"},
+    ])
+    rotators = {"openai-codex": shared}
+    first = PassthroughClient(
+        _base_config(), quality_db, mock_http, credential_rotators=rotators,
+    )
+    second = PassthroughClient(
+        _base_config(), quality_db, mock_http, credential_rotators=rotators,
+    )
+
+    assert first._rotator_for("openai-codex") is shared
+    assert second._rotator_for("openai-codex") is shared
+    assert await first._rotator_for("openai-codex").get_token() == "t1"
+    assert await second._rotator_for("openai-codex").get_token() == "t2"
 
 
 @pytest.mark.asyncio

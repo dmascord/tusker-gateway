@@ -2482,7 +2482,13 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
             if tracer is not None and tracer.enabled and root_span is not None:
                 root_span.attributes["tusker.model"] = str(body.get("model") or "")
             config = request.app["config"]
-            client = PassthroughClient(config, QualityDB(config["quality_db_path"]), request.app["http_session"], catalog_registry=request.app.get("catalog_registry"))
+            client = PassthroughClient(
+                config,
+                QualityDB(config["quality_db_path"]),
+                request.app["http_session"],
+                catalog_registry=request.app.get("catalog_registry"),
+                credential_rotators=request.app.get("credential_rotators"),
+            )
             tools = body.get("tools") if isinstance(body.get("tools"), list) else None
             if os.environ.get("TUSKER_TOOL_DIAGNOSTICS", "0").strip().lower() in {
                 "1", "true", "yes", "on"
@@ -2898,7 +2904,13 @@ async def responses_handler(request: web.Request) -> web.Response | web.StreamRe
             "stream": bool(body.get("stream", False)),
         })
         config = request.app["config"]
-        client = PassthroughClient(config, QualityDB(config["quality_db_path"]), request.app["http_session"], catalog_registry=request.app.get("catalog_registry"))
+        client = PassthroughClient(
+            config,
+            QualityDB(config["quality_db_path"]),
+            request.app["http_session"],
+            catalog_registry=request.app.get("catalog_registry"),
+            credential_rotators=request.app.get("credential_rotators"),
+        )
         _, _, result = await _call_with_pool_fallback(
             config, chat_body, client, request=request,
             metrics_registry=request.app.get("metrics"),

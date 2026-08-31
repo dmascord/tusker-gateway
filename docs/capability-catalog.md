@@ -6,7 +6,7 @@ Tusker-Gateway is a specialized AI gateway optimized for high-reliability provid
 
 ### 1. Token Lifecycle Management
 *   **OAuth Token Exchange**: Automates device-code (RFC 8628) enrollment for Copilot/Codex; automatically refreshes tokens via GHE-derived endpoints.
-*   **Rotator Logic**: `CodexTokenRotator` manages a multi-credential pool. Automatically swaps to a fresh token upon 401/near-expiry.
+*   **Rotator Logic**: `CodexTokenRotator` manages a shared multi-credential pool, selects credentials round-robin, logs the redacted credential slot, and refreshes near-expiry tokens. Failed requests continue with the next slot.
 *   **Hermes-Compatible Persistence**: Supports native Hermes `auth.json` format (`credential_pool` dict) for full interop with live deployments.
 
 ### 2. Provider Routing

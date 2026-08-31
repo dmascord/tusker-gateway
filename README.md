@@ -47,6 +47,6 @@ Capability discovery refreshes supported image/video models from provider catalo
 2. **Quality scoring** — `success_rate * 80 + latency_bonus * 20` with exponential decay. Stored in SQLite, shared across restarts.
 3. **Cooldown tracking** — per-(provider, model) with 429 body parsing. Weekly limit → 7-day cooldown, hourly → 1h, capped at 1h max.
 4. **Heavyweight filtering** — ZDR/privacy pools exclude heavyweight models by default.
-5. **Codex token rotation** — pool of OAuth credentials, rotated on failures.
+5. **Codex token rotation** — shared OAuth pools select credentials round-robin; failed requests continue with the next scheduled credential.
 6. **Virtual alias guard** — the advertised model name (e.g. `tusker-gateway`) is never persisted as a session's model or sent to a provider.
 7. **Semantic cache isolation** — approximate response reuse is restricted to deterministic text requests and scoped by caller, pool, and concrete route; tool calls and ZDR traffic are excluded. See `docs/semantic-cache.md`.
