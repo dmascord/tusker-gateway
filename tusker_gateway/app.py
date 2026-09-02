@@ -40,6 +40,7 @@ from tusker_gateway.guardrails import init_guard_pipeline, load_guardrails_confi
 from tusker_gateway.metrics import MetricsRegistry
 from tusker_gateway.rate_limit import RateLimiter, load_rate_limit_config_from_env
 from tusker_gateway.observability import attach_request_id_middleware, AccessLog
+from tusker_gateway.tracing import Tracer, load_tracer_config_from_env
 from tusker_gateway.providers.capabilities import (
     CapabilitiesRegistry,
     capabilities_refresh_loop,

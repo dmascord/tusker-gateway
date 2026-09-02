@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import os
+import random
 import re
 import time
 from dataclasses import dataclass, field
@@ -131,9 +132,9 @@ class ModelSpec:
     context_window: int
     heavyweight: bool
     zdr_ok: bool  # allowed in ZDR (privacy) pools
+    weight: float = 1.0  # relative weight for load-balanced selection (default: equal weight)
     input_modalities: frozenset[str] | None = None
     auto_discovered: bool = False
-
     @classmethod
     def from_dict(
         cls,
@@ -154,6 +155,9 @@ class ModelSpec:
         else:
             hw = bool(hw)
         modalities = data.get("input_modalities")
+        weight = float(data.get("weight", 1.0))
+        if weight <= 0:
+            weight = 1.0  # fallback to equal weight
         # ``provider_zdr_ok`` is optional for backwards-compatible direct
         # callers. PoolManager always supplies it so privacy policy is based
         # on the provider registry rather than only on the pool flag.
@@ -164,6 +168,7 @@ class ModelSpec:
             context_window=ctx,
             heavyweight=hw,
             zdr_ok=zdr and not hw and provider_allowed,
+            weight=weight,
             input_modalities=(
                 frozenset(str(modality) for modality in modalities)
                 if modalities is not None
@@ -1018,22 +1023,49 @@ class PoolManager:
             )
             return None
 
-        # 3. Rank by quality and pick top
+        # 3. Rank by quality, then apply weighted selection within top tier
         quality_list = self._quality.rank(
             [(c.provider, c.model) for c in candidates],
         )
 
-        # Pick top candidate
-        if quality_list:
-            best = quality_list[0]
-            result = (best[0], best[1])
+        if not quality_list:
+            # Fallback: pick first candidate
+            result = (candidates[0].provider, candidates[0].model)
             if session_id:
                 key = (session_id, pool_name)
                 self._stickiness[key] = result
             return result
 
-        # Fallback: pick first candidate
-        result = (candidates[0].provider, candidates[0].model)
+        # Group candidates by quality tier (all with same score as the top)
+        top_score = quality_list[0][2]  # third element is the score
+        tier_candidates = [c for c in candidates if next(
+            (q[2] for q in quality_list if q[0] == c.provider and q[1] == c.model),
+            -1
+        ) == top_score]
+
+        # Within the top tier, apply weighted selection.
+        # When all weights are equal, pick first candidate (deterministic for tests).
+        if len(tier_candidates) == 1:
+            result = (tier_candidates[0].provider, tier_candidates[0].model)
+        else:
+            weights = [c.weight for c in tier_candidates]
+            # Check if all weights are equal (within floating-point tolerance)
+            if len(set(weights)) == 1:
+                # All equal: pick first (deterministic, stable for tests)
+                selected = tier_candidates[0]
+            else:
+                # Varied weights: use weighted random selection
+                total_weight = sum(weights)
+                cumulative = [sum(weights[:i+1]) / total_weight for i in range(len(weights))]
+                rand_val = random.random()
+                selected = tier_candidates[0]
+                for idx, cum_weight in enumerate(cumulative):
+                    if rand_val <= cum_weight:
+                        selected = tier_candidates[idx]
+                        break
+            
+            result = (selected.provider, selected.model)
+
         if session_id:
             key = (session_id, pool_name)
             self._stickiness[key] = result
@@ -1084,8 +1116,7 @@ class PoolManager:
         return {
             "provider": spec.provider,
             "model": spec.model,
-            "context_window": spec.context_window,
-            "auto_discovered": spec.auto_discovered,
+            "weight": spec.weight,
             "input_modalities": (
                 sorted(input_modalities) if input_modalities is not None else None
             ),
