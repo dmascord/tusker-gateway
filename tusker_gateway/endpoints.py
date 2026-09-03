@@ -754,6 +754,7 @@ async def _normalize_stream(
     """
     from tusker_gateway.tool_formats import (
         parse_text_tool_calls,
+        remap_stream_tool_calls,
         strip_tool_text,
         tool_diagnostics_enabled,
         tool_markup_kinds,
@@ -1119,7 +1120,10 @@ async def _normalize_stream(
                 for prose_frame in pending_prose_frames:
                     yield prose_frame
                 if has_tools:
-                    tools_only = {"role": delta.get("role"), "tool_calls": tc}
+                    tools_only = {
+                        "role": delta.get("role"),
+                        "tool_calls": remap_stream_tool_calls(tc),
+                    }
                     yield f"data: {json.dumps({**new_obj, 'choices': [{**new_choice, 'delta': tools_only, 'finish_reason': None}]}, ensure_ascii=False)}\n\n".encode()
                 for tool_frame in pending_tool_frames:
                     yield tool_frame
@@ -1143,6 +1147,14 @@ async def _normalize_stream(
                 if has_delta_text or has_tools or delta or (
                     upstream_finish_reason and obj.get("usage") is not None
                 ):
+                    if has_tools and tc:
+                        # Rewrite native tool_calls args before forwarding.
+                        try:
+                            delta_tc = new_obj["choices"][new_choice["index"]]["delta"].get("tool_calls")
+                            if delta_tc:
+                                new_obj["choices"][new_choice["index"]]["delta"]["tool_calls"] = remap_stream_tool_calls(delta_tc)
+                        except (KeyError, TypeError, IndexError):
+                            pass
                     yield f"data: {json.dumps(new_obj, ensure_ascii=False)}\n\n".encode()
                 for prose_frame in pending_prose_frames:
                     yield prose_frame
@@ -1368,7 +1380,23 @@ def _assemble_stream_tool_calls(frames: list[bytes]) -> list[dict[str, Any]]:
                     current["function"]["arguments"] += _tool_argument_text(
                         function.get("arguments")
                     )
-    return [assembled[key] for key in order]
+    assembled_calls = [assembled[key] for key in order]
+    # Apply argument remapping for known tool/argument name mismatches.
+    from tusker_gateway.tool_formats import TOOL_ARGUMENT_REMAP
+    for call in assembled_calls:
+        fn = call.get("function") or {}
+        name = str(fn.get("name", "")).strip()
+        if name not in TOOL_ARGUMENT_REMAP:
+            continue
+        raw_args = fn.get("arguments", "{}")
+        try:
+            args = json.loads(raw_args)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(args, dict):
+            remap = TOOL_ARGUMENT_REMAP[name]
+            fn["arguments"] = json.dumps({remap.get(k, k): v for k, v in args.items()}, ensure_ascii=False)
+    return assembled_calls
 
 
 def _response_tool_calls(response: dict[str, Any]) -> list[dict[str, Any]]:

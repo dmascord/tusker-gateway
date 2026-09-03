@@ -63,6 +63,60 @@ _ID_SUFFIXED_TOOL_RE = re.compile(
 )
 _AUXILIARY_TEXT_FIELDS = ("reasoning_content", "reasoning", "thinking", "analysis")
 
+# Maps tool names to a dict of malformed arg name → canonical arg name.
+# Covers LLM-level mistakes the OMP harness validates before the tool handler runs.
+TOOL_ARGUMENT_REMAP: dict[str, dict[str, str]] = {
+    "todo": {
+        "status": "op",
+        "task": "name",
+        "description": "content",
+        "priority": "priority",
+        "due_date": "due",
+        "assignee": "assignee",
+        "tags": "tags",
+        "metadata": "metadata",
+    },
+}
+def remap_stream_tool_calls(
+    tool_calls: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Apply argument remapping to a list of OpenAI-style delta tool_calls.
+
+    Rewrites argument keys for tools where the LLM emits the wrong parameter
+    name.  Handles both complete-string arguments (parse → remap → re-serialize)
+    and pre-parsed-dict arguments (remap in place).  Fragments that are not
+    valid JSON dicts are returned unchanged so incremental assembly is not
+    disrupted.
+    """
+    if not tool_calls:
+        return tool_calls
+    result: list[dict[str, Any]] = []
+    for call in tool_calls:
+        call = dict(call)
+        fn = call.get("function") or {}
+        name = str(fn.get("name", "")).strip()
+        if name not in TOOL_ARGUMENT_REMAP:
+            result.append(call)
+            continue
+        args = fn.get("arguments", "{}")
+        remap = TOOL_ARGUMENT_REMAP[name]
+        if isinstance(args, dict):
+            fn["arguments"] = {remap.get(k, k): v for k, v in args.items()}
+        elif isinstance(args, str):
+            try:
+                parsed = json.loads(args)
+            except (json.JSONDecodeError, TypeError):
+                result.append(call)
+                continue
+            if isinstance(parsed, dict):
+                fn["arguments"] = json.dumps(
+                    {remap.get(k, k): v for k, v in parsed.items()},
+                    ensure_ascii=False,
+                )
+        call["function"] = fn
+        result.append(call)
+    return result
+
 
 def tool_diagnostics_enabled() -> bool:
     """Return whether safe tool-markup diagnostics are enabled."""
@@ -216,6 +270,16 @@ def normalize_tool_calls(raw: Any) -> list[dict[str, Any]]:
         name = str(name).strip()
         if not name:
             continue
+        # Apply argument remapping for known tool/argument name mismatches.
+        if name in TOOL_ARGUMENT_REMAP:
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            if isinstance(args, dict):
+                remap = TOOL_ARGUMENT_REMAP[name]
+                args = {remap.get(k, k): v for k, v in args.items()}
         call_id = str(call_id or f"call_{index}_{hashlib.sha256(name.encode()).hexdigest()[:10]}")
         calls.append({
             "id": call_id,
