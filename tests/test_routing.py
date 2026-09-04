@@ -53,6 +53,7 @@ def test_gateway_qualified_pool_aliases_resolve_to_pools():
 
 def test_legacy_model_ids_have_gateway_compatibility_routes():
     for model_id in (
+        "hermes-gateway/hermes-code",
         "hermes-gateway/hermes-balanced",
         "mlx-mac/qwen3-coder-30b-a3b-instruct-4bit",
         "hermes-reranker",

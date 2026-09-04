@@ -1,0 +1,66 @@
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: hermes-to-ai
+  namespace: hermes
+spec:
+  redirectRegex:
+    regex: ^https?://hermes\.tusker\.net\.au/(.*)$
+    replacement: https://ai.tusker.net.au/${1}
+    permanent: true
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: hermes-redirect-web
+  namespace: hermes
+spec:
+  entryPoints:
+  - web
+  routes:
+  - match: Host(`hermes.tusker.net.au`)
+    kind: Rule
+    middlewares:
+    - name: hermes-to-ai
+    services:
+    - name: tusker-gateway
+      port: 8642
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: hermes-redirect-websecure
+  namespace: hermes
+spec:
+  entryPoints:
+  - websecure
+  routes:
+  - match: Host(`hermes.tusker.net.au`)
+    kind: Rule
+    middlewares:
+    - name: hermes-to-ai
+    services:
+    - name: tusker-gateway
+      port: 8642
+  tls:
+    secretName: hermes-tls
+---
+# Preserve authenticated OpenAI-compatible API clients. Redirecting a
+# cross-host POST can cause clients to drop Authorization, so legacy /v1
+# requests stay on the old hostname while terminating at the AI gateway.
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: hermes-api-compat
+  namespace: hermes
+spec:
+  entryPoints:
+  - websecure
+  routes:
+  - match: Host(`hermes.tusker.net.au`) && PathPrefix(`/v1`)
+    kind: Rule
+    services:
+    - name: tusker-gateway
+      port: 8642
+  tls:
+    secretName: hermes-tls

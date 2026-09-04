@@ -111,11 +111,14 @@ before adding them — unknown providers raise `ProviderError("Unknown provider:
 which becomes HTTP 502 and exhausts the agent retry budget.
 
 When checking OMP routing, use the standalone provider configured as
-`tusker-gateway` with `https://ai.tusker.net.au/v1`. The older
-`hermes-gateway` provider may continue using `https://hermes.tusker.net.au/v1`:
-its `/v1/` API route now targets this gateway, while the Hermes web routes and
-deployment remain available as the rollback target. Changes to this
-deployment's `TUSKER_POOL_CODE` therefore apply to both API hostnames.
+`tusker-gateway` with `https://ai.tusker.net.au/v1`. The legacy
+`hermes-gateway` provider's `/v1` requests continue to use the old hostname
+for compatibility, but terminate at `tusker-gateway`; cross-host redirects
+would cause some clients to drop `Authorization` on API POSTs. All non-API
+Hermes traffic is redirected to the AI hostname. The legacy Hermes deployment
+is scaled to zero after cutover; its PVC, service, and secrets remain intact as
+a rollback target. Changes to this deployment's `TUSKER_POOL_CODE` therefore
+apply to both API hostnames during the compatibility transition.
 
 ## 6. Rollback
 
@@ -138,7 +141,7 @@ kubectl -n hermes delete pvc tusker-home
 |---|---|---|
 | Name | `hermes` | `tusker-gateway` |
 | Image | `hermes-agent` | `tusker-gateway` |
-| Host | `hermes.tusker.net.au` | `ai.tusker.net.au` |
+| Host | `hermes.tusker.net.au` (API compatibility + redirect) | `ai.tusker.net.au` |
 | PVC | `hermes-home` | `tusker-home` |
 | Config | `hermes-env-vault` | `tusker-env-vault` (isolated) |
 
@@ -157,5 +160,10 @@ kubectl -n hermes delete pvc tusker-home
   routes. Merged the three legacy Hermes client-key identities into
   `tusker-env-vault` (seven unique gateway-accepted keys total), changed the
   deployment to consume `API_KEYS` from that secret, and added compatibility
-  entries for the legacy model catalog. The Hermes deployment remains running
-  for rollback.
+  entries for the legacy model catalog.
+- **2026-09-04** — Redirected non-API `hermes.tusker.net.au` traffic to
+  `ai.tusker.net.au` on both Traefik entrypoints, retained a transparent
+  `/v1` compatibility route to `tusker-gateway` so authenticated API POSTs do
+  not lose their credentials across a host redirect, and scaled the legacy
+  Hermes deployment to zero. The legacy PVC, service, and secrets remain
+  available for rollback.
