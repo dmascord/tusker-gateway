@@ -1,12 +1,55 @@
 """Tests for the XML/Markdown tool-call stripper in endpoints.py."""
 from __future__ import annotations
 
+import json
+import logging
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from .conftest import HEADERS_AUTH
 
 from tusker_gateway.endpoints import _ToolCallStripper, _strip_xml_tool_calls
+
+
+@pytest.mark.asyncio
+async def test_stream_diagnostics_deduplicates_identical_native_frames(
+    monkeypatch, caplog,
+):
+    """Repeated native-tool SSE fragments must not flood the INFO log."""
+    from tusker_gateway.endpoints import _normalize_stream
+
+    monkeypatch.setenv("TUSKER_TOOL_DIAGNOSTICS", "true")
+    payload = {
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "tool_calls": [{
+                    "id": "call-1",
+                    "index": 0,
+                    "type": "function",
+                    "function": {"name": "read", "arguments": ""},
+                }],
+            },
+            "finish_reason": None,
+        }],
+    }
+
+    async def stream():
+        encoded = f"data: {json.dumps(payload)}\n\n".encode()
+        yield encoded
+        yield encoded
+        yield b'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    with caplog.at_level(logging.INFO, logger="tusker_gateway.endpoints"):
+        async for _ in _normalize_stream(stream(), provider="test", model="m"):
+            pass
+
+    diagnostics = [
+        record for record in caplog.records
+        if record.getMessage().startswith("tool diagnostics stream")
+    ]
+    assert len(diagnostics) == 1
 
 
 def test_stripper_complete_block_in_single_chunk():
@@ -67,6 +110,62 @@ def test_strip_xml_tool_calls_helper_strips_full_block():
     assert "tool_call" not in out
     assert "<function" not in out
     assert "pre" in out and "post" in out
+
+
+@pytest.mark.asyncio
+async def test_stream_normalizer_assigns_indexes_to_native_calls_without_indexes():
+    """Adjacent native calls must not be cross-wired by OMP's assembler."""
+    from tusker_gateway.endpoints import _assemble_stream_tool_calls, _normalize_stream
+
+    def make_frame(call):
+        payload = {
+            "choices": [{
+                "index": 0,
+                "delta": {"tool_calls": [call]},
+                "finish_reason": None,
+            }],
+        }
+        return f"data: {json.dumps(payload)}\n\n".encode()
+
+    async def native_stream():
+        yield make_frame({
+            "id": "read-call",
+            "type": "function",
+            "function": {"name": "read", "arguments": json.dumps({"path": "/tmp"})},
+        })
+        yield make_frame({
+            "id": "todo-call",
+            "type": "function",
+            "function": {"name": "todo", "arguments": json.dumps({"op": "init"})},
+        })
+        yield b'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    frames = [
+        frame
+        async for frame in _normalize_stream(native_stream(), provider="test", model="test")
+    ]
+    calls = []
+    for frame in frames:
+        if not frame.startswith(b"data: {"):
+            continue
+        payload = json.loads(frame[len(b"data: "):])
+        for choice in payload.get("choices", []):
+            calls.extend((choice.get("delta") or {}).get("tool_calls") or [])
+
+    assert [(call["index"], call["id"]) for call in calls] == [
+        (0, "read-call"),
+        (1, "todo-call"),
+    ]
+    assembled = _assemble_stream_tool_calls(frames)
+    assert [(call["id"], call["function"]["name"]) for call in assembled] == [
+        ("read-call", "read"),
+        ("todo-call", "todo"),
+    ]
+    assert [json.loads(call["function"]["arguments"]) for call in assembled] == [
+        {"path": "/tmp"},
+        {"op": "init"},
+    ]
 
 
 @pytest.mark.asyncio

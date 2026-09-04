@@ -21,7 +21,11 @@ import pytest
 
 from tusker_gateway.config import load_config
 from tusker_gateway.errors import ProviderError
-from tusker_gateway.passthrough import PROVIDER_ENDPOINTS, PassthroughClient
+from tusker_gateway.passthrough import (
+    PROVIDER_ENDPOINTS,
+    PassthroughClient,
+    _upstream_failure_cooldown_seconds,
+)
 from tusker_gateway.quality import QualityDB
 from tusker_gateway.routing import Route, resolve_route, split_model
 
@@ -156,6 +160,32 @@ async def test_oauth_provider_request_shape(oauth_client, provider):
     assert body["model"] == "test-model"
     assert body["messages"] == msgs
     assert body["stream"] is False
+
+
+@pytest.mark.asyncio
+async def test_copilot_image_request_sets_content_based_vision_header(oauth_client):
+    endpoint = PROVIDER_ENDPOINTS["github-copilot-enterprise"]
+    headers, _ = await oauth_client._build_request(
+        "github-copilot-enterprise",
+        "newly-added-multimodal-model",
+        [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "describe this"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,AA"},
+                },
+            ],
+        }],
+        stream=False,
+        api_key=None,
+        extra_headers=None,
+        extra_body=None,
+        endpoint=endpoint,
+    )
+
+    assert headers["Copilot-Vision-Request"] == "true"
 
 
 # ---------------------------------------------------------------------------
@@ -755,8 +785,120 @@ async def test_parse_codex_sse_assembles_item_id_argument_events():
     }]
     assert result["usage"] == {"input_tokens": 1, "output_tokens": 1}
 
+
 @pytest.mark.asyncio
-async def test_chat_codex_folds_reasoning_effort_into_reasoning_object():
+async def test_parse_codex_sse_recovers_text_from_terminal_output_items():
+    """Responses providers may put the only answer in response.completed."""
+    client = PassthroughClient.__new__(PassthroughClient)
+    events = [{
+        "type": "response.completed",
+        "response": {
+            "output": [{
+                "type": "message",
+                "content": [{"type": "output_text", "text": "terminal answer"}],
+            }],
+            "usage": {"input_tokens": 2, "output_tokens": 3},
+        },
+    }]
+    response = MagicMock()
+    response.content = _AsyncChunks(
+        [f"data: {json.dumps(event)}\n\n".encode() for event in events]
+    )
+
+    result = await client._parse_codex_sse_async(response)
+
+    assert result["choices"][0]["message"]["content"] == "terminal answer"
+    assert result["usage"] == {"input_tokens": 2, "output_tokens": 3}
+
+
+@pytest.mark.asyncio
+async def test_chat_codex_preserves_tool_turns_in_responses_input():
+    """A Responses request must include prior calls and their tool outputs."""
+    from tusker_gateway.passthrough import CodexTokenRotator, PassthroughClient
+
+    client = PassthroughClient.__new__(PassthroughClient)
+    client._codex_rotator = CodexTokenRotator([
+        {"access_token": "tok-a", "expires_at_ms": 9999999999999},
+    ])
+    client._config = {"quality_db_path": "/tmp/q.db"}
+    client._http = MagicMock()
+    captured: dict[str, Any] = {}
+
+    class FakeHTTPRequest:
+        async def __call__(self, _method, _url, *, headers=None, json=None, timeout=None, **_kw):
+            captured["json"] = json
+            response = MagicMock()
+            response.status = 400
+            response.text = AsyncMock(return_value='{"detail":"request captured"}')
+            return response
+
+    client._http.request = FakeHTTPRequest()
+
+    with pytest.raises(Exception):
+        await client._chat_codex(
+            provider="openai-codex",
+            model="gpt-5.6-luna",
+            messages=[
+                {"role": "user", "content": "inspect"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": "call-read",
+                        "type": "function",
+                        "function": {
+                            "name": "read",
+                            "arguments": '{"path":"package.json"}',
+                        },
+                    }],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call-read",
+                    "content": "package contents",
+                },
+                {"role": "user", "content": "continue"},
+            ],
+            stream=True,
+            api_key=None,
+        )
+
+    assert captured["json"]["input"] == [
+        {
+            "role": "user",
+            "content": [{"type": "input_text", "text": "inspect"}],
+        },
+        {
+            "type": "function_call",
+            "call_id": "call-read",
+            "name": "read",
+            "arguments": '{"path":"package.json"}',
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call-read",
+            "output": "package contents",
+        },
+        {
+            "role": "user",
+            "content": [{"type": "input_text", "text": "continue"}],
+        },
+    ]
+
+
+@pytest.mark.parametrize(
+    ("extra_body", "expected_effort"),
+    [
+        ({"reasoning_effort": "high"}, "high"),
+        ({"reasoning_effort": "minimal"}, "low"),
+        ({"reasoning_effort": "maximal"}, "max"),
+        ({"reasoning": {"effort": "minimal"}}, "low"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_chat_codex_folds_reasoning_effort_into_reasoning_object(
+    extra_body, expected_effort,
+):
     """_chat_codex must fold the chat-completions `reasoning_effort` top-level
     field into the Codex Responses API's nested `reasoning.effort` so the
     request isn't rejected with "Unsupported parameter: reasoning_effort".
@@ -794,13 +936,29 @@ async def test_chat_codex_folds_reasoning_effort_into_reasoning_object():
             messages=[{"role": "user", "content": "ok"}],
             stream=False,
             api_key=None,
-            extra_body={"reasoning_effort": "high"},
+            extra_body=extra_body,
         )
 
     body = captured["json"]
     # The flat chat-completions field must be folded into the nested object.
     assert "reasoning_effort" not in body
-    assert body["reasoning"] == {"effort": "high", "summary": "auto"}
+    assert body["reasoning"] == {"effort": expected_effort, "summary": "auto"}
+
+
+def test_payment_required_stream_failure_uses_quota_cooldown(monkeypatch):
+    """A quota-gated upstream must not be retried on every stream attempt."""
+    monkeypatch.delenv("TUSKER_RETRY_QUOTA_COOLDOWN", raising=False)
+    monkeypatch.delenv("TUSKER_UPSTREAM_FAILURE_COOLDOWN_SECS", raising=False)
+    exc = ProviderError("upstream payment required", code="provider_error")
+    exc.upstream_status = 402
+    exc.upstream_body = "Payment required to access this resource"
+
+    assert _upstream_failure_cooldown_seconds(exc) == 3600.0
+
+    transient = ProviderError("upstream capacity unavailable", code="provider_error")
+    transient.upstream_status = 503
+    transient.upstream_body = "provider capacity unavailable"
+    assert _upstream_failure_cooldown_seconds(transient) == 60.0
 
 
 @pytest.mark.asyncio

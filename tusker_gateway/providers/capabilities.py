@@ -27,7 +27,6 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Iterable
 
 import aiohttp
-from tusker_gateway.catalog import is_free_openrouter_model
 from tusker_gateway.model_capability import (
     MODEL_CAPABILITY_PROBE_VERSION,
     ModelCapabilityDB,
@@ -67,22 +66,59 @@ class CapabilitySnapshot:
     )
     errors: list[str] = field(default_factory=list)
 
-    def lookup(self, capability: Capability, model: str) -> CapabilityEntry | None:
-        """Return the first entry matching ``(capability, model)`` or None.
+    def lookup(
+        self,
+        capability: Capability,
+        model: str,
+        provider: str | None = None,
+    ) -> CapabilityEntry | None:
+        """Return the first entry matching a capability/model pair.
 
         When the same upstream id is published by more than one provider
         (e.g. ``google/gemini-3-pro-image`` is listed on OpenRouter and
         Google alike), this returns the first one in refresh order. The
         refresh order is deterministic and favours the cheaper / more local
         path first.
+
+        Provider/model pins are normalized before matching so a caller can
+        use ``openrouter::google/foo`` or a case variant of a provider slug
+        without bypassing the capability record.
         """
+        requested_model = _model_key(model)
+        requested_provider = _provider_key(provider) if provider else None
         for entry in self.capabilities[capability]:
-            if entry.model == model:
-                return entry
+            if _model_key(entry.model) != requested_model:
+                continue
+            if requested_provider and _provider_key(entry.provider) != requested_provider:
+                continue
+            return entry
         return None
 
     def providers_for_model(self, capability: Capability, model: str) -> list[str]:
-        return [e.provider for e in self.capabilities[capability] if e.model == model]
+        requested_model = _model_key(model)
+        return [
+            e.provider
+            for e in self.capabilities[capability]
+            if _model_key(e.model) == requested_model
+        ]
+
+
+def _model_key(model: str | None) -> str:
+    """Return a case-insensitive capability lookup key for a model id."""
+    value = str(model or "").strip()
+    if "::" in value:
+        value = value.split("::", 1)[1]
+    if value.lower().startswith("openrouter/"):
+        value = value.split("/", 1)[1]
+    return value.casefold()
+
+
+def _provider_key(provider: str | None) -> str:
+    """Normalize provider aliases used by media capability discovery."""
+    value = str(provider or "").strip().lower().replace("_", "-")
+    if value in {"codex", "openai-codex"}:
+        return "openai"
+    return value
 
 
 class CapabilitiesRegistry:
@@ -114,6 +150,7 @@ class CapabilitiesRegistry:
                 ("codex", _discover_codex_capability(self.codex_rotator)),
                 ("zai", _discover_zai(self.provider_keys.get("zai") or self.provider_keys.get("glm"), session)),
                 ("xiaomi", _discover_xiaomi(self.provider_keys.get("xiaomi"), session)),
+                ("minimax", _discover_minimax(self.provider_keys.get("minimax"))),
                 ("google", _discover_google(self.provider_keys.get("google") or self.provider_keys.get("gemini"), session)),
             ]
 
@@ -171,7 +208,13 @@ async def discover_openrouter(
     session: aiohttp.ClientSession,
     api_key: str | None,
 ) -> list[CapabilityEntry]:
-    """Discover only explicitly free OpenRouter image and video models."""
+    """Discover image/video models available to the configured OpenRouter key.
+
+    This registry is capability metadata, not the pool's auto-free allowlist.
+    Filtering paid models here made explicitly requested, account-entitled
+    media models impossible to route. Cost/pool policy remains enforced by
+    the catalog and pool layers.
+    """
     if not api_key:
         return []
     headers = {
@@ -201,7 +244,7 @@ async def discover_openrouter(
         return [
             model
             for model in models
-            if isinstance(model, dict) and is_free_openrouter_model(model)
+            if isinstance(model, dict)
         ]
 
     general_models = await fetch_models("https://openrouter.ai/api/v1/models")
@@ -212,7 +255,10 @@ async def discover_openrouter(
         ) or []
         if not isinstance(slug, str) or not slug.strip():
             continue
-        if isinstance(output_modalities, list) and "image" in output_modalities:
+        if isinstance(output_modalities, list) and any(
+            isinstance(modality, str) and modality.strip().lower() == "image"
+            for modality in output_modalities
+        ):
             seen.add((Capability.IMAGE_GENERATIONS, slug))
             out.append(
                 CapabilityEntry(
@@ -250,6 +296,7 @@ async def discover_openrouter(
 # OpenAI's pricing page as of 2026-08 and used purely for budget hints.
 _OPENAI_STATIC_MODELS: dict[Capability, list[CapabilityEntry]] = {
     Capability.IMAGE_GENERATIONS: [
+        CapabilityEntry(provider="openai", model="gpt-image-2", capability=Capability.IMAGE_GENERATIONS, cost_input=0.005, cost_output=0.005),
         CapabilityEntry(provider="openai", model="gpt-image-1", capability=Capability.IMAGE_GENERATIONS, cost_input=0.020, cost_output=0.020),
         CapabilityEntry(provider="openai", model="gpt-image-1-mini", capability=Capability.IMAGE_GENERATIONS, cost_input=0.005, cost_output=0.005),
         CapabilityEntry(provider="openai", model="dall-e-3", capability=Capability.IMAGE_GENERATIONS, cost_input=0.040, cost_output=0.040),
@@ -295,12 +342,18 @@ async def discover_openai_verified(
             if resp.status >= 400:
                 logger.warning("openai probe /v1/models: http %s", resp.status)
                 return []
+            data = await resp.json()
     except Exception as exc:
         logger.warning("openai probe failed: %s", exc)
         return []
+    available = {
+        str(row.get("id")).strip()
+        for row in (data.get("data", []) if isinstance(data, dict) else [])
+        if isinstance(row, dict) and row.get("id")
+    }
     out: list[CapabilityEntry] = []
     for entries in _OPENAI_STATIC_MODELS.values():
-        out.extend(entries)
+        out.extend(entry for entry in entries if entry.model in available)
     return out
 
 
@@ -555,6 +608,24 @@ async def _discover_xiaomi(
             )
         )
     return entries
+
+
+async def _discover_minimax(api_key: str | None) -> list[CapabilityEntry]:
+    """Register MiniMax's known image endpoint without spending a credit.
+
+    MiniMax exposes image generation separately from its chat model catalog;
+    a model-list refresh therefore cannot be used to infer this capability.
+    The credential check still happens when the request is dispatched.
+    """
+    if not api_key:
+        return []
+    return [
+        CapabilityEntry(
+            provider="minimax",
+            model="image-01",
+            capability=Capability.IMAGE_GENERATIONS,
+        )
+    ]
 
 
 # ---------------------------------------------------------------------------

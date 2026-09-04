@@ -61,18 +61,24 @@ DRY_RUN=0
 if [[ "${1:-}" == "--dry-run" ]]; then
     DRY_RUN=1
 fi
-# Resolve the value for a single key. API_KEYS lives as a literal in
-# k8s/deployment.yaml; everything else is in hermes-env-vault, with a
-# fallback to the repo .env file for keys not (yet) seeded there
-# (e.g. HF_TOKEN ↔ .env's HF_API_KEY).
+# Resolve the value for a single key. API_KEYS normally lives in the target
+# secret now; fall back to the deployment literal for an initial split from
+# an older checkout. Everything else is in hermes-env-vault, with a fallback
+# to the repo .env file for keys not (yet) seeded there (e.g. HF_TOKEN ↔
+# .env's HF_API_KEY).
 resolve_value() {
     local k="$1"
     local primary=""
     if [[ "$k" == "API_KEYS" ]]; then
+        primary=$(kubectl -n "$NAMESPACE" get secret "$TARGET_SECRET" \
+            -o jsonpath="{.data.API_KEYS}" 2>/dev/null \
+            | base64 -d 2>/dev/null || true)
+    fi
+    if [[ -z "$primary" && "$k" == "API_KEYS" ]]; then
         primary=$(kubectl -n "$NAMESPACE" get deploy tusker-gateway \
             -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="API_KEYS")].value}' \
             2>/dev/null || true)
-    else
+    elif [[ "$k" != "API_KEYS" ]]; then
         primary=$(kubectl -n "$NAMESPACE" get secret "$SOURCE_SECRET" \
             -o jsonpath="{.data.$k}" 2>/dev/null \
             | base64 -d 2>/dev/null || true)

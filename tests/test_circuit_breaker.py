@@ -194,3 +194,16 @@ def test_quota_exhaustion_429_returns_long_cooldown():
     assert _cooldown_seconds_for_429(
         {"body": "rate limit", "headers": {}}
     ) == 60.0
+
+
+def test_payment_required_non429_returns_long_cooldown():
+    """Payment-required responses must quarantine the route like quota errors."""
+    from types import SimpleNamespace
+
+    from tusker_gateway.cooldown import _cooldown_seconds_for_provider_error
+
+    exc = SimpleNamespace(
+        upstream_status=402,
+        upstream_body="Payment required to access this resource",
+    )
+    assert _cooldown_seconds_for_provider_error(exc) == 3600.0

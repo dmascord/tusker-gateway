@@ -23,7 +23,7 @@ spec:
       terminationGracePeriodSeconds: 90
       containers:
       - name: tusker-gateway
-        image: registry.tusker.net.au:5000/tusker-gateway:swarm-alpine-maintenance-20260831-c171726
+        image: registry.tusker.net.au:5000/tusker-gateway:swarm-alpine-chat-catalog-20260904082557
         imagePullPolicy: Always
         envFrom:
         - secretRef:
@@ -32,7 +32,7 @@ spec:
         - name: MODEL_NAME
           value: tusker-gateway
         - name: TUSKER_COMMIT
-          value: c171726
+          value: fb5065d
         - name: HOME
           value: /home/tusker
         - name: PYTHONUNBUFFERED
@@ -40,7 +40,10 @@ spec:
         - name: PYTHONDONTWRITEBYTECODE
           value: '1'
         - name: API_KEYS
-          value: d36fa730d29ed2e8749708ffc7ff7453d5c68a84b9b17360f15bffa9fb0a6a6d,1669ed9f11c615b5cb60fdfa60d23b4373c503de306eaa90039a20790427aef0,4f9736e8bfa246e74ffc11279cf59d2fe4b381cc70159255a9f78e26932bbb1f,e6507e72971c8e015b2958930497e3baaf75607e2dc178ae44f1db671bd49e0d
+          valueFrom:
+            secretKeyRef:
+              name: tusker-env-vault
+              key: API_KEYS
         - name: TUSKER_SEMANTIC_CACHE_ENABLED
           # Keep the production switch explicit. The image contains the
           # pinned model and the safety gates below are ready for a canary.
@@ -241,9 +244,9 @@ spec:
         - name: TUSKER_QUALIFICATION_MAINTENANCE_MAX_AGE_SECS
           value: '86400'
         - name: TUSKER_CATALOG_STARTUP_TIMEOUT_SECS
-          value: '10'
-        - name: TUSKER_UPSTREAM_SOCK_READ_SECS
           value: '30'
+        - name: TUSKER_UPSTREAM_SOCK_READ_SECS
+          value: '90'
         - name: TUSKER_BUDGETS_ENABLED
           value: 'false'
         ports:

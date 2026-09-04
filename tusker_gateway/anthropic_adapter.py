@@ -31,7 +31,13 @@ from tusker_gateway import translators
 from tusker_gateway.budget import BudgetTracker
 from tusker_gateway.circuit_breaker import CircuitBreaker, BreakerDecision
 from tusker_gateway.errors import BadRequestError, NoHealthyModelsError
-from tusker_gateway.endpoints import _normalize_stream, _required_input_modalities
+from tusker_gateway.endpoints import (
+    _build_extra_body,
+    _complete_chat_result_stream,
+    _normalize_stream,
+    _request_conversation_id,
+    _required_input_modalities,
+)
 from tusker_gateway.metrics import MetricsRegistry
 from tusker_gateway.passthrough import PassthroughClient
 from tusker_gateway.pools import PoolManager
@@ -87,7 +93,9 @@ def _openai_to_anthropic(result: dict[str, Any], original_model: str) -> dict[st
 def _parse_openai_sse_chunk(raw: bytes) -> dict[str, Any] | None:
     """Extract and parse the JSON ``data:`` payload from an OpenAI SSE line.
 
-    Returns ``None`` for ``[DONE]`` sentinels and unparseable frames.
+    Returns ``None`` for non-JSON frames and ``_OPENAI_SSE_DONE`` for the
+    ``[DONE]`` sentinel. Keeping those cases distinct prevents a provider
+    heartbeat or comment from closing an Anthropic stream prematurely.
     """
     try:
         text = raw.decode("utf-8").strip()
@@ -97,12 +105,15 @@ def _parse_openai_sse_chunk(raw: bytes) -> dict[str, Any] | None:
         if line.startswith("data: "):
             data_str = line[6:]
             if data_str == "[DONE]":
-                return None
+                return _OPENAI_SSE_DONE
             try:
                 return json.loads(data_str)
             except json.JSONDecodeError:
                 return None
     return None
+
+
+_OPENAI_SSE_DONE = object()
 
 
 class _AnthropicSSEStreamAdapter:
@@ -146,12 +157,16 @@ class _AnthropicSSEStreamAdapter:
                 return b"".join(frames)
 
             parsed = _parse_openai_sse_chunk(raw)
-            if parsed is None:
-                # [DONE] or unparseable — emit the closing sequence.
+            if parsed is _OPENAI_SSE_DONE:
+                # [DONE] — emit the closing sequence.
                 frames = translators.stream_chunk(ANTHROPIC, None, self._state)
                 if not frames:
                     raise StopAsyncIteration
                 return b"".join(frames)
+            if parsed is None:
+                # Comments/unknown frames carry no Anthropic content, but do
+                # not imply that the upstream stream has ended.
+                continue
 
             frames = translators.stream_chunk(ANTHROPIC, parsed, self._state)
             if frames:
@@ -261,6 +276,7 @@ async def _call_with_pool_fallback_anthropic(
     tools: list[dict[str, Any]] | None = None,
     breaker: CircuitBreaker | None = None,
     request: web.Request | None = None,
+    conversation_id: str | None = None,
 ) -> tuple[str, str, Any]:
     """Dispatch OpenAI-format body through pool fallback.
 
@@ -328,7 +344,9 @@ async def _call_with_pool_fallback_anthropic(
             try:
                 result = await client.chat(prov, mdl, body["messages"],
                                           stream=bool(body.get("stream")), tools=tools,
-                                          tool_choice=body.get("tool_choice"))
+                                          tool_choice=body.get("tool_choice"),
+                                          extra_body=_build_extra_body(body) or None,
+                                          conversation_id=conversation_id)
                 if isinstance(result, dict):
                     result = normalize_response_tool_calls(
                         result,
@@ -336,7 +354,19 @@ async def _call_with_pool_fallback_anthropic(
                     )
                 if breaker is not None:
                     breaker.record_success(prov, mdl)
-                if body.get("stream") and hasattr(result, "__aiter__"):
+                if body.get("stream"):
+                    if isinstance(result, dict):
+                        # Codex/Responses providers are parsed into a complete
+                        # Chat result even when the caller requested a stream.
+                        # Re-encode it before the Anthropic SSE adapter; a dict
+                        # is iterable over keys and would otherwise produce an
+                        # empty successful stream.
+                        result = _complete_chat_result_stream(result)
+                    if not hasattr(result, "__aiter__"):
+                        raise BadRequestError(
+                            "streaming Anthropic output is unavailable from the provider",
+                            code="unsupported_streaming",
+                        )
                     result = _AnthropicSSEStreamAdapter(
                         _normalize_stream(
                             result,
@@ -362,7 +392,9 @@ async def _call_with_pool_fallback_anthropic(
         try:
             result = await client.chat(route.provider, route.model, body["messages"],
                                       stream=bool(body.get("stream")), tools=tools,
-                                      tool_choice=body.get("tool_choice"))
+                                      tool_choice=body.get("tool_choice"),
+                                      extra_body=_build_extra_body(body) or None,
+                                      conversation_id=conversation_id)
             if isinstance(result, dict):
                 result = normalize_response_tool_calls(
                     result,
@@ -370,7 +402,14 @@ async def _call_with_pool_fallback_anthropic(
                 )
             if breaker is not None:
                 breaker.record_success(route.provider, route.model)
-            if body.get("stream") and hasattr(result, "__aiter__"):
+            if body.get("stream"):
+                if isinstance(result, dict):
+                    result = _complete_chat_result_stream(result)
+                if not hasattr(result, "__aiter__"):
+                    raise BadRequestError(
+                        "streaming Anthropic output is unavailable from the provider",
+                        code="unsupported_streaming",
+                    )
                 result = _AnthropicSSEStreamAdapter(
                     _normalize_stream(
                         result,
@@ -438,12 +477,22 @@ async def anthropic_messages_handler(request: web.Request) -> web.Response | web
 
             # Convert to OpenAI format.
             openai_body = _anthropic_to_openai(body)
+            conversation_body = {
+                **body,
+                "messages": openai_body.get("messages", []),
+            }
+            conversation_id = _request_conversation_id(
+                request,
+                conversation_body,
+                api_key,
+            )
 
             config = request.app["config"]
             client = PassthroughClient(
                 config,
                 QualityDB(config["quality_db_path"]),
                 request.app["http_session"],
+                catalog_registry=request.app.get("catalog_registry"),
                 credential_rotators=request.app.get("credential_rotators"),
             )
             tools = openai_body.pop("tools", None)
@@ -484,6 +533,7 @@ async def anthropic_messages_handler(request: web.Request) -> web.Response | web
             # Dispatch to backend.
             provider, target_model, result = await _call_with_pool_fallback_anthropic(
                 config, openai_body, client, tools, breaker=breaker, request=request,
+                conversation_id=conversation_id,
             )
             logger.debug("selected %s/%s for anthropic model=%s", provider, target_model, original_model)
 
@@ -501,6 +551,7 @@ async def anthropic_messages_handler(request: web.Request) -> web.Response | web
                         "Content-Type": "text/event-stream",
                         "Cache-Control": "no-cache",
                         "Connection": "keep-alive",
+                        "X-Request-ID": request.get("_request_id", ""),
                         "X-Accel-Buffering": "no",
                     },
                 )

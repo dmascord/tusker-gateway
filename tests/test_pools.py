@@ -6,7 +6,7 @@ import tempfile
 
 from tusker_gateway.config import PoolConfig, _load_pools, load_config
 from tusker_gateway.cooldown import CooldownTracker, _cooldown_seconds_for_429
-from tusker_gateway.pools import PoolManager
+from tusker_gateway.pools import ModelSpec, PoolManager, is_general_chat_model
 
 
 def test_default_code_pool_includes_current_provider_routes(monkeypatch):
@@ -103,6 +103,33 @@ def test_pool_selection_logic():
         sel2 = mgr.select("test", session_id="s1")
         sel3 = mgr.select("test", session_id="s1")
         assert sel2 == sel3, f"stickiness broken: {sel2} vs {sel3}"
+
+
+def test_equal_weight_candidates_round_robin():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = PoolManager({
+            "pools": {
+                "test": PoolConfig(
+                    name="test",
+                    models=[
+                        {"provider": "groq", "model": "m1"},
+                        {"provider": "openai", "model": "m2"},
+                    ],
+                ),
+            },
+            "quality_db_path": os.path.join(tmpdir, "quality.db"),
+            "excluded_providers": [],
+            "provider_api_keys": {"groq": "k-groq", "openai": "k-openai"},
+        })
+
+        selections = [manager.select("test") for _ in range(4)]
+
+    assert selections == [
+        ("groq", "m1"),
+        ("openai", "m2"),
+        ("groq", "m1"),
+        ("openai", "m2"),
+    ]
 
 
 def test_verified_modality_evidence_controls_pool_selection():
@@ -430,7 +457,7 @@ def test_minimax_m3_can_cover_image_tool_requests():
         ) == ("minimax", "MiniMax-M3")
 
 
-def test_unknown_modalities_remain_eligible_for_existing_providers():
+def test_unknown_non_text_modalities_are_not_eligible_without_evidence():
     with tempfile.TemporaryDirectory() as tmpdir:
         manager = PoolManager({
             "pools": {
@@ -443,8 +470,68 @@ def test_unknown_modalities_remain_eligible_for_existing_providers():
         })
 
         assert manager.select(
-            "test", required_input_modalities={"text", "image"},
+            "test", required_input_modalities={"image"},
+        ) is None
+
+        manager._model_capability_db.record(
+            provider="local-llm",
+            model="legacy",
+            capability="input_image",
+            status="passed",
+            source="modality_probe",
+        )
+        assert manager.select(
+            "test", required_input_modalities={"image"},
         ) == ("local-llm", "legacy")
+
+
+def test_configured_modality_names_are_normalized():
+    spec = ModelSpec.from_dict({
+        "provider": "openai",
+        "model": "vision-model",
+        "input_modalities": ["TEXT", "image-input"],
+    })
+
+    assert spec.input_modalities == frozenset({"text", "image_input"})
+
+
+def test_auto_discovered_unknown_non_text_modality_requires_evidence():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = PoolManager({
+            "pools": {
+                "code": PoolConfig(name="code", models=[
+                    {
+                        "provider": "groq",
+                        "model": "catalog-model",
+                        "auto_discovered": True,
+                    },
+                    {
+                        "provider": "synthetic",
+                        "model": "syn:large:vision",
+                        "input_modalities": ["text", "image"],
+                    },
+                ]),
+            },
+            "quality_db_path": os.path.join(tmpdir, "quality.db"),
+            "model_capability_db_path": os.path.join(tmpdir, "model-capability.db"),
+            "excluded_providers": [],
+            "provider_api_keys": {"groq": "k-groq", "synthetic": "k-synthetic"},
+        })
+
+        assert manager.select(
+            "code", required_input_modalities={"image"},
+        ) == ("synthetic", "syn:large:vision")
+
+        manager._model_capability_db.record(
+            provider="groq",
+            model="catalog-model",
+            capability="input_image",
+            status="passed",
+            source="modality_probe",
+        )
+        assert manager.select(
+            "code", required_input_modalities={"image"},
+        ) == ("groq", "catalog-model")
 
 
 def test_selection_excludes_special_purpose_and_provider_router_models():
@@ -469,6 +556,30 @@ def test_selection_excludes_special_purpose_and_provider_router_models():
         assert manager.select("code") == (
             "openrouter", "openai/gpt-oss-20b:free",
         )
+
+
+def test_live_audio_models_are_not_general_chat_candidates():
+    """Gemini Live/native-audio IDs require WebSocket, not HTTP chat."""
+    assert is_general_chat_model(
+        "google", "gemini-2.5-flash-native-audio-latest",
+    ) is False
+    assert is_general_chat_model(
+        "google", "gemini-3.1-flash-live-preview",
+    ) is False
+    assert is_general_chat_model(
+        "google", "gemini-2.5-flash-image",
+    ) is False
+    assert is_general_chat_model(
+        "google", "gemini-2.5-computer-use-preview-10-2025",
+    ) is False
+    assert is_general_chat_model(
+        "google", "deep-research-preview-04-2026",
+    ) is False
+    assert is_general_chat_model(
+        "google", "gemini-2.5-flash-preview-09-2025",
+    ) is True
+    # A model slug mentioning image is not automatically image generation.
+    assert is_general_chat_model("openrouter", "tool-image") is True
 
 
 def test_selection_filters_catalog_models_without_tools_or_images():

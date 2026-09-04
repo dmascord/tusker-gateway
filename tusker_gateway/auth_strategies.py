@@ -5,14 +5,13 @@ This removes auth-specific branching from PassthroughClient.
 """
 from __future__ import annotations
 
-import base64
 import hashlib
-import json
 import logging
 from typing import Any
 
 from tusker_gateway.copilot_constants import EDITOR_VERSION, EXCHANGE_USER_AGENT, is_likely_vision_model
 from tusker_gateway.copilot_exchange import copilot_request_headers, exchange_copilot_token
+from tusker_gateway.codex_oauth import codex_token_profile
 from tusker_gateway.models import ProviderConfig
 from tusker_gateway.passthrough import CodexTokenRotator
 
@@ -145,16 +144,9 @@ def codex_auth_headers(token: str) -> dict[str, str]:
         "originator": "codex_cli_rs",
         "User-Agent": "codex_cli_rs/0.0.0 (Tusker Gateway)",
     }
-    try:
-        parts = token.split(".")
-        if len(parts) >= 2:
-            payload = parts[1] + "=="  # add padding
-            claims = json.loads(base64.urlsafe_b64decode(payload))
-            acct_id = claims.get("chatgpt_account_id")
-            if acct_id:
-                headers["ChatGPT-Account-ID"] = str(acct_id)
-    except Exception:
-        pass
+    account_id = codex_token_profile(token).get("account_id")
+    if account_id:
+        headers["ChatGPT-Account-ID"] = account_id
     return headers
 
 class CodexAuthenticator(Authenticator):

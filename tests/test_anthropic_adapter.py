@@ -320,6 +320,27 @@ class TestAnthropicSSEStreamTranslator:
         assert b"event: content_block_start" in events[0]
         assert b"event: message_stop" in events[1]
 
+    async def test_non_data_sse_frame_does_not_close_stream(self):
+        """Provider comments/unknown SSE frames must not truncate later text."""
+        from tusker_gateway.anthropic_adapter import AnthropicSSEStreamTranslator
+
+        openai_chunks = [
+            b": keepalive\n\n",
+            b'event: provider.notice\ndata: not-json\n\n',
+            b'data: {"choices": [{"delta": {"content": "after"}, "finish_reason": null}]}\n\n',
+            b'data: [DONE]\n\n',
+        ]
+        stream = await self._make_stream(openai_chunks)
+        translator = AnthropicSSEStreamTranslator(stream, model="claude-3")
+
+        events = []
+        async for chunk in translator:
+            events.append(chunk)
+
+        combined = b"".join(events)
+        assert b'"after"' in combined
+        assert b"event: message_stop" in combined
+
 
 # ---------------------------------------------------------------------------
 # _validate_anthropic_body tests
@@ -470,6 +491,145 @@ async def test_messages_non_streaming(client):
         assert data["model"] == "claude-3-opus-20240229"
         assert data["usage"]["input_tokens"] == 10
         assert data["usage"]["output_tokens"] == 5
+
+
+@pytest.mark.asyncio
+async def test_messages_streaming_converts_complete_provider_response(client):
+    """A parsed Codex-style response must still reach Anthropic stream clients."""
+    complete_response = {
+        "id": "chatcmpl-complete-anthropic",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "complete response",
+                "tool_calls": [{
+                    "id": "call_read",
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "arguments": '{"path":"README.md"}',
+                    },
+                }],
+            },
+            "finish_reason": "tool_calls",
+        }],
+    }
+    with patch("tusker_gateway.anthropic_adapter.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
+        mock_chat.return_value = complete_response
+        resp = await client.post(
+            "/v1/messages",
+            json={
+                "model": "openai::gpt-4o",
+                "max_tokens": 128,
+                "stream": True,
+                "tools": [{
+                    "name": "read",
+                    "input_schema": {"type": "object"},
+                }],
+                "messages": [{"role": "user", "content": "read README"}],
+            },
+            headers=HEADERS_AUTH,
+        )
+        assert resp.status == 200
+        content = await resp.read()
+
+    assert b"event: message_start" in content
+    assert b"complete response" in content
+    assert b'"type": "tool_use"' in content
+    assert b'"id": "call_read"' in content
+    assert b"README.md" in content
+    assert b"event: message_stop" in content
+
+
+@pytest.mark.asyncio
+async def test_messages_forwards_client_session_to_provider_call(client):
+    openai_response = {
+        "choices": [{"message": {"content": "Hello"}, "finish_reason": "stop"}],
+        "usage": {},
+    }
+    with patch("tusker_gateway.anthropic_adapter.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
+        mock_chat.return_value = openai_response
+        resp = await client.post(
+            "/v1/messages",
+            json={
+                "model": "opencode-go::minimax-m3",
+                "max_tokens": 32,
+                "messages": [{"role": "user", "content": "Hi"}],
+            },
+            headers={**HEADERS_AUTH, "x-opencode-session": "anthropic-session-1"},
+        )
+
+    assert resp.status == 200
+    assert mock_chat.call_args.kwargs["conversation_id"] == "anthropic-session-1"
+
+
+@pytest.mark.asyncio
+async def test_messages_forwards_parameters_and_tool_history(client):
+    openai_response = {
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "done",
+            },
+            "finish_reason": "stop",
+        }],
+        "usage": {},
+    }
+    with patch("tusker_gateway.anthropic_adapter.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
+        mock_chat.return_value = openai_response
+        resp = await client.post(
+            "/v1/messages",
+            json={
+                "model": "openai::gpt-4o",
+                "max_tokens": 256,
+                "temperature": 0.2,
+                "top_p": 0.8,
+                "stop_sequences": ["END"],
+                "tools": [{
+                    "name": "read",
+                    "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}},
+                }],
+                "messages": [
+                    {"role": "user", "content": "inspect"},
+                    {
+                        "role": "assistant",
+                        "content": [{
+                            "type": "tool_use",
+                            "id": "toolu_read",
+                            "name": "read",
+                            "input": {"path": "README.md"},
+                        }],
+                    },
+                    {
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_read",
+                            "content": "contents",
+                        }],
+                    },
+                ],
+            },
+            headers=HEADERS_AUTH,
+        )
+
+    assert resp.status == 200
+    kwargs = mock_chat.call_args.kwargs
+    assert kwargs["tools"][0]["function"]["name"] == "read"
+    assert kwargs["extra_body"] == {
+        "max_tokens": 256,
+        "temperature": 0.2,
+        "top_p": 0.8,
+        "stop": ["END"],
+    }
+    messages = mock_chat.call_args.args[2]
+    assert messages[1]["tool_calls"][0]["function"]["name"] == "read"
+    assert messages[2] == {
+        "role": "tool",
+        "tool_call_id": "toolu_read",
+        "content": "contents",
+    }
 
 
 @pytest.mark.asyncio

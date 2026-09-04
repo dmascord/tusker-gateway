@@ -112,9 +112,10 @@ which becomes HTTP 502 and exhausts the agent retry budget.
 
 When checking OMP routing, use the standalone provider configured as
 `tusker-gateway` with `https://ai.tusker.net.au/v1`. The older
-`hermes-gateway` provider points at `https://hermes.tusker.net.au/v1` and uses
-the Hermes service's separate fallback implementation; changes to this
-deployment's `TUSKER_POOL_CODE` do not change that legacy service.
+`hermes-gateway` provider may continue using `https://hermes.tusker.net.au/v1`:
+its `/v1/` API route now targets this gateway, while the Hermes web routes and
+deployment remain available as the rollback target. Changes to this
+deployment's `TUSKER_POOL_CODE` therefore apply to both API hostnames.
 
 ## 6. Rollback
 
@@ -151,3 +152,10 @@ kubectl -n hermes delete pvc tusker-home
   Hermes's pool was cleared to prevent refresh-token reuse collisions.
   `TUSKER_POOL_CODE` and `TUSKER_POOL_PRIVACY` were rebuilt from the live hermes
   pools, plus all `openai-codex/*` models exposed by the migrated catalog.
+- **2026-09-04** — Cut the `hermes.tusker.net.au` `/v1/` API route over to
+  `tusker-gateway` without changing DNS, OMP configuration, or the Hermes web
+  routes. Merged the three legacy Hermes client-key identities into
+  `tusker-env-vault` (seven unique gateway-accepted keys total), changed the
+  deployment to consume `API_KEYS` from that secret, and added compatibility
+  entries for the legacy model catalog. The Hermes deployment remains running
+  for rollback.

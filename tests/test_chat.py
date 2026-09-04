@@ -9,8 +9,13 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from tusker_gateway.budget import BudgetDecision
-from tusker_gateway.errors import ProviderError
-from tusker_gateway.endpoints import _call_with_pool_fallback, _required_input_modalities
+from tusker_gateway.errors import ProviderError, RateLimitError
+from tusker_gateway.endpoints import (
+    _call_with_pool_fallback,
+    _public_provider_failure_response,
+    _request_conversation_id,
+    _required_input_modalities,
+)
 from .conftest import HEADERS_AUTH, HEADERS_NO_AUTH
 
 
@@ -30,6 +35,21 @@ class _FakeSemanticCache:
         return {"hits": 0, "misses": 0, "writes": 0, "evictions": 0}
 
 
+def test_public_provider_quota_failure_has_safe_machine_signal():
+    response = _public_provider_failure_response(
+        RateLimitError(
+            body=(
+                "Quota exceeded for metric "
+                "generativelanguage.googleapis.com/generate_content_free_tier_requests, "
+                "limit: 0"
+            )
+        )
+    )
+
+    assert response.status == 502
+    assert response.headers["X-Tusker-Provider-Failure"] == "provider_quota"
+
+
 def test_required_input_modalities_collects_multiple_media_types():
     assert _required_input_modalities([
         {
@@ -41,6 +61,15 @@ def test_required_input_modalities_collects_multiple_media_types():
             ],
         }
     ]) == frozenset({"audio", "image", "video"})
+
+
+def test_request_conversation_id_prefers_explicit_client_header():
+    request = SimpleNamespace(headers={"x-opencode-session": "client-session-1"})
+    body = {
+        "messages": [{"role": "user", "content": "hello"}],
+        "conversation_id": "body-session",
+    }
+    assert _request_conversation_id(request, body, "caller-key") == "client-session-1"
 
 
 @pytest.mark.asyncio
@@ -160,6 +189,55 @@ async def test_chat_completions_validation(client, payload, expected_code):
 
 
 @pytest.mark.asyncio
+async def test_chat_completions_accepts_null_assistant_content_with_tool_calls(app, client):
+    """Accept the standard tool-turn shape emitted by OMP/OpenAI clients."""
+    with patch("tusker_gateway.endpoints.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
+        mock_chat.return_value = {
+            "choices": [{"message": {"role": "assistant", "content": "done"}}],
+        }
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "minimax::MiniMax-M3",
+                "messages": [
+                    {"role": "user", "content": "inspect"},
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [{
+                            "id": "call-read",
+                            "type": "function",
+                            "function": {
+                                "name": "read",
+                                "arguments": '{"path":"skill://delivery-lifecycle"}',
+                            },
+                        }],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call-read",
+                        "content": '{"status":"ok"}',
+                    },
+                ],
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"path": {"type": "string"}},
+                        },
+                    },
+                }],
+            },
+            headers=HEADERS_AUTH,
+        )
+
+    assert resp.status == 200
+    mock_chat.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_chat_completions_pool_dispatch(client):
     # Mock PassthroughClient.chat
     with patch("tusker_gateway.endpoints.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
@@ -176,6 +254,29 @@ async def test_chat_completions_pool_dispatch(client):
         args, kwargs = mock_chat.call_args
         assert args[0] == "minimax"
         assert args[1] == "MiniMax-M3"
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_forwards_client_session_to_provider_call(app, client):
+    pool_manager = MagicMock()
+    pool_manager.select.return_value = ("opencode-go", "minimax-m3")
+    app["pool_manager"] = pool_manager
+
+    with patch("tusker_gateway.endpoints.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
+        mock_chat.return_value = {
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+        }
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-code",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            headers={**HEADERS_AUTH, "x-opencode-session": "client-session-1"},
+        )
+
+    assert resp.status == 200
+    assert mock_chat.call_args.kwargs["conversation_id"] == "client-session-1"
 
 
 @pytest.mark.asyncio

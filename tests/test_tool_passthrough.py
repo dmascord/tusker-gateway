@@ -136,6 +136,76 @@ async def test_request_body_preserves_explicit_tool_choice():
     assert body["tool_choice"] == "required"
 
 
+@pytest.mark.asyncio
+async def test_opencode_go_sets_conversation_session_header():
+    http = _mock_http({"choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]})
+    client = PassthroughClient(
+        _cfg(provider_api_keys={"opencode-go": "go-test-key"}),
+        QualityDB(":memory:"),
+        http,
+    )
+
+    await client.chat(
+        "opencode-go",
+        "minimax-m3",
+        [{"role": "user", "content": "hello"}],
+        conversation_id="omp-conversation-123",
+    )
+
+    request = http.request.call_args
+    headers = request.kwargs["headers"]
+    assert headers["x-opencode-session"] == "omp-conversation-123"
+    assert request.args[0] == "POST"
+    assert request.args[1].endswith("/zen/go/v1/chat/completions")
+
+
+@pytest.mark.asyncio
+async def test_opencode_go_fallback_session_is_stable_as_history_grows():
+    first_turn = [
+        {"role": "system", "content": "You are helpful."},
+        {"role": "user", "content": "Start this conversation."},
+    ]
+    later_turn = [
+        *first_turn,
+        {"role": "assistant", "content": "Started."},
+        {"role": "user", "content": "Continue it."},
+    ]
+    http = _mock_http({"choices": [{"message": {"role": "assistant", "content": "ok"}}]})
+    client = PassthroughClient(
+        _cfg(provider_api_keys={"opencode-go": "go-test-key"}),
+        QualityDB(":memory:"),
+        http,
+    )
+
+    await client.chat("opencode-go", "minimax-m3", first_turn)
+    first_header = http.request.call_args.kwargs["headers"]["x-opencode-session"]
+    await client.chat("opencode-go", "minimax-m3", later_turn)
+    later_header = http.request.call_args.kwargs["headers"]["x-opencode-session"]
+
+    assert first_header == later_header
+    assert first_header.startswith("tusker-")
+
+
+@pytest.mark.asyncio
+async def test_opencode_go_normalizes_openai_reasoning_effort_aliases():
+    http = _mock_http({"choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]})
+    client = PassthroughClient(
+        _cfg(provider_api_keys={"opencode-go": "go-test-key"}),
+        QualityDB(":memory:"),
+        http,
+    )
+
+    await client.chat(
+        "opencode-go",
+        "minimax-m3",
+        [{"role": "user", "content": "hello"}],
+        extra_body={"reasoning_effort": "minimal"},
+    )
+
+    body = http.request.call_args.kwargs["json"]
+    assert body["reasoning_effort"] == "low"
+
+
 def test_openai_messages_to_anthropic_round_trip():
     msgs = [
         {"role": "system", "content": "you are helpful"},

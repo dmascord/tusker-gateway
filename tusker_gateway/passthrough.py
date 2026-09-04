@@ -6,6 +6,7 @@ for Codex OAuth and cooldown tracking on failures.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -15,7 +16,7 @@ from typing import Any, AsyncIterator
 
 import aiohttp
 
-from tusker_gateway.cooldown import global_tracker
+from tusker_gateway.cooldown import _QUOTA_HINTS, global_tracker
 from tusker_gateway.errors import (
     GatewayError,
     ProviderCapacityError,
@@ -39,6 +40,111 @@ logger = logging.getLogger(__name__)
 _SENSITIVE_ERROR_VALUE_RE = re.compile(
     r"(?i)(\b(?:authorization|api[_ -]?key|access[_ -]?token|refresh[_ -]?token|token)\b\s*[:=]\s*)([\"']?)[^\s,\"'}]+",
 )
+
+_OPENCODE_GO_PROVIDER = "opencode-go"
+_OPENCODE_SESSION_HEADER = "x-opencode-session"
+_OPENCODE_REASONING_EFFORT_ALIASES = {
+    # OpenAI-compatible clients sometimes use `minimal`/`maximal`, while
+    # OpenCode Go accepts low/medium/high/xhigh/max/none/adaptive.
+    "minimal": "low",
+    "maximal": "max",
+}
+
+
+def _normalize_reasoning_effort(value: Any) -> Any:
+    """Normalize client aliases accepted by OpenCode/Codex backends."""
+    if not isinstance(value, str):
+        return value
+    return _OPENCODE_REASONING_EFFORT_ALIASES.get(
+        value.strip().lower(),
+        value,
+    )
+
+
+def _sanitize_opencode_session_id(value: Any) -> str | None:
+    """Return a safe, bounded OpenCode session header value."""
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not value or len(value) > 256:
+        return None
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
+        return None
+    return value
+
+
+def _messages_contain_image_input(messages: Any) -> bool:
+    """Return whether a chat transcript contains an image input block."""
+    if not isinstance(messages, list):
+        return False
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and str(block.get("type") or "").strip().lower() in {
+                "image_url",
+                "input_image",
+            }:
+                return True
+    return False
+
+
+def _conversation_opening(messages: Any) -> list[dict[str, Any]]:
+    """Return the stable opening portion of a chat conversation.
+
+    Chat Completions is stateless, so the gateway uses the initial system /
+    developer context and first user message as the fallback conversation
+    anchor. Later assistant/tool turns are deliberately excluded so the ID
+    remains stable as the conversation grows.
+    """
+    if not isinstance(messages, list):
+        return []
+    opening: list[dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            break
+        role = message.get("role")
+        if role in {"system", "developer"}:
+            opening.append({"role": role, "content": message.get("content")})
+            continue
+        if role == "user":
+            opening.append({"role": role, "content": message.get("content")})
+            break
+        if opening:
+            break
+    if not opening and messages and isinstance(messages[0], dict):
+        opening.append({
+            "role": messages[0].get("role"),
+            "content": messages[0].get("content"),
+        })
+    return opening
+
+
+def _stable_opencode_session_id(
+    messages: Any,
+    *,
+    caller_key: str | None = None,
+) -> str:
+    """Build a stable, non-secret fallback ID for one conversation."""
+    caller_fingerprint = (
+        hashlib.sha256(caller_key.encode("utf-8")).hexdigest()[:16]
+        if caller_key
+        else "anonymous"
+    )
+    material = json.dumps(
+        {
+            "caller": caller_fingerprint,
+            "opening": _conversation_opening(messages),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return "tusker-" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
 
 
 def _safe_upstream_body(body: str | None, *, limit: int = 500) -> str:
@@ -206,8 +312,28 @@ def _stream_frame_is_ready(frame: bytes) -> bool:
 
 
 def _upstream_failure_cooldown_seconds(exc: BaseException) -> float | None:
-    """Return a short model cooldown for retryable stream failures."""
+    """Return a model cooldown for retryable or quota-gated stream failures."""
     status = getattr(exc, "upstream_status", None)
+    try:
+        status_code = int(status) if status is not None else None
+    except (TypeError, ValueError):
+        status_code = None
+    body = str(getattr(exc, "upstream_body", None) or "").lower()
+    # Only interpret quota markers on a non-5xx provider response. A 5xx
+    # message may contain the word "capacity" while still being a transient
+    # overload; those failures must keep the short retry cooldown.
+    if status_code == 402 or (
+        status_code is not None
+        and status_code < 500
+        and any(hint in body for hint in _QUOTA_HINTS)
+    ):
+        try:
+            return max(
+                1.0,
+                float(os.environ.get("TUSKER_RETRY_QUOTA_COOLDOWN", "3600")),
+            )
+        except (TypeError, ValueError):
+            return 3600.0
     if status is not None:
         try:
             if not 500 <= int(status) < 600:
@@ -561,7 +687,7 @@ class CodexTokenRotator:
             )
 
         if self._provider == "openai-codex":
-            from tusker_gateway.codex_oauth import refresh_codex_token
+            from tusker_gateway.codex_oauth import codex_token_profile, refresh_codex_token
 
             data, expires_at = await refresh_codex_token(refresh, http=self._http)
             token = data["access_token"]
@@ -573,6 +699,12 @@ class CodexTokenRotator:
             if isinstance(id_token, str) and id_token:
                 cred["id_token"] = id_token
             cred["expires_at_ms"] = int(expires_at * 1000)
+            profile = codex_token_profile(token, id_token if isinstance(id_token, str) else None)
+            if profile.get("account_id"):
+                cred["account_id"] = profile["account_id"]
+            if profile.get("email"):
+                cred["email"] = profile["email"]
+            cred["last_refresh"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             return cred
 
         from tusker_gateway.copilot_exchange import exchange_copilot_token
@@ -590,6 +722,7 @@ class CodexTokenRotator:
         )
         cred["access_token"] = token
         cred["expires_at_ms"] = int(expires_at * 1000)
+        cred["last_refresh"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         return cred
 
     @classmethod
@@ -634,8 +767,12 @@ class CodexTokenRotator:
         if not self._auth_file:
             return
         try:
-            from tusker_gateway.copilot_enroll import save_auth_file
-            save_auth_file(self._creds, self._auth_file)
+            from tusker_gateway.copilot_enroll import save_provider_auth_pool
+            save_provider_auth_pool(
+                self._provider,
+                self._creds,
+                self._auth_file,
+            )
         except Exception:
             pass  # best-effort persistence
 
@@ -676,6 +813,94 @@ def _chat_content_to_responses(content: Any) -> str | list[dict[str, Any]]:
         else:
             raise ProviderError(f"Unsupported message content block type: {block_type}")
     return converted
+
+
+def _responses_tool_output(content: Any) -> str:
+    """Serialize a Chat Completions tool result for Responses ``output``."""
+    if isinstance(content, str):
+        return content
+    if content is None:
+        return ""
+    try:
+        return json.dumps(content, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return str(content)
+
+
+def _chat_messages_to_responses(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Translate a Chat Completions transcript into Responses input items.
+
+    Chat Completions represents a tool turn as an assistant message containing
+    ``tool_calls`` followed by one ``role=tool`` message per call.  The
+    Responses API represents the same turn as ``function_call`` and
+    ``function_call_output`` items.  Dropping either side makes every follow-up
+    request look like the model's tool call was never executed, which causes
+    agent clients to repeat the same tools indefinitely.
+    """
+    from tusker_gateway.tool_formats import normalize_tool_calls
+
+    input_data: list[dict[str, Any]] = []
+    for index, msg in enumerate(messages):
+        if not isinstance(msg, dict):
+            raise ProviderError(f"Message {index} must be an object")
+        role = msg.get("role")
+
+        if role == "tool":
+            call_id = str(msg.get("tool_call_id") or msg.get("call_id") or "").strip()
+            if not call_id:
+                # There is no safe Responses representation for an orphaned
+                # tool result. Failing explicitly prevents a malformed
+                # transcript from looking like a valid request with missing
+                # history.
+                raise ProviderError(
+                    f"Message {index} is a tool result without tool_call_id"
+                )
+            output_item: dict[str, Any] = {
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": _responses_tool_output(msg.get("content")),
+            }
+            if msg.get("is_error") is True:
+                # Responses supports a status on function-call output items;
+                # retaining it prevents a failed tool execution from being
+                # replayed upstream as if it succeeded.
+                output_item["status"] = "failed"
+            input_data.append(output_item)
+            continue
+
+        if role not in {"system", "developer", "user", "assistant"}:
+            raise ProviderError(
+                f"Message {index} has unsupported role: {role!r}"
+            )
+
+        content = _chat_content_to_responses(msg.get("content"))
+        input_role = "developer" if role == "developer" else role
+
+        if input_role == "assistant":
+            # An assistant tool-call message commonly has empty/null content;
+            # do not manufacture a redundant empty assistant item before the
+            # function_call items.
+            if content not in ("", [], None):
+                input_data.append({"role": input_role, "content": content})
+
+            raw_calls = msg.get("tool_calls")
+            if raw_calls is None and msg.get("function_call") is not None:
+                raw_calls = [msg["function_call"]]
+            for call in normalize_tool_calls(raw_calls):
+                function = call["function"]
+                input_data.append({
+                    "type": "function_call",
+                    "call_id": call["id"],
+                    "name": function["name"],
+                    "arguments": function["arguments"],
+                })
+            continue
+
+        if isinstance(content, str):
+            content = [{"type": "input_text", "text": content}]
+        input_data.append({"role": input_role, "content": content})
+
+    return input_data
 
 
 def _responses_text(content: str | list[dict[str, Any]]) -> str:
@@ -933,6 +1158,7 @@ class PassthroughClient:
         tool_choice: Any | None = None,
         extra_headers: dict[str, str] | None = None,
         extra_body: dict[str, Any] | None = None,
+        conversation_id: str | None = None,
         upstream_gateway: str | None = None,
         rtk_compress: bool = True,
         metrics_registry: Any | None = None,
@@ -1009,6 +1235,7 @@ class PassthroughClient:
             stream=stream, api_key=(self._config["api_keys"][0] if upstream_gateway else api_key),
             tools=tools, tool_choice=tool_choice,
             extra_headers=extra_headers, extra_body=extra_body,
+            conversation_id=conversation_id,
             endpoint=endpoint,
         )
 
@@ -1243,6 +1470,7 @@ class PassthroughClient:
         tool_choice: Any | None = None,
         extra_headers: dict[str, str] | None,
         extra_body: dict[str, Any] | None,
+        conversation_id: str | None = None,
         endpoint: dict[str, Any],
     ) -> tuple[dict[str, str], dict[str, Any]]:
         from tusker_gateway.auth_strategies import get_auth_strategy
@@ -1263,6 +1491,36 @@ class PassthroughClient:
                 self._config, provider, model, api_key, endpoint_model
             )
         )
+        if (
+            provider.lower()
+            in {"github-copilot", "github-copilot-enterprise"}
+            and _messages_contain_image_input(messages)
+        ):
+            # The model slug is not a reliable vision signal (for example,
+            # provider aliases and newly-added multimodal models often have
+            # text-looking names). Tell Copilot from the actual request
+            # content so image recognition is negotiated correctly.
+            headers["Copilot-Vision-Request"] = "true"
+        if provider.lower() == _OPENCODE_GO_PROVIDER:
+            explicit_header = next(
+                (
+                    value
+                    for key, value in headers.items()
+                    if key.lower() == _OPENCODE_SESSION_HEADER
+                ),
+                None,
+            )
+            session_id = (
+                _sanitize_opencode_session_id(explicit_header)
+                or _sanitize_opencode_session_id(conversation_id)
+                or _stable_opencode_session_id(messages)
+            )
+            # Normalize the spelling and remove a differently-cased duplicate
+            # supplied by a caller so aiohttp emits exactly one header.
+            for key in tuple(headers):
+                if key != _OPENCODE_SESSION_HEADER and key.lower() == _OPENCODE_SESSION_HEADER:
+                    del headers[key]
+            headers[_OPENCODE_SESSION_HEADER] = session_id
         body: dict[str, Any] = {
             "model": model,
             "messages": messages,
@@ -1274,6 +1532,10 @@ class PassthroughClient:
                 body["tool_choice"] = tool_choice
         if extra_body:
             body.update(extra_body)
+        if provider.lower() == _OPENCODE_GO_PROVIDER:
+            effort = body.get("reasoning_effort")
+            if isinstance(effort, str):
+                body["reasoning_effort"] = _normalize_reasoning_effort(effort)
         return headers, body
     async def _chat_codex(
         self,
@@ -1309,22 +1571,13 @@ class PassthroughClient:
             **(extra_headers or {}),
             **await strategy.headers(self._config, provider, model, api_key, endpoint_model),
         }
-        input_data: list[dict[str, Any]] = []
-        for msg in messages:
-            role = msg.get("role")
-            if role not in {"system", "developer", "user", "assistant"}:
-                continue
-            content = _chat_content_to_responses(msg.get("content"))
-            input_role = "developer" if role == "developer" else role
-            if input_role == "assistant" and isinstance(content, str):
-                # Keep the existing assistant-history wire shape. Responses
-                # accepts assistant input as a plain string; output_text is
-                # reserved for model output items.
-                input_data.append({"role": input_role, "content": content})
-            else:
-                if isinstance(content, str):
-                    content = [{"type": "input_text", "text": content}]
-                input_data.append({"role": input_role, "content": content})
+        if (
+            provider.lower()
+            in {"github-copilot", "github-copilot-enterprise"}
+            and _messages_contain_image_input(messages)
+        ):
+            headers["Copilot-Vision-Request"] = "true"
+        input_data = _chat_messages_to_responses(messages)
         # Codex backend requires stream=true; force it here regardless of
         # what the caller asked for (the response parser handles SSE).
         body: dict[str, Any] = {
@@ -1346,12 +1599,22 @@ class PassthroughClient:
         # variant or reject the request entirely.
         body["reasoning"] = {"effort": "medium", "summary": "auto"}
         if tools:
-            body["tools"] = [
-                {"type": "function", "name": t["function"]["name"],
-                 "description": t["function"].get("description", ""),
-                 "parameters": t["function"].get("parameters", {"type": "object", "properties": {}})}
-                for t in normalize_tools(tools)
-            ]
+            response_tools: list[dict[str, Any]] = []
+            for tool in normalize_tools(tools):
+                function = tool["function"]
+                response_tool: dict[str, Any] = {
+                    "type": "function",
+                    "name": function["name"],
+                    "description": function.get("description", ""),
+                    "parameters": function.get(
+                        "parameters",
+                        {"type": "object", "properties": {}},
+                    ),
+                }
+                if "strict" in function:
+                    response_tool["strict"] = function["strict"]
+                response_tools.append(response_tool)
+            body["tools"] = response_tools
             body["tool_choice"] = (
                 _responses_tool_choice(tool_choice)
                 if tool_choice is not None
@@ -1398,8 +1661,25 @@ class PassthroughClient:
             if reffort is not None:
                 if not isinstance(body.get("reasoning"), dict):
                     body["reasoning"] = {}
-                body["reasoning"]["effort"] = reffort
+                body["reasoning"]["effort"] = _normalize_reasoning_effort(reffort)
+            reasoning_override = mapped.pop("reasoning", None)
+            if isinstance(reasoning_override, dict):
+                if not isinstance(body.get("reasoning"), dict):
+                    body["reasoning"] = {}
+                body["reasoning"].update(reasoning_override)
+            elif reasoning_override is not None:
+                mapped["reasoning"] = reasoning_override
             body.update(mapped)
+            # Callers may already provide a Responses-shaped reasoning object
+            # through extra_body. Normalize that form too; otherwise a
+            # nested ``effort: minimal`` would bypass the flat-field fix.
+            reasoning = body.get("reasoning")
+            if isinstance(reasoning, dict):
+                reasoning.setdefault("summary", "auto")
+                if "effort" in reasoning:
+                    reasoning["effort"] = _normalize_reasoning_effort(
+                        reasoning["effort"]
+                    )
         url = f"{endpoint_raw['base_url']}{endpoint_raw['chat_path']}"
         start = time.monotonic()
         resp = await self._http.request("POST", url, headers=headers, json=body, timeout=aiohttp.ClientTimeout(total=120))
@@ -1517,9 +1797,17 @@ class PassthroughClient:
                 continue
             etype = evt.get("type", "")
             if etype == "response.output_text.delta":
-                delta = evt.get("delta") or ""
-                if delta:
+                delta = evt.get("delta")
+                if isinstance(delta, str) and delta:
                     content_parts.append(delta)
+            elif etype == "response.output_text.done":
+                # A few Responses implementations omit delta events and send
+                # the complete text only in the terminal output_text.done
+                # event. Do not lose that answer, but avoid duplicating it
+                # when deltas were already received.
+                text = evt.get("text")
+                if isinstance(text, str) and not content_parts:
+                    content_parts.append(text)
             elif etype == "response.output_item.added":
                 item = evt.get("item") or {}
                 if item.get("type") == "function_call":
@@ -1547,8 +1835,18 @@ class PassthroughClient:
                 # only on response.completed. Use them as a final metadata /
                 # argument fallback.
                 for item in response.get("output") or []:
-                    if isinstance(item, dict) and item.get("type") == "function_call":
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get("type") == "function_call":
                         ensure_function_call(item)
+                    elif item.get("type") == "message" and not content_parts:
+                        for content in item.get("content") or []:
+                            if not isinstance(content, dict):
+                                continue
+                            if content.get("type") in {"output_text", "text"}:
+                                text = content.get("text")
+                                if isinstance(text, str):
+                                    content_parts.append(text)
             elif etype == "response.failed":
                 err = evt.get("error") or {}
                 raise ProviderError(f"Codex response failed: {err.get('code','unknown')} {err.get('message','')[:200]}")

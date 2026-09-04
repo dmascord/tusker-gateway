@@ -95,6 +95,16 @@ class TestRequestAnthropicToOpenAI:
         out = translate_request(ANTHROPIC, body)
         assert out["messages"][0] == {"role": "system", "content": "You are helpful."}
 
+    def test_system_unknown_block_is_not_silently_dropped(self):
+        body = {
+            "system": [{"type": "tool_use", "id": "unexpected", "name": "read", "input": {}}],
+            "messages": [],
+        }
+
+        out = translate_request(ANTHROPIC, body)
+
+        assert "unexpected" in out["messages"][0]["content"]
+
     def test_stop_sequences_mapping(self):
         body = {"stop_sequences": ["END", "STOP"], "messages": []}
         out = translate_request(ANTHROPIC, body)
@@ -139,6 +149,55 @@ class TestRequestAnthropicToOpenAI:
     def test_stream_flag_passthrough(self):
         body = {"stream": True, "messages": []}
         assert translate_request(ANTHROPIC, body)["stream"] is True
+
+    def test_tool_use_and_tool_result_remain_structured(self):
+        body = {
+            "messages": [
+                {"role": "user", "content": "read the file"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "I will inspect it."},
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_read",
+                            "name": "read",
+                            "input": {"path": "package.json"},
+                        },
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_read",
+                        "content": [{"type": "text", "text": "{}"}],
+                        "is_error": True,
+                    }],
+                },
+            ],
+        }
+
+        out = translate_request(ANTHROPIC, body)
+
+        assert out["messages"][1] == {
+            "role": "assistant",
+            "content": "I will inspect it.",
+            "tool_calls": [{
+                "id": "toolu_read",
+                "type": "function",
+                "function": {
+                    "name": "read",
+                    "arguments": '{"path": "package.json"}',
+                },
+            }],
+        }
+        assert out["messages"][2] == {
+            "role": "tool",
+            "tool_call_id": "toolu_read",
+            "content": "{}",
+            "is_error": True,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -202,10 +261,57 @@ class TestResponseOpenAIToAnthropic:
         chunks = translate_response(ANTHROPIC, result, {})
         assert chunks[0]["content"][0]["input"] == {"x": 1}
 
+    def test_legacy_function_call_becomes_tool_use_block_without_normalizer(self):
+        result = {
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "function_call": {
+                        "name": "read",
+                        "arguments": '{"path":"README.md"}',
+                    },
+                },
+                "finish_reason": "function_call",
+            }],
+        }
+
+        response = translate_response(ANTHROPIC, result, {})[0]
+
+        block = response["content"][0]
+        assert block["type"] == "tool_use"
+        assert block["name"] == "read"
+        assert block["input"] == {"path": "README.md"}
+        assert response["stop_reason"] == "tool_use"
+
     def test_finish_reason_length(self):
         result = {"choices": [{"message": {"content": ""}, "finish_reason": "length"}]}
         chunks = translate_response(ANTHROPIC, result, {})
         assert chunks[0]["stop_reason"] == "max_tokens"
+
+    def test_preserves_output_blocks_and_usage_aliases(self):
+        result = {
+            "choices": [{
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "done"},
+                        {"type": "provider_annotation", "value": "kept"},
+                    ],
+                },
+                "finish_reason": "stop",
+            }],
+            "usage": {"input_tokens": 7, "output_tokens": 4},
+        }
+
+        response = translate_response(ANTHROPIC, result, {})[0]
+
+        assert response["content"] == [
+            {"type": "text", "text": "done"},
+            {
+                "type": "text",
+                "text": '{"type": "provider_annotation", "value": "kept"}',
+            },
+        ]
+        assert response["usage"] == {"input_tokens": 7, "output_tokens": 4}
 
 
 # ---------------------------------------------------------------------------
@@ -325,6 +431,54 @@ class TestStreaming:
         closing = translate_openai_chunk_to_anthropic(None, state)
         text = b"".join(closing).decode("utf-8")
         assert '"stop_reason": "end_turn"' in text
+
+    def test_native_tool_call_stream_preserves_id_name_and_arguments(self):
+        state = init_anthropic_stream_state(model="claude-3")
+
+        first = translate_openai_chunk_to_anthropic(
+            {
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_read",
+                            "type": "function",
+                            "function": {"name": "read", "arguments": '{"path":'},
+                        }],
+                    },
+                }],
+            },
+            state,
+        )
+        second = translate_openai_chunk_to_anthropic(
+            {
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "function": {"arguments": '"package.json"}'},
+                            },
+                        ],
+                    },
+                }],
+            },
+            state,
+        )
+        closing = translate_openai_chunk_to_anthropic(
+            {"choices": [{"finish_reason": "tool_calls", "delta": {}}]},
+            state,
+        )
+        closing.extend(translate_openai_chunk_to_anthropic(None, state))
+
+        stream_text = b"".join([*first, *second, *closing]).decode("utf-8")
+        assert '"type": "tool_use"' in stream_text
+        assert '"id": "call_read"' in stream_text
+        assert '"name": "read"' in stream_text
+        assert '"partial_json": "{\\"path\\":"' in stream_text
+        assert '"partial_json": "\\"package.json\\"}"' in stream_text
+        assert '"stop_reason": "tool_use"' in stream_text
 
     def test_via_registry_init_streaming_state(self):
         state = init_streaming_state(ANTHROPIC)

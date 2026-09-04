@@ -6,6 +6,7 @@ role alias (hermes-code, hermes-privacy, hermes-premium, hermes-swarm).
 from __future__ import annotations
 
 import logging
+import math
 import os
 import random
 import re
@@ -31,6 +32,11 @@ from tusker_gateway.tool_capability import (
 logger = logging.getLogger(__name__)
 
 
+def _normalise_input_modality(value: Any) -> str:
+    """Normalize configured modality names to the catalog/DB spelling."""
+    return str(value).strip().lower().replace("-", "_")
+
+
 # Pools that are considered "premium" tiers — heavyweight models are
 # kept for these (mirrors hermes-agent's `hermes-premium` semantics).
 # Cheap-tier pools (`hermes-code`, `hermes-privacy`) drop heavyweights.
@@ -44,6 +50,9 @@ _SPECIAL_PURPOSE_MODEL_RE = re.compile(
     r"safety[-_.]?classifier|guard(?:rail)?|embed(?:ding)?s?|"
     r"rerank(?:er)?|whisper|transcrib(?:e|er|ing)?|tts|asr|"
     r"speech[-_.]?to[-_.]?text|text[-_.]?to[-_.]?speech|"
+    r"native[-_.]?audio|live(?:[-_.]?preview)?|live[-_.]?audio|"
+    r"audio[-_.]?(?:native|realtime)|realtime[-_.]?audio|"
+    r"deep[-_.]?research|computer[-_.]?use|antigravity|aqa|"
     r"image[-_.]?(?:generation|gen)|text[-_.]?to[-_.]?image|"
     r"stable[-_.]?diffusion|dall[-_.]?e|imagen)(?:$|[/._:-])",
     re.IGNORECASE,
@@ -68,12 +77,21 @@ def is_general_chat_model(provider: str, model: str) -> bool:
     """Return whether a model is suitable for a normal chat pool.
 
     This is deliberately conservative for catalog-discovered candidates:
-    safety/moderation classifiers and provider-level routers are valid
+    safety/moderation classifiers, modality-specific endpoints such as
+    Gemini Live/native-audio models, and provider-level routers are valid
     upstream products, but they are not valid general assistant backends.
     """
     normalized_provider = str(provider).strip().lower()
     normalized_model = str(model).strip().lower()
     if (normalized_provider, normalized_model) in _PROVIDER_ROUTER_MODELS:
+        return False
+    # Google's image-output model IDs use a bare ``-image`` suffix, which is
+    # distinct from ordinary multimodal chat models whose slugs may merely
+    # mention images. Keep this provider-specific to avoid filtering valid
+    # OpenRouter/chat slugs such as a test or vision model named ``tool-image``.
+    if normalized_provider == "google" and re.search(
+        r"(?:^|[/._:-])image(?:$|[/._:-])", normalized_model,
+    ):
         return False
     return _SPECIAL_PURPOSE_MODEL_RE.search(normalized_model) is None
 
@@ -155,9 +173,12 @@ class ModelSpec:
         else:
             hw = bool(hw)
         modalities = data.get("input_modalities")
-        weight = float(data.get("weight", 1.0))
-        if weight <= 0:
+        try:
+            weight = float(data.get("weight", 1.0))
+        except (TypeError, ValueError):
             weight = 1.0  # fallback to equal weight
+        if not math.isfinite(weight) or weight <= 0:
+            weight = 1.0
         # ``provider_zdr_ok`` is optional for backwards-compatible direct
         # callers. PoolManager always supplies it so privacy policy is based
         # on the provider registry rather than only on the pool flag.
@@ -170,7 +191,11 @@ class ModelSpec:
             zdr_ok=zdr and not hw and provider_allowed,
             weight=weight,
             input_modalities=(
-                frozenset(str(modality) for modality in modalities)
+                frozenset(
+                    _normalise_input_modality(modality)
+                    for modality in modalities
+                    if _normalise_input_modality(modality)
+                )
                 if modalities is not None
                 else None
             ),
@@ -208,6 +233,7 @@ class PoolManager:
     # stop being free).
     _original_static: dict[str, frozenset[tuple[str, str]]] = field(default_factory=dict)
     _stickiness: dict[tuple[str, str], tuple[str, str]] = field(default_factory=dict)
+    _round_robin: dict[str, int] = field(default_factory=dict)
     _disabled_providers: frozenset[str] = field(
         init=False, default_factory=frozenset
     )
@@ -609,6 +635,22 @@ class PoolManager:
         modalities = spec.input_modalities
         if modalities is None:
             modalities = advertised_input_modalities(entry)
+        if modalities is None and self._model_capability_db is not None:
+            # A catalog refresh records modality claims in the persistent DB
+            # as well as retaining the in-memory catalog row. Use those
+            # records when a provider's catalog is temporarily unavailable
+            # or its row does not carry the modality fields. Explicit pool
+            # metadata remains authoritative over this fallback.
+            discovered_modalities = {
+                record.capability.removeprefix("input_")
+                for record in self._model_capability_db.for_model(
+                    spec.provider, spec.model
+                )
+                if record.capability.startswith("input_")
+                and record.status in {"advertised", "passed"}
+            }
+            if discovered_modalities:
+                modalities = frozenset(discovered_modalities)
         tool_support = advertised_tool_support(entry)
         capability_cache[key] = (modalities, tool_support)
         return modalities, tool_support
@@ -622,8 +664,9 @@ class PoolManager:
         """Apply verified modality evidence before catalog compatibility.
 
         A passed/unsupported probe is authoritative for that one input
-        modality. Unavailable results are intentionally treated as unknown so
-        a provider outage does not permanently remove a model from rotation.
+        modality. An advertised catalog claim is used when no explicit probe
+        exists. If neither is present for non-text input, the candidate is
+        held back instead of turning missing metadata into a provider 400.
         """
         for modality in required_modalities:
             capability = f"input_{modality}"
@@ -642,6 +685,19 @@ class PoolManager:
             if (
                 advertised_modalities is not None
                 and modality not in advertised_modalities
+            ):
+                return False
+            # Dynamic catalogs and operator-curated pools can both contain
+            # models whose capability metadata is missing. Admitting one for
+            # image/audio/video input turns an information gap into a
+            # provider 400 on the first real request. Text remains fail-open
+            # because it is the baseline contract for chat models. An explicit
+            # modality probe above can still admit a model whose catalog is
+            # incomplete.
+            if (
+                modality != "text"
+                and advertised_modalities is None
+                and (record is None or record.status not in {"passed"})
             ):
                 return False
         return True
@@ -773,8 +829,10 @@ class PoolManager:
         swarm) keep them. Pass an explicit True/False to override.
 
         ``required_input_modalities`` excludes models whose known input
-        modalities do not cover the request. Models without modality metadata
-        remain eligible for backward compatibility.
+        modalities do not cover the request. All models without evidence for
+        non-text input are held back until a catalog claim or explicit
+        modality probe makes them eligible. Text remains compatible with
+        metadata-free legacy candidates.
 
         ``requires_tools`` applies the same rule to catalog-advertised tool
         support. Models that explicitly lack tools are excluded; models with
@@ -799,7 +857,11 @@ class PoolManager:
         are exhausted; auto-discovered models remain gated.
         """
         excluded = excluded or set()
-        required_modalities = frozenset(required_input_modalities or ())
+        required_modalities = frozenset(
+            _normalise_input_modality(modality)
+            for modality in (required_input_modalities or ())
+            if _normalise_input_modality(modality)
+        )
         specs = self.models.get(pool_name, [])
         if not specs:
             unkeyed_count = len(self.unkeyed.get(pool_name, ()))
@@ -1044,15 +1106,17 @@ class PoolManager:
         ) == top_score]
 
         # Within the top tier, apply weighted selection.
-        # When all weights are equal, pick first candidate (deterministic for tests).
+        # Equal weights should distribute traffic, while retaining a
+        # deterministic order that is easy to observe and test.
         if len(tier_candidates) == 1:
             result = (tier_candidates[0].provider, tier_candidates[0].model)
         else:
             weights = [c.weight for c in tier_candidates]
             # Check if all weights are equal (within floating-point tolerance)
-            if len(set(weights)) == 1:
-                # All equal: pick first (deterministic, stable for tests)
-                selected = tier_candidates[0]
+            if max(weights) - min(weights) <= 1e-12:
+                offset = self._round_robin.get(pool_name, 0) % len(tier_candidates)
+                selected = tier_candidates[offset]
+                self._round_robin[pool_name] = offset + 1
             else:
                 # Varied weights: use weighted random selection
                 total_weight = sum(weights)
@@ -1116,6 +1180,8 @@ class PoolManager:
         return {
             "provider": spec.provider,
             "model": spec.model,
+            "context_window": spec.context_window,
+            "auto_discovered": spec.auto_discovered,
             "weight": spec.weight,
             "input_modalities": (
                 sorted(input_modalities) if input_modalities is not None else None

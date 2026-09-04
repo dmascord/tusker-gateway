@@ -17,6 +17,7 @@ from aiohttp import web
 from tusker_gateway.cache import ResponseCache, make_cache_key, make_caller_scope
 from tusker_gateway.budget import BudgetTracker
 from tusker_gateway.circuit_breaker import CircuitBreaker, BreakerDecision
+from tusker_gateway.cooldown import is_account_quota_exhausted
 from tusker_gateway.errors import (
     BadRequestError,
     GatewayError,
@@ -34,12 +35,14 @@ from tusker_gateway.passthrough import (
     PassthroughClient,
     _persist_cooldown,
     _safe_upstream_body,
+    _sanitize_opencode_session_id,
+    _stable_opencode_session_id,
 )
 from tusker_gateway.pools import PoolManager
 from tusker_gateway.provider_usage import is_capacity_error
 from tusker_gateway.quality import QualityDB
 from tusker_gateway.rate_limit import RateLimiter
-from tusker_gateway.routing import resolve_route
+from tusker_gateway.routing import LEGACY_MODEL_IDS, resolve_route
 from tusker_gateway.semantic_cache import make_semantic_scope, response_contains_tool_calls
 from tusker_gateway.model_capability import MODEL_CAPABILITY_PROBE_VERSION
 from tusker_gateway.sse import (
@@ -663,6 +666,12 @@ async def _normalize_stream_legacy(raw_stream: AsyncIterator[bytes]) -> AsyncIte
                     del delta["reasoning_content"]
             has_content = isinstance(raw_content, str) and bool(raw_content)
             tc = delta.get("tool_calls")
+            if not tc:
+                legacy_calls = _legacy_function_call_delta(delta, choice_index=0)
+                if legacy_calls is not None:
+                    tc = legacy_calls
+                    delta.pop("function_call", None)
+                    delta["tool_calls"] = tc
             has_tools = bool(tc) and isinstance(tc, list) and len(tc) > 0
             # Strip XML/Markdown tool-call markup from content deltas using
             # a stateful stripper so markup spanning multiple streamed chunks
@@ -733,6 +742,124 @@ async def _normalize_stream_legacy(raw_stream: AsyncIterator[bytes]) -> AsyncIte
         yield _finish_frame()
 
 
+def _normalize_native_stream_tool_calls(
+    raw_calls: Any,
+    *,
+    choice_index: int,
+    call_indices: dict[tuple[int, str], int],
+    position_indices: dict[tuple[int, int], int],
+    index_owners: dict[tuple[int, int], str],
+    index_names: dict[tuple[int, int], str],
+    next_indices: dict[int, int],
+) -> list[dict[str, Any]]:
+    """Give native streamed tool calls stable per-choice indexes.
+
+    OpenAI-compatible providers are expected to include ``index`` on every
+    streamed tool-call delta, but several otherwise usable providers omit it.
+    Passing those deltas through makes clients merge adjacent calls: a later
+    call's name is paired with the earlier call's arguments. Prefer an
+    explicit index, use the call id when available, and fall back to the
+    position only for id-less continuation fragments.
+    """
+    if not isinstance(raw_calls, list):
+        return []
+
+    def allocate() -> int:
+        candidate = next_indices.get(choice_index, 0)
+        while (choice_index, candidate) in index_owners:
+            candidate += 1
+        next_indices[choice_index] = candidate + 1
+        return candidate
+
+    normalized: list[dict[str, Any]] = []
+    used_in_frame: set[int] = set()
+    for position, raw_call in enumerate(raw_calls):
+        if not isinstance(raw_call, dict):
+            continue
+        call = dict(raw_call)
+        function = raw_call.get("function")
+        function_copy = dict(function) if isinstance(function, dict) else {}
+        call["function"] = function_copy
+
+        raw_id = raw_call.get("id") or raw_call.get("call_id")
+        call_id = str(raw_id).strip() if raw_id is not None else ""
+        known_index = call_indices.get((choice_index, call_id)) if call_id else None
+
+        explicit_index: int | None = None
+        if raw_call.get("index") is not None:
+            try:
+                explicit_index = int(raw_call["index"])
+            except (TypeError, ValueError):
+                explicit_index = None
+
+        call_name = str(function_copy.get("name") or "").strip()
+        index = known_index
+        if index is None and explicit_index is not None:
+            owner = index_owners.get((choice_index, explicit_index))
+            # A provider that reuses index=0 for a new call must not make the
+            # client append the new arguments to the old call.
+            if explicit_index not in used_in_frame and (not owner or owner == call_id):
+                index = explicit_index
+
+        if index is None and call_id:
+            index = allocate()
+
+        if index is None:
+            position_index = position_indices.get((choice_index, position))
+            known_name = (
+                index_names.get((choice_index, position_index))
+                if position_index is not None
+                else None
+            )
+            if position_index is not None and (not call_name or not known_name or known_name == call_name):
+                index = position_index
+            else:
+                index = allocate()
+
+        used_in_frame.add(index)
+        position_indices[(choice_index, position)] = index
+        index_owners.setdefault((choice_index, index), call_id)
+        if call_id:
+            call_indices[(choice_index, call_id)] = index
+        if call_name:
+            index_names[(choice_index, index)] = call_name
+        next_indices[choice_index] = max(next_indices.get(choice_index, 0), index + 1)
+        call["index"] = index
+        normalized.append(call)
+    return normalized
+
+
+def _legacy_function_call_delta(
+    delta: dict[str, Any],
+    *,
+    choice_index: int,
+) -> list[dict[str, Any]] | None:
+    """Adapt one legacy streamed ``function_call`` delta to ``tool_calls``.
+
+    A few OpenAI-compatible providers still emit the pre-0613 singular
+    ``delta.function_call`` shape.  Leaving it in the delta means every
+    downstream adapter (and the Responses compatibility endpoint) silently
+    loses the call.  Give the synthesized call a stable id so argument
+    fragments stay associated with the same tool invocation.
+    """
+    legacy = delta.get("function_call")
+    if not isinstance(legacy, dict):
+        return None
+    function = dict(legacy)
+    call_id = str(
+        legacy.get("id")
+        or delta.get("tool_call_id")
+        or f"call_legacy_{choice_index}"
+    ).strip()
+    function.pop("id", None)
+    return [{
+        "index": 0,
+        "id": call_id,
+        "type": "function",
+        "function": function,
+    }]
+
+
 async def _normalize_stream(
     raw_stream: AsyncIterator[bytes],
     *,
@@ -754,7 +881,6 @@ async def _normalize_stream(
     """
     from tusker_gateway.tool_formats import (
         parse_text_tool_calls,
-        remap_stream_tool_calls,
         strip_tool_text,
         tool_diagnostics_enabled,
         tool_markup_kinds,
@@ -770,6 +896,13 @@ async def _normalize_stream(
     reasoning_window = ""
     reasoning_chars = 0
     emitted_finish_reason: str | None = None
+    native_call_indices: dict[tuple[int, str], int] = {}
+    native_position_indices: dict[tuple[int, int], int] = {}
+    native_index_owners: dict[tuple[int, int], str] = {}
+    native_index_names: dict[tuple[int, int], str] = {}
+    native_next_indices: dict[int, int] = {}
+    synthetic_tool_call_sequence = 0
+    last_tool_diagnostics_signature: tuple[Any, ...] | None = None
 
     def malformed_tool_error() -> MalformedToolCallError:
         marker_types = tuple(sorted(tool_markup_seen)) or ("unknown",)
@@ -814,6 +947,7 @@ async def _normalize_stream(
         parsed_calls: list[dict[str, Any]],
         template_obj: dict[str, Any],
     ) -> bytes | None:
+        nonlocal synthetic_tool_call_sequence
         if not parsed_calls:
             return None
         openai_calls: list[dict[str, Any]] = []
@@ -823,13 +957,25 @@ async def _normalize_stream(
             args = fn.get("arguments", "{}")
             if not isinstance(args, str):
                 args = json.dumps(args, ensure_ascii=False)
-            cid = call.get("id") or f"call_{index}_{hashlib.sha1(name.encode()).hexdigest()[:10]}"
+            cid = call.get("id") or (
+                f"call_text_{synthetic_tool_call_sequence}_{hashlib.sha1(name.encode()).hexdigest()[:10]}"
+            )
+            synthetic_tool_call_sequence += 1
             openai_calls.append({
                 "index": index,
                 "id": str(cid),
                 "type": "function",
                 "function": {"name": name, "arguments": args},
             })
+        openai_calls = _normalize_native_stream_tool_calls(
+            openai_calls,
+            choice_index=0,
+            call_indices=native_call_indices,
+            position_indices=native_position_indices,
+            index_owners=native_index_owners,
+            index_names=native_index_names,
+            next_indices=native_next_indices,
+        )
         return sse_frame({
             "id": template_obj.get("id") or f"chatcmpl-{secrets.token_hex(14)}",
             "object": "chat.completion.chunk",
@@ -882,6 +1028,10 @@ async def _normalize_stream(
             if not isinstance(choice, dict):
                 yield frame
                 continue
+            try:
+                choice_index = int(choice.get("index", 0))
+            except (TypeError, ValueError):
+                choice_index = 0
             delta = dict(choice.get("delta") or {})
             upstream_finish_reason = choice.get("finish_reason")
             if upstream_finish_reason:
@@ -934,7 +1084,30 @@ async def _normalize_stream(
                     auxiliary_sources.append(("reasoning_details", details_text))
                 delta.pop("reasoning_details", None)
 
-            tc = delta.get("tool_calls")
+            raw_tc = delta.get("tool_calls")
+            if not raw_tc:
+                legacy_calls = _legacy_function_call_delta(
+                    delta,
+                    choice_index=choice_index,
+                )
+                if legacy_calls is not None:
+                    raw_tc = legacy_calls
+                    delta.pop("function_call", None)
+            tc = (
+                _normalize_native_stream_tool_calls(
+                    raw_tc,
+                    choice_index=choice_index,
+                    call_indices=native_call_indices,
+                    position_indices=native_position_indices,
+                    index_owners=native_index_owners,
+                    index_names=native_index_names,
+                    next_indices=native_next_indices,
+                )
+                if isinstance(raw_tc, list)
+                else raw_tc
+            )
+            if isinstance(raw_tc, list):
+                delta["tool_calls"] = tc
             has_tools = isinstance(tc, list) and bool(tc)
             raw_texts: list[tuple[str, str]] = []
             if isinstance(raw_content, str) and raw_content:
@@ -1075,13 +1248,24 @@ async def _normalize_stream(
                         f"repeated_reasoning_cycle:{cycle_chars}x{repeats}"
                     )
 
+            diagnostics_signature = (
+                raw_marker_types,
+                sum(len(value) for _, value in raw_texts),
+                len(cleaned_content) + sum(
+                    len(value) for value in cleaned_auxiliary.values()
+                ),
+                len(tc) if isinstance(tc, list) else 0,
+                text_calls_detected,
+                tuple(field for field, _ in raw_texts),
+            )
             if tool_diagnostics_enabled() and (
                 raw_marker_types
                 or content_changed
                 or auxiliary_changed
                 or text_calls_detected
                 or has_tools
-            ):
+            ) and diagnostics_signature != last_tool_diagnostics_signature:
+                last_tool_diagnostics_signature = diagnostics_signature
                 logger.info(
                     "tool diagnostics stream provider=%s model=%s request_id=%s marker_types=%s raw_chars=%d cleaned_chars=%d native_calls=%d text_calls=%d fields=%s",
                     provider or "unknown",
@@ -1122,7 +1306,7 @@ async def _normalize_stream(
                 if has_tools:
                     tools_only = {
                         "role": delta.get("role"),
-                        "tool_calls": remap_stream_tool_calls(tc),
+                        "tool_calls": tc,
                     }
                     yield f"data: {json.dumps({**new_obj, 'choices': [{**new_choice, 'delta': tools_only, 'finish_reason': None}]}, ensure_ascii=False)}\n\n".encode()
                 for tool_frame in pending_tool_frames:
@@ -1147,14 +1331,6 @@ async def _normalize_stream(
                 if has_delta_text or has_tools or delta or (
                     upstream_finish_reason and obj.get("usage") is not None
                 ):
-                    if has_tools and tc:
-                        # Rewrite native tool_calls args before forwarding.
-                        try:
-                            delta_tc = new_obj["choices"][new_choice["index"]]["delta"].get("tool_calls")
-                            if delta_tc:
-                                new_obj["choices"][new_choice["index"]]["delta"]["tool_calls"] = remap_stream_tool_calls(delta_tc)
-                        except (KeyError, TypeError, IndexError):
-                            pass
                     yield f"data: {json.dumps(new_obj, ensure_ascii=False)}\n\n".encode()
                 for prose_frame in pending_prose_frames:
                     yield prose_frame
@@ -1380,23 +1556,7 @@ def _assemble_stream_tool_calls(frames: list[bytes]) -> list[dict[str, Any]]:
                     current["function"]["arguments"] += _tool_argument_text(
                         function.get("arguments")
                     )
-    assembled_calls = [assembled[key] for key in order]
-    # Apply argument remapping for known tool/argument name mismatches.
-    from tusker_gateway.tool_formats import TOOL_ARGUMENT_REMAP
-    for call in assembled_calls:
-        fn = call.get("function") or {}
-        name = str(fn.get("name", "")).strip()
-        if name not in TOOL_ARGUMENT_REMAP:
-            continue
-        raw_args = fn.get("arguments", "{}")
-        try:
-            args = json.loads(raw_args)
-        except (json.JSONDecodeError, TypeError):
-            continue
-        if isinstance(args, dict):
-            remap = TOOL_ARGUMENT_REMAP[name]
-            fn["arguments"] = json.dumps({remap.get(k, k): v for k, v in args.items()}, ensure_ascii=False)
-    return assembled_calls
+    return [assembled[key] for key in order]
 
 
 def _response_tool_calls(response: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1412,7 +1572,10 @@ def _response_tool_calls(response: dict[str, Any]) -> list[dict[str, Any]]:
             continue
         message = choice.get("message") or {}
         if isinstance(message, dict):
-            calls.extend(normalize_tool_calls(message.get("tool_calls")))
+            raw_calls = message.get("tool_calls")
+            if raw_calls is None and message.get("function_call") is not None:
+                raw_calls = [message["function_call"]]
+            calls.extend(normalize_tool_calls(raw_calls))
     return calls
 
 
@@ -1587,6 +1750,37 @@ def _resolve_api_key(request: web.Request) -> str:
     return ""
 
 
+def _request_conversation_id(
+    request: web.Request,
+    body: dict[str, Any],
+    caller_key: str,
+) -> str:
+    """Resolve the stable conversation ID used by provider-specific headers."""
+    for header_name in (
+        "x-opencode-session",
+        "x-conversation-id",
+        "x-session-id",
+        "x-omp-session-id",
+    ):
+        value = _sanitize_opencode_session_id(request.headers.get(header_name))
+        if value:
+            return value
+
+    for field_name in ("session_id", "conversation_id"):
+        value = _sanitize_opencode_session_id(body.get(field_name))
+        if value:
+            return value
+
+    metadata = body.get("metadata")
+    if isinstance(metadata, dict):
+        for field_name in ("session_id", "conversation_id"):
+            value = _sanitize_opencode_session_id(metadata.get(field_name))
+            if value:
+                return value
+
+    return _stable_opencode_session_id(body.get("messages"), caller_key=caller_key)
+
+
 def _estimated_tokens(messages: list[dict[str, Any]]) -> int:
     """Rough prompt-token estimate for budget pre-flight.
 
@@ -1617,6 +1811,7 @@ def _estimated_tokens(messages: list[dict[str, Any]]) -> int:
 # of 'length' that OMP then interprets as 'finished'.
 _GATEWAY_HANDLED_FIELDS = frozenset({
     "model", "messages", "stream", "tools", "tool_choice",
+    "session_id", "conversation_id",
 })
 
 
@@ -1849,9 +2044,21 @@ def _is_capacity_failure(exc: BaseException | None) -> bool:
 def _public_provider_failure_response(exc: BaseException) -> web.Response:
     """Hide provider capacity details without changing other error semantics."""
     if not _is_capacity_failure(exc):
+        upstream_body = (
+            getattr(exc, "body", None)
+            or getattr(exc, "upstream_body", None)
+            or getattr(exc, "message", None)
+            or str(exc)
+        )
+        headers = {}
+        if is_account_quota_exhausted(str(upstream_body)):
+            # Keep the public error body generic while exposing a safe,
+            # machine-readable signal to the maintenance qualification path.
+            headers["X-Tusker-Provider-Failure"] = "provider_quota"
         return web.json_response(
             openai_error(str(exc), code="provider_error", error_type="provider_error"),
             status=502,
+            headers=headers,
         )
     try:
         retry_after = max(
@@ -1924,6 +2131,7 @@ async def _call_with_pool_fallback(
     metrics_registry: Any | None = None,
     initial_selection: tuple[str, str] | None = None,
     request_id: str | None = None,
+    conversation_id: str | None = None,
 ) -> tuple[str, str, Any]:
     """Call a pool candidate, trying the next candidate after provider failure.
 
@@ -1950,6 +2158,7 @@ async def _call_with_pool_fallback(
                 tools=tools,
                 tool_choice=body.get("tool_choice"),
                 extra_body=extra_body or None,
+                conversation_id=conversation_id,
                 metrics_registry=metrics_registry,
             )
             result = await _prepare_stream_result(
@@ -2131,6 +2340,7 @@ async def _call_with_pool_fallback(
                 tools=tools,
                 tool_choice=body.get("tool_choice"),
                 extra_body=extra_body or None,
+                conversation_id=conversation_id,
                 metrics_registry=metrics_registry,
             )
             result = await _prepare_stream_result(
@@ -2270,7 +2480,7 @@ def _responses_content_to_chat(content: Any, *, context: str, role: str = "user"
                 code="invalid_input",
             )
         block_type = block.get("type")
-        if block_type == "input_text":
+        if block_type in {"input_text", "output_text"}:
             text = block.get("text")
             if not isinstance(text, str):
                 raise BadRequestError(
@@ -2302,6 +2512,80 @@ def _responses_content_to_chat(content: Any, *, context: str, role: str = "user"
     return converted
 
 
+def _responses_tool_arguments(value: Any) -> str:
+    """Serialize a Responses function-call argument value for Chat API use."""
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value if value is not None else {}, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return json.dumps({"raw": str(value)}, ensure_ascii=False)
+
+
+def _responses_tools_to_chat(tools: Any) -> list[dict[str, Any]]:
+    """Convert Responses function declarations to Chat Completions tools."""
+    if not isinstance(tools, list):
+        raise BadRequestError("tools must be an array", code="invalid_tools")
+    converted: list[dict[str, Any]] = []
+    for index, tool in enumerate(tools):
+        if not isinstance(tool, dict):
+            raise BadRequestError(
+                f"tools[{index}] must be an object",
+                code="invalid_tools",
+            )
+        if tool.get("type", "function") != "function":
+            raise BadRequestError(
+                f"Unsupported Responses tool type: {tool.get('type')}",
+                code="unsupported_tool_type",
+            )
+        function = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+        name = str(function.get("name") or "").strip()
+        if not name:
+            raise BadRequestError(
+                f"tools[{index}] must contain a function name",
+                code="invalid_tools",
+            )
+        normalized_function: dict[str, Any] = {
+            "name": name,
+            "description": str(function.get("description") or ""),
+            "parameters": function.get("parameters") or {
+                "type": "object",
+                "properties": {},
+            },
+        }
+        if "strict" in function:
+            normalized_function["strict"] = function["strict"]
+        elif "strict" in tool:
+            normalized_function["strict"] = tool["strict"]
+        converted.append({
+            "type": "function",
+            "function": normalized_function,
+        })
+    return converted
+
+
+def _responses_tool_choice_to_chat(tool_choice: Any) -> Any:
+    """Convert a Responses tool choice to Chat Completions shape."""
+    if not isinstance(tool_choice, dict):
+        return tool_choice
+    if tool_choice.get("type") != "function":
+        return tool_choice
+    name = tool_choice.get("name")
+    if not isinstance(name, str):
+        function = tool_choice.get("function")
+        name = function.get("name") if isinstance(function, dict) else None
+    if isinstance(name, str) and name.strip():
+        return {"type": "function", "function": {"name": name.strip()}}
+    return tool_choice
+
+
+def _responses_instructions_to_chat(instructions: Any) -> str | list[dict[str, Any]]:
+    """Convert Responses ``instructions`` to a canonical system message."""
+    if isinstance(instructions, str):
+        return instructions
+    return _responses_content_to_chat(instructions, context="instructions")
+
+
 def _responses_input_to_messages(input_value: Any) -> list[dict[str, Any]]:
     if isinstance(input_value, str):
         return [{"role": "user", "content": input_value}]
@@ -2309,7 +2593,7 @@ def _responses_input_to_messages(input_value: Any) -> list[dict[str, Any]]:
         raise BadRequestError("input must be a string or non-empty array", code="invalid_input")
 
     if all(isinstance(item, dict) and item.get("type") in {
-        "input_text", "input_image", "text", "image_url",
+        "input_text", "output_text", "input_image", "text", "image_url",
     } for item in input_value):
         return [{
             "role": "user",
@@ -2317,36 +2601,643 @@ def _responses_input_to_messages(input_value: Any) -> list[dict[str, Any]]:
         }]
 
     messages: list[dict[str, Any]] = []
+    pending_function_calls: list[dict[str, Any]] = []
+
+    def flush_function_calls() -> None:
+        if not pending_function_calls:
+            return
+        messages.append({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": list(pending_function_calls),
+        })
+        pending_function_calls.clear()
+
     for item_index, item in enumerate(input_value):
         if not isinstance(item, dict):
             raise BadRequestError(
                 f"input[{item_index}] must be a message object",
                 code="invalid_input",
             )
-        if item.get("type") not in {None, "message"}:
+        item_type = item.get("type")
+        if item_type == "function_call":
+            name = str(item.get("name") or "").strip()
+            if not name:
+                raise BadRequestError(
+                    f"input[{item_index}] function_call must contain name",
+                    code="invalid_input",
+                )
+            call_id = str(
+                item.get("call_id") or item.get("id") or f"call_responses_{item_index}"
+            ).strip()
+            pending_function_calls.append({
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": _responses_tool_arguments(item.get("arguments")),
+                },
+            })
+            continue
+        if item_type == "function_call_output":
+            flush_function_calls()
+            call_id = str(item.get("call_id") or "").strip()
+            if not call_id:
+                raise BadRequestError(
+                    f"input[{item_index}] function_call_output must contain call_id",
+                    code="invalid_input",
+                )
+            message: dict[str, Any] = {
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": item.get("output", ""),
+            }
+            if item.get("status") in {"failed", "incomplete"}:
+                message["is_error"] = True
+            messages.append(message)
+            continue
+
+        if item_type in {"input_text", "output_text", "input_image", "text", "image_url"}:
+            flush_function_calls()
+            messages.append({
+                "role": "user",
+                "content": _responses_content_to_chat(
+                    [item],
+                    context=f"input[{item_index}]",
+                ),
+            })
+            continue
+
+        if item_type not in {None, "message"}:
             raise BadRequestError(
-                f"Unsupported Responses input item type: {item.get('type')}",
+                f"Unsupported Responses input item type: {item_type}",
                 code="unsupported_content_type",
             )
+        flush_function_calls()
         role = item.get("role")
         if role not in {"system", "developer", "user", "assistant", "tool"}:
             raise BadRequestError(
                 f"input[{item_index}] must have a valid message role",
                 code="invalid_input",
             )
-        if "content" not in item:
+        if "content" not in item and not (
+            role == "assistant" and item.get("tool_calls")
+        ):
             raise BadRequestError(
                 f"input[{item_index}] must contain content",
                 code="invalid_input",
             )
         message = {key: value for key, value in item.items() if key != "type"}
-        message["content"] = _responses_content_to_chat(
-            item["content"],
-            context=f"input[{item_index}].content",
-            role=role,
-        )
+        if "content" in item:
+            message["content"] = _responses_content_to_chat(
+                item["content"],
+                context=f"input[{item_index}].content",
+                role=role,
+            )
+        elif role == "assistant":
+            message["content"] = ""
         messages.append(message)
+    flush_function_calls()
     return messages
+
+
+def _chat_content_to_responses_output(content: Any) -> list[dict[str, Any]]:
+    """Convert canonical assistant content into Responses output blocks."""
+    if isinstance(content, str):
+        return [{"type": "output_text", "text": content}] if content else []
+    if isinstance(content, list):
+        output: list[dict[str, Any]] = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") in {"text", "output_text"}:
+                text = block.get("text")
+                if isinstance(text, str):
+                    output.append({"type": "output_text", "text": text})
+            elif isinstance(block, dict):
+                output.append({
+                    "type": "output_text",
+                    "text": json.dumps(block, ensure_ascii=False),
+                })
+            else:
+                output.append({"type": "output_text", "text": str(block)})
+        return output
+    if content is None:
+        return []
+    return [{"type": "output_text", "text": str(content)}]
+
+
+def _chat_content_to_stream_text_parts(content: Any) -> list[str]:
+    """Extract streamable text without silently discarding structured content."""
+    if isinstance(content, str):
+        return [content] if content else []
+    if content is None:
+        return []
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict):
+                block_type = block.get("type")
+                if block_type in {"text", "output_text", "input_text"}:
+                    text = block.get("text")
+                    if isinstance(text, str) and text:
+                        parts.append(text)
+                    continue
+                if block_type == "refusal" and isinstance(block.get("refusal"), str):
+                    parts.append(block["refusal"])
+                    continue
+                # Chat streaming has no portable representation for provider-
+                # specific output blocks. Keep them inspectable rather than
+                # turning a non-empty model response into an empty one.
+                parts.append(json.dumps(block, ensure_ascii=False))
+            elif block is not None:
+                parts.append(str(block))
+        return parts
+    return [str(content)]
+
+
+def _choice_index(choice: dict[str, Any], position: int) -> int:
+    """Read a provider choice index while retaining a deterministic fallback."""
+    try:
+        return int(choice.get("index", position))
+    except (TypeError, ValueError):
+        return position
+
+
+def _normalized_choice_tool_calls(message: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return native or legacy function calls in canonical Chat shape."""
+    from tusker_gateway.tool_formats import normalize_tool_calls
+
+    raw_calls = message.get("tool_calls")
+    if not raw_calls and message.get("function_call") is not None:
+        raw_calls = [message["function_call"]]
+    return normalize_tool_calls(raw_calls)
+
+
+async def _complete_chat_result_stream(result: dict[str, Any]) -> AsyncIterator[bytes]:
+    """Encode a complete Chat result as a lossless-enough OpenAI SSE stream."""
+    response_id = str(result.get("id") or f"chatcmpl-{secrets.token_hex(14)}")
+    response_model = str(result.get("model") or "tusker-gateway")
+    raw_choices = result.get("choices")
+    choices = raw_choices if isinstance(raw_choices, list) else []
+    emitted_choice = False
+
+    for position, raw_choice in enumerate(choices):
+        if not isinstance(raw_choice, dict):
+            continue
+        choice_index = _choice_index(raw_choice, position)
+        message = raw_choice.get("message") or {}
+        if not isinstance(message, dict):
+            message = {}
+        for text in _chat_content_to_stream_text_parts(message.get("content")):
+            yield sse_frame({
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "model": response_model,
+                "choices": [{
+                    "index": choice_index,
+                    "delta": {"content": text, "text": text},
+                    "finish_reason": None,
+                }],
+            })
+
+        calls = _normalized_choice_tool_calls(message)
+        if calls:
+            tool_deltas: list[dict[str, Any]] = []
+            for call_position, call in enumerate(calls):
+                function = call.get("function") or {}
+                if not isinstance(function, dict):
+                    function = {}
+                tool_deltas.append({
+                    "index": _choice_index(call, call_position),
+                    "id": str(call.get("id") or f"call_{call_position}"),
+                    "type": "function",
+                    "function": {
+                        "name": str(function.get("name") or ""),
+                        "arguments": function.get("arguments", ""),
+                    },
+                })
+            yield sse_frame({
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "model": response_model,
+                "choices": [{
+                    "index": choice_index,
+                    "delta": {"role": "assistant", "tool_calls": tool_deltas},
+                    "finish_reason": None,
+                }],
+            })
+
+        finish_reason = raw_choice.get("finish_reason")
+        if not isinstance(finish_reason, str) or not finish_reason:
+            finish_reason = "tool_calls" if calls else "stop"
+        yield sse_frame({
+            "id": response_id,
+            "object": "chat.completion.chunk",
+            "model": response_model,
+            "choices": [{
+                "index": choice_index,
+                "delta": {},
+                "finish_reason": finish_reason,
+            }],
+        })
+        emitted_choice = True
+
+    if not emitted_choice:
+        yield sse_frame({
+            "id": response_id,
+            "object": "chat.completion.chunk",
+            "model": response_model,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        })
+    yield sse_done()
+
+
+def _responses_output_for_choice(
+    choice: dict[str, Any],
+    *,
+    choice_position: int,
+) -> list[dict[str, Any]]:
+    """Convert one Chat choice into Responses output items."""
+    message = choice.get("message") or {}
+    if not isinstance(message, dict):
+        message = {}
+    output: list[dict[str, Any]] = []
+    content_blocks = _chat_content_to_responses_output(message.get("content"))
+    if content_blocks:
+        output.append({
+            "type": "message",
+            "id": f"msg_{uuid.uuid4().hex}",
+            "role": "assistant",
+            "content": content_blocks,
+            "status": "completed",
+        })
+
+    for index, tool_call in enumerate(_normalized_choice_tool_calls(message)):
+        function = tool_call.get("function") or {}
+        if not isinstance(function, dict):
+            function = {}
+        name = str(function.get("name") or "").strip()
+        if not name:
+            continue
+        call_id = str(
+            tool_call.get("id")
+            or tool_call.get("call_id")
+            or f"call_responses_{choice_position}_{index}"
+        ).strip()
+        output.append({
+            "type": "function_call",
+            "id": call_id,
+            "call_id": call_id,
+            "name": name,
+            "arguments": _responses_tool_arguments(function.get("arguments")),
+            "status": "completed",
+        })
+
+    if not output:
+        output.append({
+            "type": "message",
+            "id": f"msg_{uuid.uuid4().hex}",
+            "role": "assistant",
+            "content": [],
+            "status": "completed",
+        })
+    return output
+
+
+def _chat_result_to_responses(result: Any, model: str) -> dict[str, Any]:
+    """Convert one canonical Chat Completions result to a Responses object."""
+    choices = result.get("choices") if isinstance(result, dict) else None
+    valid_choices = [
+        choice for choice in choices
+        if isinstance(choice, dict)
+    ] if isinstance(choices, list) else []
+    if not valid_choices:
+        valid_choices = [{}]
+
+    output: list[dict[str, Any]] = []
+    for position, choice in enumerate(valid_choices):
+        output.extend(_responses_output_for_choice(choice, choice_position=position))
+
+    status = "incomplete" if any(
+        choice.get("finish_reason") in {"length", "content_filter"}
+        for choice in valid_choices
+    ) else "completed"
+    response: dict[str, Any] = {
+        "id": f"resp_{uuid.uuid4().hex}",
+        "object": "response",
+        "created_at": int(time.time()),
+        "model": model,
+        "output": output,
+        "status": status,
+    }
+    usage = result.get("usage") if isinstance(result, dict) else None
+    if isinstance(usage, dict):
+        input_tokens = int(
+            usage.get("input_tokens")
+            or usage.get("prompt_tokens")
+            or 0
+        )
+        output_tokens = int(
+            usage.get("output_tokens")
+            or usage.get("completion_tokens")
+            or 0
+        )
+        response["usage"] = {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": int(
+                usage.get("total_tokens") or input_tokens + output_tokens
+            ),
+        }
+    return response
+
+
+def _responses_sse_frame(event_type: str, payload: dict[str, Any]) -> bytes:
+    """Encode one Responses API SSE event."""
+    body = {"type": event_type, **payload}
+    return (
+        f"event: {event_type}\n"
+        f"data: {json.dumps(body, ensure_ascii=False)}\n\n"
+    ).encode("utf-8")
+
+
+def _responses_stream_from_chat(
+    raw_stream: AsyncIterator[bytes] | None,
+    *,
+    model: str,
+    complete_result: dict[str, Any] | None = None,
+) -> AsyncIterator[bytes]:
+    """Adapt canonical Chat Completions SSE to Responses SSE.
+
+    The gateway's provider layer has one canonical streaming representation.
+    The compatibility Responses endpoint must still expose a real Responses
+    event lifecycle; returning a Chat JSON object for ``stream=true`` causes
+    clients to lose text/tool deltas and is especially harmful to agent loops.
+    """
+
+    async def generate() -> AsyncIterator[bytes]:
+        response_id = f"resp_{uuid.uuid4().hex}"
+        created_at = int(time.time())
+        response: dict[str, Any] = {
+            "id": response_id,
+            "object": "response",
+            "created_at": created_at,
+            "model": model,
+            "output": [],
+            "status": "in_progress",
+        }
+        yield _responses_sse_frame("response.created", {"response": dict(response)})
+
+        output_items: list[dict[str, Any]] = []
+        message_items: dict[int, tuple[int, dict[str, Any]]] = {}
+        tool_items: dict[tuple[int, int], tuple[int, dict[str, Any]]] = {}
+        finish_reasons: dict[int, str] = {}
+        usage: dict[str, Any] = {}
+        stream_buffer = bytearray()
+        done_seen = False
+
+        def _tool_index(raw_call: dict[str, Any], position: int) -> int:
+            value = raw_call.get("index", position)
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return position
+
+        def _arguments_text(value: Any) -> str:
+            if isinstance(value, str):
+                return value
+            try:
+                return json.dumps(value, ensure_ascii=False)
+            except (TypeError, ValueError):
+                return json.dumps({"raw": str(value)}, ensure_ascii=False)
+
+        async def process_chunk(chunk: dict[str, Any]) -> AsyncIterator[bytes]:
+            nonlocal usage
+            raw_usage = chunk.get("usage")
+            if isinstance(raw_usage, dict):
+                usage = dict(raw_usage)
+            choices = chunk.get("choices")
+            if not isinstance(choices, list):
+                return
+            for choice_position, raw_choice in enumerate(choices):
+                if not isinstance(raw_choice, dict):
+                    continue
+                choice_index = _choice_index(raw_choice, choice_position)
+                delta = raw_choice.get("delta") or {}
+                if not isinstance(delta, dict):
+                    delta = {}
+
+                text_value = delta.get("content")
+                if text_value is None and isinstance(delta.get("text"), str):
+                    text_value = delta["text"]
+                for text in _chat_content_to_stream_text_parts(text_value):
+                    message_state = message_items.get(choice_index)
+                    if message_state is None:
+                        item = {
+                            "id": f"msg_{uuid.uuid4().hex}",
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [],
+                            "status": "in_progress",
+                        }
+                        output_index = len(output_items)
+                        output_items.append(item)
+                        message_items[choice_index] = (output_index, item)
+                        yield _responses_sse_frame(
+                            "response.output_item.added",
+                            {"output_index": output_index, "item": dict(item)},
+                        )
+                        yield _responses_sse_frame(
+                            "response.content_part.added",
+                            {
+                                "item_id": item["id"],
+                                "output_index": output_index,
+                                "content_index": 0,
+                                "part": {"type": "output_text", "text": "", "annotations": []},
+                            },
+                        )
+                    output_index, item = message_state or message_items[choice_index]
+                    content = item.setdefault("_text", "")
+                    item["_text"] = content + text
+                    yield _responses_sse_frame(
+                        "response.output_text.delta",
+                        {
+                            "item_id": item["id"],
+                            "output_index": output_index,
+                            "content_index": 0,
+                            "delta": text,
+                        },
+                    )
+
+                raw_tool_calls = delta.get("tool_calls")
+                if not raw_tool_calls:
+                    legacy_calls = _legacy_function_call_delta(
+                        delta,
+                        choice_index=choice_index,
+                    )
+                    if legacy_calls is not None:
+                        raw_tool_calls = legacy_calls
+                if isinstance(raw_tool_calls, list):
+                    for position, raw_call in enumerate(raw_tool_calls):
+                        if not isinstance(raw_call, dict):
+                            continue
+                        call_index = _tool_index(raw_call, position)
+                        call_key = (choice_index, call_index)
+                        tool_state = tool_items.get(call_key)
+                        function = raw_call.get("function") or {}
+                        if not isinstance(function, dict):
+                            function = {}
+                        if tool_state is None:
+                            call_id = str(
+                                raw_call.get("id")
+                                or raw_call.get("call_id")
+                                or f"call_responses_{choice_index}_{call_index}"
+                            ).strip()
+                            item = {
+                                "id": str(raw_call.get("id") or f"fc_{uuid.uuid4().hex}"),
+                                "type": "function_call",
+                                "status": "in_progress",
+                                "call_id": call_id,
+                                "name": str(function.get("name") or ""),
+                                "arguments": "",
+                            }
+                            output_index = len(output_items)
+                            output_items.append(item)
+                            tool_items[call_key] = (output_index, item)
+                            yield _responses_sse_frame(
+                                "response.output_item.added",
+                                {"output_index": output_index, "item": dict(item)},
+                            )
+                        output_index, item = tool_items[call_key]
+                        if function.get("name") and not item.get("name"):
+                            item["name"] = str(function["name"])
+                        arguments = function.get("arguments")
+                        if arguments not in (None, ""):
+                            fragment = _arguments_text(arguments)
+                            item["arguments"] += fragment
+                            yield _responses_sse_frame(
+                                "response.function_call_arguments.delta",
+                                {
+                                    "item_id": item["id"],
+                                    "output_index": output_index,
+                                    "call_id": item["call_id"],
+                                    "delta": fragment,
+                                },
+                            )
+
+                finish_reason = raw_choice.get("finish_reason")
+                if isinstance(finish_reason, str) and finish_reason:
+                    finish_reasons[choice_index] = finish_reason
+
+        async def process_frame(frame: bytes) -> AsyncIterator[bytes]:
+            nonlocal done_seen
+            for line in frame.splitlines():
+                if not line.startswith(b"data:"):
+                    continue
+                payload = line[5:].strip()
+                if payload == b"[DONE]":
+                    done_seen = True
+                    continue
+                try:
+                    chunk = json.loads(payload)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    logger.warning("dropping invalid Chat SSE event in Responses adapter")
+                    continue
+                if isinstance(chunk, dict):
+                    async for output in process_chunk(chunk):
+                        yield output
+
+        if complete_result is not None:
+            complete_choices = complete_result.get("choices")
+            completion_chunk = {
+                "choices": [
+                    {
+                        "index": choice.get("index", index),
+                        "delta": choice.get("message") or {},
+                        "finish_reason": choice.get("finish_reason"),
+                    }
+                    for index, choice in enumerate(complete_choices or [])
+                    if isinstance(choice, dict)
+                ],
+                "usage": complete_result.get("usage"),
+            }
+            async for output in process_chunk(completion_chunk):
+                yield output
+        elif raw_stream is not None:
+            async for raw in raw_stream:
+                if not raw:
+                    continue
+                stream_buffer.extend(raw)
+                while b"\n\n" in stream_buffer:
+                    frame, remainder = bytes(stream_buffer).split(b"\n\n", 1)
+                    stream_buffer = bytearray(remainder)
+                    async for output in process_frame(frame):
+                        yield output
+                    if done_seen:
+                        break
+                if done_seen:
+                    break
+            if stream_buffer and not done_seen:
+                async for output in process_frame(bytes(stream_buffer)):
+                    yield output
+
+        if not output_items:
+            item = {
+                "id": f"msg_{uuid.uuid4().hex}",
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "status": "in_progress",
+            }
+            output_items.append(item)
+            message_items[0] = (0, item)
+            yield _responses_sse_frame(
+                "response.output_item.added",
+                {"output_index": 0, "item": dict(item)},
+            )
+
+        for output_index, item in enumerate(output_items):
+            if item.get("type") == "message":
+                text_value = str(item.pop("_text", ""))
+                item["content"] = ([{"type": "output_text", "text": text_value, "annotations": []}]
+                                   if text_value else [])
+                item["status"] = "completed"
+                yield _responses_sse_frame(
+                    "response.output_text.done",
+                    {"item_id": item["id"], "output_index": output_index, "text": text_value},
+                )
+                yield _responses_sse_frame(
+                    "response.content_part.done",
+                    {
+                        "item_id": item["id"],
+                        "output_index": output_index,
+                        "content_index": 0,
+                        "part": item["content"][0] if item["content"] else {"type": "output_text", "text": "", "annotations": []},
+                    },
+                )
+            elif item.get("type") == "function_call":
+                item["status"] = "completed"
+            yield _responses_sse_frame(
+                "response.output_item.done",
+                {"output_index": output_index, "item": dict(item)},
+            )
+
+        response["output"] = output_items
+        response["status"] = (
+            "incomplete"
+            if any(reason in {"length", "content_filter"} for reason in finish_reasons.values())
+            else "completed"
+        )
+        if usage:
+            input_tokens = int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0)
+            output_tokens = int(usage.get("output_tokens") or usage.get("completion_tokens") or 0)
+            response["usage"] = {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": int(usage.get("total_tokens") or input_tokens + output_tokens),
+            }
+        yield _responses_sse_frame("response.completed", {"response": response})
+
+    return generate()
 
 
 def _validate_chat_body(body: Any) -> dict[str, Any]:
@@ -2363,12 +3254,73 @@ def _validate_chat_body(body: Any) -> dict[str, Any]:
         role = message["role"]
         if "content" not in message and role != "assistant":
             raise BadRequestError("Each message must contain content", code="invalid_messages")
-        if "content" in message:
-            _validate_message_content(
-                message["content"],
-                role=role,
-                context=f"messages[{index}]",
+        if role == "tool" and not str(
+            message.get("tool_call_id") or message.get("call_id") or ""
+        ).strip():
+            raise BadRequestError(
+                "Tool messages must contain tool_call_id",
+                code="invalid_messages",
             )
+        if (
+            role == "assistant"
+            and "content" not in message
+            and not message.get("tool_calls")
+            and message.get("function_call") is None
+        ):
+            raise BadRequestError(
+                "Assistant messages without content must contain a tool call",
+                code="invalid_messages",
+            )
+        if "content" in message:
+            # OpenAI-compatible clients commonly send ``content: null`` on
+            # an assistant message whose output is exclusively tool calls.
+            # Preserve that wire shape; it is distinct from a content-less
+            # assistant message with no tool call, which remains invalid.
+            null_tool_content = (
+                role == "assistant"
+                and message["content"] is None
+                and (
+                    bool(message.get("tool_calls"))
+                    or message.get("function_call") is not None
+                )
+            )
+            if not null_tool_content:
+                _validate_message_content(
+                    message["content"],
+                    role=role,
+                    context=f"messages[{index}]",
+                )
+    if "tools" in body:
+        tools = body["tools"]
+        if not isinstance(tools, list):
+            raise BadRequestError("tools must be an array", code="invalid_tools")
+        for tool_index, tool in enumerate(tools):
+            if not isinstance(tool, dict):
+                raise BadRequestError(
+                    f"tools[{tool_index}] must be an object",
+                    code="invalid_tools",
+                )
+            tool_type = tool.get("type", "function")
+            if tool_type != "function":
+                raise BadRequestError(
+                    f"Unsupported tool type: {tool_type}",
+                    code="unsupported_tool_type",
+                )
+            function = tool.get("function")
+            if not isinstance(function, dict):
+                function = tool
+            name = function.get("name")
+            if not isinstance(name, str) or not name.strip():
+                raise BadRequestError(
+                    f"tools[{tool_index}] must contain a function name",
+                    code="invalid_tools",
+                )
+            parameters = function.get("parameters")
+            if parameters is not None and not isinstance(parameters, dict):
+                raise BadRequestError(
+                    f"tools[{tool_index}].function.parameters must be an object",
+                    code="invalid_tools",
+                )
     if "stream" in body and not isinstance(body["stream"], bool):
         raise BadRequestError("stream must be a boolean", code="invalid_stream")
     return body
@@ -2394,6 +3346,12 @@ async def models_handler(request: web.Request) -> web.Response:
     config = request.app["config"]
     data = [{"id": config["model_name"], "object": "model", "owned_by": "tusker-gateway"}]
     data.extend({"id": alias, "object": "model", "owned_by": "tusker-gateway"} for alias in ("hermes-code", "hermes-privacy", "hermes-premium", "hermes-swarm"))
+    existing = {item["id"] for item in data}
+    data.extend(
+        {"id": model_id, "object": "model", "owned_by": "tusker-gateway"}
+        for model_id in LEGACY_MODEL_IDS
+        if model_id not in existing
+    )
     return web.json_response({"object": "list", "data": data})
 
 
@@ -2465,7 +3423,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
     tracer: Tracer | None = request.app.get("tracer")
 
     started = time.monotonic()
-    request_id = uuid.uuid4().hex[:12]
+    request_id = request.get("_request_id") or uuid.uuid4().hex[:12]
     pool_name = "passthrough"  # overwritten for pool-routed requests
     provider = "unknown"
     target_model = "unknown"
@@ -2561,6 +3519,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
             # eligibility and routing from the final body.
             tools = body.get("tools") if isinstance(body.get("tools"), list) else None
             pool_name = _pool_name(body) or "passthrough"
+            conversation_id = _request_conversation_id(request, body, api_key)
 
             # Rate-limit pre-flight (cheapest check, runs first).
             if ratelimit is not None and api_key:
@@ -2709,6 +3668,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                 metrics_registry=request.app.get("metrics"),
                 initial_selection=semantic_target,
                 request_id=request_id,
+                conversation_id=conversation_id,
             )
             logger.debug('selected rid=%s provider=%s model=%s pool=%s', request_id, provider, target_model, pool_name)
 
@@ -2781,6 +3741,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                         "Content-Type": "text/event-stream",
                         "Cache-Control": "no-cache",
                         "Connection": "keep-alive",
+                        "X-Request-ID": request_id,
                         # Disable nginx-style response buffering so SSE events
                         # flush immediately. Traefik honors this too.
                         "X-Accel-Buffering": "no",
@@ -2809,32 +3770,17 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                 stream_ok = True
                 try:
                     if isinstance(result, dict):
-                        # Convert complete response to SSE chunks.
                         # Codex parses the full response from its SSE stream;
                         # the gateway receives it as a single dict and must
-                        # emit it as proper OpenAI streaming chunks so the
-                        # client (e.g. OMP) can consume them as text deltas.
-                        choices = result.get("choices", [{}])
-                        choice = choices[0]
-                        message = choice.get("message", {})
-                        content = message.get("content", "")
-                        finish_reason = choice.get("finish_reason", "stop")
-                        
-                        # Emit content chunk if there's text
-                        if content:
-                            await resp.write(sse_frame(format_openai_chunk(content=content)))
-                        
-                        # Emit tool_calls as individual deltas if present
-                        tool_calls = message.get("tool_calls")
-                        if tool_calls:
-                            for tc in tool_calls:
-                                tc_id = tc.get("id", "")
-                                fn = tc.get("function", {})
-                                tc_delta = {"role": "assistant", "tool_calls": [{"index": 0, "id": tc_id, "type": "function", "function": {"name": fn.get("name", ""), "arguments": fn.get("arguments", "")}}]}
-                                await resp.write(sse_frame({"id": result.get("id", "chatcmpl-tusker"), "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": tc_delta}], "model": result.get("model", "tusker-gateway")}))
-                        
-                        # Emit finish_reason chunk (distinct from content to satisfy OMP)
-                        await resp.write(sse_frame(format_openai_chunk(finish_reason=finish_reason)))
+                        # emit proper OpenAI streaming chunks so clients such
+                        # as OMP can consume text, legacy calls, and all
+                        # returned choices.
+                        async for chunk in _complete_chat_result_stream(result):
+                            # The HTTP handler owns the client-facing [DONE]
+                            # sentinel, just as it does for native streams.
+                            if chunk == sse_done():
+                                continue
+                            await resp.write(chunk)
                     else:
                         stream_result = (
                             result.iterator
@@ -2926,11 +3872,36 @@ async def responses_handler(request: web.Request) -> web.Response | web.StreamRe
         if not isinstance(body, dict):
             raise BadRequestError("Request body must be a JSON object", code="invalid_request")
         messages = _responses_input_to_messages(body.get("input"))
-        chat_body = _validate_chat_body({
+        if body.get("instructions") is not None:
+            messages.insert(0, {
+                "role": "system",
+                "content": _responses_instructions_to_chat(body["instructions"]),
+            })
+
+        # Carry Responses request fields through the canonical Chat API
+        # without forwarding the fields already translated above.
+        chat_body = {
+            key: value
+            for key, value in body.items()
+            if key not in {"input", "instructions", "tools", "tool_choice", "model", "stream"}
+        }
+        chat_body.update({
             "model": body.get("model"),
             "messages": messages,
             "stream": bool(body.get("stream", False)),
         })
+        if "max_output_tokens" in body:
+            if "max_tokens" not in chat_body:
+                chat_body["max_tokens"] = body["max_output_tokens"]
+            # This is the Responses spelling. Once translated, do not send
+            # both names to a Chat Completions provider; several reject the
+            # Responses-only field instead of ignoring it.
+            chat_body.pop("max_output_tokens", None)
+        if "tools" in body:
+            chat_body["tools"] = _responses_tools_to_chat(body["tools"])
+        if "tool_choice" in body:
+            chat_body["tool_choice"] = _responses_tool_choice_to_chat(body["tool_choice"])
+        chat_body = _validate_chat_body(chat_body)
         config = request.app["config"]
         client = PassthroughClient(
             config,
@@ -2939,10 +3910,87 @@ async def responses_handler(request: web.Request) -> web.Response | web.StreamRe
             catalog_registry=request.app.get("catalog_registry"),
             credential_rotators=request.app.get("credential_rotators"),
         )
-        _, _, result = await _call_with_pool_fallback(
-            config, chat_body, client, request=request,
-            metrics_registry=request.app.get("metrics"),
+        conversation_id = _request_conversation_id(
+            request,
+            {**body, "messages": messages},
+            _resolve_api_key(request),
         )
+        _, _, result = await _call_with_pool_fallback(
+            config,
+            chat_body,
+            client,
+            tools=chat_body.get("tools"),
+            request=request,
+            metrics_registry=request.app.get("metrics"),
+            conversation_id=conversation_id,
+        )
+        if body.get("stream"):
+            from tusker_gateway.tool_formats import normalize_response_tool_calls
+
+            if isinstance(result, dict):
+                result = normalize_response_tool_calls(
+                    result,
+                    source=f"responses/{body.get('model') or config['model_name']}",
+                )
+                response_stream = _responses_stream_from_chat(
+                    None,
+                    model=body.get("model") or config["model_name"],
+                    complete_result=result,
+                )
+            else:
+                raw_stream = (
+                    result.iterator
+                    if isinstance(result, _PreparedStream)
+                    else result
+                )
+                if not hasattr(raw_stream, "__aiter__"):
+                    raise BadRequestError(
+                        "streaming Responses output is unavailable from the provider",
+                        code="unsupported_streaming",
+                    )
+                response_stream = _responses_stream_from_chat(
+                    raw_stream,
+                    model=body.get("model") or config["model_name"],
+                )
+
+            resp = web.StreamResponse(
+                status=200,
+                headers={
+                    "Content-Type": "text/event-stream",
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Request-ID": request.get("_request_id", ""),
+                    "X-Accel-Buffering": "no",
+                },
+            )
+            await resp.prepare(request)
+            stop = asyncio.Event()
+            hb_interval = _sse_heartbeat_secs()
+            hb_task = asyncio.create_task(
+                sse_heartbeat_loop(
+                    resp.write,
+                    stop,
+                    interval_secs=hb_interval,
+                    comment="keepalive",
+                ),
+                name="responses-sse-heartbeat",
+            )
+            try:
+                async for chunk in response_stream:
+                    await resp.write(chunk)
+            except (ConnectionResetError, ConnectionError, BrokenPipeError):
+                logger.info("responses stream client disconnected")
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("responses stream pump failed", exc_info=True)
+            finally:
+                stop.set()
+                try:
+                    await asyncio.wait_for(hb_task, timeout=hb_interval + 1.0)
+                except asyncio.TimeoutError:
+                    hb_task.cancel()
+            return resp
         if isinstance(result, dict):
             from tusker_gateway.tool_formats import normalize_response_tool_calls
 
@@ -2950,12 +3998,19 @@ async def responses_handler(request: web.Request) -> web.Response | web.StreamRe
                 result,
                 source=f"responses/{body.get('model') or config['model_name']}",
             )
-        if isinstance(result, dict) and "choices" in result:
-            text = result.get("choices", [{}])[0].get("message", {}).get("content", "")
-        else:
-            text = ""
-        resp_obj = {"id": f"resp_{uuid.uuid4().hex}", "object": "response", "created_at": int(time.time()), "model": body.get("model") or config["model_name"], "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]}], "status": "completed"}
-        return web.json_response(resp_obj)
+            return web.json_response(
+                _chat_result_to_responses(
+                    result,
+                    body.get("model") or config["model_name"],
+                )
+            )
+        # This compatibility endpoint has no lossless JSON representation for
+        # a Chat SSE iterator. Fail explicitly rather than returning an empty
+        # successful response that discards model output.
+        raise BadRequestError(
+            "streaming Responses output is not supported by this compatibility endpoint",
+            code="unsupported_streaming",
+        )
     except BadRequestError as exc:
         return web.json_response(
             openai_error(exc.message, code=exc.code, error_type=exc.error_type),

@@ -63,59 +63,9 @@ _ID_SUFFIXED_TOOL_RE = re.compile(
 )
 _AUXILIARY_TEXT_FIELDS = ("reasoning_content", "reasoning", "thinking", "analysis")
 
-# Maps tool names to a dict of malformed arg name → canonical arg name.
-# Covers LLM-level mistakes the OMP harness validates before the tool handler runs.
-TOOL_ARGUMENT_REMAP: dict[str, dict[str, str]] = {
-    "todo": {
-        "status": "op",
-        "task": "name",
-        "description": "content",
-        "priority": "priority",
-        "due_date": "due",
-        "assignee": "assignee",
-        "tags": "tags",
-        "metadata": "metadata",
-    },
-}
-def remap_stream_tool_calls(
-    tool_calls: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Apply argument remapping to a list of OpenAI-style delta tool_calls.
-
-    Rewrites argument keys for tools where the LLM emits the wrong parameter
-    name.  Handles both complete-string arguments (parse → remap → re-serialize)
-    and pre-parsed-dict arguments (remap in place).  Fragments that are not
-    valid JSON dicts are returned unchanged so incremental assembly is not
-    disrupted.
-    """
-    if not tool_calls:
-        return tool_calls
-    result: list[dict[str, Any]] = []
-    for call in tool_calls:
-        call = dict(call)
-        fn = call.get("function") or {}
-        name = str(fn.get("name", "")).strip()
-        if name not in TOOL_ARGUMENT_REMAP:
-            result.append(call)
-            continue
-        args = fn.get("arguments", "{}")
-        remap = TOOL_ARGUMENT_REMAP[name]
-        if isinstance(args, dict):
-            fn["arguments"] = {remap.get(k, k): v for k, v in args.items()}
-        elif isinstance(args, str):
-            try:
-                parsed = json.loads(args)
-            except (json.JSONDecodeError, TypeError):
-                result.append(call)
-                continue
-            if isinstance(parsed, dict):
-                fn["arguments"] = json.dumps(
-                    {remap.get(k, k): v for k, v in parsed.items()},
-                    ensure_ascii=False,
-                )
-        call["function"] = fn
-        result.append(call)
-    return result
+# Tool arguments are part of each tool's public schema. Do not silently rename
+# fields here: a heuristic rewrite can turn a valid call into an invalid one
+# before the client-side tool validator sees it.
 
 
 def tool_diagnostics_enabled() -> bool:
@@ -228,13 +178,20 @@ def normalize_tools(tools: Any) -> list[dict[str, Any]]:
         name = str(fn.get("name", "")).strip()
         if not name:
             continue
+        normalized_function: dict[str, Any] = {
+            "name": name,
+            "description": str(fn.get("description", "")),
+            "parameters": fn.get("parameters") or {"type": "object", "properties": {}},
+        }
+        # ``strict`` is part of the OpenAI function contract and is required
+        # by some clients to validate/execute the returned arguments. Keep it
+        # when present instead of reducing every declaration to the old
+        # three-field shape.
+        if "strict" in fn:
+            normalized_function["strict"] = fn["strict"]
         result.append({
             "type": "function",
-            "function": {
-                "name": name,
-                "description": str(fn.get("description", "")),
-                "parameters": fn.get("parameters") or {"type": "object", "properties": {}},
-            },
+            "function": normalized_function,
         })
     return result
 
@@ -270,16 +227,6 @@ def normalize_tool_calls(raw: Any) -> list[dict[str, Any]]:
         name = str(name).strip()
         if not name:
             continue
-        # Apply argument remapping for known tool/argument name mismatches.
-        if name in TOOL_ARGUMENT_REMAP:
-            if isinstance(args, str):
-                try:
-                    args = json.loads(args)
-                except (json.JSONDecodeError, TypeError):
-                    pass
-            if isinstance(args, dict):
-                remap = TOOL_ARGUMENT_REMAP[name]
-                args = {remap.get(k, k): v for k, v in args.items()}
         call_id = str(call_id or f"call_{index}_{hashlib.sha256(name.encode()).hexdigest()[:10]}")
         calls.append({
             "id": call_id,
@@ -309,13 +256,26 @@ def openai_messages_to_anthropic(messages: list[dict[str, Any]]) -> list[dict[st
         if role in {"system", "developer"}:
             role = "user"
         if role == "tool":
+            tool_content = message.get("content", "")
+            if isinstance(tool_content, list):
+                tool_content = _openai_content_to_anthropic(tool_content)
+            elif tool_content is None:
+                tool_content = ""
+            elif not isinstance(tool_content, str):
+                try:
+                    tool_content = json.dumps(tool_content, ensure_ascii=False)
+                except (TypeError, ValueError):
+                    tool_content = str(tool_content)
             result.append({"role": "user", "content": [{
                 "type": "tool_result",
                 "tool_use_id": str(message.get("tool_call_id", "")),
-                "content": str(message.get("content", "")),
+                "content": tool_content,
             }]})
             continue
-        if role == "assistant" and message.get("tool_calls"):
+        raw_calls = message.get("tool_calls")
+        if raw_calls is None and message.get("function_call") is not None:
+            raw_calls = [message["function_call"]]
+        if role == "assistant" and raw_calls:
             blocks: list[dict[str, Any]] = []
             content = message.get("content")
             if content:
@@ -324,7 +284,7 @@ def openai_messages_to_anthropic(messages: list[dict[str, Any]]) -> list[dict[st
                     blocks.append({"type": "text", "text": converted})
                 else:
                     blocks.extend(converted)
-            for call in normalize_tool_calls(message["tool_calls"]):
+            for call in normalize_tool_calls(raw_calls):
                 fn = call["function"]
                 try:
                     args = json.loads(fn["arguments"])
@@ -506,17 +466,31 @@ def normalize_response_tool_calls(
             text_parts = []
             for part in content:
                 if not isinstance(part, dict):
+                    # A few compatibility providers use strings/nulls in an
+                    # otherwise block-shaped content list. Keep those values
+                    # visible instead of losing them while extracting tools.
+                    text_parts.append(json.dumps(part, ensure_ascii=False))
                     continue
                 if "toolUse" in part:
                     found_calls.append(part["toolUse"])
                 elif isinstance(part.get("text"), str):
                     text_parts.append(part["text"])
+                elif part.get("type") in {"tool_use", "function_call"}:
+                    found_calls.append(part)
+                else:
+                    # Keep provider-specific output blocks inspectable rather
+                    # than silently dropping them while extracting Bedrock
+                    # toolUse blocks.
+                    text_parts.append(json.dumps(part, ensure_ascii=False))
             if found_calls or text_parts:
                 if found_calls:
                     message["tool_calls"] = found_calls
                 content = "\n\n".join(text_parts) if text_parts else None
 
-        native_calls = normalize_tool_calls(message.get("tool_calls"))
+        raw_native_calls = message.get("tool_calls")
+        if raw_native_calls is None and message.get("function_call") is not None:
+            raw_native_calls = [message["function_call"]]
+        native_calls = normalize_tool_calls(raw_native_calls)
         auxiliary_texts = [
             (field, message[field])
             for field in _AUXILIARY_TEXT_FIELDS
@@ -593,6 +567,7 @@ def normalize_response_tool_calls(
                 new_details = []
                 for item in details:
                     if not isinstance(item, dict):
+                        new_details.append(item)
                         continue
                     item_copy = dict(item)
                     if isinstance(item_copy.get("text"), str):

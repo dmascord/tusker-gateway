@@ -30,10 +30,6 @@ class AuthMiddleware:
         if not token:
             raise AuthenticationError("Authorization header required")
 
-        token = auth[len("Bearer ") :].strip()
-        if not token:
-            raise AuthenticationError("Invalid API key")
-
         allowed = set(request.app["config"].get("api_keys", []))
         # Dev key bypass only when no production keys are configured.
         # In production, api_keys contains real secrets and the dev key should NOT work.

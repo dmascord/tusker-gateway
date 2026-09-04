@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from typing import Any
 
 import aiohttp
@@ -492,12 +493,15 @@ async def test_opencode_zen_catalog_parses_models():
 @pytest.mark.asyncio
 async def test_opencode_go_catalog_parses_models():
     body = {"data": [{"id": "minimax-m3"}, {"id": "kimi-k2.6"}]}
-    session = FakeSession({"default": FakeResponse(200, body)})
+    session = _CapturingSession(FakeResponse(200, body))
     entries = await OpenCodeGoCatalog().fetch(session)
     assert {e.model for e in entries} == {"minimax-m3", "kimi-k2.6"}
     assert all(e.provider == "opencode-go" for e in entries)
     # Go subclass should hit /go/v1/models, not /v1/models.
     assert OpenCodeGoCatalog.ENDPOINT.endswith("/go/v1/models")
+    assert session.captured["headers"]["x-opencode-session"] == (
+        OpenCodeGoCatalog.OPENCODE_GO_CATALOG_SESSION
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -809,6 +813,70 @@ async def test_refresh_loop_stops_when_event_set():
     stop.set()
     await asyncio.wait_for(task, timeout=1.0)
     assert fetch_count == 1  # No second refresh after stop
+
+
+@pytest.mark.asyncio
+async def test_refresh_loop_runs_sync_hook_off_event_loop():
+    """Large post-refresh pool rebuilds must not block aiohttp probes."""
+    class CountingClient(CatalogClient):
+        provider = "test"
+
+        async def fetch(self, session):
+            return []
+
+    registry = CatalogRegistry()
+    registry.register("test", CountingClient())
+    stop = asyncio.Event()
+    event_loop_thread = threading.get_ident()
+    hook_threads: list[int] = []
+    hook_finished = threading.Event()
+
+    def slow_hook() -> None:
+        hook_threads.append(threading.get_ident())
+        hook_finished.set()
+
+    task = asyncio.create_task(
+        catalog_refresh_loop(
+            registry,
+            FakeSession({}),
+            interval_secs=3600.0,
+            stop_event=stop,
+            on_refresh=slow_hook,
+        )
+    )
+    try:
+        await asyncio.wait_for(asyncio.to_thread(hook_finished.wait, 1.0), timeout=1.0)
+        assert hook_threads and hook_threads[0] != event_loop_thread
+    finally:
+        stop.set()
+        await asyncio.wait_for(task, timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_catalog_postprocessing_runs_off_event_loop():
+    """Catalog enrichment must not monopolize the request event loop."""
+    class CountingClient(CatalogClient):
+        provider = "test"
+
+        async def fetch(self, session):
+            return []
+
+    class TrackingRegistry(CatalogRegistry):
+        def __init__(self):
+            super().__init__()
+            self.postprocess_thread: int | None = None
+
+        def _postprocess_refresh(self) -> None:
+            self.postprocess_thread = threading.get_ident()
+
+    registry = TrackingRegistry()
+    registry.register("test", CountingClient())
+    event_loop_thread = threading.get_ident()
+
+    await registry.refresh_all(FakeSession({}))
+
+    assert registry.postprocess_thread is not None
+    assert registry.postprocess_thread != event_loop_thread
 
 
 # ---------------------------------------------------------------------------

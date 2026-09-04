@@ -7,7 +7,7 @@ from unittest.mock import Mock
 
 import pytest
 from aiohttp import web
-from aiohttp.test_utils import make_mocked_request
+from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
 
 from tusker_gateway.observability import AccessLog, attach_request_id_middleware, _generate_request_id
 from tusker_gateway.pools import ModelSpec, PoolManager, PoolConfig
@@ -108,6 +108,63 @@ class TestRequestIDMiddleware:
         request["_request_id"] = rid
         assert request["_request_id"] == "req_custom123"
 
+    @pytest.mark.asyncio
+    async def test_middleware_bounds_id_and_logs_completed_request(self):
+        app = web.Application()
+        access_log = Mock()
+        app["access_log"] = access_log
+
+        async def handler(request):
+            return web.Response(text="ok")
+
+        app.router.add_get("/test", handler)
+        attach_request_id_middleware(app)
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            request_id = "r" * 256
+            response = await client.get(
+                "/test",
+                headers={"X-Request-ID": request_id},
+            )
+            assert response.status == 200
+            assert response.headers["X-Request-ID"] == request_id[:128]
+            access_log.log.assert_called_once()
+            assert access_log.log.call_args.args[1] == 200
+        finally:
+            await client.close()
+
+    @pytest.mark.asyncio
+    async def test_middleware_preserves_id_on_prepared_stream(self):
+        app = web.Application()
+        access_log = Mock()
+        app["access_log"] = access_log
+
+        async def handler(request):
+            response = web.StreamResponse(
+                headers={"X-Request-ID": request["_request_id"]}
+            )
+            await response.prepare(request)
+            await response.write(b"ok")
+            await response.write_eof()
+            return response
+
+        app.router.add_get("/stream", handler)
+        attach_request_id_middleware(app)
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.get(
+                "/stream",
+                headers={"X-Request-ID": "req_stream"},
+            )
+            assert response.status == 200
+            assert response.headers["X-Request-ID"] == "req_stream"
+            assert await response.text() == "ok"
+            access_log.log.assert_called_once()
+        finally:
+            await client.close()
+
 
 class TestWeightedPoolSelection:
     """Weighted load-balancing within pool tiers."""
@@ -138,6 +195,14 @@ class TestWeightedPoolSelection:
             provider_zdr_ok=True,
         )
         assert spec.weight == 1.0
+
+        for invalid in ("not-a-number", float("nan"), float("inf")):
+            spec = ModelSpec.from_dict(
+                {"provider": "openrouter", "model": "gpt-4", "weight": invalid},
+                zdr=False,
+                provider_zdr_ok=True,
+            )
+            assert spec.weight == 1.0
 
         spec = ModelSpec.from_dict(
             {"provider": "openrouter", "model": "gpt-4", "weight": 0},

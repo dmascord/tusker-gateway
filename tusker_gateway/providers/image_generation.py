@@ -19,10 +19,38 @@ import aiohttp
 from tusker_gateway.auth_strategies import get_auth_strategy
 from tusker_gateway.config import DEFAULT_PROVIDER_REGISTRY
 from tusker_gateway.errors import GatewayError
+from tusker_gateway.providers.capabilities import Capability
 
 logger = logging.getLogger(__name__)
 MAX_IMAGE_RESPONSE_BYTES = 32 * 1024 * 1024
 MAX_IMAGE_RESULTS = 4
+
+_IMAGE_CAPABILITY_BY_PATH = {
+    "/v1/images/generations": Capability.IMAGE_GENERATIONS,
+    "/v1/images/edits": Capability.IMAGE_EDITS,
+    "/v1/images/variations": Capability.IMAGE_VARIATIONS,
+}
+_IMAGE_DISPATCH_PROVIDERS = frozenset({"openai", "openrouter", "google", "zai", "minimax"})
+_IMAGE_NON_GENERATION_PATHS = frozenset(
+    {"/v1/images/edits", "/v1/images/variations"}
+)
+
+
+def _image_dispatch_provider(provider: str) -> str:
+    """Map registry provider names to the image handler dispatch names."""
+    normalized = str(provider or "").strip().lower().replace("_", "-")
+    if normalized in {"codex", "openai-codex"}:
+        return "openai"
+    return normalized
+
+
+def _require_generation_path(path: str, provider: str) -> None:
+    """Reject image operations a provider endpoint cannot represent."""
+    if path in _IMAGE_NON_GENERATION_PATHS:
+        raise GatewayError(
+            f"{provider} image edits and variations are not supported",
+            code="unsupported_endpoint",
+        )
 
 
 async def _read_capped_text(resp: aiohttp.ClientResponse) -> str:
@@ -180,6 +208,7 @@ class ImageGenerationHandler:
             if capability_registry is not None
             else self.capability_registry
         )
+        capability = _IMAGE_CAPABILITY_BY_PATH.get(path, Capability.IMAGE_GENERATIONS)
 
         pin_provider: Optional[str] = None
         if "::" in model:
@@ -190,24 +219,42 @@ class ImageGenerationHandler:
         elif model_lower.startswith("openrouter/"):
             pin_provider = "openrouter"
 
-        if pin_provider is None and registry is not None:
+        if registry is not None:
             try:
                 snap = registry.snapshot
                 if any(snap.capabilities.values()):
-                    from tusker_gateway.providers.capabilities import Capability
-
-                    capability = {
-                        "/v1/images/edits": Capability.IMAGE_EDITS,
-                        "/v1/images/variations": Capability.IMAGE_VARIATIONS,
-                    }.get(path, Capability.IMAGE_GENERATIONS)
-                    entry = snap.lookup(capability, model)
+                    # A model slug can exist on multiple providers (for
+                    # example an OpenRouter mirror of a native image model).
+                    # Resolve an explicit gateway pin first; otherwise the
+                    # registry's deterministic provider order is appropriate.
+                    entry = snap.lookup(
+                        capability,
+                        model,
+                        provider=pin_provider,
+                    ) if pin_provider else snap.lookup(capability, model)
                     if entry is not None:
-                        if entry.provider == "anthropic":
+                        provider = _image_dispatch_provider(entry.provider)
+                        if provider not in _IMAGE_DISPATCH_PROVIDERS:
                             raise GatewayError(
-                                "Anthropic models do not support image generation",
+                                f"Provider {entry.provider!r} cannot serve "
+                                f"{capability.value}",
                                 code="unsupported_model",
                             )
-                        return entry.provider
+                        return provider
+
+                    # A model known to the registry for a different image
+                    # operation must not be sent to a generation endpoint (or
+                    # vice versa). Without this check, an edits-only model
+                    # silently fell through to an unrelated provider heuristic.
+                    for other_capability in Capability:
+                        if other_capability is capability:
+                            continue
+                        if snap.lookup(other_capability, model) is not None:
+                            raise GatewayError(
+                                f"Model {model!r} does not support "
+                                f"{capability.value}",
+                                code="unsupported_model",
+                            )
             except GatewayError:
                 raise
             except Exception as exc:  # noqa: BLE001
@@ -236,7 +283,10 @@ class ImageGenerationHandler:
 
         if "gpt-image" in model_lower or "dall-e" in model_lower:
             return "openai"
-        if "gemini" in model_lower or "google" in model_lower or "imagen" in model_lower:
+        if (
+            "imagen" in model_lower
+            or ("gemini" in model_lower and "image" in model_lower)
+        ):
             return "google"
         if "claude" in model_lower or "anthropic" in model_lower:
             raise GatewayError(
@@ -247,7 +297,10 @@ class ImageGenerationHandler:
             return "zai"
         if model_lower == "image-01":
             return "minimax"
-        return "openai"
+        raise GatewayError(
+            f"No image generation capability is known for model {model!r}",
+            code="unsupported_model",
+        )
     async def handle_request(
         self,
         model: str,
@@ -346,6 +399,7 @@ class ImageGenerationHandler:
         Sends a Responses API request with the native ``image_generation`` tool,
         which is what Codex / ChatGPT currently exposes for GPT Image models.
         """
+        _require_generation_path(path, "Codex")
         from tusker_gateway.models import ProviderConfig
         endpoint = ProviderConfig.from_raw({
             "base_url": "https://chatgpt.com/backend-api/codex",
@@ -502,6 +556,7 @@ class ImageGenerationHandler:
         extra_headers: Optional[Dict[str, str]],
     ) -> Dict[str, Any]:
         """Call OpenRouter's native image generation endpoint."""
+        _require_generation_path(path, "OpenRouter")
         if not api_key:
             raise GatewayError("OpenRouter API key required", code="missing_api_key")
         prompt = body.get("prompt")
@@ -727,6 +782,7 @@ class ImageGenerationHandler:
     ) -> Dict[str, Any]:
         """Call Z.AI image generation API for CogView-4 and GLM-Image models.
         """
+        _require_generation_path(path, "Z.AI")
         if not api_key:
             raise GatewayError("Z.AI API key required", code="missing_api_key")
 

@@ -15,6 +15,15 @@ def test_normalize_tools():
     assert res[0]["function"]["name"] == "bash"
     assert normalize_tools([{"name": "x"}])[0]["function"]["name"] == "x"
 
+
+def test_normalize_tools_preserves_strict_contract_flag():
+    tools = [{
+        "type": "function",
+        "function": {"name": "read", "strict": True},
+    }]
+
+    assert normalize_tools(tools)[0]["function"]["strict"] is True
+
 def test_normalize_tool_calls():
     # OpenAI
     c = normalize_tool_calls([{"id": "c1", "type": "function", "function": {"name": "r", "arguments": "{}"}}])
@@ -44,6 +53,35 @@ def test_openai_messages_to_anthropic():
     assert res[0]["role"] == "user" # system -> user
     assert any(b["type"] == "tool_use" for b in res[2]["content"])
     assert res[3]["content"][0]["type"] == "tool_result"
+
+
+def test_openai_messages_to_anthropic_preserves_legacy_function_call_and_structured_result():
+    msgs = [
+        {
+            "role": "assistant",
+            "content": None,
+            "function_call": {
+                "name": "read",
+                "arguments": '{"path":"package.json"}',
+            },
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_read",
+            "content": [{"type": "text", "text": "{}"}],
+        },
+    ]
+
+    result = openai_messages_to_anthropic(msgs)
+
+    tool_use = result[0]["content"][0]
+    assert tool_use["type"] == "tool_use"
+    assert tool_use["id"].startswith("call_")
+    assert tool_use["name"] == "read"
+    assert tool_use["input"] == {"path": "package.json"}
+    assert result[1]["content"][0]["content"] == [
+        {"type": "text", "text": "{}"},
+    ]
 
 def test_parse_text_tool_calls():
     # XML JSON
@@ -127,6 +165,40 @@ def test_normalize_response_tool_calls_reads_reasoning_markup():
     assert message["tool_calls"][0]["function"]["name"] == "bash"
     assert json.loads(message["tool_calls"][0]["function"]["arguments"]) == {"command": "ls"}
     assert "dots_function_call" not in str(message)
+
+
+def test_normalize_response_tool_calls_preserves_unknown_content_blocks():
+    response = {
+        "choices": [{
+            "message": {
+                "content": [
+                    {"text": "hello"},
+                    {"provider_block": {"trace_id": "trace-1"}},
+                ],
+            },
+        }],
+    }
+
+    message = normalize_response_tool_calls(response)["choices"][0]["message"]
+
+    assert "hello" in message["content"]
+    assert "trace-1" in message["content"]
+
+
+def test_normalize_response_tool_calls_preserves_scalar_content_parts():
+    response = {
+        "choices": [{
+            "message": {
+                "content": ["plain provider text", None, {"text": "more"}],
+            },
+        }],
+    }
+
+    message = normalize_response_tool_calls(response)["choices"][0]["message"]
+
+    assert "plain provider text" in message["content"]
+    assert "null" in message["content"]
+    assert "more" in message["content"]
 
 
 def test_strip_tool_text_removes_json_and_namespaced_invocation_envelopes():

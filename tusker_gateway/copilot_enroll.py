@@ -16,7 +16,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 import aiohttp
 
@@ -260,7 +260,33 @@ def _append_credential_hermes(path: Path | str, cred: dict[str, Any]) -> None:
     pool.setdefault(provider, []).append(cred)
     doc["updated_at"] = _now_iso()
 
-    p.write_text(json.dumps(doc, indent=2) + "\n")
+    _write_hermes_doc(p, doc)
+
+
+def append_credential(cred: dict[str, Any], path: Path | str | None = None) -> None:
+    """Append one credential while preserving every existing auth pool."""
+    _append_credential_hermes(_resolve_path(path), cred)
+
+
+def _write_hermes_doc(path: Path, doc: dict[str, Any]) -> None:
+    """Atomically write a credential document with restrictive permissions."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            os.chmod(temporary, 0o600)
+            json.dump(doc, handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _save_pool_hermes(path: Path | str, pool: dict[str, list[dict[str, Any]]]) -> None:
@@ -276,7 +302,50 @@ def _save_pool_hermes(path: Path | str, pool: dict[str, list[dict[str, Any]]]) -
 
     doc["credential_pool"] = pool
     doc["updated_at"] = _now_iso()
-    p.write_text(json.dumps(doc, indent=2) + "\n")
+    _write_hermes_doc(p, doc)
+
+
+def save_provider_auth_pool(
+    provider: str,
+    pool: list[dict[str, Any]],
+    path: Path | str | None = None,
+) -> None:
+    """Replace one provider pool while preserving every other auth pool.
+
+    OAuth refreshers normally own only one provider's credentials.  Writing
+    that subset through :func:`save_auth_file` would silently discard the
+    unrelated pools in a Hermes-format document, so provider-specific
+    refreshes must use this merge-preserving path.
+    """
+    p = Path(_resolve_path(path))
+    if p.exists():
+        try:
+            doc = json.loads(p.read_text())
+        except (json.JSONDecodeError, OSError):
+            doc = _default_hermes_doc()
+    else:
+        doc = _default_hermes_doc()
+
+    if not _is_hermes_format(doc):
+        # Preserve a legacy flat file by converting its entries before
+        # replacing the requested provider's pool.
+        legacy = doc if isinstance(doc, list) else [doc] if doc else []
+        converted: dict[str, list[dict[str, Any]]] = {}
+        for old in legacy:
+            if not isinstance(old, dict):
+                continue
+            old_provider = str(old.get("provider", "openai-codex"))
+            converted.setdefault(old_provider, []).append(old)
+        doc = _default_hermes_doc()
+        doc["credential_pool"] = converted
+
+    credential_pool = doc.get("credential_pool")
+    if not isinstance(credential_pool, dict):
+        credential_pool = {}
+        doc["credential_pool"] = credential_pool
+    credential_pool[str(provider)] = list(pool)
+    doc["updated_at"] = _now_iso()
+    _write_hermes_doc(p, doc)
 
 
 def load_auth_file(path: Path | str | None = None) -> list[dict[str, Any]]:
@@ -337,13 +406,25 @@ def list_credentials(path: Path | str | None = None) -> list[dict[str, Any]]:
     out = []
     for i, c in enumerate(pool):
         tok = c.get("access_token") or c.get("token", "")
+        expires_at_ms = c.get("expires_at_ms", 0)
+        try:
+            expires_at = int(float(expires_at_ms) / 1000) if expires_at_ms else 0
+        except (TypeError, ValueError):
+            expires_at = 0
+        if not expires_at:
+            try:
+                expires_at = int(float(c.get("expires_at", 0) or 0))
+            except (TypeError, ValueError):
+                expires_at = 0
         out.append(
             {
                 "index": i,
                 "label": c.get("label", ""),
                 "provider": c.get("provider", ""),
                 "fingerprint": _token_fingerprint(tok) if tok else "",
-                "expires_at_ms": c.get("expires_at_ms", 0),
+                "host": urlparse(str(c.get("base_url", ""))).netloc,
+                "expires_at": expires_at,
+                "expires_at_ms": expires_at_ms,
                 "auth_type": c.get("auth_type", ""),
             }
         )

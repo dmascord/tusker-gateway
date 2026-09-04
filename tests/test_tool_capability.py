@@ -14,6 +14,7 @@ from tusker_gateway.tool_qualification import (
     PROBE_PATH,
     PROBE_TOOL_NAME,
     _classify_http_failure,
+    _is_account_quota_exhausted,
     _needs_probe,
     _route_is_quarantined,
     _result_from_stream,
@@ -350,4 +351,19 @@ def test_structured_probe_with_wrong_tool_is_not_qualified(tmp_path):
 def test_probe_transport_classification_is_bounded():
     assert _classify_http_failure(400, "tools are unsupported")[0] == ToolCapabilityLevel.UNSUPPORTED
     assert _classify_http_failure(429, "temporarily unavailable")[2] == "rate_limited"
+    assert _is_account_quota_exhausted(
+        "Quota exceeded for metric free_tier_requests, limit: 0"
+    ) is True
+    assert _classify_http_failure(
+        429, "Quota exceeded for metric free_tier_requests, limit: 0"
+    )[2] == "provider_quota"
+    assert _classify_http_failure(
+        502,
+        "Rate limited",
+        {"X-Tusker-Provider-Failure": "provider_quota"},
+    )[2] == "provider_quota"
+    assert _is_account_quota_exhausted(
+        "Quota exceeded for model requests, limit: 0"
+    ) is False
+    assert _classify_http_failure(402, "Payment required")[2] == "quota"
     assert _classify_http_failure(502, "provider down")[0] == ToolCapabilityLevel.UNAVAILABLE

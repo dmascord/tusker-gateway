@@ -28,6 +28,59 @@ POOL_ALIASES = {
     "hermes-swarm": "swarm",
 }
 
+# Model ids advertised by the legacy Hermes endpoint. Provider-prefixed ids
+# continue through the normal passthrough path; the legacy control-plane and
+# local-only ids below need a best-effort gateway pool equivalent after the
+# hostname migration because their original backends are not present here.
+LEGACY_MODEL_IDS = (
+    "github-copilot-enterprise/claude-haiku-4.5",
+    "github-copilot-enterprise/claude-opus-4.6",
+    "github-copilot-enterprise/claude-sonnet-4.5",
+    "github-copilot-enterprise/claude-sonnet-4.6",
+    "github-copilot-enterprise/gemini-3.1-pro-preview",
+    "github-copilot-enterprise/gpt-4.1",
+    "github-copilot-enterprise/gpt-4o-mini",
+    "github-copilot-enterprise/gpt-5-mini",
+    "github-copilot-enterprise/gpt-5.3-codex",
+    "github-copilot-enterprise/gpt-5.4",
+    "github-copilot-enterprise/gpt-5.4-mini",
+    "github-copilot-enterprise/gpt-5.5",
+    "github-copilot-enterprise/gpt-5.6-luna",
+    "github-copilot-enterprise/gpt-5.6-sol",
+    "github-copilot-enterprise/gpt-5.6-terra",
+    "hermes-agent",
+    "hermes-agentic-full",
+    "hermes-agentic-remote",
+    "hermes-gateway/hermes-balanced",
+    "hermes-gateway/hermes-duplicate-pr",
+    "hermes-gateway/hermes-fast",
+    "hermes-gateway/hermes-reflect",
+    "hermes-gateway/hermes-translator",
+    "hermes-gateway/hermes-triage",
+    "hermes-gateway/roo-architect",
+    "hermes-gateway/roo-ask",
+    "hermes-gateway/roo-debug",
+    "hermes-reranker",
+    "mlx-mac/qwen3-coder-30b-a3b-instruct-4bit",
+)
+
+LEGACY_POOL_COMPAT_ALIASES = {
+    "hermes-agent": "code",
+    "hermes-agentic-full": "code",
+    "hermes-agentic-remote": "code",
+    "hermes-gateway/hermes-balanced": "code",
+    "hermes-gateway/hermes-duplicate-pr": "code",
+    "hermes-gateway/hermes-fast": "code",
+    "hermes-gateway/hermes-reflect": "code",
+    "hermes-gateway/hermes-translator": "code",
+    "hermes-gateway/hermes-triage": "code",
+    "hermes-gateway/roo-architect": "code",
+    "hermes-gateway/roo-ask": "code",
+    "hermes-gateway/roo-debug": "code",
+    "hermes-reranker": "code",
+    "mlx-mac/qwen3-coder-30b-a3b-instruct-4bit": "code",
+}
+
 # Explicit provider prefix marker (e.g. "github-copilot::gpt-5.5").
 PROVIDER_PREFIX = "::"
 GATEWAY_PROVIDER = "tusker-gateway"
@@ -68,6 +121,13 @@ def resolve_route(model: str | None, body: dict[str, Any]) -> Route:
         return Route(
             kind="pool",
             pool_name=POOL_ALIASES[model],
+            role=model,
+        )
+
+    if model in LEGACY_POOL_COMPAT_ALIASES:
+        return Route(
+            kind="pool",
+            pool_name=LEGACY_POOL_COMPAT_ALIASES[model],
             role=model,
         )
 

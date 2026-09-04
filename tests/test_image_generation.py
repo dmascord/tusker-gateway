@@ -498,6 +498,23 @@ async def test_openai_raises_when_no_credentials():
     assert excinfo.value.code == "missing_api_key"
 
 
+@pytest.mark.asyncio
+async def test_codex_rejects_json_image_edits_and_variations():
+    h = ImageGenerationHandler(_make_config())
+    fake_rotator = MagicMock()
+
+    for path in ("/v1/images/edits", "/v1/images/variations"):
+        with pytest.raises(GatewayError) as excinfo:
+            await h._call_openai_codex(
+                model="gpt-image-2",
+                path=path,
+                body={"prompt": "change it"},
+                codex_rotator=fake_rotator,
+                extra_headers=None,
+            )
+        assert excinfo.value.code == "unsupported_endpoint"
+
+
 class _FakeContent:
     """Async iterable that returns one chunk of bytes then stops."""
 

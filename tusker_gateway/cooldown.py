@@ -34,9 +34,25 @@ MODEL_SCOPED_COOLDOWN_PROVIDERS = frozenset({
 _QUOTA_HINTS = (
     "quota", "quota exceeded", "usage limit", "usage_limit",
     "capacity", "insufficient", "out of credits", "out of quota",
-    "billing", "subscription limit", "limit reached", "monthly limit",
+    "billing", "payment required", "payment_required", "subscription limit",
+    "limit reached", "monthly limit",
     "daily limit", "budget exhausted",
 )
+
+
+def is_account_quota_exhausted(body: str | None) -> bool:
+    """Identify an explicit account-wide zero-quota response.
+
+    Providers also use quota errors for model-scoped limits. A response that
+    names a free-tier metric and reports a zero limit is the stronger signal:
+    the configured account has no usable quota at all, so probing every model
+    only creates avoidable maintenance failures.
+    """
+    lowered = str(body or "").lower()
+    return bool(
+        re.search(r"limit\s*:\s*0(?:\.0+)?\s*(?:[,;\]}]|$)", lowered)
+        and ("free_tier" in lowered or "free tier" in lowered)
+    )
 
 # Non-429 permanent provider failures (401 auth / 403 forbidden / 404
 # not-found). These are not transient blips; a 60s cooldown makes the

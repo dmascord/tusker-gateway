@@ -5,11 +5,13 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import Any
 
 from tusker_gateway.copilot_enroll import (
+    append_credential,
     enroll_device_code,
     import_from_env,
     list_credentials,
@@ -24,18 +26,68 @@ def _setup_logging() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 
+def _credential_summary(cred: dict[str, Any]) -> dict[str, Any]:
+    """Return safe CLI output for a newly issued or enrolled credential."""
+    return {
+        "provider": cred.get("provider", ""),
+        "label": cred.get("label", ""),
+        "base_url": cred.get("base_url", ""),
+        "expires_at_ms": cred.get("expires_at_ms", 0),
+        "has_access_token": bool(cred.get("access_token") or cred.get("token")),
+        "has_refresh_token": bool(cred.get("refresh_token")),
+    }
+
+
 def _cmd_enroll(args: argparse.Namespace) -> int:
     async def _run() -> int:
+        output = args.file or os.environ.get("TUSKER_AUTH_FILE") or str(Path.home() / ".hermes" / "auth.json")
         cred = await enroll_device_code(
-            output=args.file,
+            output=output,
             label=args.label,
             host=args.host,
             interactive=sys.stdout.isatty(),
         )
         if cred:
-            print(json.dumps(cred, indent=2))
+            summary = _credential_summary(cred)
+            summary["saved_to"] = output
+            print(json.dumps(summary, indent=2))
             return 0
         return 1
+
+    return asyncio.run(_run())
+
+
+def _cmd_codex_login(args: argparse.Namespace) -> int:
+    async def _run() -> int:
+        from tusker_gateway.codex_oauth import CodexOAuthError, issue_codex_device_token
+
+        def on_authorize(url: str, user_code: str) -> None:
+            print(f"Open {url} and enter code: {user_code}")
+
+        def on_progress(message: str) -> None:
+            print(message)
+
+        try:
+            cred = await issue_codex_device_token(
+                max_polls=args.max_polls,
+                poll_interval_seconds=args.poll_interval,
+                on_authorize=on_authorize,
+                on_progress=on_progress,
+                label=args.label,
+            )
+        except CodexOAuthError as exc:
+            logger.error("%s", exc)
+            return 1
+
+        append_credential(cred, args.file)
+        summary = _credential_summary(cred)
+        summary["saved_to"] = str(
+            args.file
+            or os.environ.get("TUSKER_AUTH_FILE")
+            or Path.home() / ".hermes" / "auth.json"
+        )
+        print(json.dumps(summary, indent=2))
+        return 0
 
     return asyncio.run(_run())
 
@@ -75,9 +127,22 @@ def _cmd_check(args: argparse.Namespace) -> int:
     ok = 0
     stale = 0
     import time
+    from tusker_gateway.codex_oauth import _jwt_exp
 
     for i, c in enumerate(pool):
-        exp = float(c.get("expires_at", 0))
+        try:
+            exp = float(c.get("expires_at_ms", 0) or 0) / 1000.0
+        except (TypeError, ValueError):
+            exp = 0.0
+        if not exp:
+            try:
+                exp = float(c.get("expires_at", 0) or 0)
+            except (TypeError, ValueError):
+                exp = 0.0
+        if not exp:
+            token = c.get("access_token") or c.get("token")
+            if isinstance(token, str):
+                exp = _jwt_exp(token) or 0.0
         is_stale = bool(exp and time.time() >= exp - 120)
         if is_stale:
             stale += 1
@@ -100,10 +165,30 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command")
 
     # enroll
-    p_enroll = sub.add_parser("enroll", help="Run GitHub device-code OAuth flow")
+    p_enroll = sub.add_parser("enroll", help="Run GitHub Copilot device-code OAuth flow")
     p_enroll.add_argument("--label", default=None, help="Label for the credential")
     p_enroll.add_argument("--host", default="github.com", help="GitHub host (e.g. github.com or corp.ghe.com)")
     p_enroll.set_defaults(func=_cmd_enroll)
+
+    # native Codex login
+    p_codex = sub.add_parser(
+        "codex-login",
+        help="Issue a native OpenAI Codex credential via device-code OAuth",
+    )
+    p_codex.add_argument("--label", default=None, help="Label for the credential")
+    p_codex.add_argument(
+        "--max-polls",
+        type=int,
+        default=120,
+        help="Maximum device authorization polls (default: 120)",
+    )
+    p_codex.add_argument(
+        "--poll-interval",
+        type=float,
+        default=None,
+        help="Override device poll interval in seconds (for testing)",
+    )
+    p_codex.set_defaults(func=_cmd_codex_login)
 
     # list
     p_list = sub.add_parser("list", help="List stored credentials")
@@ -131,3 +216,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

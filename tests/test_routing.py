@@ -49,3 +49,21 @@ def test_gateway_qualified_pool_aliases_resolve_to_pools():
             route = resolve_route(model, {})
             assert route.kind == "pool"
             assert route.pool_name == pool
+
+
+def test_legacy_model_ids_have_gateway_compatibility_routes():
+    for model_id in (
+        "hermes-gateway/hermes-balanced",
+        "mlx-mac/qwen3-coder-30b-a3b-instruct-4bit",
+        "hermes-reranker",
+    ):
+        route = resolve_route(model_id, {})
+        assert route.kind == "pool"
+        assert route.pool_name == "code"
+
+
+def test_legacy_provider_model_ids_keep_passthrough_routing():
+    route = resolve_route("github-copilot-enterprise/gpt-5.5", {})
+    assert route.kind == "passthrough"
+    assert route.provider == "github-copilot-enterprise"
+    assert route.model == "gpt-5.5"

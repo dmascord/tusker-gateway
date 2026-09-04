@@ -75,6 +75,147 @@ async def test_streaming_dict_response_with_tool_calls(client):
 
 
 @pytest.mark.asyncio
+async def test_streaming_dict_response_preserves_legacy_function_call(client):
+    """Complete legacy calls must remain executable on the streaming path."""
+    dict_response = {
+        "id": "chatcmpl-legacy-1",
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "function_call": {
+                    "name": "read",
+                    "arguments": '{"path":"README.md"}',
+                },
+            },
+            "finish_reason": "function_call",
+        }],
+    }
+    with patch("tusker_gateway.endpoints.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
+        mock_chat.return_value = dict_response
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={"model": "hermes-code", "messages": [{"role": "user", "content": "read it"}], "stream": True},
+            headers=HEADERS_AUTH,
+        )
+        assert resp.status == 200
+        content = await resp.read()
+
+    assert b'"name": "read"' in content
+    assert b'README.md' in content
+    assert b'"finish_reason": "tool_calls"' in content
+    assert b"data: [DONE]" in content
+
+
+@pytest.mark.asyncio
+async def test_streaming_legacy_function_call_deltas_are_normalized(client):
+    """Legacy streamed function_call fragments must not disappear."""
+    async def upstream():
+        yield b'data: {"choices":[{"index":0,"delta":{"function_call":{"name":"read","arguments":"{\\"path\\":"}},"finish_reason":null}]}' + b"\n\n"
+        yield b'data: {"choices":[{"index":0,"delta":{"function_call":{"arguments":"\\"README.md\\"}"}},"finish_reason":null}]}' + b"\n\n"
+        yield b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"function_call"}]}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "read",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
+        },
+    }]
+    with patch("tusker_gateway.endpoints.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
+        mock_chat.return_value = upstream()
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-code",
+                "messages": [{"role": "user", "content": "read it"}],
+                "tools": tools,
+                "stream": True,
+            },
+            headers=HEADERS_AUTH,
+        )
+        assert resp.status == 200
+        content = await resp.read()
+
+    assert b'"name": "read"' in content
+    assert b'README.md' in content
+    assert b"data: [DONE]" in content
+
+
+@pytest.mark.asyncio
+async def test_streaming_dict_response_preserves_parallel_tool_call_indexes(client):
+    """Parallel calls must keep distinct indexes so clients do not merge them."""
+    dict_response = {
+        "id": "chatcmpl-codex-parallel-1",
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-todo",
+                        "type": "function",
+                        "function": {
+                            "name": "todo",
+                            "arguments": '{"op":"start","task":"Verify tool indexes"}',
+                        },
+                    },
+                    {
+                        "id": "call-read",
+                        "type": "function",
+                        "function": {
+                            "name": "read",
+                            "arguments": '{"path":"package.json"}',
+                        },
+                    },
+                ],
+            },
+            "finish_reason": "tool_calls",
+        }],
+    }
+    with patch("tusker_gateway.endpoints.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
+        mock_chat.return_value = dict_response
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-code",
+                "messages": [{"role": "user", "content": "inspect the project"}],
+                "stream": True,
+            },
+            headers=HEADERS_AUTH,
+        )
+        assert resp.status == 200
+        content = await resp.read()
+
+    tool_calls = []
+    for line in content.splitlines():
+        if not line.startswith(b"data: {"):
+            continue
+        event = json.loads(line[len(b"data: "):])
+        for choice in event.get("choices", []):
+            tool_calls.extend((choice.get("delta") or {}).get("tool_calls") or [])
+
+    assert [call["index"] for call in tool_calls] == [0, 1]
+    assert [call["id"] for call in tool_calls] == ["call-todo", "call-read"]
+    assert [call["function"]["name"] for call in tool_calls] == ["todo", "read"]
+    assert json.loads(tool_calls[0]["function"]["arguments"]) == {
+        "op": "start",
+        "task": "Verify tool indexes",
+    }
+    assert json.loads(tool_calls[1]["function"]["arguments"]) == {"path": "package.json"}
+    assert b"data: [DONE]" in content
+
+
+@pytest.mark.asyncio
 async def test_streaming_dict_response_missing_required_tool_args_falls_back(app, client):
     """Codex-style complete responses must not send ``read {}`` to OMP."""
     pool_manager = MagicMock()

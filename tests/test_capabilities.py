@@ -12,10 +12,12 @@ from typing import Any, Callable, Optional
 
 import pytest
 
+from tusker_gateway.errors import GatewayError
 from tusker_gateway.providers.capabilities import (
     Capability,
     CapabilityEntry,
     CapabilitiesRegistry,
+    discover_openai_verified,
     _discover_xiaomi,
     capabilities_refresh_loop,
     discover_openrouter,
@@ -160,7 +162,7 @@ async def test_discover_openrouter_picks_dedicated_video_models():
 
 
 @pytest.mark.asyncio
-async def test_discover_openrouter_filters_paid_and_unknown_price_media():
+async def test_discover_openrouter_keeps_entitled_paid_and_unknown_price_media():
     catalog = {
         "data": [
             {
@@ -218,6 +220,44 @@ async def test_discover_openrouter_filters_paid_and_unknown_price_media():
     assert {entry.model for entry in entries} == {
         "free/image:free",
         "free/dedicated-image:free",
+        "paid/image",
+        "unknown/image",
+        "paid/dedicated-image",
+    }
+
+
+@pytest.mark.asyncio
+async def test_discover_openai_verified_only_registers_models_in_account_catalog():
+    session = _FakeSession()
+    session.route(
+        "GET",
+        "api.openai.com/v1/models",
+        lambda *_: (
+            200,
+            json.dumps(
+                {
+                    "data": [
+                        {"id": "gpt-image-2"},
+                        {"id": "dall-e-2"},
+                        {"id": "tts-1"},
+                    ]
+                }
+            ).encode(),
+            {},
+        ),
+    )
+
+    entries = await discover_openai_verified(session, "sk-test")
+
+    assert {
+        (entry.capability, entry.model)
+        for entry in entries
+    } == {
+        (Capability.IMAGE_GENERATIONS, "gpt-image-2"),
+        (Capability.IMAGE_GENERATIONS, "dall-e-2"),
+        (Capability.IMAGE_EDITS, "dall-e-2"),
+        (Capability.IMAGE_VARIATIONS, "dall-e-2"),
+        (Capability.TTS_SPEECH, "tts-1"),
     }
 
 @pytest.mark.asyncio
@@ -298,6 +338,25 @@ async def test_registry_resolves_provider_for_model():
     assert entry.provider == "openrouter"
 
 
+def test_registry_lookup_normalizes_provider_pins_and_aliases():
+    reg = CapabilitiesRegistry()
+    reg.snapshot.capabilities[Capability.IMAGE_GENERATIONS].append(
+        CapabilityEntry(
+            provider="codex",
+            model="gpt-image-2",
+            capability=Capability.IMAGE_GENERATIONS,
+        )
+    )
+
+    entry = reg.snapshot.lookup(
+        Capability.IMAGE_GENERATIONS,
+        "openai-codex::GPT-IMAGE-2",
+        provider="openai",
+    )
+    assert entry is not None
+    assert entry.provider == "codex"
+
+
 def test_normalise_model_for_lookup_handles_provider_prefix():
     assert normalise_model_for_lookup("openai::gpt-image-1") == "gpt-image-1"
     # 'openrouter/google/gemini-...' is the canonical prefix form. After
@@ -321,6 +380,17 @@ def test_capability_enum_values_are_stable():
     assert Capability.IMAGE_VARIATIONS.value == "image_variations"
     assert Capability.TTS_SPEECH.value == "tts_speech"
     assert Capability.VIDEO_GENERATIONS.value == "video_generations"
+
+
+@pytest.mark.asyncio
+async def test_discover_minimax_registers_image_endpoint_without_probe():
+    from tusker_gateway.providers.capabilities import _discover_minimax
+
+    entries = await _discover_minimax("minimax-test-key")
+
+    assert [(entry.provider, entry.model, entry.capability) for entry in entries] == [
+        ("minimax", "image-01", Capability.IMAGE_GENERATIONS)
+    ]
 
 
 # ---------- Refresh loop ----------
@@ -417,6 +487,89 @@ async def test_image_handler_consults_registry_when_present():
         "/v1/images/generations",
         capability_registry=reg,
     )
+    assert provider == "openrouter"
+
+
+@pytest.mark.asyncio
+async def test_image_handler_maps_codex_capability_to_openai_dispatch():
+    from tusker_gateway.providers.image_generation import ImageGenerationHandler
+
+    reg = CapabilitiesRegistry()
+    reg.snapshot.capabilities[Capability.IMAGE_GENERATIONS].append(
+        CapabilityEntry(
+            provider="codex",
+            model="gpt-image-2",
+            capability=Capability.IMAGE_GENERATIONS,
+        )
+    )
+
+    provider = ImageGenerationHandler({}).get_provider_for_image_request(
+        "gpt-image-2",
+        "/v1/images/generations",
+        capability_registry=reg,
+    )
+
+    assert provider == "openai"
+
+
+@pytest.mark.asyncio
+async def test_image_handler_rejects_model_on_wrong_image_operation():
+    from tusker_gateway.providers.image_generation import ImageGenerationHandler
+
+    reg = CapabilitiesRegistry()
+    reg.snapshot.capabilities[Capability.IMAGE_GENERATIONS].append(
+        CapabilityEntry(
+            provider="openai",
+            model="gpt-image-2",
+            capability=Capability.IMAGE_GENERATIONS,
+        )
+    )
+
+    with pytest.raises(GatewayError) as excinfo:
+        ImageGenerationHandler({}).get_provider_for_image_request(
+            "gpt-image-2",
+            "/v1/images/edits",
+            capability_registry=reg,
+        )
+
+    assert excinfo.value.code == "unsupported_model"
+
+
+def test_image_handler_rejects_unknown_image_model():
+    from tusker_gateway.providers.image_generation import ImageGenerationHandler
+
+    with pytest.raises(GatewayError) as excinfo:
+        ImageGenerationHandler({}).get_provider_for_image_request(
+            "some-text-only-model",
+            "/v1/images/generations",
+        )
+
+    assert excinfo.value.code == "unsupported_model"
+
+
+def test_image_handler_honours_provider_pin_when_model_is_mirrored():
+    from tusker_gateway.providers.image_generation import ImageGenerationHandler
+
+    reg = CapabilitiesRegistry()
+    reg.snapshot.capabilities[Capability.IMAGE_GENERATIONS].extend([
+        CapabilityEntry(
+            provider="openai",
+            model="shared-image-model",
+            capability=Capability.IMAGE_GENERATIONS,
+        ),
+        CapabilityEntry(
+            provider="openrouter",
+            model="shared-image-model",
+            capability=Capability.IMAGE_GENERATIONS,
+        ),
+    ])
+
+    provider = ImageGenerationHandler({}).get_provider_for_image_request(
+        "openrouter::shared-image-model",
+        "/v1/images/generations",
+        capability_registry=reg,
+    )
+
     assert provider == "openrouter"
 
 

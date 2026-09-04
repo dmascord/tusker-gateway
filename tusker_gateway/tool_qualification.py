@@ -25,6 +25,7 @@ import aiohttp
 
 from tusker_gateway.catalog import CatalogRegistry
 from tusker_gateway.config import load_config
+from tusker_gateway.cooldown import is_account_quota_exhausted as _is_account_quota_exhausted
 from tusker_gateway.pools import PoolManager, is_general_chat_model
 from tusker_gateway.tool_capability import (
     TOOL_CAPABILITY_PROBE_VERSION,
@@ -146,9 +147,18 @@ def _parse_sse_line(
     return finish_reason
 
 
-def _classify_http_failure(status: int, body: str) -> tuple[ToolCapabilityLevel, str, str]:
+def _classify_http_failure(
+    status: int,
+    body: str,
+    headers: Any | None = None,
+) -> tuple[ToolCapabilityLevel, str, str]:
     """Classify transport failures without retaining the upstream body."""
     lowered = body.lower()
+    if status == 402 or any(
+        marker in lowered
+        for marker in ("payment required", "payment_required", "billing")
+    ):
+        return ToolCapabilityLevel.UNAVAILABLE, "unavailable", "quota"
     if status == 400 and any(
         marker in lowered for marker in ("tool", "function calling", "unsupported parameter")
     ):
@@ -157,6 +167,16 @@ def _classify_http_failure(status: int, body: str) -> tuple[ToolCapabilityLevel,
         marker in lowered for marker in ("unauthorized", "forbidden", "invalid api key")
     ):
         return ToolCapabilityLevel.UNAVAILABLE, "unavailable", "auth"
+    provider_failure = ""
+    if headers is not None:
+        try:
+            provider_failure = str(
+                headers.get("X-Tusker-Provider-Failure", "")
+            ).strip().lower()
+        except AttributeError:
+            provider_failure = ""
+    if provider_failure == "provider_quota" or _is_account_quota_exhausted(lowered):
+        return ToolCapabilityLevel.UNAVAILABLE, "unavailable", "provider_quota"
     if status == 429 or any(
         marker in lowered for marker in ("rate limit", "rate-limited", "quota", "temporarily")
     ):
@@ -291,7 +311,11 @@ async def probe_model(
             status_code = response.status
             if status_code != 200:
                 body = (await response.read()).decode("utf-8", "replace")[:4096]
-                level, status, failure_class = _classify_http_failure(status_code, body)
+                level, status, failure_class = _classify_http_failure(
+                    status_code,
+                    body,
+                    response.headers,
+                )
                 return {
                     "provider": provider,
                     "model": model,
@@ -506,9 +530,12 @@ async def run_qualification(
             )
 
         semaphore = asyncio.Semaphore(max(1, max_concurrency))
+        provider_quota_exhausted: set[str] = set()
 
-        async def one(pair: tuple[str, str]) -> dict[str, Any]:
+        async def one(pair: tuple[str, str]) -> dict[str, Any] | None:
             async with semaphore:
+                if pair[0] in provider_quota_exhausted:
+                    return None
                 result = await probe_model(
                     session,
                     base_url=base_url,
@@ -517,9 +544,21 @@ async def run_qualification(
                     model=pair[1],
                 )
                 capability_db.record(**result)
+                if result.get("failure_class") == "provider_quota":
+                    provider_quota_exhausted.add(pair[0])
                 return result
 
-        return await asyncio.gather(*(one(pair) for pair in pairs))
+        gathered = await asyncio.gather(*(one(pair) for pair in pairs))
+        skipped_provider_quota = len(gathered) - sum(
+            result is not None for result in gathered
+        )
+        if skipped_provider_quota:
+            logger.info(
+                "tool qualification pool=%s skipped_provider_quota=%d",
+                pool_name,
+                skipped_provider_quota,
+            )
+        return [result for result in gathered if result is not None]
 
 
 def _print_results(results: list[dict[str, Any]], *, pool_name: str) -> None:

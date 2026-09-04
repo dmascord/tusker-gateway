@@ -113,19 +113,51 @@ def attach_request_id_middleware(app: web.Application) -> None:
 
     @web.middleware
     async def request_id_middleware(request, handler):
+        started = time.monotonic()
         # Extract or generate request ID
         request_id = request.headers.get("X-Request-ID", "").strip()
         if not request_id:
             request_id = _generate_request_id()
 
+        # Bound caller-controlled IDs so logs and downstream systems cannot
+        # receive unbounded correlation values.
+        request_id = request_id[:128]
+
         # Attach to request for downstream use
         request["_request_id"] = request_id
 
-        # Process request
-        response = await handler(request)
+        access_log = app.get("access_log")
+        try:
+            response = await handler(request)
+        except web.HTTPException as exc:
+            if access_log is not None:
+                access_log.log(
+                    request,
+                    exc.status,
+                    (time.monotonic() - started) * 1000,
+                    error=exc.__class__.__name__,
+                )
+            raise
+        except Exception as exc:
+            if access_log is not None:
+                access_log.log(
+                    request,
+                    500,
+                    (time.monotonic() - started) * 1000,
+                    error=exc.__class__.__name__,
+                )
+            raise
 
-        # Attach to response headers
-        response.headers["X-Request-ID"] = request_id
+        if access_log is not None:
+            access_log.log(
+                request,
+                response.status,
+                (time.monotonic() - started) * 1000,
+            )
+        # StreamResponse headers are immutable after prepare(). Streaming
+        # handlers must set X-Request-ID in their initial headers.
+        if not response.prepared:
+            response.headers["X-Request-ID"] = request_id
         return response
 
     # Insert before auth middleware so ID is available everywhere

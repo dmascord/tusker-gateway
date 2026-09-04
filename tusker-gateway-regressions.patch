@@ -1,0 +1,136 @@
+diff --git a/tusker_gateway/observability.py b/tusker_gateway/observability.py
+--- a/tusker_gateway/observability.py
++++ b/tusker_gateway/observability.py
+@@ -105,16 +105,36 @@ def attach_request_id_middleware(app: web.Application) -> None:
+     @web.middleware
+     async def request_id_middleware(request, handler):
++        started = time.monotonic()
+         # Extract or generate request ID
+         request_id = request.headers.get("X-Request-ID", "").strip()
+         if not request_id:
+             request_id = _generate_request_id()
++
++        # Bound caller-controlled IDs so logs and downstream systems cannot
++        # receive unbounded correlation values.
++        request_id = request_id[:128]
+ 
+         # Attach to request for downstream use
+         request["_request_id"] = request_id
+ 
+-        # Process request
+-        response = await handler(request)
++        access_log = app.get("access_log")
++        try:
++            response = await handler(request)
++        except web.HTTPException as exc:
++            if access_log is not None:
++                access_log.log(request, exc.status, (time.monotonic() - started) * 1000,
++                               error=exc.__class__.__name__)
++            raise
++        except Exception as exc:
++            if access_log is not None:
++                access_log.log(request, 500, (time.monotonic() - started) * 1000,
++                               error=exc.__class__.__name__)
++            raise
+ 
+-        # Attach to response headers
+-        response.headers["X-Request-ID"] = request_id
++        if access_log is not None:
++            access_log.log(
++                request, response.status, (time.monotonic() - started) * 1000,
++            )
++        # StreamResponse headers are immutable after prepare(). Streaming
++        # handlers must set X-Request-ID in their initial headers.
++        if not response.prepared:
++            response.headers["X-Request-ID"] = request_id
+         return response
+diff --git a/tusker_gateway/endpoints.py b/tusker_gateway/endpoints.py
+--- a/tusker_gateway/endpoints.py
++++ b/tusker_gateway/endpoints.py
+@@ -2465,7 +2465,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.StreamResponse:
+ 
+     started = time.monotonic()
+-    request_id = uuid.uuid4().hex[:12]
++    request_id = request.get("_request_id") or uuid.uuid4().hex[:12]
+@@ -2762,6 +2762,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.StreamResponse:
+                         "Connection": "keep-alive",
++                        "X-Request-ID": request_id,
+                         # Disable nginx-style response buffering so SSE events
+diff --git a/tusker_gateway/pools.py b/tusker_gateway/pools.py
+--- a/tusker_gateway/pools.py
++++ b/tusker_gateway/pools.py
+@@ -5,6 +5,7 @@
+ 
+ import logging
++import math
+ import os
+ import random
+@@ -196,6 +197,7 @@ class PoolManager:
+     _original_static: dict[str, frozenset[tuple[str, str]]] = field(default_factory=dict)
+     _stickiness: dict[tuple[str, str], tuple[str, str]] = field(default_factory=dict)
++    _round_robin: dict[str, int] = field(default_factory=dict)
+@@ -154,7 +156,13 @@ class ModelSpec:
+         else:
+             hw = bool(hw)
+         modalities = data.get("input_modalities")
+-        weight = float(data.get("weight", 1.0))
+-        if weight <= 0:
++        try:
++            weight = float(data.get("weight", 1.0))
++        except (TypeError, ValueError):
+             weight = 1.0  # fallback to equal weight
++        if not math.isfinite(weight) or weight <= 0:
++            weight = 1.0
+@@ -1050,9 +1058,17 @@ class PoolManager:
+             weights = [c.weight for c in tier_candidates]
+             # Check if all weights are equal (within floating-point tolerance)
+-            if len(set(weights)) == 1:
+-                # All equal: pick first (deterministic, stable for tests)
+-                selected = tier_candidates[0]
++            if max(weights) - min(weights) <= 1e-12:
++                # Equal weights should distribute traffic, while retaining a
++                # deterministic order that is easy to test.
++                offset = self._round_robin.get(pool_name, 0) % len(tier_candidates)
++                selected = tier_candidates[offset]
++                self._round_robin[pool_name] = offset + 1
+@@ -1119,8 +1135,10 @@ class PoolManager:
+         return {
+             "provider": spec.provider,
+             "model": spec.model,
++            "context_window": spec.context_window,
++            "auto_discovered": spec.auto_discovered,
+             "weight": spec.weight,
+diff --git a/tusker_gateway/tool_formats.py b/tusker_gateway/tool_formats.py
+--- a/tusker_gateway/tool_formats.py
++++ b/tusker_gateway/tool_formats.py
+@@ -275,7 +275,17 @@ def normalize_tool_calls(raw: Any) -> list[dict[str, Any]]:
+             if isinstance(args, dict):
+                 remap = TOOL_ARGUMENT_REMAP[name]
+-                args = {remap.get(k, k): v for k, v in args.items()}
++                # Preserve an explicitly canonical key if both the alias and
++                # canonical spelling are present; never silently overwrite it.
++                remapped = dict(args)
++                for alias, canonical in remap.items():
++                    if alias == canonical or alias not in args:
++                        continue
++                    if canonical not in args:
++                        remapped[canonical] = remapped.pop(alias)
++                    else:
++                        remapped.pop(alias, None)
++                args = remapped
+diff --git a/tusker_gateway/tool_formats.py b/tusker_gateway/tool_formats.py
+--- a/tusker_gateway/tool_formats.py
++++ b/tusker_gateway/tool_formats.py
+@@ -91,7 +91,17 @@ def remap_stream_tool_calls(
+         remap = TOOL_ARGUMENT_REMAP[name]
+         if isinstance(args, dict):
+-            fn["arguments"] = {remap.get(k, k): v for k, v in args.items()}
++            remapped = dict(args)
++            for alias, canonical in remap.items():
++                if alias == canonical or alias not in args:
++                    continue
++                if canonical not in args:
++                    remapped[canonical] = remapped.pop(alias)
++                else:
++                    remapped.pop(alias, None)
++            fn["arguments"] = remapped

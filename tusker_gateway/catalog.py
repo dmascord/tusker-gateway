@@ -679,11 +679,19 @@ class OpenCodeCatalog(CatalogClient):
 
     ENDPOINT = "https://opencode.ai/zen/v1/models"
 
+    # Model discovery is not a user conversation, but OpenCode Go still
+    # requires the session header on every request. Keep one stable
+    # maintenance-session ID so repeated catalog refreshes are associated
+    # with the same client session without pretending they are chat turns.
+    OPENCODE_GO_CATALOG_SESSION = "tusker-catalog-opencode-go"
+
     async def fetch(self, session: aiohttp.ClientSession) -> list[CatalogEntry]:
         headers = self._auth_headers({
             "User-Agent": "tusker-gateway/1.0 (catalog-refresh)",
             "accept": "application/json",
         })
+        if self.provider == "opencode-go":
+            headers["x-opencode-session"] = self.OPENCODE_GO_CATALOG_SESSION
         async with session.get(self.ENDPOINT, headers=headers) as resp:
             if resp.status != 200:
                 raise CatalogError(f"opencode {self.provider} HTTP {resp.status}")
@@ -997,6 +1005,14 @@ class CatalogRegistry:
         for client, res in zip(self._clients.values(), results):
             if isinstance(res, Exception):
                 logger.warning("%s catalog refresh raised: %s", client.provider, res)
+        # Both passes can touch thousands of catalog rows (models.dev alone
+        # commonly contains several thousand). Keep that synchronous work
+        # off aiohttp's event loop so /health and /ready remain responsive
+        # while the background catalog task updates its snapshot.
+        await asyncio.to_thread(self._postprocess_refresh)
+
+    def _postprocess_refresh(self) -> None:
+        """Enrich and persist a completed catalog snapshot off-loop."""
         self._enrich_pricing()
         self._record_catalog_capabilities()
 
@@ -1182,7 +1198,8 @@ async def catalog_refresh_loop(
     successful refresh_all(); the pool manager uses it to merge
     auto-free catalog entries into the runtime pool, so newly free
     upstreams (e.g. ``stealth/ox-alpha``) enter rotation without a
-    gateway restart.
+    gateway restart. Synchronous hooks run in a worker thread because pool
+    rebuilding can be expensive for large catalogs.
     """
     try:
         await registry.refresh_all(session)
@@ -1190,7 +1207,7 @@ async def catalog_refresh_loop(
         logger.warning("initial catalog refresh failed: %s", exc)
     if on_refresh is not None:
         try:
-            on_refresh()
+            await asyncio.to_thread(on_refresh)
         except Exception as exc:
             logger.warning("post-refresh hook failed: %s", exc)
     while not stop_event.is_set():
@@ -1202,6 +1219,6 @@ async def catalog_refresh_loop(
         try:
             await registry.refresh_all(session)
             if on_refresh is not None:
-                on_refresh()
+                await asyncio.to_thread(on_refresh)
         except Exception as exc:
             logger.warning("scheduled catalog refresh failed: %s", exc)

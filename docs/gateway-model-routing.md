@@ -247,6 +247,12 @@ exclude that modality from pool selection, while `unavailable` remains
 retryable and does not permanently remove a model after a quota, auth, or
 transport incident.
 
+For non-text requests, missing evidence is treated as ineligible rather than
+silently sending an image/audio/video payload to an unknown model. A catalog
+claim or a successful modality probe is required; text-only requests retain
+the legacy metadata-free behavior. This keeps image recognition fail-closed
+while providers refresh incomplete catalogs.
+
 Run bounded input tests from the gateway build host or pod:
 
 ```bash
