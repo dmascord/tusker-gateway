@@ -9,7 +9,12 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
 
-from tusker_gateway.observability import AccessLog, attach_request_id_middleware, _generate_request_id
+from tusker_gateway.observability import (
+    AccessLog,
+    attach_request_id_middleware,
+    set_access_log_context,
+    _generate_request_id,
+)
 from tusker_gateway.pools import ModelSpec, PoolManager, PoolConfig
 
 
@@ -162,6 +167,39 @@ class TestRequestIDMiddleware:
             assert response.headers["X-Request-ID"] == "req_stream"
             assert await response.text() == "ok"
             access_log.log.assert_called_once()
+        finally:
+            await client.close()
+
+    @pytest.mark.asyncio
+    async def test_middleware_logs_request_routing_context(self):
+        app = web.Application()
+        access_log = Mock()
+        app["access_log"] = access_log
+
+        async def handler(request):
+            set_access_log_context(
+                request,
+                provider="openrouter",
+                model="qwen/qwen3-coder",
+                pool="code",
+                cache_status="miss",
+            )
+            return web.Response(text="ok")
+
+        app.router.add_get("/context", handler)
+        attach_request_id_middleware(app)
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.get("/context")
+            assert response.status == 200
+            access_log.log.assert_called_once()
+            assert access_log.log.call_args.kwargs == {
+                "provider": "openrouter",
+                "model": "qwen/qwen3-coder",
+                "pool": "code",
+                "cache_status": "miss",
+            }
         finally:
             await client.close()
 

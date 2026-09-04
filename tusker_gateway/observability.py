@@ -15,6 +15,44 @@ from aiohttp import web
 
 logger = logging.getLogger(__name__)
 
+_ACCESS_LOG_CONTEXT_KEY = "_access_log_context"
+_ACCESS_LOG_FIELDS = frozenset({
+    "provider",
+    "model",
+    "pool",
+    "cache_status",
+    "tokens_in",
+    "tokens_out",
+})
+
+
+def set_access_log_context(request: web.Request, **fields: Any) -> None:
+    """Attach known routing/cache fields to this request's access record.
+
+    Handlers learn these values at different stages (routing, cache lookup,
+    or upstream completion).  Ignore unknown fields and retain earlier
+    non-None values so a later partial update cannot erase useful context.
+    """
+    context = request.get(_ACCESS_LOG_CONTEXT_KEY)
+    if not isinstance(context, dict):
+        context = {}
+        request[_ACCESS_LOG_CONTEXT_KEY] = context
+    for name, value in fields.items():
+        if name in _ACCESS_LOG_FIELDS and value is not None:
+            context[name] = value
+
+
+def _access_log_context(request: web.Request) -> dict[str, Any]:
+    """Return only fields accepted by :meth:`AccessLog.log`."""
+    context = request.get(_ACCESS_LOG_CONTEXT_KEY)
+    if not isinstance(context, dict):
+        return {}
+    return {
+        name: context[name]
+        for name in _ACCESS_LOG_FIELDS
+        if name in context
+    }
+
 
 def _generate_request_id() -> str:
     """Generate a unique request ID for correlation."""
@@ -135,6 +173,7 @@ def attach_request_id_middleware(app: web.Application) -> None:
                     request,
                     exc.status,
                     (time.monotonic() - started) * 1000,
+                    **_access_log_context(request),
                     error=exc.__class__.__name__,
                 )
             raise
@@ -144,6 +183,7 @@ def attach_request_id_middleware(app: web.Application) -> None:
                     request,
                     500,
                     (time.monotonic() - started) * 1000,
+                    **_access_log_context(request),
                     error=exc.__class__.__name__,
                 )
             raise
@@ -153,6 +193,7 @@ def attach_request_id_middleware(app: web.Application) -> None:
                 request,
                 response.status,
                 (time.monotonic() - started) * 1000,
+                **_access_log_context(request),
             )
         # StreamResponse headers are immutable after prepare(). Streaming
         # handlers must set X-Request-ID in their initial headers.

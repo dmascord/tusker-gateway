@@ -39,6 +39,7 @@ from tusker_gateway.endpoints import (
     _required_input_modalities,
 )
 from tusker_gateway.metrics import MetricsRegistry
+from tusker_gateway.observability import set_access_log_context
 from tusker_gateway.passthrough import PassthroughClient
 from tusker_gateway.pools import PoolManager
 from tusker_gateway.quality import QualityDB
@@ -497,6 +498,7 @@ async def anthropic_messages_handler(request: web.Request) -> web.Response | web
             )
             tools = openai_body.pop("tools", None)
             pool_name = _pool_name_for_anthropic(original_model)
+            set_access_log_context(request, pool=pool_name)
 
             # Rate-limit pre-flight.
             if ratelimit is not None and api_key:
@@ -536,6 +538,12 @@ async def anthropic_messages_handler(request: web.Request) -> web.Response | web
                 conversation_id=conversation_id,
             )
             logger.debug("selected %s/%s for anthropic model=%s", provider, target_model, original_model)
+            set_access_log_context(
+                request,
+                provider=provider,
+                model=target_model,
+                pool=pool_name,
+            )
 
             # Budget recording.
             if budget is not None and api_key and isinstance(result, dict):

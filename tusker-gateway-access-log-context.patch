@@ -1,0 +1,238 @@
+diff --git a/tusker_gateway/observability.py b/tusker_gateway/observability.py
+--- a/tusker_gateway/observability.py
++++ b/tusker_gateway/observability.py
+@@ -15,6 +15,40 @@ from aiohttp import web
+ 
+ logger = logging.getLogger(__name__)
+ 
++_ACCESS_LOG_CONTEXT_KEY = "_access_log_context"
++_ACCESS_LOG_FIELDS = frozenset({
++    "provider",
++    "model",
++    "pool",
++    "cache_status",
++    "tokens_in",
++    "tokens_out",
++})
++
++
++def set_access_log_context(request: web.Request, **fields: Any) -> None:
++    """Attach known routing outcome fields to one request's final access log.
++
++    Handlers may learn these values at different stages (pool selection,
++    cache lookup, or upstream completion). A None value leaves an existing
++    value unchanged, so an upstream route does not erase a cache-miss marker.
++    """
++    context = request.get(_ACCESS_LOG_CONTEXT_KEY)
++    if not isinstance(context, dict):
++        context = {}
++        request[_ACCESS_LOG_CONTEXT_KEY] = context
++    for name, value in fields.items():
++        if name in _ACCESS_LOG_FIELDS and value is not None:
++            context[name] = value
++
++
++def _access_log_context(request: web.Request) -> dict[str, Any]:
++    """Return only fields accepted by AccessLog.log."""
++    context = request.get(_ACCESS_LOG_CONTEXT_KEY)
++    if not isinstance(context, dict):
++        return {}
++    return {name: context[name] for name in _ACCESS_LOG_FIELDS if name in context}
++
+ 
+ def _generate_request_id() -> str:
+     """Generate a unique request ID for correlation."""
+@@ -132,7 +161,8 @@ def attach_request_id_middleware(app: web.Application) -> None:
+                 access_log.log(
+                     request,
+                     exc.status,
+                     (time.monotonic() - started) * 1000,
++                    **_access_log_context(request),
+                     error=exc.__class__.__name__,
+                 )
+             raise
+@@ -141,7 +172,8 @@ def attach_request_id_middleware(app: web.Application) -> None:
+                 access_log.log(
+                     request,
+                     500,
+                     (time.monotonic() - started) * 1000,
++                    **_access_log_context(request),
+                     error=exc.__class__.__name__,
+                 )
+             raise
+@@ -151,6 +183,7 @@ def attach_request_id_middleware(app: web.Application) -> None:
+             access_log.log(
+                 request,
+                 response.status,
+                 (time.monotonic() - started) * 1000,
++                **_access_log_context(request),
+             )
+         # StreamResponse headers are immutable after prepare(). Streaming
+diff --git a/tusker_gateway/endpoints.py b/tusker_gateway/endpoints.py
+--- a/tusker_gateway/endpoints.py
++++ b/tusker_gateway/endpoints.py
+@@ -34,5 +34,6 @@ from tusker_gateway.passthrough import (
+     _sanitize_opencode_session_id,
+     _stable_opencode_session_id,
+ )
++from tusker_gateway.observability import set_access_log_context
+ from tusker_gateway.pools import PoolManager
+ from tusker_gateway.provider_usage import is_capacity_error
+@@ -3497,6 +3498,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.StreamResponse:
+             pool_name = _pool_name(body) or "passthrough"
+             logger.info('chat request rid=%s model=%s pool=%s stream=%s', request_id, body.get("model"), pool_name, body.get("stream"))
+             bypass_cache = request.headers.get("X-Tusker-Cache", "").strip().lower() == "bypass"
++            set_access_log_context(request, pool=pool_name)
+ 
+             # Guard pipeline: input/output guards.
+             guard_pipeline = request.app.get("guard_pipeline")
+@@ -3520,6 +3522,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.StreamResponse:
+             tools = body.get("tools") if isinstance(body.get("tools"), list) else None
+             pool_name = _pool_name(body) or "passthrough"
+             conversation_id = _request_conversation_id(request, body, api_key)
++            set_access_log_context(request, pool=pool_name)
+ 
+             # Rate-limit pre-flight (cheapest check, runs first).
+             if ratelimit is not None and api_key:
+@@ -3598,8 +3601,14 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.StreamResponse:
+                             metrics.requests_total.inc(
+                                 {"pool": pool_name, "provider": "cache", "model": str(body.get("model") or ""), "status": "cache_hit"}
+                             )
+                             metrics.request_duration.observe(time.monotonic() - started, {"pool": pool_name, "provider": "cache", "model": str(body.get("model") or "")})
++                        set_access_log_context(
++                            request, provider="cache",
++                            model=str(body.get("model") or ""),
++                            pool=pool_name, cache_status="hit",
++                        )
+                         return web.json_response(hit)
++                set_access_log_context(request, cache_status="miss")
+ 
+             # Semantic cache lookup (after exact-match miss).
+             sem_hit: dict[str, Any] | None = None
+@@ -3622,8 +3631,14 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.StreamResponse:
+                             metrics.requests_total.inc(
+                                 {"pool": pool_name, "provider": "semantic_cache", "model": str(body.get("model") or ""), "status": "cache_hit"}
+                             )
+                             metrics.request_duration.observe(time.monotonic() - started, {"pool": pool_name, "provider": "semantic_cache", "model": str(body.get("model") or "")})
++                    set_access_log_context(
++                        request, provider="semantic_cache",
++                        model=str(body.get("model") or ""),
++                        pool=pool_name, cache_status="hit",
++                    )
+                     return web.json_response(sem_hit)
++                set_access_log_context(request, cache_status="miss")
+ 
+             provider, target_model, result = await _call_with_pool_fallback(
+                 config, body, client, tools,
+@@ -3671,6 +3686,9 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.StreamResponse:
+                 conversation_id=conversation_id,
+             )
+             logger.debug('selected rid=%s provider=%s model=%s pool=%s', request_id, provider, target_model, pool_name)
++            set_access_log_context(
++                request, provider=provider, model=target_model, pool=pool_name,
++            )
+ 
+             if isinstance(result, dict):
+                 from tusker_gateway.tool_formats import normalize_response_tool_calls
+@@ -3909,6 +3928,8 @@ async def responses_handler(request: web.Request) -> web.Response | web.StreamResponse:
+         )
+         chat_body = _validate_chat_body(chat_body)
+         config = request.app["config"]
++        pool_name = _pool_name(chat_body) or "passthrough"
++        set_access_log_context(request, pool=pool_name)
+         client = PassthroughClient(
+             config,
+             QualityDB(config["quality_db_path"]),
+@@ -3920,6 +3942,6 @@ async def responses_handler(request: web.Request) -> web.Response | web.StreamResponse:
+             _resolve_api_key(request),
+         )
+-        _, _, result = await _call_with_pool_fallback(
++        provider, target_model, result = await _call_with_pool_fallback(
+             config,
+             chat_body,
+             client,
+@@ -3930,5 +3952,8 @@ async def responses_handler(request: web.Request) -> web.Response | web.StreamResponse:
+             metrics_registry=request.app.get("metrics"),
+             conversation_id=conversation_id,
+         )
++        set_access_log_context(
++            request, provider=provider, model=target_model, pool=pool_name,
++        )
+         if body.get("stream"):
+             from tusker_gateway.tool_formats import normalize_response_tool_calls
+diff --git a/tusker_gateway/anthropic_adapter.py b/tusker_gateway/anthropic_adapter.py
+--- a/tusker_gateway/anthropic_adapter.py
++++ b/tusker_gateway/anthropic_adapter.py
+@@ -37,4 +37,5 @@ from tusker_gateway.endpoints import (
+ )
+ from tusker_gateway.metrics import MetricsRegistry
++from tusker_gateway.observability import set_access_log_context
+ from tusker_gateway.passthrough import PassthroughClient
+ from tusker_gateway.pools import PoolManager
+@@ -496,5 +497,6 @@ async def anthropic_messages_handler(request: web.Request) -> web.Response | web.StreamResponse:
+             tools = openai_body.pop("tools", None)
+             pool_name = _pool_name_for_anthropic(original_model)
++            set_access_log_context(request, pool=pool_name)
+ 
+             # Rate-limit pre-flight.
+             if ratelimit is not None and api_key:
+@@ -539,6 +541,9 @@ async def anthropic_messages_handler(request: web.Request) -> web.Response | web.StreamResponse:
+                 conversation_id=conversation_id,
+             )
+             logger.debug("selected %s/%s for anthropic model=%s", provider, target_model, original_model)
++            set_access_log_context(
++                request, provider=provider, model=target_model, pool=pool_name,
++            )
+ 
+             # Budget recording.
+             if budget is not None and api_key and isinstance(result, dict):
+diff --git a/tests/test_observability.py b/tests/test_observability.py
+--- a/tests/test_observability.py
++++ b/tests/test_observability.py
+@@ -9,4 +9,9 @@ from aiohttp import web
+ from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
+ 
+-from tusker_gateway.observability import AccessLog, attach_request_id_middleware, _generate_request_id
++from tusker_gateway.observability import (
++    AccessLog,
++    attach_request_id_middleware,
++    set_access_log_context,
++    _generate_request_id,
++)
+ from tusker_gateway.pools import ModelSpec, PoolManager, PoolConfig
+@@ -133,3 +138,35 @@ class TestRequestIDMiddleware:
+         finally:
+             await client.close()
+ 
++    @pytest.mark.asyncio
++    async def test_middleware_logs_request_routing_context(self):
++        app = web.Application()
++        access_log = Mock()
++        app["access_log"] = access_log
++
++        async def handler(request):
++            set_access_log_context(
++                request,
++                provider="openrouter",
++                model="qwen/qwen3-coder",
++                pool="code",
++                cache_status="miss",
++            )
++            return web.Response(text="ok")
++
++        app.router.add_get("/context", handler)
++        attach_request_id_middleware(app)
++        client = TestClient(TestServer(app))
++        await client.start_server()
++        try:
++            response = await client.get("/context")
++            assert response.status == 200
++            access_log.log.assert_called_once()
++            assert access_log.log.call_args.kwargs == {
++                "provider": "openrouter",
++                "model": "qwen/qwen3-coder",
++                "pool": "code",
++                "cache_status": "miss",
++            }
++        finally:
++            await client.close()

@@ -31,6 +31,7 @@ from tusker_gateway.errors import (
     openai_error,
 )
 from tusker_gateway.metrics import MetricsRegistry
+from tusker_gateway.observability import set_access_log_context
 from tusker_gateway.passthrough import (
     PassthroughClient,
     _persist_cooldown,
@@ -3498,6 +3499,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
             pool_name = _pool_name(body) or "passthrough"
             logger.info('chat request rid=%s model=%s pool=%s stream=%s', request_id, body.get("model"), pool_name, body.get("stream"))
             bypass_cache = request.headers.get("X-Tusker-Cache", "").strip().lower() == "bypass"
+            set_access_log_context(request, pool=pool_name)
 
             # Guard pipeline: input/output guards.
             guard_pipeline = request.app.get("guard_pipeline")
@@ -3520,6 +3522,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
             tools = body.get("tools") if isinstance(body.get("tools"), list) else None
             pool_name = _pool_name(body) or "passthrough"
             conversation_id = _request_conversation_id(request, body, api_key)
+            set_access_log_context(request, pool=pool_name)
 
             # Rate-limit pre-flight (cheapest check, runs first).
             if ratelimit is not None and api_key:
@@ -3630,7 +3633,15 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                                 {"pool": pool_name, "provider": "cache", "model": str(body.get("model") or ""), "status": "cache_hit"}
                             )
                             metrics.request_duration.observe(time.monotonic() - started, {"pool": pool_name, "provider": "cache", "model": str(body.get("model") or "")})
+                        set_access_log_context(
+                            request,
+                            provider="cache",
+                            model=str(body.get("model") or ""),
+                            pool=pool_name,
+                            cache_status="hit",
+                        )
                         return web.json_response(hit)
+                set_access_log_context(request, cache_status="miss")
 
             # Semantic cache lookup (after exact-match miss).
             sem_hit: dict[str, Any] | None = None
@@ -3660,7 +3671,15 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                             {"pool": pool_name, "provider": "semantic_cache", "model": str(body.get("model") or ""), "status": "cache_hit"}
                         )
                         metrics.request_duration.observe(time.monotonic() - started, {"pool": pool_name, "provider": "semantic_cache", "model": str(body.get("model") or "")})
+                    set_access_log_context(
+                        request,
+                        provider="semantic_cache",
+                        model=str(body.get("model") or ""),
+                        pool=pool_name,
+                        cache_status="hit",
+                    )
                     return web.json_response(sem_hit)
+                set_access_log_context(request, cache_status="miss")
 
             provider, target_model, result = await _call_with_pool_fallback(
                 config, body, client, tools,
@@ -3671,6 +3690,12 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                 conversation_id=conversation_id,
             )
             logger.debug('selected rid=%s provider=%s model=%s pool=%s', request_id, provider, target_model, pool_name)
+            set_access_log_context(
+                request,
+                provider=provider,
+                model=target_model,
+                pool=pool_name,
+            )
 
             if isinstance(result, dict):
                 from tusker_gateway.tool_formats import normalize_response_tool_calls
@@ -3903,6 +3928,8 @@ async def responses_handler(request: web.Request) -> web.Response | web.StreamRe
             chat_body["tool_choice"] = _responses_tool_choice_to_chat(body["tool_choice"])
         chat_body = _validate_chat_body(chat_body)
         config = request.app["config"]
+        pool_name = _pool_name(chat_body) or "passthrough"
+        set_access_log_context(request, pool=pool_name)
         client = PassthroughClient(
             config,
             QualityDB(config["quality_db_path"]),
@@ -3915,7 +3942,7 @@ async def responses_handler(request: web.Request) -> web.Response | web.StreamRe
             {**body, "messages": messages},
             _resolve_api_key(request),
         )
-        _, _, result = await _call_with_pool_fallback(
+        provider, target_model, result = await _call_with_pool_fallback(
             config,
             chat_body,
             client,
@@ -3923,6 +3950,12 @@ async def responses_handler(request: web.Request) -> web.Response | web.StreamRe
             request=request,
             metrics_registry=request.app.get("metrics"),
             conversation_id=conversation_id,
+        )
+        set_access_log_context(
+            request,
+            provider=provider,
+            model=target_model,
+            pool=pool_name,
         )
         if body.get("stream"):
             from tusker_gateway.tool_formats import normalize_response_tool_calls
