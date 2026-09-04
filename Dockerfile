@@ -6,7 +6,11 @@ LABEL org.opencontainers.image.title="tusker-gateway" \
 
 ARG TUSKER_COMMIT=unknown
 ARG TUSKER_SEMANTIC_CACHE_MODEL_REVISION=1110a243fdf4706b3f48f1d95db1a4f5529b4d41
-ENV TUSKER_COMMIT=${TUSKER_COMMIT}
+# Keep build-time Python imports from filling image layers with bytecode. The
+# runtime sets this too, but the model prewarm below imports a large package
+# tree before the final runtime environment is declared.
+ENV TUSKER_COMMIT=${TUSKER_COMMIT} \
+    PYTHONDONTWRITEBYTECODE=1
 WORKDIR /opt/tusker-gateway
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
