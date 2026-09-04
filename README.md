@@ -16,7 +16,7 @@ semantic_cache.py — Scoped, bounded semantic response cache (opt-in)
 pools.py       — PoolManager: candidate lists, selection, session stickiness
 routing.py     — role-alias routing + passthrough detection
 passthrough.py — provider HTTP client + Codex OAuth token rotation
-endpoints.py   — OpenAI chat, responses, image, TTS, and video handlers
+endpoints.py   — OpenAI chat, responses, rerank, image, TTS, and video handlers
 app.py         — aiohttp application factory + entry point
 __main__.py    — python -m tusker_gateway
 ```
@@ -29,8 +29,9 @@ __main__.py    — python -m tusker_gateway
 | Image generation | `/v1/images/generations` | OpenAI/Codex, OpenRouter, Google Gemini/Imagen, Z.AI CogView/GLM-Image. |
 | Image edits/variations | `/v1/images/edits`, `/v1/images/variations` | OpenAI-compatible image providers; unsupported provider surfaces fail explicitly. |
 | Video generation | `/v1/videos` | OpenAI Sora, OpenRouter video models, Google Veo, Z.AI CogVideoX/Vidu. `wait=false` returns the upstream job; waited Z.AI results retain the signed result URL. |
+| Reranking | `/v1/rerank` | Cohere v2, Voyage, and Jina native rerank APIs with provider fallback. `hermes-reranker` is the virtual model alias. |
 
-Capability discovery refreshes supported image/video models from provider catalogs. Anthropic supports image input for understanding, not image generation. Media routes use the same authenticated per-key rate limit, budget, and guardrail preflight as chat.
+Capability discovery refreshes supported image/video models from provider catalogs. Anthropic supports image input for understanding, not image generation. Media and rerank routes use the same authenticated per-key rate limit, budget, and guardrail preflight as chat.
 
 ## Virtual model aliases
 

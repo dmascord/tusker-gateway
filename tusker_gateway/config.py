@@ -29,6 +29,9 @@ class ProviderConfig:
     # Optional provider-native model-list endpoint. Absolute URLs are allowed
     # for providers whose catalog lives outside the chat API base URL.
     models_path: str | None = None
+    # Optional provider-native rerank endpoint. Absolute URLs are allowed for
+    # providers whose rerank API is not rooted at ``base_url``.
+    rerank_path: str | None = None
 
 
 class PoolConfig:
@@ -162,6 +165,8 @@ def load_config() -> dict[str, Any]:
         "google": ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
         "cerebras": ["CEREBRAS_API_KEY"],
         "cohere": ["COHERE_API_KEY"],
+        "voyage": ["VOYAGE_API_KEY"],
+        "jina": ["JINA_API_KEY"],
         "minimax": ["MINIMAX_API_KEY"],
         "synthetic": ["SYNTHETIC_API_KEY"],
         "ollama-cloud": ["OLLAMA_API_KEY", "OLLAMA_MAC_API_KEY"],
@@ -292,6 +297,7 @@ def _provider_registry_from_env() -> dict[str, ProviderConfig]:
                     "zdr_ok": bool(value.get("zdr_ok", False)),
                     "heavyweight": bool(value.get("heavyweight", False)),
                     "models_path": value.get("models_path", value.get("catalog_path")),
+                    "rerank_path": value.get("rerank_path"),
                 }
                 registry[str(name).lower()] = ProviderConfig(**merged)
 
@@ -319,7 +325,11 @@ DEFAULT_PROVIDER_REGISTRY: dict[str, ProviderConfig] = {
     "arliai": ProviderConfig("arliai", "bearer", "https://api.arliai.com", "/v1/chat/completions", auth_env="ARLIAI_API_KEY", models_path="/v1/models"),
     "google": ProviderConfig("google", "bearer", "https://generativelanguage.googleapis.com", "/v1beta/openai/chat/completions", auth_env="GEMINI_API_KEY", models_path="/v1beta/openai/models"),
     "cerebras": ProviderConfig("cerebras", "bearer", "https://api.cerebras.ai", "/v1/chat/completions", auth_env="CEREBRAS_API_KEY", models_path="/v1/models"),
-    "cohere": ProviderConfig("cohere", "bearer", "https://api.cohere.com/compatibility", "/v1/chat/completions", auth_env="COHERE_API_KEY", models_path="https://api.cohere.com/v1/models?page_size=1000"),
+    "cohere": ProviderConfig("cohere", "bearer", "https://api.cohere.com/compatibility", "/v1/chat/completions", auth_env="COHERE_API_KEY", models_path="https://api.cohere.com/v1/models?page_size=1000", rerank_path="https://api.cohere.com/v2/rerank"),
+    # Rerank-only providers intentionally have no model catalog or chat pool
+    # route. Their native endpoint is exposed through POST /v1/rerank.
+    "voyage": ProviderConfig("voyage", "bearer", "https://api.voyageai.com", "/v1/chat/completions", auth_env="VOYAGE_API_KEY", rerank_path="/v1/rerank"),
+    "jina": ProviderConfig("jina", "bearer", "https://api.jina.ai", "/v1/chat/completions", auth_env="JINA_API_KEY", rerank_path="/v1/rerank"),
     "minimax": ProviderConfig("minimax", "bearer", "https://api.minimax.io", "/v1/chat/completions", auth_env="MINIMAX_API_KEY", models_path="/v1/models"),
     # Synthetic's API policy states that prompts/completions are not retained
     # or used for training, and requires the same posture from inference
@@ -365,6 +375,7 @@ def _provider_registry_from_env() -> dict[str, ProviderConfig]:
                     "zdr_ok": bool(value.get("zdr_ok", False)),
                     "heavyweight": bool(value.get("heavyweight", False)),
                     "models_path": value.get("models_path", value.get("catalog_path")),
+                    "rerank_path": value.get("rerank_path"),
                 }
                 registry[str(name).lower()] = ProviderConfig(**merged)
     business_copilot = os.environ.get("TUSKER_COPILOT_BUSINESS", "").strip().lower() in {

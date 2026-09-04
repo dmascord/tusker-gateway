@@ -1,4 +1,4 @@
-"""Endpoint handlers: /models, /chat/completions, /responses."""
+"""Endpoint handlers: models, chat, responses, media, and reranking."""
 from __future__ import annotations
 
 import asyncio
@@ -12,7 +12,7 @@ import time
 import uuid
 from typing import Any, AsyncIterator
 
-from aiohttp import web
+from aiohttp import ContentTypeError, web
 
 from tusker_gateway.cache import ResponseCache, make_cache_key, make_caller_scope
 from tusker_gateway.budget import BudgetTracker
@@ -3346,7 +3346,7 @@ async def models_handler(request: web.Request) -> web.Response:
     """GET /v1/models — list available models."""
     config = request.app["config"]
     data = [{"id": config["model_name"], "object": "model", "owned_by": "tusker-gateway"}]
-    data.extend({"id": alias, "object": "model", "owned_by": "tusker-gateway"} for alias in ("hermes-code", "hermes-privacy", "hermes-premium", "hermes-swarm"))
+    data.extend({"id": alias, "object": "model", "owned_by": "tusker-gateway"} for alias in ("hermes-code", "hermes-privacy", "hermes-premium", "hermes-swarm", "hermes-reranker"))
     existing = {item["id"] for item in data}
     data.extend(
         {"id": model_id, "object": "model", "owned_by": "tusker-gateway"}
@@ -4077,6 +4077,7 @@ async def _media_preflight(
     body: dict[str, Any],
     *,
     budget_units: int,
+    budget_pool: str = "media",
 ) -> web.Response | None:
     """Apply the shared auth-key controls before expensive media calls."""
     api_key = _resolve_api_key(request)
@@ -4100,7 +4101,7 @@ async def _media_preflight(
 
     budget: BudgetTracker | None = request.app.get("budget")
     if budget is not None and api_key:
-        decision = budget.check(api_key, "media", budget_units)
+        decision = budget.check(api_key, budget_pool, budget_units)
         if not decision.allowed:
             return web.json_response(
                 openai_error(
@@ -4139,11 +4140,12 @@ def _record_media_budget(
     request: web.Request,
     *,
     budget_units: int,
+    budget_pool: str = "media",
 ) -> None:
     budget: BudgetTracker | None = request.app.get("budget")
     api_key = _resolve_api_key(request)
     if budget is not None and api_key:
-        budget.record(api_key, "media", budget_units)
+        budget.record(api_key, budget_pool, budget_units)
 
 
 def _record_media_capabilities(
@@ -4345,6 +4347,110 @@ async def video_handler(request: web.Request) -> web.Response:
         logger.exception("Unexpected video request failure")
         return web.json_response(
             openai_error(str(exc), code="video_error", error_type="provider_error"),
+            status=502,
+        )
+
+
+async def rerank_handler(request: web.Request) -> web.Response:
+    """POST /v1/rerank with provider-aware fallback.
+
+    The public response follows Cohere/Hermes' ``results`` contract even when
+    the selected backend returns Voyage's ``data`` shape.  Reranking is kept
+    separate from the chat pools: a provider disabled for chat can still be
+    used here when its native rerank key and endpoint are configured.
+    """
+    from tusker_gateway.providers.rerank import RerankHandler
+
+    started = time.monotonic()
+    metrics: MetricsRegistry | None = request.app.get("metrics")
+    provider = "unknown"
+    model = "unknown"
+    set_access_log_context(request, pool="rerank")
+
+    def _emit(status_label: str) -> None:
+        if metrics is None:
+            return
+        labels = {"pool": "rerank", "provider": provider, "model": model}
+        metrics.requests_total.inc({**labels, "status": status_label})
+        metrics.request_duration.observe(time.monotonic() - started, labels)
+
+    try:
+        try:
+            body = await request.json()
+        except (ContentTypeError, json.JSONDecodeError, UnicodeDecodeError, TypeError, ValueError) as exc:
+            raise BadRequestError(
+                "Request body must be valid JSON",
+                code="invalid_request",
+            ) from exc
+        if not isinstance(body, dict):
+            raise BadRequestError(
+                "Request body must be a JSON object",
+                code="invalid_request",
+            )
+
+        requested_model = body.get("model")
+        if isinstance(requested_model, str) and requested_model.strip():
+            model = requested_model.strip()
+            set_access_log_context(request, model=model)
+
+        reranker = request.app.get("rerank_handler")
+        if reranker is None:
+            reranker = RerankHandler(request.app["config"])
+
+        parsed = RerankHandler.validate_request(body)
+        blocked = await _media_preflight(
+            request,
+            body,
+            budget_units=parsed.budget_units,
+            budget_pool="rerank",
+        )
+        if blocked is not None:
+            _emit("blocked")
+            return blocked
+        # Guardrails may rewrite the body. Revalidate after that hook so the
+        # provider never receives a shape the preflight did not inspect.
+        parsed = RerankHandler.validate_request(body)
+
+        provider, model, result = await reranker.rerank(
+            body,
+            session=request.app.get("http_session"),
+            breaker=request.app.get("breaker"),
+        )
+        set_access_log_context(
+            request,
+            pool="rerank",
+            provider=provider,
+            model=model,
+        )
+        _record_media_budget(
+            request,
+            budget_units=parsed.budget_units,
+            budget_pool="rerank",
+        )
+        _emit("ok")
+        return web.json_response(result)
+    except GatewayError as exc:
+        _emit(exc.code or "error")
+        headers: dict[str, str] = {}
+        retry_after = getattr(exc, "headers", {}).get("Retry-After")
+        if retry_after is not None:
+            headers["Retry-After"] = str(retry_after)
+        response_kwargs: dict[str, Any] = {"status": _media_error_status(exc)}
+        if headers:
+            response_kwargs["headers"] = headers
+        return web.json_response(
+            openai_error(exc.message, code=exc.code, error_type=exc.error_type),
+            **response_kwargs,
+        )
+    except Exception:
+        _emit("internal_error")
+        logger.exception("Unexpected rerank request failure")
+        return web.json_response(
+            openai_error(
+                "Rerank provider request failed",
+                code="provider_error",
+                error_type="provider_error",
+            ),
             status=502,
         )
 

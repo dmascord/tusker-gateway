@@ -100,11 +100,19 @@ The gateway reads provider keys for every provider named in those pools:
 - `CEREBRAS_API_KEY`
 - `GEMINI_API_KEY`
 - `COHERE_API_KEY`
+- `VOYAGE_API_KEY` (optional, for `/v1/rerank`)
+- `JINA_API_KEY` (optional, for `/v1/rerank`)
 - `ZAI_API_KEY`
 - `XIAOMI_API_KEY`
 - `NVIDIA_API_KEY` (retained in the isolated secret, but direct NVIDIA
   catalog discovery is disabled while its upstream capacity is saturated)
 - `SYNTHETIC_API_KEY`
+
+`POST /v1/rerank` is independent of chat-pool disablement. For example,
+Cohere may remain excluded from chat pool/catalog construction while its
+native rerank endpoint is still available when `COHERE_API_KEY` is present.
+The gateway uses Cohere first, then configured Voyage/Jina keys, and exposes
+the normalized `hermes-reranker` model alias.
 
 Always verify pool providers exist in `tusker_gateway/config.py:DEFAULT_PROVIDER_REGISTRY`
 before adding them — unknown providers raise `ProviderError("Unknown provider: ...")`

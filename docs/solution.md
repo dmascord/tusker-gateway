@@ -46,9 +46,10 @@ registers:
   `TUSKER_METRICS_TOKEN`).
 - `GET /dashboard` + `/dashboard/partials/*`: server-rendered status dashboard
   with HTMX auto-refresh (Release 2).
-- `GET /v1/models`: exposed model catalog.
+- `GET /v1/models`: exposed model catalog, including the `hermes-reranker` alias.
 - `POST /v1/chat/completions`: OpenAI chat completion proxy.
 - `POST /v1/responses`: Responses-compatible endpoint.
+- `POST /v1/rerank`: provider-aware reranking proxy with Cohere-compatible results.
 
 The shared `aiohttp.ClientSession` avoids per-request connection setup. Cleanup
 closes it during application shutdown.
@@ -59,6 +60,7 @@ closes it during application shutdown.
 
 - `base_url`
 - `chat_path`
+- optional native `rerank_path` for dedicated reranking providers
 - `auth_type`: `bearer` or `oauth`
 - optional provider model header
 

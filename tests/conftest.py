@@ -15,6 +15,7 @@ from tusker_gateway.config import load_config
 from tusker_gateway.endpoints import (
     chat_completions_handler,
     models_handler,
+    rerank_handler,
     responses_handler,
 )
 from tusker_gateway.anthropic_adapter import anthropic_messages_handler
@@ -102,6 +103,7 @@ def _create_test_app(config=None):
     app.router.add_post("/v1/chat/completions", chat_completions_handler)
     app.router.add_post("/v1/responses", responses_handler)
     app.router.add_post("/v1/messages", anthropic_messages_handler)
+    app.router.add_post("/v1/rerank", rerank_handler)
     return app
 
 

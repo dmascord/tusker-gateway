@@ -34,7 +34,7 @@ Metric catalogue:
     tusker_rtk_calls_total{outcome}                           counter
 
 We deliberately scope labels to keep cardinality bounded:
-    - `pool` is one of {code, privacy, premium, swarm, passthrough}
+    - `pool` is one of {code, privacy, premium, swarm, passthrough, rerank}
     - `provider` is one of the configured providers (~10 today)
     - `model` is the (provider, model) pair as a single string label.
 """

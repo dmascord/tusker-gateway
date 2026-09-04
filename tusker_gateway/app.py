@@ -28,6 +28,7 @@ from tusker_gateway.endpoints import (
     images_handler,
     metrics_handler,
     models_handler,
+    rerank_handler,
     responses_handler,
     tts_handler,
     video_handler,
@@ -46,6 +47,7 @@ from tusker_gateway.providers.capabilities import (
     capabilities_refresh_loop,
 )
 from tusker_gateway.model_capability import ModelCapabilityDB
+from tusker_gateway.providers.rerank import RerankHandler
 
 
 def create_app() -> web.Application:
@@ -173,6 +175,9 @@ def create_app() -> web.Application:
     app["video_handler"] = VideoHandler(
         app["config"], capability_registry=capability_registry
     )
+    # Reranking is a dedicated provider pathway rather than a chat-pool
+    # candidate. Its provider keys/endpoints are resolved per request.
+    app["rerank_handler"] = RerankHandler(app["config"])
 
 
     async def on_startup(app):
@@ -446,6 +451,7 @@ def create_app() -> web.Application:
     app.router.add_post("/v1/images/variations", images_handler)
     app.router.add_post("/v1/audio/speech", tts_handler)
     app.router.add_post("/v1/videos", video_handler)
+    app.router.add_post("/v1/rerank", rerank_handler)
     app.router.add_get("/v1/models", models_handler)
     app.router.add_post("/v1/chat/completions", chat_completions_handler)
     app.router.add_post("/v1/responses", responses_handler)
