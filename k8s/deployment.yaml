@@ -23,7 +23,7 @@ spec:
       terminationGracePeriodSeconds: 90
       containers:
       - name: tusker-gateway
-        image: registry.tusker.net.au:5000/tusker-gateway:swarm-alpine-hermes-cutover-access-20260904201728
+        image: registry.tusker.net.au:5000/tusker-gateway:swarm-alpine-rerank-20260904210224
         imagePullPolicy: Always
         envFrom:
         - secretRef:
@@ -32,7 +32,7 @@ spec:
         - name: MODEL_NAME
           value: tusker-gateway
         - name: TUSKER_COMMIT
-          value: b80fbc3
+          value: 61ddb97
         - name: HOME
           value: /home/tusker
         - name: PYTHONUNBUFFERED
