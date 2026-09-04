@@ -176,4 +176,26 @@ def status_handler(request: web.Request) -> web.Response:
             else {}
         ),
     }
+    identity_store = request.app.get("identity_store")
+    identity_config = getattr(identity_store, "config", None)
+    audit = request.app.get("audit")
+    audit_config = getattr(audit, "config", None)
+    deadline_config = request.app.get("deadline_config")
+    idempotency = request.app.get("idempotency")
+    idempotency_config = getattr(idempotency, "config", None)
+    status["enterprise_controls"] = {
+        "identity_profiles": len(getattr(identity_config, "identities", {})),
+        "identity_required": bool(getattr(identity_config, "required", False)),
+        "audit_enabled": bool(getattr(audit_config, "enabled", False)),
+        "audit_integrity": (
+            "hmac-sha256"
+            if getattr(audit_config, "hmac_key", "")
+            else "sha256" if getattr(audit_config, "enabled", False) else "disabled"
+        ),
+        "audit_fail_closed": bool(getattr(audit_config, "fail_closed", False)),
+        "request_timeout_ms": getattr(deadline_config, "default_timeout_ms", 0),
+        "max_request_timeout_ms": getattr(deadline_config, "max_timeout_ms", 0),
+        "idempotency_enabled": bool(getattr(idempotency_config, "enabled", False)),
+        "idempotency_ttl_secs": getattr(idempotency_config, "ttl_secs", 0),
+    }
     return web.json_response(status)

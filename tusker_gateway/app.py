@@ -3,12 +3,13 @@
 import asyncio
 import logging
 import os
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import aiohttp
 from aiohttp import web
 
 from tusker_gateway.auth import AuthMiddleware
+from tusker_gateway.audit import AuditLogger, attach_audit_middleware, load_audit_config_from_env
 from tusker_gateway.budget import BudgetTracker, load_budget_config_from_env
 from tusker_gateway.cache import ResponseCache, load_cache_config_from_env
 from tusker_gateway.circuit_breaker import CircuitBreaker, load_circuit_config_from_env
@@ -38,6 +39,17 @@ from tusker_gateway.anthropic_adapter import anthropic_messages_handler
 from tusker_gateway.errors import GatewayError, openai_error
 from tusker_gateway.health import health_handler, ready_handler, status_handler
 from tusker_gateway.guardrails import init_guard_pipeline, load_guardrails_config_from_env
+from tusker_gateway.deadline import attach_deadline_middleware, load_deadline_config_from_env
+from tusker_gateway.idempotency import (
+    IdempotencyStore,
+    attach_idempotency_middleware,
+    load_idempotency_config_from_env,
+)
+from tusker_gateway.identity import (
+    IdentityStore,
+    attach_authorization_middleware,
+    load_identity_config_from_env,
+)
 from tusker_gateway.metrics import MetricsRegistry
 from tusker_gateway.rate_limit import RateLimiter, load_rate_limit_config_from_env
 from tusker_gateway.observability import attach_request_id_middleware, AccessLog
@@ -48,6 +60,9 @@ from tusker_gateway.providers.capabilities import (
 )
 from tusker_gateway.model_capability import ModelCapabilityDB
 from tusker_gateway.providers.rerank import RerankHandler
+
+if TYPE_CHECKING:
+    from tusker_gateway.passthrough import CodexTokenRotator
 
 
 def create_app() -> web.Application:
@@ -89,6 +104,26 @@ def create_app() -> web.Application:
 
     tracer_cfg = load_tracer_config_from_env()
     app["tracer"] = Tracer(tracer_cfg)
+
+    # Enterprise controls: identity policy, tamper-evident audit, bounded
+    # request deadlines, and persistent duplicate suppression.
+    identity_store = IdentityStore(load_identity_config_from_env())
+    app["identity_store"] = identity_store
+    audit = AuditLogger(load_audit_config_from_env())
+    app["audit"] = audit
+    deadline_cfg = load_deadline_config_from_env()
+    app["deadline_config"] = deadline_cfg
+    idempotency = IdempotencyStore(load_idempotency_config_from_env())
+    app["idempotency"] = idempotency
+    log.info(
+        "enterprise controls identities=%d strict_identity=%s audit=%s "
+        "deadline_ms=%d idempotency=%s",
+        len(identity_store.config.identities),
+        identity_store.config.required,
+        audit.config.enabled,
+        deadline_cfg.default_timeout_ms if deadline_cfg.enabled else 0,
+        idempotency.config.enabled,
+    )
 
     # Release 3: semantic cache (optional, default-disabled).
     try:
@@ -184,7 +219,9 @@ def create_app() -> web.Application:
         startup_log = logging.getLogger("tusker_gateway.startup")
         config = app["config"]
         app["http_session"] = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=120),
+            timeout=aiohttp.ClientTimeout(
+                total=max(120.0, deadline_cfg.max_timeout_ms / 1000)
+            ),
         )
         for rotator in app.get("credential_rotators", {}).values():
             # The rotators are constructed before aiohttp startup so they can
@@ -403,7 +440,7 @@ def create_app() -> web.Application:
         if "http_session" in app:
             await app["http_session"].close()
 
-    auth = AuthMiddleware()
+    auth = AuthMiddleware(identity_store)
     metrics_token = os.environ.get("TUSKER_METRICS_TOKEN", "").strip()
 
     @web.middleware
@@ -428,12 +465,15 @@ def create_app() -> web.Application:
                 status=exc.status,
             )
         return await handler(request)
-    # Attach request-ID middleware before auth so ID is available everywhere
-    attach_request_id_middleware(app)
-    # Instantiate access logger for use in handlers
+    # Middleware order is deliberate: correlation and audit wrap authentication;
+    # authorization precedes deadlines and duplicate suppression.
     app["access_log"] = AccessLog()
-
+    attach_request_id_middleware(app)
+    attach_audit_middleware(app, audit)
     app.middlewares.append(auth_middleware)
+    attach_authorization_middleware(app)
+    attach_deadline_middleware(app, deadline_cfg)
+    attach_idempotency_middleware(app, idempotency)
 
     app.router.add_get("/health", health_handler)
     app.router.add_get("/ready", ready_handler)

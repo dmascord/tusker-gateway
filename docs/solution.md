@@ -214,6 +214,19 @@ All three modules below default to disabled. Enable per-deployment via env:
 - `/dashboard` is always registered; auth via `TUSKER_METRICS_TOKEN` (same
   as `/metrics`).
 
+## Enterprise controls
+
+- Fingerprint-keyed caller identities add tenant/principal attribution, route
+  scopes, and pool/model/provider allowlists without copying raw keys into
+  policy configuration.
+- Optional JSONL audit events are append-only and SHA-256 or HMAC-SHA-256
+  chained. Request content and credentials are excluded.
+- End-to-end `/v1` deadlines cancel upstream work and cap client overrides.
+- Optional persistent idempotency reserves and replays successful,
+  non-streaming POSTs within a caller-specific scope.
+- GitHub Actions validates Python 3.11/3.12, deterministic tests, static defect
+  checks, and dependency vulnerabilities. See `docs/enterprise-controls.md`.
+
 ## Extension rules
 
 For a new provider:

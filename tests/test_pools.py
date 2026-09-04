@@ -132,6 +132,30 @@ def test_equal_weight_candidates_round_robin():
     ]
 
 
+def test_caller_provider_policy_filters_pool_before_selection():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = PoolManager({
+            "pools": {
+                "test": PoolConfig(
+                    name="test",
+                    models=[
+                        {"provider": "groq", "model": "m1"},
+                        {"provider": "openai", "model": "m2"},
+                    ],
+                ),
+            },
+            "quality_db_path": os.path.join(tmpdir, "quality.db"),
+            "excluded_providers": [],
+            "provider_api_keys": {"groq": "k-groq", "openai": "k-openai"},
+        })
+
+        assert manager.select("test", allowed_providers=("open*",)) == (
+            "openai",
+            "m2",
+        )
+        assert manager.select("test", allowed_providers=()) is None
+
+
 def test_verified_modality_evidence_controls_pool_selection():
     with tempfile.TemporaryDirectory() as tmpdir:
         config = {

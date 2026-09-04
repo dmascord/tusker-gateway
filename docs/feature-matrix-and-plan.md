@@ -141,6 +141,19 @@ behind a feature flag and roll back safely.
 - **A2A gateway** (lite) — agent-to-agent routing and auth delegation.
 - **A/B routing** — split traffic across two providers by hash for comparison.
 
+### Release 5 — Enterprise foundation (implemented 2026-09-04)
+
+- **Tenant identities and authorization** — fingerprint-keyed principal/tenant
+  profiles with route scopes and pool/model/provider allowlists.
+- **Tamper-evident audit** — append-only JSONL records chained with SHA-256 or
+  an operator-supplied HMAC key, with no prompts, outputs, or credentials.
+- **Request deadlines** — bounded end-to-end cancellation with explicit 504s
+  before response preparation and safe stream termination afterward.
+- **Persistent idempotency** — transactional reservation and replay for
+  successful non-streaming POSTs, scoped to the caller and route.
+- **Release gates** — Python 3.11/3.12 tests, static defect checks, dependency
+  audit, and weekly dependency update pull requests.
+
 ## Acceptance criteria for the plan
 
 Each release item must:
@@ -168,5 +181,5 @@ Each release item must:
 Tusker has structural advantages in auth/credential lifecycle that no other
 gateway replicates. Closing the caching and observability gaps moves it from
 "specialized tool" to "general-purpose gateway with best-in-class auth." The
-four-release sequence respects existing invariants and ships incremental value
+release sequence respects existing invariants and ships incremental value
 behind feature flags.

@@ -22,3 +22,7 @@ Tusker-Gateway is a specialized AI gateway optimized for high-reliability provid
 ### 4. Enterprise Hardening
 *   **ZDR Compliance**: Automatically excludes "heavyweight" models from privacy-compliant (ZDR) pools.
 *   **Multi-Auth Strategies**: Decoupled auth modules for extensible provider support.
+*   **Tenant Policy**: Fingerprint-keyed identities enforce API scopes and pool/model/provider allowlists.
+*   **Audit Integrity**: Optional append-only request events use SHA-256 or HMAC-SHA-256 chaining.
+*   **Retry Safety**: Bounded request deadlines and persistent idempotency prevent runaway and duplicate non-streaming work.
+*   **Release Safety**: CI tests supported Python versions, scans dependencies, and blocks undefined-name defects.

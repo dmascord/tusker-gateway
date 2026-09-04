@@ -37,3 +37,4 @@ async def test_status_authenticated(client):
     assert data["status"] == "ok"
     assert "pools" in data
     assert "quality" in data
+    assert "enterprise_controls" in data

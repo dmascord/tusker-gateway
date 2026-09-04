@@ -39,6 +39,7 @@ from tusker_gateway.endpoints import (
     _required_input_modalities,
 )
 from tusker_gateway.metrics import MetricsRegistry
+from tusker_gateway.identity import provider_patterns_for_request
 from tusker_gateway.observability import set_access_log_context
 from tusker_gateway.passthrough import PassthroughClient
 from tusker_gateway.pools import PoolManager
@@ -309,6 +310,9 @@ async def _call_with_pool_fallback_anthropic(
                 "excluded": set(excluded),
                 "required_input_modalities": required_input_modalities,
             }
+            allowed_providers = provider_patterns_for_request(request)
+            if allowed_providers is not None:
+                select_kwargs["allowed_providers"] = allowed_providers
             if requires_tools:
                 select_kwargs["requires_tools"] = True
             selected = pool_mgr.select(active_pool, **select_kwargs)
@@ -322,6 +326,8 @@ async def _call_with_pool_fallback_anthropic(
                         "excluded": set(excluded),
                         "required_input_modalities": required_input_modalities,
                     }
+                    if allowed_providers is not None:
+                        select_kwargs["allowed_providers"] = allowed_providers
                     if requires_tools:
                         select_kwargs["requires_tools"] = True
                     selected = pool_mgr.select(active_pool, **select_kwargs)

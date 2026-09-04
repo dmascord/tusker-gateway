@@ -16,6 +16,7 @@ from tusker_gateway.observability import (
     _generate_request_id,
 )
 from tusker_gateway.pools import ModelSpec, PoolManager, PoolConfig
+from tusker_gateway.identity import CallerIdentity
 
 
 class TestRequestIDGeneration:
@@ -93,6 +94,24 @@ class TestAccessLog:
         record = json.loads(log_message)
         assert record["usage"] == {"in": 100, "out": 50}
         assert record["cache"] == "hit"
+
+    def test_access_log_includes_enterprise_identity(self, caplog):
+        log = AccessLog()
+        request = make_mocked_request("POST", "/v1/chat/completions")
+        request["_request_id"] = "req_identity"
+        request["identity"] = CallerIdentity(
+            key_fingerprint="a" * 64,
+            principal="svc-build",
+            tenant="engineering",
+        )
+
+        with caplog.at_level(logging.INFO, logger="tusker_gateway.access"):
+            log.log(request, 200, 10.0)
+
+        record = json.loads(caplog.records[0].message)
+        assert record["principal"] == "svc-build"
+        assert record["tenant"] == "engineering"
+        assert record["key_fingerprint"] == "a" * 64
 
 
 class TestRequestIDMiddleware:

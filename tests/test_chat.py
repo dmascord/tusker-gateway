@@ -249,11 +249,11 @@ async def test_chat_completions_pool_dispatch(client):
         data = await resp.json()
         assert data["choices"][0]["message"]["content"] == "hello"
 
-        # Verify the configured deterministic ordering. The current default
-        # code pool starts with the lightweight MiniMax route.
+        # The test environment has no MiniMax/provider API keys, so those
+        # candidates are correctly filtered and the OAuth Codex route leads.
         args, kwargs = mock_chat.call_args
-        assert args[0] == "minimax"
-        assert args[1] == "MiniMax-M3"
+        assert args[0] == "openai-codex"
+        assert args[1] == "gpt-5.6-luna"
 
 
 @pytest.mark.asyncio

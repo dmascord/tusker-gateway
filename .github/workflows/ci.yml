@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install package and quality tools
+        run: python -m pip install --upgrade pip && python -m pip install -e '.[dev]'
+      - name: Compile package
+        run: python -m compileall -q tusker_gateway tests
+      - name: Static defect checks
+        run: ruff check tusker_gateway tests
+      - name: Deterministic test suite
+        run: pytest tests/ -p no:cacheprovider --ignore=tests/test_passthrough_providers.py
+
+  dependency-audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install runtime and audit tool
+        run: python -m pip install --upgrade pip && python -m pip install . 'pip-audit>=2.9,<3'
+      - name: Scan installed dependencies
+        run: pip-audit --local --skip-editable

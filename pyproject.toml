@@ -11,6 +11,12 @@ dependencies = [
 ]
 [project.optional-dependencies]
 semantic-cache = ["chromadb==1.5.9", "sentence-transformers==6.0.0"]
+dev = [
+    "pip-audit>=2.9,<3",
+    "pytest>=9.0.3,<10",
+    "pytest-asyncio>=0.24,<2",
+    "ruff>=0.12,<1",
+]
 
 [project.scripts]
 tusker-gateway = "tusker_gateway.__main__:main"
@@ -26,3 +32,13 @@ exclude = ["tests*"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+# Keep the first gate focused on defects rather than a repository-wide style
+# rewrite. The selection catches syntax errors, undefined names, and invalid
+# control flow in both production and test code.
+select = ["E9", "F63", "F7", "F82"]

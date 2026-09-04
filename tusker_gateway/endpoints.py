@@ -31,6 +31,7 @@ from tusker_gateway.errors import (
     openai_error,
 )
 from tusker_gateway.metrics import MetricsRegistry
+from tusker_gateway.identity import provider_patterns_for_request
 from tusker_gateway.observability import set_access_log_context
 from tusker_gateway.passthrough import (
     PassthroughClient,
@@ -1744,11 +1745,10 @@ def _tool_choice_requires_call(tool_choice: Any) -> bool:
 
 
 def _resolve_api_key(request: web.Request) -> str:
-    """Return the raw bearer token used by the caller (for budget keying)."""
-    auth = request.headers.get("Authorization", "")
-    if auth.startswith("Bearer "):
-        return auth[len("Bearer "):].strip()
-    return ""
+    """Return the OpenAI/Anthropic caller key used for quota scoping."""
+    from tusker_gateway.identity import extract_api_key
+
+    return extract_api_key(request)
 
 
 def _request_conversation_id(
@@ -1929,11 +1929,14 @@ def _select_cache_route_target(
     required_modalities = _required_input_modalities(body.get("messages"))
     excluded: set[tuple[str, str]] = set()
     while True:
-        selected = pool_manager.select(
-            pool_name,
-            excluded=set(excluded),
-            required_input_modalities=required_modalities,
-        )
+        select_kwargs: dict[str, Any] = {
+            "excluded": set(excluded),
+            "required_input_modalities": required_modalities,
+        }
+        allowed_providers = provider_patterns_for_request(request)
+        if allowed_providers is not None:
+            select_kwargs["allowed_providers"] = allowed_providers
+        selected = pool_manager.select(pool_name, **select_kwargs)
         if selected is None:
             return None
         if breaker is None or breaker.check(selected[0], selected[1]).allowed:
@@ -2237,6 +2240,9 @@ async def _call_with_pool_fallback(
                 "excluded": set(excluded),
                 "required_input_modalities": required_input_modalities,
             }
+            allowed_providers = provider_patterns_for_request(request)
+            if allowed_providers is not None:
+                select_kwargs["allowed_providers"] = allowed_providers
             if requires_tools:
                 select_kwargs["requires_tools"] = True
             if recovery_probe:
@@ -3457,7 +3463,9 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
         tracer.span("chat_completion", attributes={
             "http.method": request.method,
             "http.path": "/v1/chat/completions",
-            "tusker.api_key_fingerprint": _resolve_api_key(request)[:16],
+            "tusker.api_key_fingerprint": request.get(
+                "_api_key_fingerprint", "unknown"
+            )[:16],
         })
         if tracer is not None and tracer.enabled
         else _noop_cm()

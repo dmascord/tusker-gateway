@@ -10,6 +10,10 @@ errors.py      — OpenAI-compatible error types
 sse.py         — SSE framing utilities
 cooldown.py    — per-(provider, model) cooldown tracking with 429 parsing
 auth.py        — Bearer token verification (fail-closed)
+identity.py    — tenant identities, scopes, and routing allowlists
+audit.py       — append-only integrity-chained audit events
+deadline.py    — end-to-end request deadlines and bounded client overrides
+idempotency.py — persistent duplicate suppression for non-streaming POSTs
 health.py      — /health, /ready, /status endpoints
 quality.py     — SQLite-backed per-model quality scoring (success rate + latency decay)
 semantic_cache.py — Scoped, bounded semantic response cache (opt-in)
@@ -51,3 +55,4 @@ Capability discovery refreshes supported image/video models from provider catalo
 5. **Codex token rotation** — shared OAuth pools select credentials round-robin; failed requests continue with the next scheduled credential.
 6. **Virtual alias guard** — the advertised model name (e.g. `tusker-gateway`) is never persisted as a session's model or sent to a provider.
 7. **Semantic cache isolation** — approximate response reuse is restricted to deterministic text requests and scoped by caller, pool, and concrete route; tool calls and ZDR traffic are excluded. See `docs/semantic-cache.md`.
+8. **Enterprise controls** — optional tenant identities, least-privilege API scopes, tamper-evident request audit, and persistent idempotency are enforced before provider dispatch. Request deadlines are bounded globally. See `docs/enterprise-controls.md`.

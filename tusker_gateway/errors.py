@@ -25,6 +25,14 @@ class AuthenticationError(GatewayError):
         super().__init__(message, code=code)
 
 
+class AuthorizationError(GatewayError):
+    status = 403
+    error_type = "permission_error"
+
+    def __init__(self, message: str = "Forbidden", *, code: str | None = "forbidden"):
+        super().__init__(message, code=code)
+
+
 class BadRequestError(GatewayError):
     status = 400
     error_type = "invalid_request_error"

@@ -11,6 +11,7 @@ import os
 import random
 import re
 import time
+import fnmatch
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -819,6 +820,7 @@ class PoolManager:
         allow_unqualified_static_tools: bool = False,
         allow_structured_tool_fallback: bool = False,
         allow_tool_compatibility_fallback: bool = False,
+        allowed_providers: tuple[str, ...] | None = None,
     ) -> tuple[str, str] | None:
         """Select the best (provider, model) from a pool.
 
@@ -855,6 +857,10 @@ class PoolManager:
         escape hatch for curated models whose persisted probe says tools are
         unsupported. It is used only after strict and structured candidates
         are exhausted; auto-discovered models remain gated.
+
+        ``allowed_providers`` applies caller identity patterns before sticky,
+        weighted, quality, or recovery selection. An empty tuple denies every
+        candidate; ``None`` leaves provider policy unrestricted.
         """
         excluded = excluded or set()
         required_modalities = frozenset(
@@ -863,6 +869,15 @@ class PoolManager:
             if _normalise_input_modality(modality)
         )
         specs = self.models.get(pool_name, [])
+        if allowed_providers is not None:
+            specs = [
+                spec
+                for spec in specs
+                if any(
+                    fnmatch.fnmatchcase(spec.provider, pattern)
+                    for pattern in allowed_providers
+                )
+            ]
         if not specs:
             unkeyed_count = len(self.unkeyed.get(pool_name, ()))
             logger.warning(

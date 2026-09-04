@@ -54,6 +54,11 @@ def _access_log_context(request: web.Request) -> dict[str, Any]:
     }
 
 
+def get_access_log_context(request: web.Request) -> dict[str, Any]:
+    """Return a copy of the bounded routing context for audit integrations."""
+    return _access_log_context(request)
+
+
 def _generate_request_id() -> str:
     """Generate a unique request ID for correlation."""
     return f"req_{secrets.token_hex(8)}"
@@ -111,6 +116,14 @@ class AccessLog:
             "status": response_status,
             "latency_ms": round(latency_ms, 1),
         }
+
+        identity = request.get("identity")
+        if identity is not None:
+            record["principal"] = getattr(identity, "principal", "unknown")
+            record["tenant"] = getattr(identity, "tenant", "unknown")
+            record["key_fingerprint"] = getattr(
+                identity, "key_fingerprint", "unknown"
+            )
 
         # Upstream details
         if provider:
@@ -181,7 +194,7 @@ def attach_request_id_middleware(app: web.Application) -> None:
             if access_log is not None:
                 access_log.log(
                     request,
-                    500,
+                    504 if request.get("_deadline_exceeded") else 500,
                     (time.monotonic() - started) * 1000,
                     **_access_log_context(request),
                     error=exc.__class__.__name__,
