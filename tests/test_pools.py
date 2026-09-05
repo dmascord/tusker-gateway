@@ -156,6 +156,32 @@ def test_caller_provider_policy_filters_pool_before_selection():
         assert manager.select("test", allowed_providers=()) is None
 
 
+def test_caller_model_policy_filters_concrete_pool_candidates():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = PoolManager({
+            "pools": {
+                "test": PoolConfig(
+                    name="test",
+                    models=[
+                        {"provider": "openrouter", "model": "approved"},
+                        {"provider": "openrouter", "model": "denied"},
+                    ],
+                ),
+            },
+            "quality_db_path": os.path.join(tmpdir, "quality.db"),
+            "excluded_providers": [],
+            "provider_api_keys": {"openrouter": "k-openrouter"},
+        })
+
+        assert manager.select(
+            "test", allowed_models=("openrouter/approved",)
+        ) == ("openrouter", "approved")
+        assert manager.select(
+            "test", allowed_models=("openrouter::approved",)
+        ) == ("openrouter", "approved")
+        assert manager.select("test", allowed_models=()) is None
+
+
 def test_verified_modality_evidence_controls_pool_selection():
     with tempfile.TemporaryDirectory() as tmpdir:
         config = {

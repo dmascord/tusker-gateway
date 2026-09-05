@@ -821,6 +821,7 @@ class PoolManager:
         allow_structured_tool_fallback: bool = False,
         allow_tool_compatibility_fallback: bool = False,
         allowed_providers: tuple[str, ...] | None = None,
+        allowed_models: tuple[str, ...] | None = None,
     ) -> tuple[str, str] | None:
         """Select the best (provider, model) from a pool.
 
@@ -861,6 +862,10 @@ class PoolManager:
         ``allowed_providers`` applies caller identity patterns before sticky,
         weighted, quality, or recovery selection. An empty tuple denies every
         candidate; ``None`` leaves provider policy unrestricted.
+
+        ``allowed_models`` applies patterns to the concrete model slug and both
+        supported provider-qualified forms. This prevents a permitted virtual
+        alias from silently selecting an unpermitted concrete model.
         """
         excluded = excluded or set()
         required_modalities = frozenset(
@@ -876,6 +881,20 @@ class PoolManager:
                 if any(
                     fnmatch.fnmatchcase(spec.provider, pattern)
                     for pattern in allowed_providers
+                )
+            ]
+        if allowed_models is not None:
+            specs = [
+                spec
+                for spec in specs
+                if any(
+                    fnmatch.fnmatchcase(candidate, pattern)
+                    for candidate in (
+                        spec.model,
+                        f"{spec.provider}/{spec.model}",
+                        f"{spec.provider}::{spec.model}",
+                    )
+                    for pattern in allowed_models
                 )
             ]
         if not specs:

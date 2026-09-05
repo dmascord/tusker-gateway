@@ -47,6 +47,10 @@ Allowlist entries use shell-style patterns. Omitted lists default to `*`; an
 explicit empty list denies that dimension. Media requests use the logical
 `media` pool and reranking requests use `rerank` for pool allowlists. Set
 `TUSKER_IDENTITY_REQUIRED=true` only after every accepted key has a profile.
+Pool aliases and concrete routes are both enforced: every configured fallback
+pool must be allowed, and the selected model must match its bare model ID,
+`provider/model`, or `provider::model`. When restricting a virtual alias, list
+both the permitted alias and the permitted concrete-model patterns.
 In strict mode, startup fails if the identity JSON is absent or malformed, and
 a valid key without a profile is denied with HTTP 403. Access logs include
 principal, tenant, and the key fingerprint. Anthropic `x-api-key` requests use
@@ -64,6 +68,8 @@ Each record contains the previous record's digest and its own digest. Set
 tamper-evident to parties that can edit the file but do not hold the integrity
 key. Without the key, the chain uses plain SHA-256 and detects accidental
 damage only. File appends use an exclusive lock, mode `0600`, flush, and fsync.
+Caller-derived metadata is bounded before serialization so an oversized model
+or routing label cannot make the next chain append unreadable.
 
 Operational knobs:
 
@@ -113,6 +119,10 @@ The database uses `BEGIN IMMEDIATE`, WAL, and a busy timeout for multi-process
 safety on a single host. Do not place SQLite on NFS for sustained multi-replica
 operation; move this store and the existing quota state to a transactional
 shared database before running active-active replicas.
+Canonical request identity includes normalized query keys and values, so query
+ordering does not affect replay while a changed query conflicts. A cancelled or
+timed-out operation releases its processing reservation before propagating the
+cancellation.
 
 ## 5. Automated quality and dependency gates
 

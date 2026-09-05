@@ -39,7 +39,11 @@ from tusker_gateway.endpoints import (
     _required_input_modalities,
 )
 from tusker_gateway.metrics import MetricsRegistry
-from tusker_gateway.identity import provider_patterns_for_request
+from tusker_gateway.identity import (
+    model_patterns_for_request,
+    pool_allowed_for_request,
+    provider_patterns_for_request,
+)
 from tusker_gateway.observability import set_access_log_context
 from tusker_gateway.passthrough import PassthroughClient
 from tusker_gateway.pools import PoolManager
@@ -302,6 +306,11 @@ async def _call_with_pool_fallback_anthropic(
         configured_fallbacks = pool_mgr.fallback_pools(pool_name)
         if not isinstance(configured_fallbacks, (list, tuple)):
             configured_fallbacks = ()
+        configured_fallbacks = tuple(
+            fallback
+            for fallback in configured_fallbacks
+            if pool_allowed_for_request(request, fallback)
+        )
         pool_names = [pool_name, *configured_fallbacks]
         pool_index = 0
         active_pool = pool_names[pool_index]
@@ -313,6 +322,9 @@ async def _call_with_pool_fallback_anthropic(
             allowed_providers = provider_patterns_for_request(request)
             if allowed_providers is not None:
                 select_kwargs["allowed_providers"] = allowed_providers
+            allowed_models = model_patterns_for_request(request)
+            if allowed_models is not None:
+                select_kwargs["allowed_models"] = allowed_models
             if requires_tools:
                 select_kwargs["requires_tools"] = True
             selected = pool_mgr.select(active_pool, **select_kwargs)
@@ -328,6 +340,8 @@ async def _call_with_pool_fallback_anthropic(
                     }
                     if allowed_providers is not None:
                         select_kwargs["allowed_providers"] = allowed_providers
+                    if allowed_models is not None:
+                        select_kwargs["allowed_models"] = allowed_models
                     if requires_tools:
                         select_kwargs["requires_tools"] = True
                     selected = pool_mgr.select(active_pool, **select_kwargs)

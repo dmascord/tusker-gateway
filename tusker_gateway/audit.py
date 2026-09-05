@@ -20,6 +20,10 @@ from tusker_gateway.observability import get_access_log_context
 logger = logging.getLogger(__name__)
 
 _GENESIS_HASH = "0" * 64
+_MAX_AUDIT_TEXT_CHARS = 2_048
+_MAX_AUDIT_COLLECTION_ITEMS = 32
+_MAX_AUDIT_RECORD_BYTES = 64 * 1024
+_MAX_LEGACY_RECORD_BYTES = 1024 * 1024
 
 try:  # pragma: no cover - Linux in production; fallback keeps local portability.
     import fcntl
@@ -80,16 +84,52 @@ class AuditLogger:
             ).hexdigest()
         return hashlib.sha256(message).hexdigest()
 
+    @classmethod
+    def _bounded_value(cls, value: Any, *, depth: int = 0) -> Any:
+        """Bound caller-derived metadata so one event cannot poison the chain."""
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+        if isinstance(value, str):
+            if len(value) <= _MAX_AUDIT_TEXT_CHARS:
+                return value
+            return value[: _MAX_AUDIT_TEXT_CHARS - 1] + "…"
+        if depth >= 2:
+            return cls._bounded_value(str(value), depth=depth)
+        if isinstance(value, Mapping):
+            return {
+                cls._bounded_value(str(key), depth=depth + 1): cls._bounded_value(
+                    item, depth=depth + 1
+                )
+                for key, item in list(value.items())[:_MAX_AUDIT_COLLECTION_ITEMS]
+            }
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return [
+                cls._bounded_value(item, depth=depth + 1)
+                for item in list(value)[:_MAX_AUDIT_COLLECTION_ITEMS]
+            ]
+        return cls._bounded_value(str(value), depth=depth)
+
     @staticmethod
     def _previous_hash(handle) -> str:
         handle.seek(0, os.SEEK_END)
         size = handle.tell()
         if size == 0:
             return _GENESIS_HASH
-        # Audit events are deliberately bounded metadata records. Reading the
-        # final 64 KiB keeps append cost constant as retention files grow.
-        handle.seek(max(0, size - 65_536))
-        lines = [line for line in handle.read().splitlines() if line.strip()]
+        # New records are bounded below 64 KiB, but scan farther so a log
+        # created by an older release with one oversized final record remains
+        # recoverable after upgrade.
+        buffer = b""
+        position = size
+        while position > 0:
+            start = max(0, position - 65_536)
+            handle.seek(start)
+            buffer = handle.read(position - start) + buffer
+            position = start
+            lines = [line for line in buffer.splitlines() if line.strip()]
+            if len(buffer) > _MAX_LEGACY_RECORD_BYTES:
+                raise AuditWriteError("audit log final record exceeds the recovery limit")
+            if position == 0 or len(lines) >= 2:
+                break
         if not lines:
             return _GENESIS_HASH
         record = json.loads(lines[-1].decode("utf-8"))
@@ -110,7 +150,10 @@ class AuditLogger:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
             try:
                 previous_hash = self._previous_hash(handle)
-                payload = dict(event)
+                payload = {
+                    str(key)[:128]: self._bounded_value(value)
+                    for key, value in list(event.items())[:_MAX_AUDIT_COLLECTION_ITEMS]
+                }
                 payload["chain_version"] = 1
                 payload["previous_hash"] = previous_hash
                 payload["integrity"] = (
@@ -119,13 +162,16 @@ class AuditLogger:
                 canonical = json.dumps(
                     payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
                 ).encode("utf-8")
+                if len(canonical) > _MAX_AUDIT_RECORD_BYTES:
+                    raise AuditWriteError("audit event exceeds the maximum record size")
                 payload["hash"] = self._digest(previous_hash, canonical)
+                serialized = json.dumps(
+                    payload, sort_keys=True, ensure_ascii=False
+                ).encode("utf-8")
+                if len(serialized) > _MAX_AUDIT_RECORD_BYTES:
+                    raise AuditWriteError("audit event exceeds the maximum record size")
                 handle.seek(0, os.SEEK_END)
-                handle.write(
-                    (json.dumps(payload, sort_keys=True, ensure_ascii=False) + "\n").encode(
-                        "utf-8"
-                    )
-                )
+                handle.write(serialized + b"\n")
                 handle.flush()
                 if self.config.fsync:
                     os.fsync(handle.fileno())

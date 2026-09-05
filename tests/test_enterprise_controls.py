@@ -1,7 +1,10 @@
 """Deterministic coverage for enterprise identity, audit, and resilience controls."""
 from __future__ import annotations
 
+import asyncio
 import json
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 from aiohttp import web
@@ -10,7 +13,13 @@ from aiohttp.test_utils import TestClient, TestServer
 from tusker_gateway.audit import AuditConfig, AuditLogger, attach_audit_middleware
 from tusker_gateway.auth import AuthMiddleware
 from tusker_gateway.deadline import DeadlineConfig, attach_deadline_middleware
-from tusker_gateway.errors import GatewayError, openai_error
+from tusker_gateway.endpoints import (
+    _call_with_pool_fallback,
+    images_handler,
+    tts_handler,
+    video_handler,
+)
+from tusker_gateway.errors import GatewayError, NoHealthyModelsError, openai_error
 from tusker_gateway.idempotency import (
     IdempotencyConfig,
     IdempotencyStore,
@@ -19,6 +28,7 @@ from tusker_gateway.idempotency import (
 from tusker_gateway.identity import (
     IdentityStore,
     attach_authorization_middleware,
+    authorize_request_body,
     fingerprint_api_key,
     load_identity_config_from_env,
 )
@@ -219,6 +229,140 @@ class TestEnterpriseIdentity:
         finally:
             await client.close()
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("allowed_pools", "expected_status", "expected_selected_pools"),
+        [
+            (("code",), 503, ["code", "code"]),
+            (("code", "premium"), 200, ["code", "premium"]),
+        ],
+    )
+    async def test_pool_fallback_respects_identity_pool_policy(
+        self,
+        allowed_pools,
+        expected_status,
+        expected_selected_pools,
+    ):
+        api_key = "sk-pool-policy"
+        fingerprint = fingerprint_api_key(api_key)
+        config = load_identity_config_from_env(
+            {
+                "TUSKER_IDENTITY_REQUIRED": "true",
+                "TUSKER_IDENTITIES_JSON": json.dumps(
+                    {
+                        fingerprint: {
+                            "principal": "svc-pool-policy",
+                            "tenant": "engineering",
+                            "scopes": ["inference:chat"],
+                            "allowed_pools": list(allowed_pools),
+                        }
+                    }
+                ),
+            }
+        )
+        app = web.Application()
+        app["config"] = {"api_keys": [api_key]}
+        pool_manager = MagicMock()
+        pool_manager.fallback_pools.return_value = ("premium",)
+        if "premium" in allowed_pools:
+            pool_manager.select.side_effect = [None, ("openai-codex", "premium-model")]
+        else:
+            pool_manager.select.return_value = None
+        app["pool_manager"] = pool_manager
+        app.middlewares.append(_auth_middleware(IdentityStore(config)))
+        attach_authorization_middleware(app)
+
+        class FakeClient:
+            calls = 0
+
+            async def chat(self, provider, model, messages, **kwargs):
+                self.calls += 1
+                return {"provider": provider, "model": model}
+
+        upstream = FakeClient()
+
+        async def handler(request):
+            body = await request.json()
+            try:
+                provider, model, _ = await _call_with_pool_fallback(
+                    app["config"], body, upstream, request=request
+                )
+            except NoHealthyModelsError:
+                return web.json_response({"error": "no route"}, status=503)
+            return web.json_response({"provider": provider, "model": model})
+
+        app.router.add_post("/v1/chat/completions", handler)
+        client = await _client(app)
+        try:
+            response = await client.post(
+                "/v1/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json={
+                    "model": "hermes-code",
+                    "messages": [{"role": "user", "content": "hello"}],
+                },
+            )
+            assert response.status == expected_status
+            assert [call.args[0] for call in pool_manager.select.call_args_list] == (
+                expected_selected_pools
+            )
+            assert upstream.calls == (1 if expected_status == 200 else 0)
+        finally:
+            await client.close()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("rewritten_model", "expected_status"),
+        [("hermes-code", 200), ("hermes-premium", 403)],
+    )
+    async def test_body_rewrite_is_reauthorized(
+        self, rewritten_model, expected_status
+    ):
+        api_key = "sk-rewrite-policy"
+        config = load_identity_config_from_env(
+            {
+                "TUSKER_IDENTITIES_JSON": json.dumps(
+                    {
+                        fingerprint_api_key(api_key): {
+                            "principal": "svc-rewrite",
+                            "tenant": "engineering",
+                            "scopes": ["inference:chat"],
+                            "allowed_pools": ["code"],
+                        }
+                    }
+                )
+            }
+        )
+        app = web.Application()
+        app["config"] = {"api_keys": [api_key]}
+        app.middlewares.append(_auth_middleware(IdentityStore(config)))
+        attach_authorization_middleware(app)
+
+        async def handler(request):
+            await request.json()
+            try:
+                authorize_request_body(request, {"model": rewritten_model})
+            except GatewayError as exc:
+                return web.json_response(
+                    openai_error(
+                        exc.message, code=exc.code, error_type=exc.error_type
+                    ),
+                    status=exc.status,
+                )
+            return web.json_response({"model": rewritten_model})
+
+        app.router.add_post("/v1/chat/completions", handler)
+        client = await _client(app)
+        try:
+            response = await client.post(
+                "/v1/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json={"model": "hermes-code"},
+            )
+            assert response.status == expected_status
+        finally:
+            await client.close()
+
 
 class TestAuditLog:
     @pytest.mark.asyncio
@@ -278,6 +422,23 @@ class TestAuditLog:
         assert record["principal"] == "svc-audit"
         assert record["tenant"] == "security"
         assert record["key_fingerprint"] == fingerprint
+
+    @pytest.mark.asyncio
+    async def test_oversized_metadata_is_bounded_and_chain_remains_appendable(
+        self, tmp_path
+    ):
+        path = tmp_path / "audit.jsonl"
+        config = AuditConfig(
+            path=str(path), hmac_key="audit-secret", fail_closed=True, fsync=False
+        )
+        audit = AuditLogger(config)
+
+        await audit.write({"event_type": "gateway.request", "model": "m" * 70_000})
+        await audit.write({"event_type": "gateway.request", "model": "normal"})
+
+        assert AuditLogger.verify_file(config) == (True, 2)
+        first = json.loads(path.read_text().splitlines()[0])
+        assert len(first["model"]) <= 2_048
 
 
 class TestRequestDeadlines:
@@ -380,6 +541,91 @@ class TestIdempotency:
         finally:
             await client.close()
 
+
+    @pytest.mark.asyncio
+    async def test_query_parameters_participate_in_request_identity(self, tmp_path):
+        store = IdempotencyStore(
+            IdempotencyConfig(enabled=True, path=str(tmp_path / "idempotency.db"))
+        )
+        app = web.Application()
+        attach_idempotency_middleware(app, store)
+
+        async def handler(request):
+            return web.json_response(
+                {
+                    "wait": request.query.get("wait"),
+                    "quality": request.query.get("quality"),
+                }
+            )
+
+        app.router.add_post("/v1/videos", handler)
+        client = await _client(app)
+        try:
+            headers = {"Idempotency-Key": "video-42"}
+            first = await client.post(
+                "/v1/videos?wait=false&quality=high",
+                headers=headers,
+                json={"model": "sora-2"},
+            )
+            reordered = await client.post(
+                "/v1/videos?quality=high&wait=false",
+                headers=headers,
+                json={"model": "sora-2"},
+            )
+            changed = await client.post(
+                "/v1/videos?wait=true&quality=high",
+                headers=headers,
+                json={"model": "sora-2"},
+            )
+
+            assert first.status == 200
+            assert reordered.status == 200
+            assert reordered.headers["Idempotency-Replayed"] == "true"
+            assert changed.status == 409
+            assert (await changed.json())["error"]["code"] == "idempotency_conflict"
+        finally:
+            await client.close()
+
+    @pytest.mark.asyncio
+    async def test_deadline_cancellation_releases_processing_claim(self, tmp_path):
+        store = IdempotencyStore(
+            IdempotencyConfig(
+                enabled=True,
+                path=str(tmp_path / "idempotency.db"),
+                lock_secs=30,
+            )
+        )
+        app = web.Application()
+        attach_deadline_middleware(
+            app, DeadlineConfig(default_timeout_ms=10, max_timeout_ms=10)
+        )
+        attach_idempotency_middleware(app, store)
+        calls = 0
+
+        async def handler(request):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                await asyncio.sleep(0.05)
+            return web.json_response({"call": calls})
+
+        app.router.add_post("/v1/chat/completions", handler)
+        client = await _client(app)
+        try:
+            headers = {"Idempotency-Key": "cancelled-operation"}
+            first = await client.post(
+                "/v1/chat/completions", headers=headers, json={"model": "hermes-code"}
+            )
+            second = await client.post(
+                "/v1/chat/completions", headers=headers, json={"model": "hermes-code"}
+            )
+
+            assert first.status == 504
+            assert second.status == 200
+            assert await second.json() == {"call": 2}
+        finally:
+            await client.close()
+
     @pytest.mark.asyncio
     async def test_streaming_requests_are_never_replayed(self, tmp_path):
         store = IdempotencyStore(
@@ -435,5 +681,119 @@ class TestIdempotency:
             assert await one.read() == b"image-one"
             assert await two.read() == b"image-two"
             assert calls == 2
+        finally:
+            await client.close()
+
+
+class _FakeImageHandler:
+    def get_provider_for_image_request(self, model, path):
+        return "openai"
+
+    async def handle_request(self, **kwargs):
+        return {"data": []}
+
+
+class _FakeTTSHandler:
+    called = False
+
+    def get_provider_for_tts_request(self, model):
+        return "openai"
+
+    async def handle_request(self, **kwargs):
+        self.called = True
+        return b"audio", "audio/mpeg"
+
+
+class _FakeVideoHandler:
+    def get_provider_for_video_request(self, model):
+        return "openai"
+
+    async def handle_request(self, **kwargs):
+        return {"id": "video-1"}
+
+
+class TestMediaEnterpriseControls:
+    @staticmethod
+    async def _media_client(path, handler_name, handler, *, allowed):
+        class RateLimiter:
+            def check(self, api_key):
+                return SimpleNamespace(
+                    allowed=allowed,
+                    retry_after=60,
+                    reason=None if allowed else "blocked by policy",
+                )
+
+        class CaptureLog:
+            fields = None
+
+            def log(self, request, response_status, latency_ms, **fields):
+                self.fields = fields
+
+        app = web.Application()
+        capture = CaptureLog()
+        app["config"] = {"provider_api_keys": {"openai": "upstream-key"}}
+        app[handler_name] = handler
+        app["ratelimit"] = RateLimiter()
+        app["budget"] = None
+        app["guard_pipeline"] = None
+        app["model_capabilities"] = None
+        app["access_log"] = capture
+        attach_request_id_middleware(app)
+        route_handler = {
+            "image_handler": images_handler,
+            "tts_handler": tts_handler,
+            "video_handler": video_handler,
+        }[handler_name]
+        app.router.add_post(path, route_handler)
+        client = await _client(app)
+        return client, capture
+
+    @pytest.mark.asyncio
+    async def test_tts_rate_limit_blocks_provider_dispatch(self):
+        tts = _FakeTTSHandler()
+        client, _ = await self._media_client(
+            "/v1/audio/speech", "tts_handler", tts, allowed=False
+        )
+        try:
+            response = await client.post(
+                "/v1/audio/speech",
+                headers={"Authorization": "Bearer sk-client"},
+                json={"model": "tts-1", "input": "hello"},
+            )
+            assert response.status == 429
+            assert tts.called is False
+        finally:
+            await client.close()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("path", "handler_name", "model", "handler_factory"),
+        [
+            (
+                "/v1/images/generations",
+                "image_handler",
+                "openai::gpt-image-1",
+                _FakeImageHandler,
+            ),
+            ("/v1/audio/speech", "tts_handler", "tts-1", _FakeTTSHandler),
+            ("/v1/videos", "video_handler", "openai::sora-2", _FakeVideoHandler),
+        ],
+    )
+    async def test_successful_media_request_populates_access_routing_fields(
+        self, path, handler_name, model, handler_factory
+    ):
+        client, capture = await self._media_client(
+            path, handler_name, handler_factory(), allowed=True
+        )
+        try:
+            response = await client.post(
+                path,
+                headers={"Authorization": "Bearer sk-client"},
+                json={"model": model, "input": "hello", "prompt": "hello"},
+            )
+            assert response.status == 200
+            assert capture.fields["pool"] == "media"
+            assert capture.fields["provider"] == "openai"
+            assert capture.fields["model"] == model
         finally:
             await client.close()

@@ -5,6 +5,7 @@ import asyncio
 from dataclasses import dataclass
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import sqlite3
@@ -16,6 +17,8 @@ from aiohttp import web
 from tusker_gateway.errors import openai_error
 from tusker_gateway.identity import extract_api_key, fingerprint_api_key
 from tusker_gateway.observability import set_access_log_context
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -221,6 +224,14 @@ def _canonical_request_hash(request: web.Request, body: bytes) -> str:
     digest.update(b"\0")
     digest.update(request.path.encode("utf-8"))
     digest.update(b"\0")
+    query = [
+        (key, list(request.query.getall(key)))
+        for key in sorted(set(request.query))
+    ]
+    digest.update(
+        json.dumps(query, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    )
+    digest.update(b"\0")
     digest.update(canonical)
     return digest.hexdigest()
 
@@ -232,6 +243,20 @@ def _record_key(request: web.Request, idempotency_key: str) -> str:
         fingerprint = fingerprint_api_key(api_key) if api_key else "anonymous"
     scope = f"{fingerprint}\0{request.method}\0{request.path}\0{idempotency_key}"
     return hashlib.sha256(scope.encode("utf-8")).hexdigest()
+
+
+async def _abandon_safely(
+    store: IdempotencyStore,
+    record_key: str,
+    request_hash: str,
+) -> None:
+    """Release a reservation without replacing the request's real failure."""
+    try:
+        await asyncio.shield(
+            asyncio.to_thread(store.abandon, record_key, request_hash)
+        )
+    except (OSError, sqlite3.Error):
+        logger.exception("could not release idempotency reservation")
 
 
 def attach_idempotency_middleware(
@@ -323,8 +348,11 @@ def attach_idempotency_middleware(
         try:
             set_access_log_context(request, cache_status="idempotency_miss")
             response = await handler(request)
+        except asyncio.CancelledError:
+            await _abandon_safely(store, record_key, request_hash)
+            raise
         except Exception:
-            await asyncio.to_thread(store.abandon, record_key, request_hash)
+            await _abandon_safely(store, record_key, request_hash)
             raise
 
         response_body = response.body if isinstance(response, web.Response) else None
@@ -357,7 +385,7 @@ def attach_idempotency_middleware(
                 response.headers["Idempotency-Key"] = key
                 response.headers["Idempotency-Replayed"] = "false"
         else:
-            await asyncio.to_thread(store.abandon, record_key, request_hash)
+            await _abandon_safely(store, record_key, request_hash)
         return response
 
     app.middlewares.append(idempotency_middleware)

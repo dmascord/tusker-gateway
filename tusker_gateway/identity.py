@@ -35,6 +35,11 @@ _ROUTE_SCOPES = {
     ("POST", "/v1/videos"): "inference:video",
     ("POST", "/v1/rerank"): "inference:rerank",
 }
+_CHAT_ROUTES = frozenset({
+    "/v1/chat/completions",
+    "/v1/responses",
+    "/v1/messages",
+})
 
 
 def fingerprint_api_key(api_key: str) -> str:
@@ -182,6 +187,54 @@ def _deny(message: str, code: str) -> None:
     raise AuthorizationError(message, code=code)
 
 
+def authorize_request_body(request: web.Request, body: Mapping[str, Any]) -> None:
+    """Authorize an inspected body, including any trusted guardrail rewrite."""
+    identity = request.get("identity")
+    if not isinstance(identity, CallerIdentity):
+        return
+
+    requested_model = body.get("model")
+    model = str(requested_model).strip() if requested_model is not None else ""
+    if request.path in _CHAT_ROUTES:
+        route = resolve_route(model or None, dict(body))
+        pool = route.pool_name or ("code" if route.kind == "code" else None)
+        provider = route.provider
+        model_candidates = tuple(
+            candidate
+            for candidate in (
+                model or "hermes-code",
+                route.model,
+                f"{route.provider}/{route.model}" if route.provider and route.model else None,
+                f"{route.provider}::{route.model}" if route.provider and route.model else None,
+            )
+            if candidate
+        )
+    else:
+        pool = "rerank" if request.path == "/v1/rerank" else "media"
+        raw_provider = body.get("provider")
+        provider = str(raw_provider).strip() if raw_provider is not None else None
+        if provider is None and model:
+            provider = resolve_route(model, dict(body)).provider
+        model_candidates = (model,) if model else ()
+    if pool and not identity.allows_pool(pool):
+        _deny("Caller is not authorized for the requested model pool", "pool_not_allowed")
+    if provider and not identity.allows_provider(provider):
+        _deny("Caller is not authorized for the requested provider", "provider_not_allowed")
+    if (
+        request.path not in _CHAT_ROUTES
+        and identity.allowed_providers != _WILDCARD
+        and not provider
+    ):
+        _deny(
+            "An explicit provider is required by the caller's provider policy",
+            "provider_required_by_policy",
+        )
+    if model_candidates and not any(
+        identity.allows_model(candidate) for candidate in model_candidates
+    ):
+        _deny("Caller is not authorized for the requested model", "model_not_allowed")
+
+
 async def authorize_request(request: web.Request) -> None:
     """Enforce route, pool, provider, and model policy for a caller."""
     identity = request.get("identity")
@@ -194,11 +247,6 @@ async def authorize_request(request: web.Request) -> None:
 
     if request.method != "POST" or not request.path.startswith("/v1/"):
         return
-    chat_routes = {
-        "/v1/chat/completions",
-        "/v1/responses",
-        "/v1/messages",
-    }
     if not any(
         patterns != _WILDCARD
         for patterns in (
@@ -209,7 +257,7 @@ async def authorize_request(request: web.Request) -> None:
     ):
         return
 
-    if request.path not in chat_routes:
+    if request.path not in _CHAT_ROUTES:
         logical_pool = "rerank" if request.path == "/v1/rerank" else "media"
         if not identity.allows_pool(logical_pool):
             _deny(
@@ -239,46 +287,7 @@ async def authorize_request(request: web.Request) -> None:
     if not isinstance(body, dict):
         return
 
-    requested_model = body.get("model")
-    model = str(requested_model).strip() if requested_model is not None else ""
-    if request.path in chat_routes:
-        route = resolve_route(model or None, body)
-        pool = route.pool_name or ("code" if route.kind == "code" else None)
-        provider = route.provider
-        model_candidates = tuple(
-            candidate
-            for candidate in (
-                model or "hermes-code",
-                route.model,
-                f"{route.provider}/{route.model}" if route.provider and route.model else None,
-                f"{route.provider}::{route.model}" if route.provider and route.model else None,
-            )
-            if candidate
-        )
-    else:
-        pool = "rerank" if request.path == "/v1/rerank" else "media"
-        raw_provider = body.get("provider")
-        provider = str(raw_provider).strip() if raw_provider is not None else None
-        if provider is None and model:
-            provider = resolve_route(model, body).provider
-        model_candidates = (model,) if model else ()
-    if pool and not identity.allows_pool(pool):
-        _deny("Caller is not authorized for the requested model pool", "pool_not_allowed")
-    if provider and not identity.allows_provider(provider):
-        _deny("Caller is not authorized for the requested provider", "provider_not_allowed")
-    if (
-        request.path not in chat_routes
-        and identity.allowed_providers != _WILDCARD
-        and not provider
-    ):
-        _deny(
-            "An explicit provider is required by the caller's provider policy",
-            "provider_required_by_policy",
-        )
-    if model_candidates and not any(
-        identity.allows_model(candidate) for candidate in model_candidates
-    ):
-        _deny("Caller is not authorized for the requested model", "model_not_allowed")
+    authorize_request_body(request, body)
 
 
 def provider_patterns_for_request(request: web.Request | None) -> tuple[str, ...] | None:
@@ -292,6 +301,47 @@ def provider_patterns_for_request(request: web.Request | None) -> tuple[str, ...
     if not isinstance(identity, CallerIdentity):
         return None
     return None if identity.allowed_providers == _WILDCARD else identity.allowed_providers
+
+
+def model_patterns_for_request(request: web.Request | None) -> tuple[str, ...] | None:
+    """Return concrete-model patterns that pool selection must enforce."""
+    if request is None:
+        return None
+    getter = getattr(request, "get", None)
+    if not callable(getter):
+        return None
+    identity = getter("identity")
+    if not isinstance(identity, CallerIdentity):
+        return None
+    return None if identity.allowed_models == _WILDCARD else identity.allowed_models
+
+
+def pool_allowed_for_request(request: web.Request | None, pool: str) -> bool:
+    """Return whether the caller may enter ``pool`` during fallback routing."""
+    if request is None:
+        return True
+    getter = getattr(request, "get", None)
+    if not callable(getter):
+        return True
+    identity = getter("identity")
+    return not isinstance(identity, CallerIdentity) or identity.allows_pool(pool)
+
+
+def model_allowed_for_request(
+    request: web.Request | None,
+    provider: str,
+    model: str,
+) -> bool:
+    """Return whether a concrete provider/model pair satisfies caller policy."""
+    patterns = model_patterns_for_request(request)
+    if patterns is None:
+        return True
+    candidates = (model, f"{provider}/{model}", f"{provider}::{model}")
+    return any(
+        fnmatch.fnmatchcase(candidate, pattern)
+        for candidate in candidates
+        for pattern in patterns
+    )
 
 
 def attach_authorization_middleware(app: web.Application) -> None:
@@ -316,9 +366,13 @@ __all__ = [
     "IdentityConfig",
     "IdentityStore",
     "attach_authorization_middleware",
+    "authorize_request_body",
     "authorize_request",
     "extract_api_key",
     "fingerprint_api_key",
     "load_identity_config_from_env",
+    "model_allowed_for_request",
+    "model_patterns_for_request",
+    "pool_allowed_for_request",
     "provider_patterns_for_request",
 ]

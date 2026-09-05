@@ -31,7 +31,13 @@ from tusker_gateway.errors import (
     openai_error,
 )
 from tusker_gateway.metrics import MetricsRegistry
-from tusker_gateway.identity import provider_patterns_for_request
+from tusker_gateway.identity import (
+    authorize_request_body,
+    model_allowed_for_request,
+    model_patterns_for_request,
+    pool_allowed_for_request,
+    provider_patterns_for_request,
+)
 from tusker_gateway.observability import set_access_log_context
 from tusker_gateway.passthrough import (
     PassthroughClient,
@@ -1936,6 +1942,9 @@ def _select_cache_route_target(
         allowed_providers = provider_patterns_for_request(request)
         if allowed_providers is not None:
             select_kwargs["allowed_providers"] = allowed_providers
+        allowed_models = model_patterns_for_request(request)
+        if allowed_models is not None:
+            select_kwargs["allowed_models"] = allowed_models
         selected = pool_manager.select(pool_name, **select_kwargs)
         if selected is None:
             return None
@@ -2208,6 +2217,11 @@ async def _call_with_pool_fallback(
     configured_fallbacks = pool_mgr.fallback_pools(pool_name)
     if not isinstance(configured_fallbacks, (list, tuple)):
         configured_fallbacks = ()
+    configured_fallbacks = tuple(
+        fallback
+        for fallback in configured_fallbacks
+        if pool_allowed_for_request(request, fallback)
+    )
     pool_names = [pool_name, *configured_fallbacks]
     pool_index = 0
     active_pool = pool_names[pool_index]
@@ -2235,6 +2249,8 @@ async def _call_with_pool_fallback(
         if pending_selection is not None:
             selected = pending_selection
             pending_selection = None
+            if not model_allowed_for_request(request, selected[0], selected[1]):
+                selected = None
         else:
             select_kwargs: dict[str, Any] = {
                 "excluded": set(excluded),
@@ -2243,6 +2259,9 @@ async def _call_with_pool_fallback(
             allowed_providers = provider_patterns_for_request(request)
             if allowed_providers is not None:
                 select_kwargs["allowed_providers"] = allowed_providers
+            allowed_models = model_patterns_for_request(request)
+            if allowed_models is not None:
+                select_kwargs["allowed_models"] = allowed_models
             if requires_tools:
                 select_kwargs["requires_tools"] = True
             if recovery_probe:
@@ -3525,6 +3544,8 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                 if guard_result.modified_body is not None:
                     body = guard_result.modified_body
 
+            authorize_request_body(request, body)
+
             # Guards may normalize or remove request fields, so derive cache
             # eligibility and routing from the final body.
             tools = body.get("tools") if isinstance(body.get("tools"), list) else None
@@ -4141,6 +4162,7 @@ async def _media_preflight(
         ):
             body.clear()
             body.update(guard_result.modified_body)
+    authorize_request_body(request, body)
     return None
 
 
@@ -4209,6 +4231,7 @@ async def images_handler(request: web.Request) -> web.Response:
     Image generation endpoint for OpenAI GPT Image models and other providers.
     Delegates to the ImageGenerationHandler for routing and processing.
     """
+    set_access_log_context(request, pool="media")
     try:
         started = time.monotonic()
         body = await request.json()
@@ -4226,6 +4249,9 @@ async def images_handler(request: web.Request) -> web.Response:
             )
 
         provider = image_handler.get_provider_for_image_request(model, request.path)
+        set_access_log_context(
+            request, pool="media", provider=provider, model=model
+        )
         config = request.app["config"]
         provider_keys = config.get("provider_api_keys", {})
         api_key = provider_keys.get(provider)
@@ -4268,9 +4294,14 @@ async def images_handler(request: web.Request) -> web.Response:
 
 async def tts_handler(request: web.Request) -> web.Response:
     """POST /v1/audio/speech and return upstream-generated binary audio."""
+    set_access_log_context(request, pool="media")
     try:
         started = time.monotonic()
         body = await request.json()
+        budget_units = 4096
+        blocked = await _media_preflight(request, body, budget_units=budget_units)
+        if blocked is not None:
+            return blocked
         model = body.get("model", "tts-1")
         tts = request.app.get("tts_handler")
         if tts is None:
@@ -4281,6 +4312,9 @@ async def tts_handler(request: web.Request) -> web.Response:
         config = request.app["config"]
         provider_keys = config.get("provider_api_keys", {})
         provider = tts.get_provider_for_tts_request(model)
+        set_access_log_context(
+            request, pool="media", provider=provider, model=model
+        )
         api_key = provider_keys.get(provider)
         audio_bytes, content_type = await tts.handle_request(
             model=model,
@@ -4294,7 +4328,14 @@ async def tts_handler(request: web.Request) -> web.Response:
             capabilities=("output_audio", "tts_speech"),
             started=started,
         )
+        _record_media_budget(request, budget_units=budget_units)
         return web.Response(body=audio_bytes, content_type=content_type)
+    except GatewayError as exc:
+        logger.warning("TTS request failed: %s", exc)
+        return web.json_response(
+            openai_error(exc.message, code=exc.code, error_type=exc.error_type),
+            status=_media_error_status(exc),
+        )
     except Exception as exc:
         logger.warning("TTS request failed: %s", exc)
         return web.json_response(
@@ -4311,6 +4352,7 @@ async def video_handler(request: web.Request) -> web.Response:
     includes the rendered MP4 as base64 under b64_json. Set wait=false to
     get the initial job object immediately.
     """
+    set_access_log_context(request, pool="media")
     try:
         started = time.monotonic()
         body = await request.json()
@@ -4329,6 +4371,9 @@ async def video_handler(request: web.Request) -> web.Response:
         config = request.app["config"]
         provider_keys = config.get("provider_api_keys", {})
         provider = video.get_provider_for_video_request(model)
+        set_access_log_context(
+            request, pool="media", provider=provider, model=model
+        )
         api_key = provider_keys.get(provider)
         result = await video.handle_request(
             model=model,
