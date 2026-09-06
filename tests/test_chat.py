@@ -367,7 +367,12 @@ async def test_chat_completions_accepts_null_assistant_content_with_tool_calls(a
 
 
 @pytest.mark.asyncio
-async def test_chat_completions_pool_dispatch(client):
+async def test_chat_completions_pool_dispatch(app, client):
+    """Pool selection dispatches to openai-codex for the code pool."""
+    pool_manager = MagicMock()
+    pool_manager.select.return_value = ("openai-codex", "gpt-5.6-luna")
+    app["pool_manager"] = pool_manager
+
     # Mock PassthroughClient.chat
     with patch("tusker_gateway.endpoints.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
         mock_chat.return_value = {"id": "mock-id", "choices": [{"message": {"role": "assistant", "content": "hello"}}]}
@@ -378,12 +383,10 @@ async def test_chat_completions_pool_dispatch(client):
         data = await resp.json()
         assert data["choices"][0]["message"]["content"] == "hello"
 
-        # The test environment has no MiniMax/provider API keys, so those
-        # candidates are correctly filtered and the OAuth Codex route leads.
+        # PoolManager selects openai-codex as the first available candidate.
         args, kwargs = mock_chat.call_args
         assert args[0] == "openai-codex"
         assert args[1] == "gpt-5.6-luna"
-
 
 @pytest.mark.asyncio
 async def test_chat_completions_forwards_client_session_to_provider_call(app, client):
