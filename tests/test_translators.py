@@ -26,6 +26,7 @@ from tusker_gateway.translators import (
     translate_response,
 )
 from tusker_gateway.translators.anthropic import (
+    _sse_frame,
     init_anthropic_stream_state,
     response_openai_to_anthropic,
     translate_openai_chunk_to_anthropic,
@@ -43,6 +44,16 @@ def test_registry_has_anthropic_after_import():
     assert ANTHROPIC in translators._request_translators
     assert ANTHROPIC in translators._response_translators
     assert ANTHROPIC in translators._stream_chunk_translators
+
+
+def test_anthropic_sse_frames_end_with_a_blank_line():
+    frame = _sse_frame("message_stop", {"type": "message_stop"})
+
+    assert frame.endswith(b"\n\n")
+    assert frame.split(b"\n\n") == [
+        b'event: message_stop\ndata: {"type": "message_stop"}',
+        b"",
+    ]
 
 
 def test_translate_request_openai_passthrough():

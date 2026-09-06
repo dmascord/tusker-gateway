@@ -164,6 +164,32 @@ class RequiredToolCallError(ProviderError):
         self.upstream_body = "required tool call missing"
 
 
+class ToolCallContractError(ProviderError):
+    """An upstream model violated the request's declared tool contract."""
+
+    def __init__(
+        self,
+        *,
+        reason: str,
+        actual_tool: str | None = None,
+        expected_tool: str | None = None,
+    ) -> None:
+        super().__init__(
+            "Provider emitted a tool call that violates the request contract",
+            code="tool_call_contract_violation",
+        )
+        actual = (actual_tool or "none")[:100]
+        expected = (expected_tool or "none")[:100]
+        self.upstream_status = 502
+        self.upstream_body = (
+            f"tool-call contract violation: reason={reason}; "
+            f"actual={actual}; expected={expected}"
+        )
+        self.reason = reason
+        self.actual_tool = actual_tool
+        self.expected_tool = expected_tool
+
+
 class UnusableToolResponseError(ProviderError):
     """An upstream model produced no client-visible answer for a tool turn."""
 

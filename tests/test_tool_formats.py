@@ -36,6 +36,15 @@ def test_normalize_tool_calls():
     c = normalize_tool_calls([{"toolUse": {"toolUseId": "b1", "name": "w", "input": {"p": "x"}}}])
     assert c[0]["id"] == "b1"
 
+
+def test_normalize_tool_calls_generates_unique_ids_per_invocation():
+    first = normalize_tool_calls([{"name": "bash", "arguments": {"command": "one"}}])
+    second = normalize_tool_calls([{"name": "bash", "arguments": {"command": "two"}}])
+
+    assert first[0]["id"].startswith("call_")
+    assert second[0]["id"].startswith("call_")
+    assert first[0]["id"] != second[0]["id"]
+
 def test_openai_to_anthropic_tools():
     tools = [{"type": "function", "function": {"name": "b", "parameters": {"type": "object", "properties": {}}}}]
     res = openai_to_anthropic_tools(tools)

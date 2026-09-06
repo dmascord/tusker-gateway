@@ -169,6 +169,72 @@ async def test_stream_normalizer_assigns_indexes_to_native_calls_without_indexes
 
 
 @pytest.mark.asyncio
+async def test_stream_normalizer_keeps_separate_rescued_calls_to_same_function():
+    """Text rescue must not merge two independent same-name invocations."""
+    from tusker_gateway.endpoints import _assemble_stream_tool_calls, _normalize_stream
+
+    def frame(content):
+        payload = {
+            "choices": [{
+                "index": 0,
+                "delta": {"content": content},
+                "finish_reason": None,
+            }],
+        }
+        return f"data: {json.dumps(payload)}\n\n".encode()
+
+    async def text_stream():
+        yield frame('TOOL_CALL: bash({"command":"one"})')
+        yield frame('TOOL_CALL: bash({"command":"two"})')
+        yield b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    frames = [
+        item
+        async for item in _normalize_stream(
+            text_stream(),
+            provider="test",
+            model="test",
+            tools_requested=True,
+        )
+    ]
+    calls = _assemble_stream_tool_calls(frames)
+
+    assert len(calls) == 2
+    assert calls[0]["id"] != calls[1]["id"]
+    assert [json.loads(call["function"]["arguments"]) for call in calls] == [
+        {"command": "one"},
+        {"command": "two"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_tool_stream_rejects_multiple_provider_choices():
+    from tusker_gateway.endpoints import _normalize_stream
+    from tusker_gateway.errors import ToolCallContractError
+
+    async def multiple_choices():
+        payload = {
+            "choices": [
+                {"index": 0, "delta": {"content": "first"}, "finish_reason": None},
+                {"index": 1, "delta": {"content": "second"}, "finish_reason": None},
+            ],
+        }
+        yield f"data: {json.dumps(payload)}\n\n".encode()
+
+    with pytest.raises(ToolCallContractError, match="violates the request contract"):
+        _ = [
+            item
+            async for item in _normalize_stream(
+                multiple_choices(),
+                provider="test",
+                model="test",
+                tools_requested=True,
+            )
+        ]
+
+
+@pytest.mark.asyncio
 async def test_stream_normalizer_strips_inline_tool_call_text(client):
     """The streaming endpoint must strip XML tool calls from content deltas."""
     # Simulate a model that emits raw text tool_call markup in the content.

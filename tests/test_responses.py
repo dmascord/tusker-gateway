@@ -261,9 +261,13 @@ async def test_responses_streaming_preserves_native_tool_call_deltas(client):
     assert b'"type": "function_call"' in content
     assert b'"call_id": "call_read"' in content
     assert b"event: response.function_call_arguments.delta" in content
+    assert b"event: response.function_call_arguments.done" in content
     assert b"README.md" in content
     assert b"event: response.output_item.done" in content
     assert b"event: response.completed" in content
+    assert content.index(b"event: response.function_call_arguments.done") < content.index(
+        b"event: response.output_item.done"
+    )
 
 
 @pytest.mark.asyncio

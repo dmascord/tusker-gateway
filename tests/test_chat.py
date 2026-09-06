@@ -9,12 +9,14 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from tusker_gateway.budget import BudgetDecision
-from tusker_gateway.errors import ProviderError, RateLimitError
+from tusker_gateway.errors import ProviderError, RateLimitError, ToolCallContractError
 from tusker_gateway.endpoints import (
     _call_with_pool_fallback,
     _public_provider_failure_response,
     _request_conversation_id,
     _required_input_modalities,
+    _validate_chat_body,
+    _validate_complete_tool_response,
 )
 from .conftest import HEADERS_AUTH, HEADERS_NO_AUTH
 
@@ -186,6 +188,133 @@ async def test_chat_completions_validation(client, payload, expected_code):
     assert resp.status == 400
     data = await resp.json()
     assert data["error"]["code"] == expected_code
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "extra,expected_code",
+    [
+        (
+            {
+                "n": 2,
+                "stream": True,
+                "tools": [{"type": "function", "function": {"name": "read"}}],
+            },
+            "unsupported_multiple_completions",
+        ),
+        ({"n": 0}, "invalid_request"),
+        ({"tool_choice": "sometimes"}, "invalid_tool_choice"),
+        ({"tool_choice": "required"}, "invalid_tool_choice"),
+        (
+            {
+                "tools": [{"type": "function", "function": {"name": "read"}}],
+                "tool_choice": {
+                    "type": "function",
+                    "function": {"name": "write"},
+                },
+            },
+            "invalid_tool_choice",
+        ),
+    ],
+)
+async def test_chat_rejects_unsupported_choice_and_completion_contracts(
+    client,
+    extra,
+    expected_code,
+):
+    resp = await client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "hermes-code",
+            "messages": [{"role": "user", "content": "inspect"}],
+            **extra,
+        },
+        headers=HEADERS_AUTH,
+    )
+
+    assert resp.status == 400
+    assert (await resp.json())["error"]["code"] == expected_code
+
+
+def test_chat_allows_multiple_non_streaming_text_completions():
+    body = {
+        "model": "openai::gpt-4o",
+        "messages": [{"role": "user", "content": "give alternatives"}],
+        "n": 2,
+    }
+
+    assert _validate_chat_body(body) is body
+
+
+def test_complete_tool_response_enforces_declared_and_selected_tools():
+    tools = [
+        {"type": "function", "function": {"name": "read"}},
+        {"type": "function", "function": {"name": "write"}},
+    ]
+
+    def response(name):
+        return {
+            "choices": [{
+                "message": {
+                    "content": "",
+                    "tool_calls": [{
+                        "id": f"call-{name}",
+                        "type": "function",
+                        "function": {"name": name, "arguments": "{}"},
+                    }],
+                },
+            }],
+        }
+
+    named_read = {"type": "function", "function": {"name": "read"}}
+    assert _validate_complete_tool_response(
+        response("read"),
+        tools,
+        provider="test",
+        model="model",
+        request_id="request",
+        require_tool_call=True,
+        reject_empty=True,
+        tool_choice=named_read,
+    )
+
+    with pytest.raises(ToolCallContractError) as mismatch:
+        _validate_complete_tool_response(
+            response("write"),
+            tools,
+            provider="test",
+            model="model",
+            request_id="request",
+            require_tool_call=True,
+            reject_empty=True,
+            tool_choice=named_read,
+        )
+    assert mismatch.value.reason == "named_tool_mismatch"
+
+    with pytest.raises(ToolCallContractError) as undeclared:
+        _validate_complete_tool_response(
+            response("ghost"),
+            tools,
+            provider="test",
+            model="model",
+            request_id="request",
+            require_tool_call=False,
+            reject_empty=True,
+        )
+    assert undeclared.value.reason == "undeclared_tool"
+
+    with pytest.raises(ToolCallContractError) as forbidden:
+        _validate_complete_tool_response(
+            response("read"),
+            tools,
+            provider="test",
+            model="model",
+            request_id="request",
+            require_tool_call=False,
+            reject_empty=True,
+            tool_choice="none",
+        )
+    assert forbidden.value.reason == "tool_choice_none"
 
 
 @pytest.mark.asyncio
@@ -424,7 +553,18 @@ async def test_chat_pool_requires_tool_capability_and_forwards_tool_choice(app, 
 
     with patch("tusker_gateway.endpoints.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
         mock_chat.return_value = {
-            "choices": [{"message": {"role": "assistant", "content": ""}, "finish_reason": "tool_calls"}],
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call-bash",
+                        "type": "function",
+                        "function": {"name": "bash", "arguments": "{}"},
+                    }],
+                },
+                "finish_reason": "tool_calls",
+            }],
         }
         resp = await client.post(
             "/v1/chat/completions",
@@ -756,6 +896,64 @@ async def test_chat_stream_required_tool_call_falls_back_on_clean_stop(app, clie
     assert b'"name": "read"' in body
     assert b'"finish_reason": "tool_calls"' in body
     assert pool_manager.select.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_named_tool_choice_falls_back_on_wrong_declared_tool(app, client):
+    pool_manager = MagicMock()
+    pool_manager.select.side_effect = [
+        ("openrouter", "wrong-tool-model"),
+        ("openai", "correct-tool-model"),
+    ]
+    app["pool_manager"] = pool_manager
+
+    def tool_response(name, call_id):
+        return {
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": name, "arguments": "{}"},
+                    }],
+                },
+                "finish_reason": "tool_calls",
+            }],
+        }
+
+    with patch(
+        "tusker_gateway.endpoints.PassthroughClient.chat",
+        new_callable=AsyncMock,
+    ) as mock_chat:
+        mock_chat.side_effect = [
+            tool_response("write", "call-wrong"),
+            tool_response("read", "call-correct"),
+        ]
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-code",
+                "messages": [{"role": "user", "content": "read it"}],
+                "tools": [
+                    {"type": "function", "function": {"name": "read"}},
+                    {"type": "function", "function": {"name": "write"}},
+                ],
+                "tool_choice": {
+                    "type": "function",
+                    "function": {"name": "read"},
+                },
+            },
+            headers=HEADERS_AUTH,
+        )
+        data = await resp.json()
+
+    assert resp.status == 200
+    call_data = data["choices"][0]["message"]["tool_calls"][0]
+    assert call_data["id"] == "call-correct"
+    assert call_data["function"]["name"] == "read"
+    assert mock_chat.call_count == 2
 
 
 @pytest.mark.asyncio
@@ -1102,7 +1300,14 @@ async def test_semantic_cache_never_handles_tool_requests(app, client):
     with patch("tusker_gateway.endpoints.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
         mock_chat.return_value = {
             "choices": [{
-                "message": {"tool_calls": [{"id": "call-1"}]},
+                "message": {
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "bash", "arguments": "{}"},
+                    }],
+                },
                 "finish_reason": "tool_calls",
             }],
         }

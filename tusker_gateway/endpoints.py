@@ -27,6 +27,7 @@ from tusker_gateway.errors import (
     ProviderCapacityError,
     RateLimitError,
     RequiredToolCallError,
+    ToolCallContractError,
     UnusableToolResponseError,
     openai_error,
 )
@@ -1032,6 +1033,12 @@ async def _normalize_stream(
             if not isinstance(choices, list) or not choices:
                 yield frame
                 continue
+            if tools_requested and len(choices) != 1:
+                # Tool-envelope parsing is stateful per completion. Until the
+                # gateway maintains isolated parser state for every choice,
+                # accepting a multi-choice tool stream would leave later
+                # choices unsanitized or cross-wire their calls.
+                raise ToolCallContractError(reason="multiple_stream_choices")
             choice = choices[0]
             if not isinstance(choice, dict):
                 yield frame
@@ -1428,6 +1435,68 @@ def _tool_required_arguments(tools: Any) -> dict[str, tuple[str, ...]]:
     return required
 
 
+def _declared_tool_names(tools: Any) -> frozenset[str]:
+    """Return the normalized function names declared by a request."""
+    from tusker_gateway.tool_formats import normalize_tools
+
+    return frozenset(
+        str((tool.get("function") or {}).get("name") or "").strip()
+        for tool in normalize_tools(tools)
+        if str((tool.get("function") or {}).get("name") or "").strip()
+    )
+
+
+def _tool_choice_constraint(tool_choice: Any) -> tuple[str, str | None]:
+    """Return ``(mode, expected_name)`` for a Chat tool-choice value."""
+    if tool_choice == "none":
+        return "none", None
+    if tool_choice == "required":
+        return "required", None
+    if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
+        function = tool_choice.get("function")
+        if isinstance(function, dict):
+            name = function.get("name")
+            if isinstance(name, str) and name.strip():
+                return "named", name.strip()
+    return "auto", None
+
+
+def _validate_tool_call_contract(
+    calls: list[dict[str, Any]],
+    tools: Any,
+    *,
+    tool_choice: Any = None,
+    require_tool_call: bool = False,
+) -> None:
+    """Reject undeclared calls and provider violations of ``tool_choice``."""
+    declared = _declared_tool_names(tools)
+    mode, expected_name = _tool_choice_constraint(tool_choice)
+
+    for call in calls:
+        function = call.get("function") or {}
+        actual_name = str(function.get("name") or "").strip()
+        if actual_name not in declared:
+            raise ToolCallContractError(
+                reason="undeclared_tool",
+                actual_tool=actual_name or None,
+            )
+        if mode == "named" and actual_name != expected_name:
+            raise ToolCallContractError(
+                reason="named_tool_mismatch",
+                actual_tool=actual_name,
+                expected_tool=expected_name,
+            )
+
+    if mode == "none" and calls:
+        function = calls[0].get("function") or {}
+        raise ToolCallContractError(
+            reason="tool_choice_none",
+            actual_tool=str(function.get("name") or "").strip() or None,
+        )
+    if (require_tool_call or mode in {"required", "named"}) and not calls:
+        raise RequiredToolCallError()
+
+
 def _tool_argument_text(value: Any) -> str:
     """Convert a tool argument fragment to text without exposing its value."""
     if isinstance(value, str):
@@ -1613,9 +1682,16 @@ def _validate_complete_tool_response(
     request_id: str | None,
     require_tool_call: bool,
     reject_empty: bool,
+    tool_choice: Any = None,
 ) -> dict[str, Any]:
     """Validate a complete provider response before it can reach the client."""
     calls = _response_tool_calls(response)
+    _validate_tool_call_contract(
+        calls,
+        tools,
+        tool_choice=tool_choice,
+        require_tool_call=require_tool_call,
+    )
     if calls:
         _validate_tool_call_arguments(
             calls,
@@ -1624,8 +1700,6 @@ def _validate_complete_tool_response(
             model=model,
             request_id=request_id,
         )
-    if reject_empty and require_tool_call and not calls:
-        raise RequiredToolCallError()
     if reject_empty and not calls and not _response_has_visible_content(response):
         raise UnusableToolResponseError(
             reason="reasoning_only_or_empty",
@@ -1653,6 +1727,7 @@ async def _prepare_stream_result(
     tools_requested: bool,
     tools: list[dict[str, Any]] | None = None,
     require_tool_call: bool = False,
+    tool_choice: Any = None,
 ) -> Any:
     """Preflight a tool stream before committing a client response.
 
@@ -1664,7 +1739,7 @@ async def _prepare_stream_result(
     committed, then replay the buffered stream so successful streams retain
     their output.
     """
-    if isinstance(result, dict) and tools:
+    if isinstance(result, dict) and (tools is not None or tool_choice is not None):
         from tusker_gateway.tool_formats import normalize_response_tool_calls
 
         normalized = normalize_response_tool_calls(
@@ -1679,6 +1754,7 @@ async def _prepare_stream_result(
             request_id=request_id,
             require_tool_call=require_tool_call,
             reject_empty=tools_requested,
+            tool_choice=tool_choice,
         )
 
     if not tools_requested or not hasattr(result, "__aiter__"):
@@ -1709,6 +1785,12 @@ async def _prepare_stream_result(
         await _close_async_iterator(normalized)
         raise
     assembled_calls = _assemble_stream_tool_calls(buffered)
+    _validate_tool_call_contract(
+        assembled_calls,
+        tools,
+        tool_choice=tool_choice,
+        require_tool_call=require_tool_call,
+    )
     if assembled_calls:
         _validate_tool_call_arguments(
             assembled_calls,
@@ -2006,6 +2088,7 @@ def _quarantine_tool_response_failure(
             InvalidToolCallArgumentsError,
             MalformedToolCallError,
             RequiredToolCallError,
+            ToolCallContractError,
             UnusableToolResponseError,
         ),
     ):
@@ -2179,9 +2262,13 @@ async def _call_with_pool_fallback(
                 provider=provider,
                 model=model,
                 request_id=request_id,
-                tools_requested=bool(tools) and bool(body.get("stream")),
+                tools_requested=(
+                    bool(body.get("stream"))
+                    and (bool(tools) or body.get("tool_choice") == "none")
+                ),
                 tools=tools,
                 require_tool_call=_tool_choice_requires_call(body.get("tool_choice")),
+                tool_choice=body.get("tool_choice"),
             )
             if breaker is not None:
                 breaker.record_success(provider, model)
@@ -2374,9 +2461,13 @@ async def _call_with_pool_fallback(
                 provider=provider,
                 model=model,
                 request_id=request_id,
-                tools_requested=bool(tools) and bool(body.get("stream")),
+                tools_requested=(
+                    bool(body.get("stream"))
+                    and (bool(tools) or body.get("tool_choice") == "none")
+                ),
                 tools=tools,
                 require_tool_call=_tool_choice_requires_call(body.get("tool_choice")),
+                tool_choice=body.get("tool_choice"),
             )
             if breaker is not None:
                 breaker.record_success(provider, model)
@@ -3242,6 +3333,14 @@ def _responses_stream_from_chat(
                 )
             elif item.get("type") == "function_call":
                 item["status"] = "completed"
+                yield _responses_sse_frame(
+                    "response.function_call_arguments.done",
+                    {
+                        "item_id": item["id"],
+                        "output_index": output_index,
+                        "arguments": item.get("arguments", ""),
+                    },
+                )
             yield _responses_sse_frame(
                 "response.output_item.done",
                 {"output_index": output_index, "item": dict(item)},
@@ -3264,6 +3363,57 @@ def _responses_stream_from_chat(
         yield _responses_sse_frame("response.completed", {"response": response})
 
     return generate()
+
+
+def _validate_tool_choice_request(tool_choice: Any, tools: Any) -> None:
+    """Validate a Chat tool choice and any named function reference."""
+    if tool_choice is None:
+        return
+    declared = _declared_tool_names(tools)
+    expected_name: str | None = None
+    requires_tools = False
+    if isinstance(tool_choice, str):
+        if tool_choice not in {"auto", "none", "required"}:
+            raise BadRequestError(
+                f"Unsupported tool_choice: {tool_choice}",
+                code="invalid_tool_choice",
+            )
+        requires_tools = tool_choice == "required"
+    elif isinstance(tool_choice, dict):
+        if tool_choice.get("type") != "function":
+            raise BadRequestError(
+                "tool_choice objects must have type 'function'",
+                code="invalid_tool_choice",
+            )
+        function = tool_choice.get("function")
+        expected_name = (
+            function.get("name")
+            if isinstance(function, dict)
+            else None
+        )
+        if not isinstance(expected_name, str) or not expected_name.strip():
+            raise BadRequestError(
+                "Named tool_choice must contain function.name",
+                code="invalid_tool_choice",
+            )
+        expected_name = expected_name.strip()
+        requires_tools = True
+    else:
+        raise BadRequestError(
+            "tool_choice must be a string or object",
+            code="invalid_tool_choice",
+        )
+
+    if requires_tools and not declared:
+        raise BadRequestError(
+            "tool_choice requires at least one declared tool",
+            code="invalid_tool_choice",
+        )
+    if expected_name is not None and expected_name not in declared:
+        raise BadRequestError(
+            f"tool_choice references undeclared function '{expected_name}'",
+            code="invalid_tool_choice",
+        )
 
 
 def _validate_chat_body(body: Any) -> dict[str, Any]:
@@ -3349,6 +3499,28 @@ def _validate_chat_body(body: Any) -> dict[str, Any]:
                 )
     if "stream" in body and not isinstance(body["stream"], bool):
         raise BadRequestError("stream must be a boolean", code="invalid_stream")
+    _validate_tool_choice_request(body.get("tool_choice"), body.get("tools"))
+    if "n" in body and (
+        isinstance(body["n"], bool)
+        or not isinstance(body["n"], int)
+        or body["n"] < 1
+    ):
+        raise BadRequestError(
+            "n must be a positive integer",
+            code="invalid_request",
+        )
+    if (
+        body.get("n", 1) != 1
+        and bool(body.get("stream"))
+        and bool(body.get("tools"))
+    ):
+        # The stream normalizer maintains one tool-envelope parser and terminal
+        # state. Silently forwarding additional choices leaves later choices
+        # unsanitized, so reject unsupported fan-out at the public boundary.
+        raise BadRequestError(
+            "Only n=1 is supported",
+            code="unsupported_multiple_completions",
+        )
     return body
 
 

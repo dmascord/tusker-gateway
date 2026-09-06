@@ -32,11 +32,16 @@ from tusker_gateway.budget import BudgetTracker
 from tusker_gateway.circuit_breaker import CircuitBreaker, BreakerDecision
 from tusker_gateway.errors import BadRequestError, NoHealthyModelsError
 from tusker_gateway.endpoints import (
+    _PreparedStream,
     _build_extra_body,
     _complete_chat_result_stream,
     _normalize_stream,
+    _prepare_stream_result,
+    _quarantine_tool_response_failure,
     _request_conversation_id,
     _required_input_modalities,
+    _tool_choice_requires_call,
+    _validate_tool_choice_request,
 )
 from tusker_gateway.metrics import MetricsRegistry
 from tusker_gateway.identity import (
@@ -137,7 +142,7 @@ class _AnthropicSSEStreamAdapter:
         model: str,
         input_tokens: int = 0,
     ):
-        self._stream = openai_stream
+        self._stream = openai_stream.__aiter__()
         self._state = init_anthropic_stream_state()
         update_stream_state(
             self._state, model=model, input_tokens=input_tokens,
@@ -373,6 +378,19 @@ async def _call_with_pool_fallback_anthropic(
                         result,
                         source=f"{prov}/{mdl}",
                     )
+                result = await _prepare_stream_result(
+                    result,
+                    provider=prov,
+                    model=mdl,
+                    request_id=(request.get("_request_id") if request is not None else None),
+                    tools_requested=(
+                        bool(body.get("stream"))
+                        and (bool(tools) or body.get("tool_choice") == "none")
+                    ),
+                    tools=tools,
+                    require_tool_call=_tool_choice_requires_call(body.get("tool_choice")),
+                    tool_choice=body.get("tool_choice"),
+                )
                 if breaker is not None:
                     breaker.record_success(prov, mdl)
                 if body.get("stream"):
@@ -388,17 +406,23 @@ async def _call_with_pool_fallback_anthropic(
                             "streaming Anthropic output is unavailable from the provider",
                             code="unsupported_streaming",
                         )
-                    result = _AnthropicSSEStreamAdapter(
-                        _normalize_stream(
+                    openai_stream = (
+                        result
+                        if isinstance(result, _PreparedStream)
+                        else _normalize_stream(
                             result,
                             provider=prov,
                             model=mdl,
-                        ),
+                        )
+                    )
+                    result = _AnthropicSSEStreamAdapter(
+                        openai_stream,
                         model=model,
                         input_tokens=_estimated_tokens(body.get("messages", [])),
                     )
                 return prov, mdl, result
             except Exception as exc:
+                _quarantine_tool_response_failure(config, prov, mdl, exc)
                 if breaker is not None:
                     breaker.record_failure(prov, mdl)
                 last_error = exc
@@ -421,6 +445,19 @@ async def _call_with_pool_fallback_anthropic(
                     result,
                     source=f"{route.provider}/{route.model}",
                 )
+            result = await _prepare_stream_result(
+                result,
+                provider=route.provider,
+                model=route.model,
+                request_id=(request.get("_request_id") if request is not None else None),
+                tools_requested=(
+                    bool(body.get("stream"))
+                    and (bool(tools) or body.get("tool_choice") == "none")
+                ),
+                tools=tools,
+                require_tool_call=_tool_choice_requires_call(body.get("tool_choice")),
+                tool_choice=body.get("tool_choice"),
+            )
             if breaker is not None:
                 breaker.record_success(route.provider, route.model)
             if body.get("stream"):
@@ -431,17 +468,28 @@ async def _call_with_pool_fallback_anthropic(
                         "streaming Anthropic output is unavailable from the provider",
                         code="unsupported_streaming",
                     )
-                result = _AnthropicSSEStreamAdapter(
-                    _normalize_stream(
+                openai_stream = (
+                    result
+                    if isinstance(result, _PreparedStream)
+                    else _normalize_stream(
                         result,
                         provider=route.provider,
                         model=route.model,
-                    ),
+                    )
+                )
+                result = _AnthropicSSEStreamAdapter(
+                    openai_stream,
                     model=model,
                     input_tokens=_estimated_tokens(body.get("messages", [])),
                 )
             return route.provider, route.model, result
-        except Exception:
+        except Exception as exc:
+            _quarantine_tool_response_failure(
+                config,
+                route.provider,
+                route.model,
+                exc,
+            )
             if breaker is not None:
                 breaker.record_failure(route.provider, route.model)
             raise
@@ -498,6 +546,10 @@ async def anthropic_messages_handler(request: web.Request) -> web.Response | web
 
             # Convert to OpenAI format.
             openai_body = _anthropic_to_openai(body)
+            _validate_tool_choice_request(
+                openai_body.get("tool_choice"),
+                openai_body.get("tools"),
+            )
             conversation_body = {
                 **body,
                 "messages": openai_body.get("messages", []),

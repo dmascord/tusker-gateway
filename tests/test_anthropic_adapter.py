@@ -540,6 +540,82 @@ async def test_messages_streaming_converts_complete_provider_response(client):
     assert b'"id": "call_read"' in content
     assert b"README.md" in content
     assert b"event: message_stop" in content
+    events = [frame for frame in content.split(b"\n\n") if frame.strip()]
+    assert len(events) >= 5
+    assert all(frame.startswith(b"event: ") for frame in events)
+
+
+@pytest.mark.asyncio
+async def test_messages_required_tool_stream_falls_back_before_response(app, client):
+    """Anthropic tool streams use the same preflight and fallback as Chat."""
+    pool_manager = MagicMock()
+    pool_manager.fallback_pools.return_value = ()
+    pool_manager.select.side_effect = [
+        ("openrouter", "ignores-required-tool"),
+        ("openai", "tool-capable-fallback"),
+    ]
+    app["pool_manager"] = pool_manager
+
+    async def ignored_tool_stream():
+        yield (
+            b'data: {"choices":[{"index":0,"delta":{"content":"plain text"},'
+            b'"finish_reason":"stop"}]}\n\n'
+        )
+        yield b"data: [DONE]\n\n"
+
+    async def valid_tool_stream():
+        payload = {
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call-read",
+                        "type": "function",
+                        "function": {
+                            "name": "read",
+                            "arguments": '{"path":"README.md"}',
+                        },
+                    }],
+                },
+                "finish_reason": "tool_calls",
+            }],
+        }
+        yield f"data: {json.dumps(payload)}\n\n".encode()
+        yield b"data: [DONE]\n\n"
+
+    with patch(
+        "tusker_gateway.anthropic_adapter.PassthroughClient.chat",
+        new_callable=AsyncMock,
+    ) as mock_chat:
+        mock_chat.side_effect = [ignored_tool_stream(), valid_tool_stream()]
+        resp = await client.post(
+            "/v1/messages",
+            json={
+                "model": "hermes-code",
+                "max_tokens": 128,
+                "stream": True,
+                "tools": [{
+                    "name": "read",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                        "required": ["path"],
+                    },
+                }],
+                "tool_choice": {"type": "any"},
+                "messages": [{"role": "user", "content": "read README"}],
+            },
+            headers=HEADERS_AUTH,
+        )
+        content = await resp.read()
+
+    assert resp.status == 200
+    assert b"plain text" not in content
+    assert b'"type": "tool_use"' in content
+    assert b'"name": "read"' in content
+    assert b"README.md" in content
+    assert mock_chat.call_count == 2
 
 
 @pytest.mark.asyncio

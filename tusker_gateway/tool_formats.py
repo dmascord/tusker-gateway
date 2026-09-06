@@ -6,11 +6,11 @@ this module converts those representations without executing tools.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
 import re
+import secrets
 from typing import Any
 
 from tusker_gateway.errors import BadRequestError
@@ -227,7 +227,11 @@ def normalize_tool_calls(raw: Any) -> list[dict[str, Any]]:
         name = str(name).strip()
         if not name:
             continue
-        call_id = str(call_id or f"call_{index}_{hashlib.sha256(name.encode()).hexdigest()[:10]}")
+        # Missing provider ids must be unique per invocation. A deterministic
+        # name/index fallback collides when a text-emitting model calls the same
+        # function in separate streamed blocks, causing clients to concatenate
+        # two independent argument objects into one malformed call.
+        call_id = str(call_id or f"call_{secrets.token_hex(12)}")
         calls.append({
             "id": call_id,
             "type": "function",

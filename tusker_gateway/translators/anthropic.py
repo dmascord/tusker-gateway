@@ -500,11 +500,11 @@ def update_stream_state(
 
 def _sse_frame(event: str, payload: dict[str, Any]) -> bytes:
     """Encode a single Anthropic SSE event to bytes."""
-    return "\n".join([
+    return ("\n".join([
         f"event: {event}",
         f"data: {json.dumps(payload, ensure_ascii=False)}",
         "",
-    ]).encode("utf-8")
+    ]) + "\n").encode("utf-8")
 
 
 def _message_start_frame(
