@@ -42,6 +42,7 @@ echo "Image pushed: ${IMAGE}"
 
 # --- Apply manifests ---
 echo "--- Apply manifests ---"
+kubectl -n "${NAMESPACE}" apply -f k8s/pvc-rwx.yaml
 kubectl -n "${NAMESPACE}" apply -f k8s/pvc.yaml
 kubectl -n "${NAMESPACE}" apply -f k8s/config.yaml
 kubectl -n "${NAMESPACE}" apply -f k8s/deployment.yaml
@@ -60,9 +61,10 @@ kubectl -n "${NAMESPACE}" get pods -o wide | grep -E 'tusker-gateway|NAME'
 smoke_check() {
   local label="$1"
   local path="$2"
-  # Recreate leaves a short propagation window between the new pod becoming
-  # Ready and the public ingress receiving its EndpointSlice update. Retry
-  # transient 503/no-endpoint responses instead of reporting a false failure.
+  # RollingUpdate with maxUnavailable:0 keeps the old pod serving until the
+  # new pod is Ready, but ingress EndpointSlice propagation can still lag
+  # briefly behind the pod condition. Retry transient 503/no-endpoint
+  # responses instead of reporting a false failure.
   curl --fail --retry 24 --retry-delay 5 --retry-all-errors \
     --connect-timeout 5 --max-time 15 -sS \
     -o /dev/null -w "${label} http=%{http_code} time=%{time_total}s\\n" \

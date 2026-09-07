@@ -43,8 +43,11 @@ IMAGE=registry.tusker.net.au:5000/tusker-gateway:$TAG
 buildah bud -f Dockerfile -t "$IMAGE" .
 buildah push "$IMAGE"
 
-# Apply manifests. The current pool JSON is inline in deployment.yaml;
-# config.yaml currently only ensures the namespace exists.
+# Apply manifests. The gateway mounts ``tusker-home-rwx`` (ReadWriteMany,
+# cloned from the live ``tusker-home`` volume) so RollingUpdate with
+# maxSurge:1/maxUnavailable:0 can co-mount both pods during rollout.
+# ``pvc.yaml`` is the old RWO PVC, retained as an offline fall-back copy.
+kubectl -n hermes apply -f k8s/pvc-rwx.yaml
 kubectl -n hermes apply -f k8s/pvc.yaml
 kubectl -n hermes apply -f k8s/config.yaml
 kubectl -n hermes apply -f k8s/service.yaml
@@ -137,17 +140,17 @@ kubectl -n hermes rollout undo deployment/tusker-gateway
 ## 7. Teardown
 
 ```bash
-kubectl -n hermes delete ingressroute tusker-gateway
+kubectl -n hermes delete pvc tusker-home-rwx
+kubectl -n hermes delete pvc tusker-home
 kubectl -n hermes delete service tusker-gateway
 kubectl -n hermes delete deployment tusker-gateway
-kubectl -n hermes delete pvc tusker-home
 ```
 
 ## Key differences from Hermes
 
 | | Hermes | Tusker Gateway |
 |---|---|---|
-| Name | `hermes` | `tusker-gateway` |
+| PVC | `hermes-home` | `tusker-home-rwx` (ReadWriteMany; `tusker-home` retained as fall-back) |
 | Image | `hermes-agent` | `tusker-gateway` |
 | Host | `hermes.tusker.net.au` (API compatibility + redirect) | `ai.tusker.net.au` |
 | PVC | `hermes-home` | `tusker-home` |
