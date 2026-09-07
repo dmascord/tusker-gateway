@@ -32,7 +32,7 @@ spec:
         - name: MODEL_NAME
           value: tusker-gateway
         - name: TUSKER_COMMIT
-          value: 028ac49
+          value: b75ad75
         - name: HOME
           value: /home/tusker
         - name: PYTHONUNBUFFERED
