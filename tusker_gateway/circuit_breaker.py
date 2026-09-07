@@ -33,7 +33,6 @@ Storage:
 from __future__ import annotations
 
 import os
-import sqlite3
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -41,6 +40,8 @@ from pathlib import Path
 from typing import Any
 
 import logging
+
+from tusker_gateway.storage import shared_database
 
 logger = logging.getLogger(__name__)
 
@@ -108,18 +109,21 @@ class CircuitBreaker:
     def __init__(self, config: BreakerConfig):
         self._config = config
         self.stats = BreakerStats()
+        self._db = shared_database(config.path) if config.enabled else None
         if not config.enabled:
             return
         try:
-            Path(config.path).parent.mkdir(parents=True, exist_ok=True)
+            assert self._db is not None
+            if not self._db.is_postgres:
+                Path(config.path).parent.mkdir(parents=True, exist_ok=True)
             self._ensure_db()
         except (PermissionError, OSError) as exc:
             logger.warning("circuit breaker disabled: cannot create %s: %s", config.path, exc)
             self._config.enabled = False
 
     def _ensure_db(self) -> None:
-        with sqlite3.connect(self._config.path) as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
+        assert self._db is not None
+        with self._db.connection() as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS breakers (
@@ -139,11 +143,21 @@ class CircuitBreaker:
             )
             # Idempotent migration for pre-existing DBs created before the
             # per-row cooldown override column existed.
-            cur = conn.execute("PRAGMA table_info(breakers)")
-            cols = {r[1] for r in cur.fetchall()}
+            if self._db.is_postgres:
+                cur = conn.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = current_schema() AND table_name = ?",
+                    ("breakers",),
+                )
+                cols = {str(r[0]) for r in cur.fetchall()}
+            else:
+                cur = conn.execute("PRAGMA table_info(breakers)")
+                cols = {r[1] for r in cur.fetchall()}
             if "cooldown_secs" not in cols:
                 conn.execute(
-                    "ALTER TABLE breakers ADD COLUMN cooldown_secs REAL"
+                    "ALTER TABLE breakers ADD COLUMN "
+                    + ("IF NOT EXISTS " if self._db.is_postgres else "")
+                    + "cooldown_secs REAL"
                 )
             conn.commit()
 
@@ -336,8 +350,8 @@ class CircuitBreaker:
         """Return current breaker state for the dashboard."""
         if not self._config.enabled:
             return {}
-        with sqlite3.connect(self._config.path) as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
+        assert self._db is not None
+        with self._db.connection() as conn:
             rows = conn.execute(
                 "SELECT provider, model, state, opened_at, window_failures, window_total, consecutive_failures FROM breakers"
             ).fetchall()
@@ -360,22 +374,28 @@ class CircuitBreaker:
     # -- internals -------------------------------------------------------
 
     def _read(self, provider: str, model: str) -> dict[str, Any] | None:
-        with sqlite3.connect(self._config.path) as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.row_factory = sqlite3.Row
+        assert self._db is not None
+        columns = (
+            "provider, model, state, consecutive_failures, window_failures, "
+            "window_total, window_started_at, opened_at, cooldown_secs, "
+            "half_open_probe_inflight"
+        )
+        with self._db.connection() as conn:
             row = conn.execute(
-                "SELECT * FROM breakers WHERE provider = ? AND model = ?",
+                f"SELECT {columns} FROM breakers WHERE provider = ? AND model = ?",
                 (provider, model),
             ).fetchone()
-        return dict(row) if row else None
+        if row is None:
+            return None
+        return dict(zip(columns.replace(" ", "").split(","), row))
 
     def _upsert(self, provider: str, model: str, **fields: Any) -> None:
+        assert self._db is not None
         cols = ["provider", "model", *fields.keys()]
         placeholders = ",".join("?" for _ in cols)
         values = [provider, model, *fields.values()]
         updates = ",".join(f"{k}=excluded.{k}" for k in fields.keys())
-        with sqlite3.connect(self._config.path) as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
+        with self._db.connection() as conn:
             conn.execute(
                 f"INSERT INTO breakers ({','.join(cols)}) VALUES ({placeholders}) "
                 f"ON CONFLICT(provider, model) DO UPDATE SET {updates}",
@@ -388,8 +408,8 @@ class CircuitBreaker:
             return
         sets = ",".join(f"{k}=?" for k in fields.keys())
         values = [*fields.values(), provider, model]
-        with sqlite3.connect(self._config.path) as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
+        assert self._db is not None
+        with self._db.connection() as conn:
             conn.execute(
                 f"UPDATE breakers SET {sets} WHERE provider = ? AND model = ?",
                 values,

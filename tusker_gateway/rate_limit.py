@@ -32,13 +32,14 @@ from __future__ import annotations
 
 import hashlib
 import os
-import sqlite3
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import logging
+
+from tusker_gateway.storage import StorageUnavailableError, shared_database
 
 logger = logging.getLogger(__name__)
 
@@ -98,18 +99,26 @@ class RateLimiter:
     def __init__(self, config: RateLimitConfig):
         self._config = config
         self.stats = RateLimitStats()
+        self._db = None
         if not config.enabled:
             return
         try:
-            Path(config.path).parent.mkdir(parents=True, exist_ok=True)
+            self._db = shared_database(config.path, fallback_policy="critical")
+            if not self._db.is_postgres:
+                Path(config.path).parent.mkdir(parents=True, exist_ok=True)
             self._ensure_db()
+        except StorageUnavailableError as exc:
+            # Keep the limiter enabled and fail closed at request time.  A
+            # PostgreSQL outage must not silently turn a shared limiter into
+            # an uncoordinated SQLite/RWX limiter.
+            logger.warning("rate limit state unavailable: %s", exc)
         except (PermissionError, OSError) as exc:
             logger.warning("rate limit disabled: cannot create %s: %s", config.path, exc)
             self._config.enabled = False
 
     def _ensure_db(self) -> None:
-        with sqlite3.connect(self._config.path) as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
+        assert self._db is not None
+        with self._db.connection() as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS buckets (
@@ -144,8 +153,8 @@ class RateLimiter:
         now = time.time()
 
         self.stats.checks += 1
-        with sqlite3.connect(self._config.path) as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
+        assert self._db is not None
+        with self._db.connection() as conn:
             row = conn.execute(
                 "SELECT tokens, last_refill_at FROM buckets WHERE fingerprint = ?",
                 (fp,),
@@ -163,8 +172,7 @@ class RateLimiter:
 
         if tokens >= cost:
             tokens -= cost
-            with sqlite3.connect(self._config.path) as conn:
-                conn.execute("PRAGMA journal_mode=WAL")
+            with self._db.connection() as conn:
                 conn.execute(
                     """
                     INSERT INTO buckets (fingerprint, tokens, last_refill_at)
@@ -181,8 +189,7 @@ class RateLimiter:
             return RateLimitDecision(allowed=True, remaining=tokens)
         else:
             # Persist the refilled amount so we don't lose refill progress.
-            with sqlite3.connect(self._config.path) as conn:
-                conn.execute("PRAGMA journal_mode=WAL")
+            with self._db.connection() as conn:
                 conn.execute(
                     """
                     INSERT INTO buckets (fingerprint, tokens, last_refill_at)
@@ -212,8 +219,8 @@ class RateLimiter:
         """Per-key bucket state for the dashboard."""
         if not self._config.enabled:
             return {}
-        with sqlite3.connect(self._config.path) as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
+        assert self._db is not None
+        with self._db.connection() as conn:
             rows = conn.execute(
                 "SELECT fingerprint, tokens, last_refill_at FROM buckets"
             ).fetchall()

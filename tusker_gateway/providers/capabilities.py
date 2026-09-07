@@ -159,6 +159,7 @@ class CapabilitiesRegistry:
                 return_exceptions=False,
             )
             merged = CapabilitySnapshot()
+            discovered_records: list[tuple[str, str, str]] = []
             for provider_name, entries in results:  # type: ignore[misc]
                 if isinstance(entries, Exception):
                     merged.errors.append(f"{provider_name}: {entries}")
@@ -166,14 +167,29 @@ class CapabilitiesRegistry:
                 for entry in entries:
                     merged.capabilities[entry.capability].append(entry)
                     if self.model_capability_db is not None:
-                        self.model_capability_db.record(
-                            provider=entry.provider,
-                            model=entry.model,
-                            capability=entry.capability.value,
+                        discovered_records.append(
+                            (entry.provider, entry.model, entry.capability.value)
+                        )
+
+            # A capability refresh can discover many entries. SQLite writes on
+            # the shared RWX volume are synchronous, so keep them off aiohttp's
+            # event loop; otherwise liveness/readiness probes can time out
+            # while the registry is persisting evidence.
+            if discovered_records and self.model_capability_db is not None:
+                database = self.model_capability_db
+
+                def persist_discovered_records() -> None:
+                    for provider, model, capability in discovered_records:
+                        database.record(
+                            provider=provider,
+                            model=model,
+                            capability=capability,
                             status="discovered",
                             source="capability_registry",
                             probe_version=MODEL_CAPABILITY_PROBE_VERSION,
                         )
+
+                await asyncio.to_thread(persist_discovered_records)
 
             self.snapshot = merged
             total = sum(len(v) for v in merged.capabilities.values())

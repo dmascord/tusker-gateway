@@ -7,13 +7,14 @@ that returns HTTP 200 with unusable prose cannot look healthy by accident.
 from __future__ import annotations
 
 import os
-import sqlite3
 import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from enum import IntEnum
 from pathlib import Path
 from typing import Iterator
+
+from tusker_gateway.storage import shared_database
 
 
 TOOL_CAPABILITY_PROBE_VERSION = "stream-tool-contract-v1"
@@ -109,28 +110,29 @@ class ToolCapabilityDB:
 
     def __init__(self, path: str):
         self.path = path
-        self._memory_connection: sqlite3.Connection | None = None
-        if path == ":memory:":
-            self._memory_connection = sqlite3.connect(path)
-            self._memory_connection.execute("PRAGMA journal_mode=WAL")
-        else:
+        self._db = shared_database(path)
+        if not self._db.is_postgres and path != ":memory:":
             Path(path).parent.mkdir(parents=True, exist_ok=True)
         self._ensure_db()
 
     @contextmanager
-    def _connection(self) -> Iterator[sqlite3.Connection]:
-        connection = self._memory_connection or sqlite3.connect(
-            self.path, timeout=30
-        )
-        connection.execute("PRAGMA journal_mode=WAL")
-        try:
+    def _connection(self) -> Iterator[object]:
+        with self._db.connection() as connection:
             yield connection
-        finally:
-            if connection is not self._memory_connection:
-                connection.close()
 
     def _ensure_db(self) -> None:
+        database_preexisting = (
+            not self._db.is_postgres
+            and self.path != ":memory:"
+            and Path(self.path).exists()
+            and Path(self.path).stat().st_size > 0
+        )
         with self._connection() as connection:
+            # Changing journal mode takes a write lock. On the shared RWX
+            # volume a rolling-update peer may still be using an existing
+            # database, so only set WAL while creating a new file.
+            if not self._db.is_postgres and not database_preexisting:
+                connection.execute("PRAGMA journal_mode=WAL")
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS model_tool_capability (

@@ -7,6 +7,8 @@ from typing import Any
 
 from aiohttp import web
 
+from tusker_gateway.storage import storage_status
+
 logger = logging.getLogger(__name__)
 
 _GIT_COMMIT = os.environ.get("TUSKER_COMMIT", "unknown").strip()
@@ -137,6 +139,7 @@ def health_handler(request: web.Request) -> web.Response:
         "semantic_cache_enabled": bool(
             semantic_cache is not None and semantic_cache.enabled
         ),
+        "state_store": storage_status(),
     })
 
 
@@ -199,6 +202,7 @@ def ready_handler(request: web.Request) -> web.Response:
                     "primary_route": primary_route,
                     "empty_pools": empty_pools,
                     "pools": pool_health,
+                    "state_store": storage_status(),
                 },
                 status=503,
             )
@@ -209,6 +213,7 @@ def ready_handler(request: web.Request) -> web.Response:
                 "primary_route": primary_route,
                 "degraded_pools": empty_pools,
                 "pools": pool_health,
+                "state_store": storage_status(),
             }
         )
 
@@ -301,6 +306,7 @@ def ready_handler(request: web.Request) -> web.Response:
                 "primary_route": primary_route,
                 "empty_pools": empty_pools,
                 "pools": pool_health,
+                "state_store": storage_status(),
             },
             status=503,
         )
@@ -312,6 +318,7 @@ def ready_handler(request: web.Request) -> web.Response:
             "primary_route": primary_route,
             "degraded_pools": empty_pools,
             "pools": pool_health,
+            "state_store": storage_status(),
         }
     )
 
@@ -367,6 +374,7 @@ def status_handler(request: web.Request) -> web.Response:
         "cooldowns": global_tracker().snapshot(),
         "purged_cooldowns": purged,
         "rtk_enabled": request.app.get("rtk_enabled", is_enabled()),
+        "state_store": storage_status(),
     }
     qualification_task = request.app.get("qualification_task")
     status["qualification_maintenance"] = {

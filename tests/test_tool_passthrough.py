@@ -160,6 +160,29 @@ async def test_opencode_go_sets_conversation_session_header():
 
 
 @pytest.mark.asyncio
+async def test_opencode_zen_sets_conversation_session_header():
+    http = _mock_http({"choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]})
+    client = PassthroughClient(
+        _cfg(provider_api_keys={"opencode-zen": "zen-test-key"}),
+        QualityDB(":memory:"),
+        http,
+    )
+
+    await client.chat(
+        "opencode-zen",
+        "big-pickle",
+        [{"role": "user", "content": "hello"}],
+        conversation_id="omp-conversation-123",
+    )
+
+    request = http.request.call_args
+    headers = request.kwargs["headers"]
+    assert headers["x-opencode-session"] == "omp-conversation-123"
+    assert request.args[0] == "POST"
+    assert request.args[1].endswith("/zen/v1/chat/completions")
+
+
+@pytest.mark.asyncio
 async def test_opencode_go_fallback_session_is_stable_as_history_grows():
     first_turn = [
         {"role": "system", "content": "You are helpful."},

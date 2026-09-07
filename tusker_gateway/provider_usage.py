@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import os
 import re
-import sqlite3
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from tusker_gateway.storage import shared_database
 
 
 NVIDIA_CAPACITY_GROUP = "nvidia"
@@ -191,18 +192,13 @@ class ProviderUsageDB:
 
     def __init__(self, path: str):
         self.path = path
-        self._memory_connection: sqlite3.Connection | None = None
-        if path == ":memory:":
-            self._memory_connection = sqlite3.connect(path)
-            self._memory_connection.execute("PRAGMA journal_mode=WAL")
-        else:
+        self._db = shared_database(path)
+        if not self._db.is_postgres and path != ":memory:":
             Path(path).parent.mkdir(parents=True, exist_ok=True)
         self._ensure_db()
 
-    def _connection(self) -> sqlite3.Connection:
-        connection = self._memory_connection or sqlite3.connect(self.path, timeout=30)
-        connection.execute("PRAGMA journal_mode=WAL")
-        return connection
+    def _connection(self):
+        return self._db.connection()
 
     def _ensure_db(self) -> None:
         with self._connection() as connection:
@@ -243,20 +239,21 @@ class ProviderUsageDB:
         group_name = group or provider
         now = time.time()
         with self._connection() as connection:
+            current = "provider_usage_daily." if getattr(connection, "is_postgres", False) else ""
             connection.execute(
-                """
+                f"""
                 INSERT INTO provider_usage_daily (
                     usage_day, group_name, provider, model, requests,
                     successes, failures, capacity_rejections, prompt_tokens,
                     completion_tokens, updated_at
                 ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(usage_day, group_name, provider, model) DO UPDATE SET
-                    requests = requests + 1,
-                    successes = successes + excluded.successes,
-                    failures = failures + excluded.failures,
-                    capacity_rejections = capacity_rejections + excluded.capacity_rejections,
-                    prompt_tokens = prompt_tokens + excluded.prompt_tokens,
-                    completion_tokens = completion_tokens + excluded.completion_tokens,
+                    requests = {current}requests + 1,
+                    successes = {current}successes + excluded.successes,
+                    failures = {current}failures + excluded.failures,
+                    capacity_rejections = {current}capacity_rejections + excluded.capacity_rejections,
+                    prompt_tokens = {current}prompt_tokens + excluded.prompt_tokens,
+                    completion_tokens = {current}completion_tokens + excluded.completion_tokens,
                     updated_at = excluded.updated_at
                 """,
                 (

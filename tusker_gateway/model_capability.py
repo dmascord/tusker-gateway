@@ -21,16 +21,20 @@ The status is deliberately evidence-oriented:
 """
 from __future__ import annotations
 
+import logging
 import os
-import sqlite3
 import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterator
 
+from tusker_gateway.storage import shared_database
+
 
 MODEL_CAPABILITY_PROBE_VERSION = "model-capability-v1"
+
+logger = logging.getLogger(__name__)
 
 INPUT_MODALITY_CAPABILITIES = frozenset({
     "input_text",
@@ -118,29 +122,30 @@ class ModelCapabilityDB:
 
     def __init__(self, path: str):
         self.path = str(path)
-        self._memory_connection: sqlite3.Connection | None = None
-        if self.path == ":memory:":
-            self._memory_connection = sqlite3.connect(self.path)
-            self._memory_connection.execute("PRAGMA journal_mode=WAL")
-        else:
+        self._db = shared_database(self.path)
+        if not self._db.is_postgres and self.path != ":memory:":
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         self._ensure_db()
 
     @contextmanager
-    def _connection(self) -> Iterator[sqlite3.Connection]:
-        connection = self._memory_connection or sqlite3.connect(
-            self.path, timeout=30
-        )
-        connection.execute("PRAGMA journal_mode=WAL")
-        try:
-            connection.execute("PRAGMA busy_timeout=30000")
+    def _connection(self) -> Iterator[object]:
+        with self._db.connection() as connection:
             yield connection
-        finally:
-            if connection is not self._memory_connection:
-                connection.close()
 
     def _ensure_db(self) -> None:
+        database_preexisting = (
+            not self._db.is_postgres
+            and self.path != ":memory:"
+            and Path(self.path).exists()
+            and Path(self.path).stat().st_size > 0
+        )
         with self._connection() as connection:
+            # Changing journal mode takes a write lock. On the shared RWX
+            # volume a rolling-update peer may still be using an existing
+            # database, so only set WAL while creating a new file. Existing
+            # files are checked read-only below.
+            if not self._db.is_postgres and not database_preexisting:
+                connection.execute("PRAGMA journal_mode=WAL")
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS model_capability (
@@ -158,6 +163,34 @@ class ModelCapabilityDB:
                 )
                 """
             )
+            if not self._db.is_postgres:
+                journal_mode = connection.execute(
+                    "PRAGMA journal_mode"
+                ).fetchone()
+                if journal_mode and str(journal_mode[0]).lower() != "wal":
+                    logger.warning(
+                        "model capability database journal mode is %s; "
+                        "leaving existing mode unchanged during shared-volume startup",
+                        journal_mode[0],
+                    )
+                integrity = connection.execute(
+                    "PRAGMA integrity_check(1)"
+                ).fetchone()
+                if integrity and str(integrity[0]).lower() != "ok":
+                    logger.warning(
+                        "model capability database integrity check failed: %s; "
+                        "rebuilding indexes",
+                        integrity[0],
+                    )
+                    connection.execute("REINDEX model_capability")
+                    repaired = connection.execute(
+                        "PRAGMA integrity_check(1)"
+                    ).fetchone()
+                    if not repaired or str(repaired[0]).lower() != "ok":
+                        raise RuntimeError(
+                            "model capability database remains corrupt after reindex: "
+                            f"{repaired[0] if repaired else 'no result'}"
+                        )
             connection.commit()
 
     def record(

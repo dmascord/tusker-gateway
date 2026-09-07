@@ -5,13 +5,14 @@ The score combines success rate and latency with exponential decay.
 """
 from __future__ import annotations
 
-import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import logging
+
+from tusker_gateway.storage import shared_database
 
 logger = logging.getLogger(__name__)
 
@@ -35,12 +36,18 @@ def _coarse_token_count(text: str) -> int:
 class QualityDB:
     def __init__(self, path: str):
         self._path = path
+        self._db = shared_database(path)
         self._ensure_db()
 
     def _ensure_db(self) -> None:
-        Path(self._path).parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self._path) as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
+        if not self._db.is_postgres:
+            Path(self._path).parent.mkdir(parents=True, exist_ok=True)
+        event_id_definition = (
+            "BIGSERIAL PRIMARY KEY"
+            if self._db.is_postgres
+            else "INTEGER PRIMARY KEY AUTOINCREMENT"
+        )
+        with self._db.connection() as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS model_quality (
@@ -56,9 +63,9 @@ class QualityDB:
                 """
             )
             conn.execute(
-                """
+                f"""
                 CREATE TABLE IF NOT EXISTS model_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id {event_id_definition},
                     provider TEXT NOT NULL,
                     model TEXT NOT NULL,
                     success INTEGER NOT NULL,
@@ -73,12 +80,14 @@ class QualityDB:
         """Record a call outcome and update quality score."""
         now = time.time()
         logger.debug('record %s/%s success=%s latency=%.1fms', provider, model, success, latency_ms)
-        with sqlite3.connect(self._path) as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
+        with self._db.connection() as conn:
             conn.execute(
-                """
-                INSERT OR IGNORE INTO model_quality (provider, model) VALUES (?, ?)
-                """,
+                (
+                    "INSERT INTO model_quality (provider, model) VALUES (?, ?) "
+                    "ON CONFLICT(provider, model) DO NOTHING"
+                    if self._db.is_postgres
+                    else "INSERT OR IGNORE INTO model_quality (provider, model) VALUES (?, ?)"
+                ),
                 (provider, model),
             )
             conn.execute(
@@ -114,7 +123,7 @@ class QualityDB:
             self._recompute_score(conn, provider, model)
             conn.commit()
 
-    def _recompute_score(self, conn: sqlite3.Connection, provider: str, model: str) -> None:
+    def _recompute_score(self, conn: Any, provider: str, model: str) -> None:
         """Recompute quality_score = success_rate * 80 + latency_bonus * 20.
 
         latency_bonus decays exponentially with the recent average latency.
@@ -158,8 +167,7 @@ class QualityDB:
 
     def get_quality(self, provider: str, model: str) -> float | None:
         """Return quality score for (provider, model), or None if no data."""
-        with sqlite3.connect(self._path) as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
+        with self._db.connection() as conn:
             row = conn.execute(
                 """
                 SELECT quality_score FROM model_quality WHERE provider = ? AND model = ?
@@ -205,8 +213,7 @@ class QualityDB:
 
     def status(self) -> dict[str, Any]:
         """Return summary status for /status endpoint."""
-        with sqlite3.connect(self._path) as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
+        with self._db.connection() as conn:
             count = conn.execute("SELECT COUNT(*) FROM model_quality").fetchone()[0]
             healthy = conn.execute(
                 "SELECT COUNT(*) FROM model_quality WHERE quality_score >= 50.0"

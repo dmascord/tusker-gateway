@@ -9,7 +9,12 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from tusker_gateway.budget import BudgetDecision
-from tusker_gateway.errors import ProviderError, RateLimitError, ToolCallContractError
+from tusker_gateway.errors import (
+    ProviderError,
+    ProviderRouteDisabledError,
+    RateLimitError,
+    ToolCallContractError,
+)
 from tusker_gateway.endpoints import (
     _call_with_pool_fallback,
     _public_provider_failure_response,
@@ -50,6 +55,28 @@ def test_public_provider_quota_failure_has_safe_machine_signal():
 
     assert response.status == 502
     assert response.headers["X-Tusker-Provider-Failure"] == "provider_quota"
+
+
+@pytest.mark.asyncio
+async def test_disabled_passthrough_provider_fails_before_upstream_call():
+    upstream = MagicMock()
+    upstream.chat = AsyncMock()
+
+    with pytest.raises(ProviderRouteDisabledError) as exc_info:
+        await _call_with_pool_fallback(
+            {
+                "pools": {},
+                "passthrough_disabled_providers": ["google"],
+            },
+            {
+                "model": "google/gemini-3.1-pro-preview",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            upstream,
+        )
+
+    assert exc_info.value.code == "provider_route_disabled"
+    upstream.chat.assert_not_awaited()
 
 
 def test_required_input_modalities_collects_multiple_media_types():

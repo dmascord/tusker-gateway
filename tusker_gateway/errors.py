@@ -66,6 +66,18 @@ class NoHealthyModelsError(BadRequestError):
         self.headers = {"Retry-After": str(retry_after)}
 
 
+class ProviderRouteDisabledError(BadRequestError):
+    """An explicitly requested provider route is disabled by operator policy."""
+
+    def __init__(self, provider: str) -> None:
+        normalized = str(provider or "").strip().lower().replace("_", "-")
+        super().__init__(
+            f"Provider route '{normalized}' is currently disabled; choose another model.",
+            code="provider_route_disabled",
+        )
+        self.provider = normalized
+
+
 class NotFoundError(GatewayError):
     status = 404
     error_type = "invalid_request_error"

@@ -684,6 +684,7 @@ class PoolManager:
         self,
         spec: ModelSpec,
         capability_cache: dict[tuple[str, str], tuple[frozenset[str] | None, bool | None]],
+        model_capability_records: dict[tuple[str, str], tuple[Any, ...]] | None = None,
     ) -> tuple[frozenset[str] | None, bool | None]:
         """Resolve effective input/tool capabilities for a pool candidate."""
         key = (spec.provider, spec.model)
@@ -700,11 +701,14 @@ class PoolManager:
             # records when a provider's catalog is temporarily unavailable
             # or its row does not carry the modality fields. Explicit pool
             # metadata remains authoritative over this fallback.
+            records = (
+                model_capability_records.get(key, ())
+                if model_capability_records is not None
+                else self._model_capability_db.for_model(spec.provider, spec.model)
+            )
             discovered_modalities = {
                 record.capability.removeprefix("input_")
-                for record in self._model_capability_db.for_model(
-                    spec.provider, spec.model
-                )
+                for record in records
                 if record.capability.startswith("input_")
                 and record.status in {"advertised", "passed"}
             }
@@ -809,6 +813,7 @@ class PoolManager:
         self,
         spec: ModelSpec,
         *,
+        capability_cache: dict[tuple[str, str], Any] | None = None,
         allow_unqualified_static_tools: bool = False,
         allow_structured_tool_fallback: bool = False,
         allow_tool_compatibility_fallback: bool = False,
@@ -827,7 +832,10 @@ class PoolManager:
             return True
         if self._tool_capabilities is None:
             return not spec.auto_discovered or mode != "strict"
-        result = self._tool_capabilities.get(spec.provider, spec.model)
+        if capability_cache is None:
+            result = self._tool_capabilities.get(spec.provider, spec.model)
+        else:
+            result = capability_cache.get((spec.provider, spec.model))
         if result is not None:
             if result.qualified_for_tools:
                 return True
@@ -967,6 +975,23 @@ class PoolManager:
         capability_cache: dict[
             tuple[str, str], tuple[frozenset[str] | None, bool | None]
         ] = {}
+        model_capability_records: dict[tuple[str, str], tuple[Any, ...]] | None = None
+        if self._model_capability_db is not None:
+            grouped_records: dict[tuple[str, str], list[Any]] = {}
+            for record in self._model_capability_db.records():
+                grouped_records.setdefault((record.provider, record.model), []).append(record)
+            model_capability_records = {
+                key: tuple(records) for key, records in grouped_records.items()
+            }
+        tool_capability_cache: dict[tuple[str, str], Any] | None = None
+        if requires_tools and self._tool_capabilities is not None:
+            # Selection may inspect hundreds of candidates. Read the compact
+            # qualification table once instead of opening/reconfiguring a
+            # SQLite connection for every candidate on the RWX volume.
+            tool_capability_cache = {
+                (record.provider, record.model): record
+                for record in self._tool_capabilities.records()
+            }
 
         # Resolve heavyweight gate from pool tier if not explicitly set.
         if heavyweight_ok is None:
@@ -1000,7 +1025,7 @@ class PoolManager:
                             self._drop_stickiness(key)
                             break
                         modalities, tool_support = self._model_capabilities(
-                            s, capability_cache
+                            s, capability_cache, model_capability_records
                         )
                         if not self._input_modalities_allowed(
                             s, required_modalities, modalities
@@ -1014,6 +1039,7 @@ class PoolManager:
                             break
                         if requires_tools and not self._tool_capability_allowed(
                             s,
+                            capability_cache=tool_capability_cache,
                             allow_unqualified_static_tools=allow_unqualified_static_tools,
                             allow_structured_tool_fallback=allow_structured_tool_fallback,
                             allow_tool_compatibility_fallback=allow_tool_compatibility_fallback,
@@ -1078,7 +1104,9 @@ class PoolManager:
             if not heavyweight_ok and s.heavyweight:
                 filter_counts["heavyweight"] += 1
                 continue
-            modalities, tool_support = self._model_capabilities(s, capability_cache)
+            modalities, tool_support = self._model_capabilities(
+                s, capability_cache, model_capability_records
+            )
             if not self._input_modalities_allowed(
                 s, required_modalities, modalities
             ):
@@ -1093,6 +1121,7 @@ class PoolManager:
                 continue
             if requires_tools and not self._tool_capability_allowed(
                 s,
+                capability_cache=tool_capability_cache,
                 allow_unqualified_static_tools=allow_unqualified_static_tools,
                 allow_structured_tool_fallback=allow_structured_tool_fallback,
                 allow_tool_compatibility_fallback=allow_tool_compatibility_fallback,

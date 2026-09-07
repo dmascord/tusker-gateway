@@ -442,6 +442,8 @@ def create_app() -> web.Application:
             await sem_cache.close()
         if "http_session" in app:
             await app["http_session"].close()
+        from tusker_gateway.storage import close_shared_pools
+        close_shared_pools()
 
     auth = AuthMiddleware(identity_store)
     metrics_token = os.environ.get("TUSKER_METRICS_TOKEN", "").strip()

@@ -30,7 +30,12 @@ from aiohttp import web
 from tusker_gateway import translators
 from tusker_gateway.budget import BudgetTracker
 from tusker_gateway.circuit_breaker import CircuitBreaker, BreakerDecision
-from tusker_gateway.errors import BadRequestError, NoHealthyModelsError
+from tusker_gateway.config import provider_route_is_disabled
+from tusker_gateway.errors import (
+    BadRequestError,
+    NoHealthyModelsError,
+    ProviderRouteDisabledError,
+)
 from tusker_gateway.endpoints import (
     _PreparedStream,
     _build_extra_body,
@@ -57,6 +62,7 @@ from tusker_gateway.quality import QualityDB
 from tusker_gateway.rate_limit import RateLimiter
 from tusker_gateway.routing import resolve_route
 from tusker_gateway.sse import sse_heartbeat_loop
+from tusker_gateway.storage import StorageUnavailableError
 from tusker_gateway.tool_formats import normalize_response_tool_calls
 from tusker_gateway.tracing import Tracer
 
@@ -438,6 +444,8 @@ async def _call_with_pool_fallback_anthropic(
                 last_error = exc
                 excluded.add(selected)
     elif route.kind == "passthrough" and route.provider and route.model:
+        if provider_route_is_disabled(config, route.provider):
+            raise ProviderRouteDisabledError(route.provider)
         decision = (
             await asyncio.to_thread(breaker.check, route.provider, route.model)
             if breaker
@@ -594,7 +602,19 @@ async def anthropic_messages_handler(request: web.Request) -> web.Response | web
 
             # Rate-limit pre-flight.
             if ratelimit is not None and api_key:
-                rl = await asyncio.to_thread(ratelimit.check, api_key)
+                try:
+                    rl = await asyncio.to_thread(ratelimit.check, api_key)
+                except StorageUnavailableError:
+                    status = "state_store_unavailable"
+                    _emit(status)
+                    return web.json_response(
+                        _anthropic_error(
+                            "Gateway state storage is temporarily unavailable",
+                            type="server_error",
+                        ),
+                        status=503,
+                        headers={"Retry-After": "2"},
+                    )
                 if not rl.allowed:
                     status = "ratelimit_blocked"
                     if metrics is not None:
@@ -613,7 +633,21 @@ async def anthropic_messages_handler(request: web.Request) -> web.Response | web
             # Budget pre-flight.
             if budget is not None and api_key:
                 est = _estimated_tokens(openai_body.get("messages", []))
-                decision = await asyncio.to_thread(budget.check, api_key, pool_name, est)
+                try:
+                    decision = await asyncio.to_thread(
+                        budget.check, api_key, pool_name, est
+                    )
+                except StorageUnavailableError:
+                    status = "state_store_unavailable"
+                    _emit(status)
+                    return web.json_response(
+                        _anthropic_error(
+                            "Gateway state storage is temporarily unavailable",
+                            type="server_error",
+                        ),
+                        status=503,
+                        headers={"Retry-After": "2"},
+                    )
                 if not decision.allowed:
                     status = "budget_blocked"
                     if metrics is not None:

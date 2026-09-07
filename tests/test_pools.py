@@ -68,6 +68,17 @@ def test_load_config_normalizes_auto_free_provider_exclusions(monkeypatch):
     assert config["auto_free_excluded_providers"] == ["nvidia", "open-router"]
 
 
+def test_load_config_parses_passthrough_disabled_providers(monkeypatch):
+    monkeypatch.setenv(
+        "TUSKER_PASSTHROUGH_DISABLED_PROVIDERS",
+        "Google, cerebras",
+    )
+
+    config = load_config()
+
+    assert config["passthrough_disabled_providers"] == ["google", "cerebras"]
+
+
 def test_pool_config_normalizes_auto_catalog_providers():
     pool = PoolConfig(
         name="code",

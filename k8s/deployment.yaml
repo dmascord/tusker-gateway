@@ -28,7 +28,7 @@ spec:
       terminationGracePeriodSeconds: 90
       containers:
       - name: tusker-gateway
-        image: registry.tusker.net.au:5000/tusker-gateway:swarm-alpine-20260907101729
+        image: registry.tusker.net.au:5000/tusker-gateway:swarm-alpine-postgres-state-sanitize-202609071921
         imagePullPolicy: Always
         envFrom:
         - secretRef:
@@ -37,13 +37,33 @@ spec:
         - name: MODEL_NAME
           value: tusker-gateway
         - name: TUSKER_COMMIT
-          value: b75ad75
+          value: postgres-state-sanitize-202609071921
         - name: HOME
           value: /home/tusker
         - name: PYTHONUNBUFFERED
           value: '1'
         - name: PYTHONDONTWRITEBYTECODE
           value: '1'
+        # Shared mutable gateway state lives in the dedicated PostgreSQL
+        # service. SQLite paths remain as local/test fallbacks only.
+        - name: TUSKER_STATE_DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: tusker-gateway-postgres-auth
+              key: DATABASE_URL
+        - name: TUSKER_STATE_DATABASE_POOL_MAX
+          value: '12'
+        # Startup and request-path state operations remain bounded during a
+        # PostgreSQL restart. Advisory stores use process-local safe defaults;
+        # rate limits, budgets, and idempotency fail explicitly with 503.
+        - name: TUSKER_STATE_DATABASE_CONNECT_TIMEOUT
+          value: '2'
+        - name: TUSKER_STATE_DEGRADED_MODE
+          value: advisory
+        # The response cache is disposable; keep it off the shared RWX volume
+        # so SQLite is no longer a multi-writer failure surface in production.
+        - name: TUSKER_CACHE_ENABLED
+          value: 'false'
         - name: API_KEYS
           valueFrom:
             secretKeyRef:
@@ -91,11 +111,16 @@ spec:
         # direct routes remain diagnosable and can be re-enabled by removing
         # the provider from this list after credentials/quota are repaired.
         - name: TUSKER_CATALOG_DISABLED_PROVIDERS
-          value: arcee,arliai,cohere,local-llm,openai
+          value: arcee,arliai,cohere,local-llm,openai,google,cerebras
         # These providers currently have no usable pool route. Keeping them
         # out of pool construction prevents repeated missing-key/quota noise.
         - name: TUSKER_DISABLED_PROVIDERS
-          value: arcee,cohere
+          value: arcee,cohere,google,cerebras
+        # Block explicit chat/Responses/Anthropic provider routes while the
+        # upstream accounts are retired or unavailable. This fails fast with
+        # provider_route_disabled instead of returning an upstream 502.
+        - name: TUSKER_PASSTHROUGH_DISABLED_PROVIDERS
+          value: google,cerebras
         # /v1/rerank is a dedicated native-provider route and is not disabled
         # by the chat-pool list above. It uses rerank_path + provider keys.
         - name: TUSKER_POOL_CODE
@@ -247,7 +272,9 @@ spec:
         - name: TUSKER_TOOL_DIAGNOSTICS
           value: 'true'
         - name: TUSKER_MODEL_CAPABILITY_DB_PATH
-          value: /home/tusker/.hermes/model_capability.db
+          # Keep a fresh evidence store after the prior RWX index corruption;
+          # the old file remains untouched for offline forensic recovery.
+          value: /home/tusker/.hermes/model_capability-recovered.db
         - name: TUSKER_CAPABILITY_PROBE_GENERATION
           value: 'false'
         - name: TUSKER_QUALIFICATION_MAINTENANCE_ENABLED

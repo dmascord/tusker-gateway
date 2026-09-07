@@ -9,7 +9,6 @@ import logging
 import os
 from pathlib import Path
 import secrets
-import sqlite3
 import time
 from typing import Any, Mapping
 
@@ -18,6 +17,11 @@ from aiohttp import web
 from tusker_gateway.errors import openai_error
 from tusker_gateway.identity import extract_api_key, fingerprint_api_key
 from tusker_gateway.observability import set_access_log_context
+from tusker_gateway.storage import (
+    StorageUnavailableError,
+    shared_database,
+    storage_error_types,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -78,27 +82,40 @@ class IdempotencyStore:
 
     def __init__(self, config: IdempotencyConfig):
         self.config = config
+        self._db = (
+            shared_database(config.path, timeout=10.0, fallback_policy="critical")
+            if config.enabled
+            else None
+        )
         if config.enabled:
+            assert self._db is not None
             path = Path(config.path)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            self._ensure_db()
+            if not self._db.is_postgres:
+                path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                self._ensure_db()
+            except StorageUnavailableError as exc:
+                # Preserve the enabled flag so middleware returns a deliberate
+                # 503 until the authoritative store recovers.
+                logger.warning("idempotency state unavailable: %s", exc)
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.config.path, timeout=10)
-        conn.execute("PRAGMA busy_timeout=10000")
-        return conn
+    def _connect(self):
+        """Return a compatibility connection context for diagnostics/tests."""
+        assert self._db is not None
+        return self._db.connection()
 
     def _ensure_db(self) -> None:
-        with self._connect() as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
+        assert self._db is not None
+        with self._db.connection() as conn:
+            body_type = "BYTEA" if self._db.is_postgres else "BLOB"
             conn.execute(
-                """
+                f"""
                 CREATE TABLE IF NOT EXISTS idempotency_records (
                     record_key TEXT PRIMARY KEY,
                     request_hash TEXT NOT NULL,
                     state TEXT NOT NULL,
                     response_status INTEGER,
-                    response_body BLOB,
+                    response_body {body_type},
                     content_type TEXT,
                     locked_until REAL NOT NULL,
                     expires_at REAL NOT NULL,
@@ -107,11 +124,26 @@ class IdempotencyStore:
                 )
                 """
             )
-            columns = {
-                str(row[1]) for row in conn.execute("PRAGMA table_info(idempotency_records)")
-            }
+            if self._db.is_postgres:
+                columns = {
+                    str(row[0])
+                    for row in conn.execute(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_schema = current_schema() AND table_name = ?",
+                        ("idempotency_records",),
+                    )
+                }
+            else:
+                columns = {
+                    str(row[1])
+                    for row in conn.execute("PRAGMA table_info(idempotency_records)")
+                }
             if "lease_token" not in columns:
-                conn.execute("ALTER TABLE idempotency_records ADD COLUMN lease_token TEXT")
+                conn.execute(
+                    "ALTER TABLE idempotency_records ADD COLUMN "
+                    + ("IF NOT EXISTS " if self._db.is_postgres else "")
+                    + "lease_token TEXT"
+                )
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_idempotency_expires
@@ -121,8 +153,8 @@ class IdempotencyStore:
 
     def claim(self, record_key: str, request_hash: str) -> Claim:
         now = time.time()
-        conn = self._connect()
-        try:
+        assert self._db is not None
+        with self._db.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute("DELETE FROM idempotency_records WHERE expires_at <= ?", (now,))
             row = conn.execute(
@@ -152,15 +184,12 @@ class IdempotencyStore:
                         now,
                     ),
                 )
-                conn.commit()
                 return Claim("claimed", lease_token=lease_token)
 
             stored_hash, state, status, body, content_type, locked_until = row
             if stored_hash != request_hash:
-                conn.commit()
                 return Claim("conflict")
             if state == "complete":
-                conn.commit()
                 return Claim(
                     "replay",
                     status=int(status),
@@ -180,13 +209,7 @@ class IdempotencyStore:
                 """,
                 (lease_token, now + self.config.lock_secs, now + self.config.ttl_secs, now, record_key),
             )
-            conn.commit()
             return Claim("claimed", lease_token=lease_token)
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
 
     def complete(
         self,
@@ -198,7 +221,8 @@ class IdempotencyStore:
         content_type: str | None,
     ) -> bool:
         now = time.time()
-        with self._connect() as conn:
+        assert self._db is not None
+        with self._db.connection() as conn:
             cursor = conn.execute(
                 """
                 UPDATE idempotency_records
@@ -212,7 +236,8 @@ class IdempotencyStore:
             return cursor.rowcount == 1
 
     def abandon(self, record_key: str, request_hash: str, lease_token: str) -> bool:
-        with self._connect() as conn:
+        assert self._db is not None
+        with self._db.connection() as conn:
             cursor = conn.execute(
                 """
                 DELETE FROM idempotency_records
@@ -225,7 +250,8 @@ class IdempotencyStore:
 
     def renew(self, record_key: str, request_hash: str, lease_token: str) -> bool:
         now = time.time()
-        with self._connect() as conn:
+        assert self._db is not None
+        with self._db.connection() as conn:
             cursor = conn.execute(
                 """
                 UPDATE idempotency_records
@@ -292,7 +318,7 @@ async def _abandon_safely(
         await asyncio.shield(
             asyncio.to_thread(store.abandon, record_key, request_hash, lease_token)
         )
-    except (OSError, sqlite3.Error):
+    except (OSError, storage_error_types()):
         logger.exception("could not release idempotency reservation")
 
 
@@ -339,7 +365,7 @@ def attach_idempotency_middleware(
         request_hash = _canonical_request_hash(request, body)
         try:
             claim = await asyncio.to_thread(store.claim, record_key, request_hash)
-        except (OSError, sqlite3.Error):
+        except (OSError, storage_error_types()):
             return web.json_response(
                 openai_error(
                     "Idempotency persistence is unavailable",
@@ -407,7 +433,7 @@ def attach_idempotency_middleware(
                     renewed = await asyncio.to_thread(
                         store.renew, record_key, request_hash, lease_token
                     )
-                except (OSError, sqlite3.Error):
+                except (OSError, storage_error_types()):
                     logger.exception("could not renew idempotency lease")
                     renewed = False
                 if not renewed:
@@ -457,7 +483,7 @@ def attach_idempotency_middleware(
                     body_bytes,
                     response.headers.get("Content-Type"),
                 )
-            except (OSError, sqlite3.Error):
+            except (OSError, storage_error_types()):
                 return web.json_response(
                     openai_error(
                         "The operation completed but its idempotency record could not be persisted",

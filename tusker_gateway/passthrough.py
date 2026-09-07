@@ -44,6 +44,7 @@ _SENSITIVE_ERROR_VALUE_RE = re.compile(
 )
 
 _OPENCODE_GO_PROVIDER = "opencode-go"
+_OPENCODE_SESSION_PROVIDERS = frozenset({_OPENCODE_GO_PROVIDER, "opencode-zen"})
 _OPENCODE_SESSION_HEADER = "x-opencode-session"
 _OPENCODE_REASONING_EFFORT_ALIASES = {
     # OpenAI-compatible clients sometimes use `minimal`/`maximal`, while
@@ -1538,7 +1539,7 @@ class PassthroughClient:
             # text-looking names). Tell Copilot from the actual request
             # content so image recognition is negotiated correctly.
             headers["Copilot-Vision-Request"] = "true"
-        if provider.lower() == _OPENCODE_GO_PROVIDER:
+        if provider.lower() in _OPENCODE_SESSION_PROVIDERS:
             explicit_header = next(
                 (
                     value

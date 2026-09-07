@@ -83,6 +83,49 @@ def test_tool_capability_db_round_trip_and_gate(tmp_path):
     assert db.is_qualified("openrouter", "bad") is False
 
 
+def test_tool_selection_reads_capability_table_once(tmp_path, monkeypatch):
+    manager = PoolManager(
+        {
+            "pools": {
+                "code": PoolConfig(
+                    name="code",
+                    models=[
+                        {"provider": "openrouter", "model": "curated-a"},
+                        {"provider": "openrouter", "model": "curated-b"},
+                    ],
+                ),
+            },
+            "quality_db_path": os.path.join(tmp_path, "quality.db"),
+            "tool_capability_db_path": os.path.join(tmp_path, "capability.db"),
+            "excluded_providers": [],
+            "provider_api_keys": {"openrouter": "test-key"},
+        }
+    )
+    records_calls = 0
+
+    original_records = manager._tool_capabilities.records
+
+    def records_once():
+        nonlocal records_calls
+        records_calls += 1
+        return original_records()
+
+    monkeypatch.setattr(manager._tool_capabilities, "records", records_once)
+    monkeypatch.setattr(
+        manager._tool_capabilities,
+        "get",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("selection should use its snapshot")
+        ),
+    )
+
+    assert manager.select("code", requires_tools=True) == (
+        "openrouter",
+        "curated-a",
+    )
+    assert records_calls == 1
+
+
 def test_auto_discovered_model_requires_qualified_stream_probe(tmp_path):
     manager = _manager(str(tmp_path))
     manager.catalog_registry = _Registry()

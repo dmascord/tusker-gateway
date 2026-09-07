@@ -6,7 +6,6 @@ differentiate "still active" from "stale" after a restart.
 """
 from __future__ import annotations
 
-import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,6 +21,7 @@ from tusker_gateway.cooldown import (
     CooldownTracker,
     MAX_COOLDOWN_SECS,
 )
+from tusker_gateway.storage import shared_database
 
 
 @dataclass
@@ -29,7 +29,9 @@ class PersistentCooldownStore:
     db_path: Path
 
     def __post_init__(self) -> None:
-        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+        self._db = shared_database(self.db_path, timeout=5.0)
+        if not self._db.is_postgres:
+            Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             conn.execute(
                 """
@@ -62,10 +64,8 @@ class PersistentCooldownStore:
             )
             conn.commit()
 
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(str(self.db_path), timeout=5)
-        connection.execute("PRAGMA journal_mode=WAL")
-        return connection
+    def _connect(self):
+        return self._db.connection()
 
     def record(self, provider: str, model: str, seconds: float) -> None:
         """Persist a (provider, model) cooldown until `seconds` from now."""
@@ -96,18 +96,19 @@ class PersistentCooldownStore:
 
     @staticmethod
     def _upsert_provider(
-        conn: sqlite3.Connection,
+        conn: Any,
         provider: str,
         until_epoch: float,
         updated_at: float,
     ) -> None:
         """Store the longest active provider-wide cooldown."""
+        greatest = "GREATEST" if getattr(conn, "is_postgres", False) else "MAX"
         conn.execute(
-            """
+            f"""
             INSERT INTO provider_cooldowns (provider, until_epoch, updated_at)
             VALUES (?, ?, ?)
             ON CONFLICT(provider) DO UPDATE SET
-                until_epoch = MAX(provider_cooldowns.until_epoch, excluded.until_epoch),
+                until_epoch = {greatest}(provider_cooldowns.until_epoch, excluded.until_epoch),
                 updated_at = excluded.updated_at
             """,
             (provider, until_epoch, updated_at),
@@ -132,12 +133,13 @@ class PersistentCooldownStore:
         now = time.time()
         until_epoch = now + seconds
         with self._connect() as conn:
+            greatest = "GREATEST" if getattr(conn, "is_postgres", False) else "MAX"
             conn.execute(
-                """
+                f"""
                 INSERT INTO capacity_group_cooldowns (group_name, until_epoch, updated_at)
                 VALUES (?, ?, ?)
                 ON CONFLICT(group_name) DO UPDATE SET
-                    until_epoch = MAX(capacity_group_cooldowns.until_epoch, excluded.until_epoch),
+                    until_epoch = {greatest}(capacity_group_cooldowns.until_epoch, excluded.until_epoch),
                     updated_at = excluded.updated_at
                 """,
                 (group, until_epoch, now),

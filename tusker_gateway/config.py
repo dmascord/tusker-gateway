@@ -129,6 +129,15 @@ def load_config() -> dict[str, Any]:
         for p in _parse_env_list("TUSKER_DISABLED_PROVIDERS")
         if p.strip()
     ]
+    # Explicit provider-prefixed chat routes can be blocked independently of
+    # the registry while a provider is retired, over quota, or under repair.
+    # This is intentionally separate from ``disabled_providers`` because the
+    # latter only controls pool construction for backwards compatibility.
+    config["passthrough_disabled_providers"] = [
+        p.strip().lower().replace("_", "-")
+        for p in _parse_env_list("TUSKER_PASSTHROUGH_DISABLED_PROVIDERS")
+        if p.strip()
+    ]
 
     # Normalized provider registry and API-key map.
     config["providers"] = _load_providers()
@@ -266,6 +275,12 @@ def load_config() -> dict[str, Any]:
         config["model_capability_db_path"],
     )
     return config
+
+
+def provider_route_is_disabled(config: dict[str, Any], provider: str) -> bool:
+    """Return whether explicit chat passthrough is disabled for a provider."""
+    normalized = str(provider or "").strip().lower().replace("_", "-")
+    return normalized in config.get("passthrough_disabled_providers", ())
 
 
 def _load_providers() -> dict[str, ProviderConfig]:

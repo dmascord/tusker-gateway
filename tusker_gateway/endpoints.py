@@ -18,6 +18,7 @@ from tusker_gateway.cache import ResponseCache, make_cache_key, make_caller_scop
 from tusker_gateway.budget import BudgetTracker
 from tusker_gateway.circuit_breaker import CircuitBreaker, BreakerDecision
 from tusker_gateway.cooldown import is_account_quota_exhausted
+from tusker_gateway.config import provider_route_is_disabled
 from tusker_gateway.errors import (
     BadRequestError,
     GatewayError,
@@ -25,6 +26,7 @@ from tusker_gateway.errors import (
     MalformedToolCallError,
     NoHealthyModelsError,
     ProviderCapacityError,
+    ProviderRouteDisabledError,
     RateLimitError,
     RequiredToolCallError,
     ToolCallContractError,
@@ -54,6 +56,7 @@ from tusker_gateway.rate_limit import RateLimiter
 from tusker_gateway.routing import LEGACY_MODEL_IDS, resolve_route
 from tusker_gateway.semantic_cache import make_semantic_scope, response_contains_tool_calls
 from tusker_gateway.model_capability import MODEL_CAPABILITY_PROBE_VERSION
+from tusker_gateway.storage import StorageUnavailableError
 from tusker_gateway.sse import (
     format_openai_chunk,
     split_sse_frame,
@@ -2033,6 +2036,8 @@ def _select_cache_route_target(
     """Resolve one healthy concrete route for a semantic-cache namespace."""
     route = resolve_route(body.get("model"), body)
     if route.kind == "passthrough" and route.provider and route.model:
+        if provider_route_is_disabled(config, route.provider):
+            raise ProviderRouteDisabledError(route.provider)
         if breaker is not None and not breaker.check(route.provider, route.model).allowed:
             return None
         return route.provider, route.model
@@ -3576,6 +3581,8 @@ def _route_target(config: dict[str, Any], body: dict[str, Any]) -> tuple[str, st
             raise NoHealthyModelsError(pool=route.pool_name or "code")
         return selected
     if route.kind == "passthrough" and route.provider and route.model:
+        if provider_route_is_disabled(config, route.provider):
+            raise ProviderRouteDisabledError(route.provider)
         return route.provider, route.model
     raise BadRequestError("Unsupported model route", code="unsupported_route")
 
@@ -3770,7 +3777,20 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
 
             # Rate-limit pre-flight (cheapest check, runs first).
             if ratelimit is not None and api_key:
-                rl = await asyncio.to_thread(ratelimit.check, api_key)
+                try:
+                    rl = await asyncio.to_thread(ratelimit.check, api_key)
+                except StorageUnavailableError:
+                    status = "state_store_unavailable"
+                    _emit(status)
+                    return web.json_response(
+                        openai_error(
+                            "Gateway state storage is temporarily unavailable",
+                            code="state_store_unavailable",
+                            error_type="server_error",
+                        ),
+                        status=503,
+                        headers={"Retry-After": "2"},
+                    )
                 if not rl.allowed:
                     status = "ratelimit_blocked"
                     if metrics is not None:
@@ -3790,7 +3810,22 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
             # response; otherwise cached requests bypass quota enforcement.
             if budget is not None and api_key:
                 est = _estimated_tokens(body["messages"])
-                decision = await asyncio.to_thread(budget.check, api_key, pool_name, est)
+                try:
+                    decision = await asyncio.to_thread(
+                        budget.check, api_key, pool_name, est
+                    )
+                except StorageUnavailableError:
+                    status = "state_store_unavailable"
+                    _emit(status)
+                    return web.json_response(
+                        openai_error(
+                            "Gateway state storage is temporarily unavailable",
+                            code="state_store_unavailable",
+                            error_type="server_error",
+                        ),
+                        status=503,
+                        headers={"Retry-After": "2"},
+                    )
                 if not decision.allowed:
                     status = "budget_blocked"
                     if metrics is not None:
@@ -4517,7 +4552,18 @@ async def _media_preflight(
     api_key = _resolve_api_key(request)
     ratelimit: RateLimiter | None = request.app.get("ratelimit")
     if ratelimit is not None and api_key:
-        decision = await asyncio.to_thread(ratelimit.check, api_key)
+        try:
+            decision = await asyncio.to_thread(ratelimit.check, api_key)
+        except StorageUnavailableError:
+            return web.json_response(
+                openai_error(
+                    "Gateway state storage is temporarily unavailable",
+                    code="state_store_unavailable",
+                    error_type="server_error",
+                ),
+                status=503,
+                headers={"Retry-After": "2"},
+            )
         if not decision.allowed:
             return web.json_response(
                 openai_error(
@@ -4535,9 +4581,20 @@ async def _media_preflight(
 
     budget: BudgetTracker | None = request.app.get("budget")
     if budget is not None and api_key:
-        decision = await asyncio.to_thread(
-            budget.check, api_key, budget_pool, budget_units
-        )
+        try:
+            decision = await asyncio.to_thread(
+                budget.check, api_key, budget_pool, budget_units
+            )
+        except StorageUnavailableError:
+            return web.json_response(
+                openai_error(
+                    "Gateway state storage is temporarily unavailable",
+                    code="state_store_unavailable",
+                    error_type="server_error",
+                ),
+                status=503,
+                headers={"Retry-After": "2"},
+            )
         if not decision.allowed:
             return web.json_response(
                 openai_error(

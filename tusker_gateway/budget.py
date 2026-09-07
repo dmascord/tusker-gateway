@@ -39,13 +39,14 @@ from __future__ import annotations
 
 import hashlib
 import os
-import sqlite3
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import logging
+
+from tusker_gateway.storage import StorageUnavailableError, shared_database
 
 logger = logging.getLogger(__name__)
 
@@ -118,18 +119,25 @@ class BudgetTracker:
     def __init__(self, config: BudgetConfig):
         self._config = config
         self.stats = BudgetStats()
+        self._db = None
         if not config.enabled:
             return
         try:
-            Path(config.path).parent.mkdir(parents=True, exist_ok=True)
+            self._db = shared_database(config.path, fallback_policy="critical")
+            if not self._db.is_postgres:
+                Path(config.path).parent.mkdir(parents=True, exist_ok=True)
             self._ensure_db()
+        except StorageUnavailableError as exc:
+            # Budget enforcement is correctness-critical.  Keep it enabled so
+            # request preflight returns a clear 503 while PostgreSQL is down.
+            logger.warning("budget state unavailable: %s", exc)
         except (PermissionError, OSError) as exc:
             logger.warning("budget disabled: cannot create %s: %s", config.path, exc)
             self._config.enabled = False
 
     def _ensure_db(self) -> None:
-        with sqlite3.connect(self._config.path) as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
+        assert self._db is not None
+        with self._db.connection() as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS usage (
@@ -225,16 +233,23 @@ class BudgetTracker:
             return
         fp = _key_fingerprint(api_key)
         now = time.time()
-        with sqlite3.connect(self._config.path) as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
-            # Daily
-            self._bump(conn, fp, "daily", now, self.DAILY_WINDOW, tokens)
-            # Monthly
-            self._bump(conn, fp, "monthly", now, self.MONTHLY_WINDOW, tokens)
-            # Per-pool
-            if pool_name:
-                self._bump(conn, fp, f"pool:{pool_name}", now, self.DAILY_WINDOW, tokens)
-            conn.commit()
+        assert self._db is not None
+        try:
+            with self._db.connection() as conn:
+                # Daily
+                self._bump(conn, fp, "daily", now, self.DAILY_WINDOW, tokens)
+                # Monthly
+                self._bump(conn, fp, "monthly", now, self.MONTHLY_WINDOW, tokens)
+                # Per-pool
+                if pool_name:
+                    self._bump(conn, fp, f"pool:{pool_name}", now, self.DAILY_WINDOW, tokens)
+                conn.commit()
+        except StorageUnavailableError:
+            # The request has already completed; do not convert a successful
+            # provider response into a gateway error solely because usage
+            # accounting became unavailable afterwards.
+            logger.warning("budget record skipped while state store is unavailable")
+            return
         self.stats.records += 1
         logger.debug('budget record key=%s tokens=%d pool=%s', fp[:8], tokens, pool_name)
 
@@ -244,13 +259,17 @@ class BudgetTracker:
             return
         fp = _key_fingerprint(api_key)
         now = time.time()
-        with sqlite3.connect(self._config.path) as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
-            self._bump(conn, fp, "daily", now, self.DAILY_WINDOW, -tokens)
-            self._bump(conn, fp, "monthly", now, self.MONTHLY_WINDOW, -tokens)
-            if pool_name:
-                self._bump(conn, fp, f"pool:{pool_name}", now, self.DAILY_WINDOW, -tokens)
-            conn.commit()
+        assert self._db is not None
+        try:
+            with self._db.connection() as conn:
+                self._bump(conn, fp, "daily", now, self.DAILY_WINDOW, -tokens)
+                self._bump(conn, fp, "monthly", now, self.MONTHLY_WINDOW, -tokens)
+                if pool_name:
+                    self._bump(conn, fp, f"pool:{pool_name}", now, self.DAILY_WINDOW, -tokens)
+                conn.commit()
+        except StorageUnavailableError:
+            logger.warning("budget refund skipped while state store is unavailable")
+            return
         self.stats.refunds += 1
         logger.info('budget refund key=%s tokens=%d', fp[:8], tokens)
 
@@ -263,15 +282,18 @@ class BudgetTracker:
             return {}
         fp = _key_fingerprint(api_key)
         now = time.time()
-        with sqlite3.connect(self._config.path) as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
-            rows = conn.execute(
-                """
-                SELECT period, period_start, tokens FROM usage
-                WHERE fingerprint = ? AND period_start > ?
-                """,
-                (fp, now - self.MONTHLY_WINDOW),
-            ).fetchall()
+        assert self._db is not None
+        try:
+            with self._db.connection() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT period, period_start, tokens FROM usage
+                    WHERE fingerprint = ? AND period_start > ?
+                    """,
+                    (fp, now - self.MONTHLY_WINDOW),
+                ).fetchall()
+        except StorageUnavailableError:
+            return {}
         out: dict[str, dict[str, int]] = {}
         for period, period_start, tokens in rows:
             out.setdefault(period, {})[str(int(period_start))] = tokens
@@ -281,8 +303,8 @@ class BudgetTracker:
 
     def _sum(self, fp: str, period: str, now: float, window: float) -> int:
         window_start = now - window
-        with sqlite3.connect(self._config.path) as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
+        assert self._db is not None
+        with self._db.connection() as conn:
             row = conn.execute(
                 """
                 SELECT COALESCE(SUM(tokens), 0) FROM usage
@@ -292,7 +314,7 @@ class BudgetTracker:
             ).fetchone()
         return int(row[0])
 
-    def _bump(self, conn: sqlite3.Connection, fp: str, period: str,
+    def _bump(self, conn: Any, fp: str, period: str,
               now: float, window: float, tokens: int) -> None:
         # The "period_start" we store is the START of the current window.
         # We pick the largest multiple of `window` <= now so all writes
@@ -300,12 +322,13 @@ class BudgetTracker:
         # accumulate as separate rows that are simply excluded by the
         # `period_start > now - window` predicate in `_sum`.
         window_start = now - (now % window)
+        current = "usage.tokens" if getattr(conn, "is_postgres", False) else "tokens"
         conn.execute(
-            """
+            f"""
             INSERT INTO usage (fingerprint, period, period_start, tokens)
             VALUES (?, ?, ?, ?)
             ON CONFLICT(fingerprint, period, period_start) DO UPDATE SET
-                tokens = tokens + excluded.tokens
+                tokens = {current} + excluded.tokens
             """,
             (fp, period, window_start, tokens),
         )

@@ -1,0 +1,129 @@
+# Dedicated PostgreSQL service for Tusker Gateway shared state.
+# The password is intentionally supplied through the separately-created
+# tusker-gateway-postgres-auth Secret; it is never committed to this repo.
+apiVersion: v1
+kind: Service
+metadata:
+  name: tusker-gateway-postgres
+  namespace: hermes
+  labels:
+    app: tusker-gateway-postgres
+spec:
+  ports:
+  - name: postgres
+    port: 5432
+    targetPort: postgres
+  selector:
+    app: tusker-gateway-postgres
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: tusker-gateway-postgres-data
+  namespace: hermes
+  labels:
+    app: tusker-gateway-postgres
+spec:
+  accessModes:
+  - ReadWriteOnce
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tusker-gateway-postgres
+  namespace: hermes
+  labels:
+    app: tusker-gateway-postgres
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: tusker-gateway-postgres
+  template:
+    metadata:
+      labels:
+        app: tusker-gateway-postgres
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+      - name: postgres
+        image: postgres:16-alpine
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: POSTGRES_DB
+          value: tusker_gateway
+        - name: POSTGRES_USER
+          value: tusker_gateway
+        - name: PGDATA
+          value: /var/lib/postgresql/data/pgdata
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: tusker-gateway-postgres-auth
+              key: POSTGRES_PASSWORD
+        ports:
+        - name: postgres
+          containerPort: 5432
+        volumeMounts:
+        - name: postgres-data
+          mountPath: /var/lib/postgresql/data
+        readinessProbe:
+          exec:
+            command:
+            - sh
+            - -ec
+            - pg_isready -U tusker_gateway -d tusker_gateway
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 12
+        livenessProbe:
+          exec:
+            command:
+            - sh
+            - -ec
+            - pg_isready -U tusker_gateway -d tusker_gateway
+          periodSeconds: 20
+          timeoutSeconds: 3
+          failureThreshold: 6
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+      volumes:
+      - name: postgres-data
+        persistentVolumeClaim:
+          claimName: tusker-gateway-postgres-data
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-tusker-gateway-postgres
+  namespace: hermes
+  labels:
+    app: tusker-gateway-postgres
+spec:
+  podSelector:
+    matchLabels:
+      app: tusker-gateway-postgres
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: tusker-gateway
+    - podSelector:
+        matchLabels:
+          app: tusker-gateway-state-migration
+    ports:
+    - protocol: TCP
+      port: 5432
