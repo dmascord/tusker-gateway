@@ -1,0 +1,28 @@
+# tusker-home RWX PVC — cloned from the live RWO `tusker-home` PVC so the
+# gateway can do a RollingUpdate maxSurge:1/maxUnavailable:0 with both pods
+# mounted on the same data. The clone picks up auth.json, CODEX_CREDENTIALS
+# backups, and SQLite state from the live volume. Requires:
+#   1. A cluster StorageClass named ``longhorn-rwx`` (see longhorn-rwx-sc.yaml)
+#   2. Disk tag "rwx-capable" set on replica-eligible Longhorn disks
+#      (kubectl patch nodes.longhorn.io <node> --type=merge --patch '{"spec":{"disks":{...}}}').
+#   3. Visor cross-node pod networking verified (see docs/zero-downtime-deploys.md).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: tusker-home-rwx
+  namespace: hermes
+  annotations:
+    tusker.gateway.io/derived-from: tusker-home
+spec:
+  accessModes: ["ReadWriteMany"]
+  storageClassName: longhorn-rwx
+  # Clone the live RWO volume: takes a Longhorn snapshot of `tusker-home`
+  # and copies byte-for-byte into the new RWX volume. Requires cluster
+  # side CSI snapshot CRDs (Longhorn ships them).
+  dataSource:
+    kind: PersistentVolumeClaim
+    name: tusker-home
+  resources:
+    requests:
+      # Must be at least the source size; resize after if we need more.
+      storage: 5Gi

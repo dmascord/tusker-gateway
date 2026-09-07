@@ -1,0 +1,35 @@
+# Longhorn RWX StorageClass — used by tusker-home-rwx PVC for the tusker-gateway
+# zero-downtime migration so RollingUpdate maxSurge:1/maxUnavailable:0 can
+# mount a single volume in both the old and new pod during the rollout window.
+#
+# This file documents the contract we assume: a cluster-level
+# StorageClass named ``longhorn-rwx`` with numberOfReplicas >=2 and an
+# allowedTopology that excludes nodes the Longhorn engine cannot reach
+# cross-node (specifically ``visor`` until the Calico repair is verified).
+# If the cluster is missing this SC, see docs/zero-downtime-deploys.md.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: longhorn-rwx
+  annotations:
+    tusker.gateway.io/contract: "Provisioned cluster-side; this manifest only documents it."
+provisioner: driver.longhorn.io
+allowVolumeExpansion: true
+reclaimPolicy: Retain
+volumeBindingMode: Immediate
+# Disk tags must include "rwx-capable" on every replica node (and that
+# tag MUST be absent on the engine host when visor-side networking is
+# suspect). The Patcher applies these labels via ``kubectl patch
+# nodes.longhorn.io``. See docs/zero-downtime-deploys.md for the
+# topology rationale.
+parameters:
+  numberOfReplicas: "2"
+  staleReplicaTimeout: "30"
+  fromBackup: ""
+  fsType: "ext4"
+  dataLocality: "disabled"
+allowedTopologies:
+  - matchLabelExpressions:
+      - key: kubernetes.io/hostname
+        operator: In
+        values: [wyrm, wytch, wyvern, wyzard]
