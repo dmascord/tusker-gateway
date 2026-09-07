@@ -6,11 +6,13 @@ Hermes-compatible auth.json format support.
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
 import hashlib
 import json
 import logging
 import os
 import sys
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -33,6 +35,29 @@ from tusker_gateway.copilot_constants import (
 )
 
 logger = logging.getLogger(__name__)
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback uses process-local lock
+    fcntl = None
+
+_AUTH_FILE_THREAD_LOCK = threading.RLock()
+
+
+@contextmanager
+def _auth_file_lock(path: Path):
+    """Serialize auth-file read/modify/write transactions across workers."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(f".{path.name}.lock")
+    with _AUTH_FILE_THREAD_LOCK, lock_path.open("a+b") as handle:
+        os.chmod(lock_path, 0o600)
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 
@@ -238,6 +263,11 @@ def _append_credential_hermes(path: Path | str, cred: dict[str, Any]) -> None:
     """Append a credential to the Hermes-format auth.json (creates if missing)."""
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
+    with _auth_file_lock(p):
+        _append_credential_hermes_unlocked(p, cred)
+
+
+def _append_credential_hermes_unlocked(p: Path, cred: dict[str, Any]) -> None:
 
     if p.exists():
         try:
@@ -292,6 +322,11 @@ def _write_hermes_doc(path: Path, doc: dict[str, Any]) -> None:
 def _save_pool_hermes(path: Path | str, pool: dict[str, list[dict[str, Any]]]) -> None:
     """Overwrite the credential_pool block of a Hermes-format auth.json."""
     p = Path(path)
+    with _auth_file_lock(p):
+        _save_pool_hermes_unlocked(p, pool)
+
+
+def _save_pool_hermes_unlocked(p: Path, pool: dict[str, list[dict[str, Any]]]) -> None:
     if p.exists():
         try:
             doc = json.loads(p.read_text())
@@ -318,6 +353,15 @@ def save_provider_auth_pool(
     refreshes must use this merge-preserving path.
     """
     p = Path(_resolve_path(path))
+    with _auth_file_lock(p):
+        _save_provider_auth_pool_unlocked(provider, pool, p)
+
+
+def _save_provider_auth_pool_unlocked(
+    provider: str,
+    pool: list[dict[str, Any]],
+    p: Path,
+) -> None:
     if p.exists():
         try:
             doc = json.loads(p.read_text())

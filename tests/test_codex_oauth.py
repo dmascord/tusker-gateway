@@ -4,11 +4,14 @@ from __future__ import annotations
 import json
 import base64
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 from urllib.parse import parse_qs
 
 import pytest
+
+from tusker_gateway import copilot_enroll
 
 
 class _Response:
@@ -44,6 +47,35 @@ class _SequenceSession:
     def post(self, url: str, **kwargs: Any) -> _Response:
         self.calls.append((url, kwargs))
         return next(self.responses)
+
+
+def test_concurrent_provider_pool_saves_preserve_both_updates(tmp_path, monkeypatch):
+    path = tmp_path / "auth.json"
+    original_write = copilot_enroll._write_hermes_doc
+
+    def slow_write(target, document):
+        time.sleep(0.02)
+        original_write(target, document)
+
+    monkeypatch.setattr(copilot_enroll, "_write_hermes_doc", slow_write)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(
+                copilot_enroll.save_provider_auth_pool,
+                provider,
+                [{"provider": provider, "access_token": provider}],
+                path,
+            )
+            for provider in ("openai-codex", "github-copilot")
+        ]
+        for future in futures:
+            future.result()
+
+    document = json.loads(path.read_text())
+    assert set(document["credential_pool"]) == {
+        "openai-codex",
+        "github-copilot",
+    }
 
 
 def _jwt(payload: dict[str, Any]) -> str:

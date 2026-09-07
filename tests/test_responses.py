@@ -28,6 +28,52 @@ async def test_responses_endpoint_string_input(client):
 
 
 @pytest.mark.asyncio
+async def test_responses_rate_limit_blocks_before_provider(app, client):
+    limiter = MagicMock()
+    limiter.check.return_value = MagicMock(
+        allowed=False,
+        retry_after=2.0,
+        reason="limited",
+    )
+    app["ratelimit"] = limiter
+    with patch(
+        "tusker_gateway.endpoints.PassthroughClient.chat",
+        new_callable=AsyncMock,
+    ) as mock_chat:
+        response = await client.post(
+            "/v1/responses",
+            json={"model": "hermes-code", "input": "hi"},
+            headers=HEADERS_AUTH,
+        )
+    assert response.status == 429
+    mock_chat.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_responses_guardrail_blocks_before_provider(app, client):
+    guard = MagicMock()
+    guard.run = AsyncMock(
+        return_value=MagicMock(
+            allowed=False,
+            message="blocked",
+            modified_body=None,
+        )
+    )
+    app["guard_pipeline"] = guard
+    with patch(
+        "tusker_gateway.endpoints.PassthroughClient.chat",
+        new_callable=AsyncMock,
+    ) as mock_chat:
+        response = await client.post(
+            "/v1/responses",
+            json={"model": "hermes-code", "input": "hi"},
+            headers=HEADERS_AUTH,
+        )
+    assert response.status == 400
+    mock_chat.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_responses_endpoint_array_input(client):
     with patch("tusker_gateway.endpoints.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
         mock_chat.return_value = {

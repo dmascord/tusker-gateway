@@ -202,11 +202,13 @@ def attach_request_id_middleware(app: web.Application) -> None:
             raise
 
         if access_log is not None:
+            stream_error = request.get("_stream_error")
             access_log.log(
                 request,
                 response.status,
                 (time.monotonic() - started) * 1000,
                 **_access_log_context(request),
+                **({"error": stream_error} if stream_error else {}),
             )
         # StreamResponse headers are immutable after prepare(). Streaming
         # handlers must set X-Request-ID in their initial headers.

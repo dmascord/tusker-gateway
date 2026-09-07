@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -34,6 +35,7 @@ from tusker_gateway.provider_usage import (
     ProviderUsageDB,
 )
 from tusker_gateway.quality import QualityDB
+from tusker_gateway.sse import split_sse_frame, sse_data_payload
 
 logger = logging.getLogger(__name__)
 
@@ -309,6 +311,27 @@ def _stream_frame_is_ready(frame: bytes) -> bool:
         ):
             return True
     return False
+
+
+def _stream_frame_is_terminal(frame: bytes) -> bool:
+    payload = sse_data_payload(frame)
+    if payload is None:
+        return False
+    if payload.strip() == b"[DONE]":
+        return True
+    try:
+        parsed = json.loads(payload)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return False
+    if not isinstance(parsed, dict):
+        return False
+    if parsed.get("type") in {"response.completed", "response.failed", "response.incomplete"}:
+        return True
+    choices = parsed.get("choices")
+    return isinstance(choices, list) and any(
+        isinstance(choice, dict) and choice.get("finish_reason") is not None
+        for choice in choices
+    )
 
 
 def _upstream_failure_cooldown_seconds(exc: BaseException) -> float | None:
@@ -774,7 +797,10 @@ class CodexTokenRotator:
                 self._auth_file,
             )
         except Exception:
-            pass  # best-effort persistence
+            logger.exception(
+                "oauth credential persistence failed provider=%s",
+                self._provider,
+            )
 
 
 def _chat_content_to_responses(content: Any) -> str | list[dict[str, Any]]:
@@ -1294,19 +1320,6 @@ class PassthroughClient:
                 self._release_capacity(capacity_lease)
                 resp.release()
                 raise
-            # Record quality on streaming success
-            try:
-                latency_ms = (time.monotonic() - start) * 1000
-                await self._record_quality(provider, model, True, latency_ms)
-                self._record_usage(
-                    provider,
-                    model,
-                    success=True,
-                    group=capacity_group,
-                )
-                global_tracker().clear_failures(provider)
-            except Exception:
-                pass
             return self._stream_events(
                 resp,
                 provider=provider,
@@ -1314,6 +1327,8 @@ class PassthroughClient:
                 initial_chunks=prefetched_chunks,
                 stream_iterator=upstream_iterator,
                 capacity_lease=capacity_lease,
+                capacity_group=capacity_group,
+                started=start,
             )
         try:
             async with self._http.request(
@@ -1418,7 +1433,8 @@ class PassthroughClient:
             event_count < _UPSTREAM_PREFETCH_MAX_EVENTS
             and prefetched_bytes < _UPSTREAM_PREFETCH_MAX_BYTES
         ):
-            while b"\n\n" not in pending and prefetched_bytes < _UPSTREAM_PREFETCH_MAX_BYTES:
+            frame, remainder = split_sse_frame(pending)
+            while frame is None and prefetched_bytes < _UPSTREAM_PREFETCH_MAX_BYTES:
                 try:
                     chunk = await upstream_iterator.__anext__()
                 except StopAsyncIteration:
@@ -1429,8 +1445,9 @@ class PassthroughClient:
                 prefetched.append(chunk)
                 prefetched_bytes += len(chunk)
                 pending.extend(chunk)
+                frame, remainder = split_sse_frame(pending)
 
-            if b"\n\n" not in pending:
+            if frame is None:
                 if reached_eof or prefetched_bytes >= _UPSTREAM_PREFETCH_MAX_BYTES:
                     frame = bytes(pending)
                     pending.clear()
@@ -1443,7 +1460,6 @@ class PassthroughClient:
                         raise error
                 break
 
-            frame, remainder = pending.split(b"\n\n", 1)
             pending = bytearray(remainder)
             event_count += 1
             error = _stream_error_from_frame(
@@ -1915,6 +1931,8 @@ class PassthroughClient:
         initial_chunks: list[bytes] | None = None,
         stream_iterator: AsyncIterator[bytes] | None = None,
         capacity_lease: CapacityLease | None = None,
+        capacity_group: str | None = None,
+        started: float | None = None,
     ) -> AsyncIterator[bytes]:
         """Pump an upstream SSE response byte-for-byte to the gateway caller.
 
@@ -1931,30 +1949,66 @@ class PassthroughClient:
         upstream = getattr(resp, "url", None)
         upstream_str = str(upstream) if upstream is not None else (provider or "?")
         status = getattr(resp, "status", None)
+        telemetry_buffer = b""
+        saw_terminal = False
+
+        def observe(chunk: bytes) -> None:
+            nonlocal telemetry_buffer, saw_terminal
+            telemetry_buffer += chunk
+            if len(telemetry_buffer) > _UPSTREAM_PREFETCH_MAX_BYTES:
+                raise ProviderError(
+                    "Provider stream frame exceeds the gateway limit",
+                    code="upstream_stream_invalid",
+                )
+            while True:
+                frame, remainder = split_sse_frame(telemetry_buffer)
+                if frame is None:
+                    break
+                telemetry_buffer = remainder
+                if _stream_frame_is_terminal(frame):
+                    saw_terminal = True
         try:
             for chunk in initial_chunks or []:
+                observe(chunk)
                 yield chunk
             iterator = stream_iterator or resp.content.iter_any()
             async for chunk in iterator:
+                observe(chunk)
                 yield chunk
+            if not saw_terminal:
+                incomplete = ProviderError(
+                    "Provider stream ended without a terminal event",
+                    code="upstream_stream_incomplete",
+                )
+                incomplete.upstream_status = 502
+                raise incomplete
         except aiohttp.ServerDisconnectedError as exc:
             logger.info(
                 "upstream server disconnected mid-stream provider=%s model=%s "
                 "url=%s status=%s err=%s",
                 provider, model, upstream_str, status, exc,
             )
+            if provider and model:
+                await self._record_stream_failure(provider, model, exc, started or time.monotonic())
+            raise
         except aiohttp.ClientConnectionError as exc:
             logger.info(
                 "upstream connection error mid-stream provider=%s model=%s "
                 "url=%s status=%s err=%s",
                 provider, model, upstream_str, status, exc,
             )
+            if provider and model:
+                await self._record_stream_failure(provider, model, exc, started or time.monotonic())
+            raise
         except asyncio.TimeoutError:
             logger.warning(
                 "upstream SSE read timeout (>%ss idle) provider=%s model=%s "
                 "url=%s status=%s",
                 _UPSTREAM_STREAM_SOCK_READ_SECS, provider, model, upstream_str, status,
             )
+            if provider and model:
+                await self._record_stream_failure(provider, model, TimeoutError(), started or time.monotonic())
+            raise
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "upstream SSE read failed provider=%s model=%s "
@@ -1962,6 +2016,15 @@ class PassthroughClient:
                 provider, model, upstream_str, status, exc,
                 exc_info=True,
             )
+            if provider and model:
+                await self._record_stream_failure(provider, model, exc, started or time.monotonic())
+            raise
+        else:
+            if provider and model:
+                latency_ms = (time.monotonic() - (started or time.monotonic())) * 1000
+                await self._record_quality(provider, model, True, latency_ms)
+                self._record_usage(provider, model, success=True, group=capacity_group)
+                global_tracker().clear_failures(provider)
         finally:
             resp.release()
             self._release_capacity(capacity_lease)
@@ -1970,7 +2033,13 @@ class PassthroughClient:
         self, provider: str, model: str, success: bool, latency_ms: float
     ) -> None:
         try:
-            if hasattr(self._quality, "record"):
-                await self._quality.record(provider, model, success, latency_ms)
+            record = getattr(self._quality, "record", None)
+            if record is not None:
+                if inspect.iscoroutinefunction(record):
+                    await record(provider, model, success, latency_ms)
+                else:
+                    await asyncio.to_thread(
+                        record, provider, model, success, latency_ms
+                    )
         except Exception:
             pass  # Quality DB is best-effort

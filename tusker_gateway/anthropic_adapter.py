@@ -34,6 +34,7 @@ from tusker_gateway.errors import BadRequestError, NoHealthyModelsError
 from tusker_gateway.endpoints import (
     _PreparedStream,
     _build_extra_body,
+    _close_async_iterator,
     _complete_chat_result_stream,
     _normalize_stream,
     _prepare_stream_result,
@@ -150,6 +151,9 @@ class _AnthropicSSEStreamAdapter:
 
     def __aiter__(self) -> "_AnthropicSSEStreamAdapter":
         return self
+
+    async def aclose(self) -> None:
+        await _close_async_iterator(self._stream)
 
     async def __anext__(self) -> bytes:
         # Pump the upstream until we have at least one non-empty frame to
@@ -332,10 +336,14 @@ async def _call_with_pool_fallback_anthropic(
                 select_kwargs["allowed_models"] = allowed_models
             if requires_tools:
                 select_kwargs["requires_tools"] = True
-            selected = pool_mgr.select(active_pool, **select_kwargs)
+            selected = await asyncio.to_thread(
+                pool_mgr.select, active_pool, **select_kwargs
+            )
             if breaker is not None and selected is not None:
                 while selected is not None:
-                    decision = breaker.check(selected[0], selected[1])
+                    decision = await asyncio.to_thread(
+                        breaker.check, selected[0], selected[1]
+                    )
                     if decision.allowed:
                         break
                     excluded.add(selected)
@@ -349,7 +357,9 @@ async def _call_with_pool_fallback_anthropic(
                         select_kwargs["allowed_models"] = allowed_models
                     if requires_tools:
                         select_kwargs["requires_tools"] = True
-                    selected = pool_mgr.select(active_pool, **select_kwargs)
+                    selected = await asyncio.to_thread(
+                        pool_mgr.select, active_pool, **select_kwargs
+                    )
             if not selected:
                 if pool_index + 1 < len(pool_names):
                     previous_pool = active_pool
@@ -392,7 +402,7 @@ async def _call_with_pool_fallback_anthropic(
                     tool_choice=body.get("tool_choice"),
                 )
                 if breaker is not None:
-                    breaker.record_success(prov, mdl)
+                    await asyncio.to_thread(breaker.record_success, prov, mdl)
                 if body.get("stream"):
                     if isinstance(result, dict):
                         # Codex/Responses providers are parsed into a complete
@@ -424,11 +434,15 @@ async def _call_with_pool_fallback_anthropic(
             except Exception as exc:
                 _quarantine_tool_response_failure(config, prov, mdl, exc)
                 if breaker is not None:
-                    breaker.record_failure(prov, mdl)
+                    await asyncio.to_thread(breaker.record_failure, prov, mdl)
                 last_error = exc
                 excluded.add(selected)
     elif route.kind == "passthrough" and route.provider and route.model:
-        decision = breaker.check(route.provider, route.model) if breaker else BreakerDecision(allowed=True, state=None)
+        decision = (
+            await asyncio.to_thread(breaker.check, route.provider, route.model)
+            if breaker
+            else BreakerDecision(allowed=True, state=None)
+        )
         if not decision.allowed:
             raise BadRequestError(
                 f"circuit open for {route.provider}/{route.model}: {decision.reason}",
@@ -459,7 +473,9 @@ async def _call_with_pool_fallback_anthropic(
                 tool_choice=body.get("tool_choice"),
             )
             if breaker is not None:
-                breaker.record_success(route.provider, route.model)
+                await asyncio.to_thread(
+                    breaker.record_success, route.provider, route.model
+                )
             if body.get("stream"):
                 if isinstance(result, dict):
                     result = _complete_chat_result_stream(result)
@@ -491,7 +507,9 @@ async def _call_with_pool_fallback_anthropic(
                 exc,
             )
             if breaker is not None:
-                breaker.record_failure(route.provider, route.model)
+                await asyncio.to_thread(
+                    breaker.record_failure, route.provider, route.model
+                )
             raise
     else:
         raise BadRequestError("Unsupported model route", code="unsupported_route")
@@ -515,6 +533,8 @@ async def anthropic_messages_handler(request: web.Request) -> web.Response | web
     target_model = "unknown"
     status = "ok"
     body: dict[str, Any] | None = None
+    budget_recorded = False
+    budget_charged = 0
     openai_body: dict[str, Any] = {}
     api_key = _resolve_api_key(request)
     original_model = ""
@@ -563,7 +583,7 @@ async def anthropic_messages_handler(request: web.Request) -> web.Response | web
             config = request.app["config"]
             client = PassthroughClient(
                 config,
-                QualityDB(config["quality_db_path"]),
+                request.app.get("quality_db") or QualityDB(config["quality_db_path"]),
                 request.app["http_session"],
                 catalog_registry=request.app.get("catalog_registry"),
                 credential_rotators=request.app.get("credential_rotators"),
@@ -574,7 +594,7 @@ async def anthropic_messages_handler(request: web.Request) -> web.Response | web
 
             # Rate-limit pre-flight.
             if ratelimit is not None and api_key:
-                rl = ratelimit.check(api_key)
+                rl = await asyncio.to_thread(ratelimit.check, api_key)
                 if not rl.allowed:
                     status = "ratelimit_blocked"
                     if metrics is not None:
@@ -593,7 +613,7 @@ async def anthropic_messages_handler(request: web.Request) -> web.Response | web
             # Budget pre-flight.
             if budget is not None and api_key:
                 est = _estimated_tokens(openai_body.get("messages", []))
-                decision = budget.check(api_key, pool_name, est)
+                decision = await asyncio.to_thread(budget.check, api_key, pool_name, est)
                 if not decision.allowed:
                     status = "budget_blocked"
                     if metrics is not None:
@@ -621,10 +641,21 @@ async def anthropic_messages_handler(request: web.Request) -> web.Response | web
             if budget is not None and api_key and isinstance(result, dict):
                 usage = result.get("usage") or {}
                 used = int(usage.get("total_tokens") or _estimated_tokens(openai_body.get("messages", [])))
-                budget.record(api_key, pool_name, used)
+                await asyncio.to_thread(budget.record, api_key, pool_name, used)
+                budget_recorded = True
+                budget_charged = used
 
             # Streaming response.
             if body.get("stream"):
+                if budget is not None and api_key and not budget_recorded:
+                    await asyncio.to_thread(
+                        budget.record,
+                        api_key,
+                        pool_name,
+                        _estimated_tokens(openai_body.get("messages", [])),
+                    )
+                    budget_recorded = True
+                    budget_charged = _estimated_tokens(openai_body.get("messages", []))
                 resp = web.StreamResponse(
                     status=200,
                     headers={
@@ -654,21 +685,37 @@ async def anthropic_messages_handler(request: web.Request) -> web.Response | web
                         await resp.write(chunk)
                 except (ConnectionResetError, ConnectionError, BrokenPipeError) as exc:
                     stream_ok = False
+                    status = "client_disconnected"
+                    request["_stream_error"] = status
                     logger.info(
                         "anthropic stream client disconnected provider=%s model=%s err=%s",
                         provider, target_model, exc,
                     )
+                    if budget_recorded and budget is not None and api_key:
+                        await asyncio.to_thread(budget.refund, api_key, pool_name, budget_charged)
+                        budget_recorded = False
                 except asyncio.CancelledError:
                     stream_ok = False
+                    status = "stream_cancelled"
+                    request["_stream_error"] = status
+                    if budget_recorded and budget is not None and api_key:
+                        await asyncio.to_thread(budget.refund, api_key, pool_name, budget_charged)
+                        budget_recorded = False
                     raise
                 except Exception as exc:  # noqa: BLE001
                     stream_ok = False
+                    status = "upstream_stream_error"
+                    request["_stream_error"] = status
                     logger.warning(
                         "anthropic stream pump failed provider=%s model=%s err=%s",
                         provider, target_model, exc,
                         exc_info=True,
                     )
+                    if budget_recorded and budget is not None and api_key:
+                        await asyncio.to_thread(budget.refund, api_key, pool_name, budget_charged)
+                        budget_recorded = False
                 finally:
+                    await _close_async_iterator(result)
                     stop.set()
                     try:
                         await asyncio.wait_for(hb_task, timeout=hb_interval + 1.0)
@@ -701,8 +748,8 @@ async def anthropic_messages_handler(request: web.Request) -> web.Response | web
             logger.warning("anthropic request failed: %s", exc)
             status = "provider_error"
             _emit(status)
-            if budget is not None and api_key and body is not None:
-                budget.refund(api_key, pool_name, _estimated_tokens(openai_body.get("messages", [])))
+            if budget_recorded and budget is not None and api_key and body is not None:
+                await asyncio.to_thread(budget.refund, api_key, pool_name, budget_charged)
             return web.json_response(
                 _anthropic_error(str(exc), type="api_error"),
                 status=502,
