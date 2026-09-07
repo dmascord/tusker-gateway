@@ -40,6 +40,14 @@ RUN mkdir -p /opt/huggingface \
  && python -c "import os; from sentence_transformers import SentenceTransformer; SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2', device='cpu', revision=os.environ['TUSKER_SEMANTIC_CACHE_MODEL_REVISION'])" \
  && chown -R nobody:nogroup /opt/huggingface
 
+# pip and the model prewarm can still emit bytecode despite the environment
+# guard above. Remove it before the final image commit so repeated Buildah
+# builds do not retain a needless layer and exhaust the visor root volume.
+RUN find /opt/tusker-gateway /usr/local/lib/python3.11 \
+      -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true \
+ && find /opt/tusker-gateway /usr/local/lib/python3.11 \
+      -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete 2>/dev/null || true
+
 # Persistent data (quality DB, cooldowns, OAuth pool)
 RUN mkdir -p /home/tusker/.hermes && chown -R nobody:nogroup /home/tusker
 ENV HOME=/home/tusker \

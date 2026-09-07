@@ -56,8 +56,22 @@ kubectl -n "${NAMESPACE}" rollout status deployment/"${DEPLOY}" --timeout=180s
 # --- Smoke test ---
 echo "--- Smoke test ---"
 kubectl -n "${NAMESPACE}" get pods -o wide | grep -E 'tusker-gateway|NAME'
-curl -sS -o /dev/null -w "health http=%{http_code} time=%{time_total}s\n" "https://ai.tusker.net.au/health"
-curl -sS -o /dev/null -w "ready  http=%{http_code} time=%{time_total}s\n" "https://ai.tusker.net.au/ready"
-curl -sS "https://ai.tusker.net.au/ready" && echo
+
+smoke_check() {
+  local label="$1"
+  local path="$2"
+  # Recreate leaves a short propagation window between the new pod becoming
+  # Ready and the public ingress receiving its EndpointSlice update. Retry
+  # transient 503/no-endpoint responses instead of reporting a false failure.
+  curl --fail --retry 24 --retry-delay 5 --retry-all-errors \
+    --connect-timeout 5 --max-time 15 -sS \
+    -o /dev/null -w "${label} http=%{http_code} time=%{time_total}s\\n" \
+    "https://ai.tusker.net.au${path}"
+}
+
+smoke_check health /health
+smoke_check ready /ready
+curl --retry 24 --retry-delay 5 --retry-all-errors \
+  --connect-timeout 5 --max-time 15 -sS "https://ai.tusker.net.au/ready" && echo
 
 echo "=== Done ==="

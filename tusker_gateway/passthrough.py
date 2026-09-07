@@ -325,13 +325,34 @@ def _stream_frame_is_terminal(frame: bytes) -> bool:
         return False
     if not isinstance(parsed, dict):
         return False
-    if parsed.get("type") in {"response.completed", "response.failed", "response.incomplete"}:
+    # Only ``response.completed`` indicates a successful terminal. ``response.failed``/``response.incomplete`` are surfaced as ProviderError by ``_stream_events`` rather than treated as success here.
+    if parsed.get("type") == "response.completed":
         return True
     choices = parsed.get("choices")
     return isinstance(choices, list) and any(
         isinstance(choice, dict) and choice.get("finish_reason") is not None
         for choice in choices
     )
+
+def _stream_frame_is_failure(frame: bytes) -> str | None:
+    """Return the terminal type when a provider streams ``response.failed``/``response.incomplete``.
+
+    These frames must NOT be treated as a successful terminal event —
+    they indicate the upstream refused or terminated mid-stream. Returning
+    the type allows callers to raise a precise ``ProviderError`` and
+    trigger cooldown/quality recording on the failure path.
+    """
+    payload = sse_data_payload(frame)
+    if payload is None:
+        return None
+    try:
+        parsed = json.loads(payload)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    event_type = parsed.get("type")
+    return event_type if event_type in {"response.failed", "response.incomplete"} else None
 
 
 def _upstream_failure_cooldown_seconds(exc: BaseException) -> float | None:
@@ -1965,6 +1986,14 @@ class PassthroughClient:
                 if frame is None:
                     break
                 telemetry_buffer = remainder
+                error_type = _stream_frame_is_failure(frame)
+                if error_type is not None:
+                    failure = ProviderError(
+                        f"Provider streamed terminal {error_type}",
+                        code="upstream_stream_invalid",
+                    )
+                    failure.upstream_status = 502
+                    raise failure
                 if _stream_frame_is_terminal(frame):
                     saw_terminal = True
         try:

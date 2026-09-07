@@ -163,19 +163,54 @@ def ready_handler(request: web.Request) -> web.Response:
 
     live_manager = request.app.get("pool_manager")
     if live_manager is not None and hasattr(live_manager, "readiness_status"):
-        pool_health, empty_pools = live_manager.readiness_status()
-        if empty_pools:
-            logger.warning("readiness failed: pools with no selectable candidates: %s", empty_pools)
+        # Credential-aware status: OAuth/Codex providers with no rotator are
+        # not considered "selectable" and surface as empty in ``empty_pools``.
+        pool_health, empty_pools = live_manager.readiness_status(
+            credential_sizes=_credential_pool_sizes(request, cfg),
+        )
+        # Only the primary route must be eligible. Optional pools may be empty
+        # without taking the gateway out of service — they are reported as
+        # degraded so operators can see why.
+        primary_pool = "code" if "code" in pools else next(iter(pools), None)
+        primary_route: list[str] = []
+        if primary_pool is not None:
+            primary_route.append(primary_pool)
+            primary_route.extend(
+                _pool_fallbacks(primary_pool, pools[primary_pool], live_manager)
+            )
+        primary_route = [name for name in primary_route if name in pool_health]
+        primary_usable = any(
+            pool_health.get(name, {}).get("selectable", 0) > 0
+            for name in primary_route
+        )
+        if not primary_route or not primary_usable:
+            logger.warning(
+                "readiness failed: primary route has no usable candidates "
+                "primary=%s route=%s empty_pools=%s",
+                primary_pool,
+                primary_route,
+                empty_pools,
+            )
             return web.json_response(
                 {
                     "status": "error",
-                    "reason": "pools with no selectable candidates",
+                    "reason": "no usable candidates for primary route",
+                    "primary_pool": primary_pool,
+                    "primary_route": primary_route,
                     "empty_pools": empty_pools,
                     "pools": pool_health,
                 },
                 status=503,
             )
-        return web.json_response({"status": "ok", "pools": pool_health})
+        return web.json_response(
+            {
+                "status": "ok",
+                "primary_pool": primary_pool,
+                "primary_route": primary_route,
+                "degraded_pools": empty_pools,
+                "pools": pool_health,
+            }
+        )
 
     # Validate that every pool has at least one candidate whose provider is known.
     from tusker_gateway.config import DEFAULT_PROVIDER_REGISTRY

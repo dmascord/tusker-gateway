@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import threading
 import random
 import re
 import time
@@ -204,6 +205,24 @@ class ModelSpec:
         )
 
 
+
+def _spec_has_credentials(
+    spec: "ModelSpec",
+    credential_sizes: dict[str, int] | None,
+) -> bool:
+    """Return ``True`` if ``spec`` can authenticate given ``credential_sizes``.
+
+    OAuth and Codex providers require at least one credential in the rotator
+    to authenticate requests. When ``credential_sizes`` is ``None`` (test
+    apps / bare executors without rotators) we cannot prove the provider is
+    unkeyed, so we treat the spec as eligible and let the runtime path
+    surface the failure at request time.
+    """
+    if credential_sizes is None:
+        return True
+    return int(credential_sizes.get(str(spec.provider).strip().lower().replace("_", "-"), 0)) > 0
+
+
 @dataclass
 class PoolManager:
     """Central pool manager: models, selection, stickiness."""
@@ -239,6 +258,13 @@ class PoolManager:
     _disabled_providers: frozenset[str] = field(
         init=False, default_factory=frozenset
     )
+    # Lock protecting mutable selection state: ``_round_robin``,
+    # ``_stickiness``, and ``_stickiness_expires``. ``select()`` is invoked
+    # from request handlers via ``asyncio.to_thread``, so concurrent selects
+    # can race on these dicts without per-instance serialisation.
+    _selection_lock: threading.Lock = field(
+        init=False, default_factory=threading.Lock
+    )
     STICKINESS_TTL = 3600.0  # 1 hour
     STICKINESS_MAX_ENTRIES = 10_000
 
@@ -269,6 +295,17 @@ class PoolManager:
         if isinstance(endpoint, dict):
             return bool(endpoint.get("zdr_ok", False))
         return bool(getattr(endpoint, "zdr_ok", False))
+
+    def _provider_kind(self, provider: str) -> str:
+        """Return the configured auth kind (e.g. ``"oauth"``) for the provider."""
+        endpoint = self._providers.get(provider)
+        if endpoint is None:
+            return ""
+        if isinstance(endpoint, dict):
+            return str(endpoint.get("kind", endpoint.get("auth_type", "bearer"))).lower()
+        return str(
+            getattr(endpoint, "kind", getattr(endpoint, "auth_type", "bearer"))
+        ).lower()
 
     def _provider_is_disabled(self, provider: str) -> bool:
         """Return whether operator policy disables this provider for pools."""
@@ -1175,9 +1212,14 @@ class PoolManager:
             weights = [c.weight for c in tier_candidates]
             # Check if all weights are equal (within floating-point tolerance)
             if max(weights) - min(weights) <= 1e-12:
-                offset = self._round_robin.get(pool_name, 0) % len(tier_candidates)
+                # Read/advance the round-robin counter under the selection
+                # lock so concurrent ``select()`` calls (via
+                # ``asyncio.to_thread``) cannot read the same offset and pick
+                # the same candidate.
+                with self._selection_lock:
+                    offset = self._round_robin.get(pool_name, 0) % len(tier_candidates)
+                    self._round_robin[pool_name] = offset + 1
                 selected = tier_candidates[offset]
-                self._round_robin[pool_name] = offset + 1
             else:
                 # Varied weights: use weighted random selection
                 total_weight = sum(weights)
@@ -1193,7 +1235,8 @@ class PoolManager:
 
         if session_id:
             key = (session_id, pool_name)
-            self._remember_stickiness(key, result)
+            with self._selection_lock:
+                self._remember_stickiness(key, result)
         return result
 
     def status(self) -> dict[str, Any]:
@@ -1227,8 +1270,17 @@ class PoolManager:
             }
         return result
 
-    def readiness_status(self) -> tuple[dict[str, Any], list[str]]:
-        """Report durable request-time eligibility without transient cooldowns."""
+    def readiness_status(
+        self,
+        credential_sizes: dict[str, int] | None = None,
+    ) -> tuple[dict[str, Any], list[str]]:
+        """Report durable request-time eligibility without transient cooldowns.
+
+        ``credential_sizes`` maps provider name -> number of credentials available
+        (e.g. OAuth/Codex token rotator size). OAuth- and Codex-kind providers
+        without credentials cannot authenticate, so those specs are filtered out
+        of the ``selectable`` count even when the provider registry knows them.
+        """
         health: dict[str, Any] = {}
         empty: list[str] = []
         for name, specs in self.models.items():
@@ -1240,6 +1292,10 @@ class PoolManager:
                 and is_general_chat_model(spec.provider, spec.model)
                 and (pool is None or not pool.zdr or spec.zdr_ok)
                 and (self.pool_keeps_heavyweight(name) or not spec.heavyweight)
+                and (
+                    self._provider_kind(spec.provider) not in {"oauth", "codex"}
+                    or _spec_has_credentials(spec, credential_sizes)
+                )
             ]
             health[name] = {
                 "configured": len(specs) + len(self.unkeyed.get(name, ())),

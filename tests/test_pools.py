@@ -846,3 +846,142 @@ def test_static_xiaomi_privacy_entry_remains_operator_curated():
         assert [(spec.provider, spec.model) for spec in manager.models["privacy"]] == [
             ("xiaomi", "mimo-v2.5-pro"),
         ]
+
+
+def test_readiness_reports_oauth_pool_with_empty_rotator_as_empty():
+    """An OAuth-only pool with an empty credential rotator must be unselectable.
+
+    Pre-fix regression: ``readiness_status`` did not check credential sizes,
+    so OAuth providers with an empty rotator were counted as ``selectable``
+    even though requests cannot authenticate. The preflight would succeed
+    and the first request would surface a 401/503 from the provider. This
+    test wires a custom providers registry so the OAuth kind is visible to
+    PoolManager and asserts the spec is filtered out when no credentials
+    exist.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = PoolManager({
+            "pools": {
+                "code": PoolConfig(
+                    name="code",
+                    models=[{"provider": "openai-codex", "model": "gpt-5"}],
+                ),
+            },
+            "providers": {
+                "openai-codex": {"kind": "oauth", "zdr_ok": False},
+            },
+            "quality_db_path": os.path.join(tmpdir, "quality.db"),
+            "provider_api_keys": {},
+        })
+        # Without credential_sizes, OAuth providers with no registry keys are
+        # still considered eligible — useful for bare test executors. With an
+        # empty credential_sizes map they are filtered out.
+        health, empty = manager.readiness_status(credential_sizes={})
+        assert "code" in empty
+        assert health["code"]["selectable"] == 0
+        assert health["code"]["configured"] >= 1
+
+
+def test_readiness_counts_oauth_pool_with_credential_as_selectable():
+    """An OAuth pool backed by >=1 credential is selectable. The presence of a
+    credential in the rotator map should be sufficient for preflight success.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = PoolManager({
+            "pools": {
+                "code": PoolConfig(
+                    name="code",
+                    models=[{"provider": "openai-codex", "model": "gpt-5"}],
+                ),
+            },
+            "providers": {
+                "openai-codex": {"kind": "oauth", "zdr_ok": False},
+            },
+            "quality_db_path": os.path.join(tmpdir, "quality.db"),
+            "provider_api_keys": {},
+        })
+        health, empty = manager.readiness_status(
+            credential_sizes={"openai-codex": 3},
+        )
+        assert "code" not in empty
+        assert health["code"]["selectable"] == 1
+
+
+def test_concurrent_selects_distribute_without_dropping_increments():
+    """Concurrent ``select()`` calls must distribute even without lost increments.
+
+    Pre-fix regression: ``_round_robin`` was an unguarded dict mutated under
+    ``asyncio.to_thread`` (concurrent thread workers), so N threads could all
+    read the same offset before any of them wrote back ``offset + 1``. The
+    round-robin counter would advance only by 1 instead of N and the same
+    candidate would be picked repeatedly, breaking equal-weight distribution.
+    The lock-guarded critical region keeps offsets unique per thread.
+    """
+    import threading
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = PoolManager({
+            "pools": {
+                "test": PoolConfig(
+                    name="test",
+                    models=[
+                        {"provider": "groq", "model": "m1"},
+                        {"provider": "openai", "model": "m2"},
+                        {"provider": "openai", "model": "m3"},
+                    ],
+                ),
+            },
+            "quality_db_path": os.path.join(tmpdir, "quality.db"),
+            "provider_api_keys": {"groq": "k", "openai": "k"},
+        })
+
+        results: list[tuple[str, str]] = []
+        results_lock = threading.Lock()
+        error: list[BaseException] = []
+
+        def worker() -> None:
+            try:
+                chosen = manager.select("test")
+                if chosen is None:
+                    error.append(RuntimeError("select() returned None"))
+                    return
+                with results_lock:
+                    results.append(chosen)
+            except BaseException as exc:  # noqa: BLE001
+                error.append(exc)
+
+        n_workers = 50
+        threads = [threading.Thread(target=worker) for _ in range(n_workers)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert not error, f"workers raised: {error[:3]}"
+        assert len(results) == n_workers
+        # Counter is an offset that cycles 0..N-1 under % len(tier). With
+        # N threads each writing ``offset + 1`` and the lock serialising
+        # those writes, the post-call counter must be the
+        # ``n_workers mod len(tier)`` value but every observed offset has
+        # been claimed exactly once across workers. Pre-fix regression:
+        # the counter would advance by a single increment for 50 threads
+        # (no lock) so all but one worker saw offset 0 and picked the
+        # same candidate.
+        assert manager._round_robin["test"] == n_workers % 3, (
+            "round-robin counter must match n_workers mod len(tier); "
+            f"got {manager._round_robin.get('test')!r} for {n_workers} selects / 3-tier pool"
+        )
+        # Distribution check: a perfectly even round-robin over 3 candidates
+        # with 50 workers can vary by ±1. Heavy skew (one model picked by
+        # > 50% of workers) would indicate lost offset increments.
+        from collections import Counter
+        counts = Counter(model for _, model in results)
+        worst = max(counts.values())
+        assert worst <= (n_workers // 2) + 1, (
+            f"distribution skew detected: {counts!r} — round-robin offsets were lost"
+        )
+        # Equal weights -> each candidate must be served roughly N/3 times
+        # within a 1-element tolerance window. The exact distribution is
+        # (m1, m2, m3) interleaved: any distribution where one candidate
+        # was chosen more than ceil(N/3) * 2 times would indicate lost
+        # increments.
