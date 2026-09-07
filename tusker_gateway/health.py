@@ -48,6 +48,22 @@ def ready_handler(request: web.Request) -> web.Response:
         logger.warning('readiness failed: no pools configured')
         return web.json_response({"status": "error", "reason": "no pools configured"}, status=503)
 
+    live_manager = request.app.get("pool_manager")
+    if live_manager is not None and hasattr(live_manager, "readiness_status"):
+        pool_health, empty_pools = live_manager.readiness_status()
+        if empty_pools:
+            logger.warning("readiness failed: pools with no selectable candidates: %s", empty_pools)
+            return web.json_response(
+                {
+                    "status": "error",
+                    "reason": "pools with no selectable candidates",
+                    "empty_pools": empty_pools,
+                    "pools": pool_health,
+                },
+                status=503,
+            )
+        return web.json_response({"status": "ok", "pools": pool_health})
+
     # Validate that every pool has at least one candidate whose provider is known.
     from tusker_gateway.config import DEFAULT_PROVIDER_REGISTRY
     from tusker_gateway.pools import ModelSpec

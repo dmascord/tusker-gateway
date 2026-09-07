@@ -8,6 +8,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import secrets
 import sqlite3
 import time
 from typing import Any, Mapping
@@ -33,6 +34,7 @@ class IdempotencyConfig:
 @dataclass(frozen=True)
 class Claim:
     state: str
+    lease_token: str | None = None
     status: int | None = None
     body: bytes | None = None
     content_type: str | None = None
@@ -105,6 +107,11 @@ class IdempotencyStore:
                 )
                 """
             )
+            columns = {
+                str(row[1]) for row in conn.execute("PRAGMA table_info(idempotency_records)")
+            }
+            if "lease_token" not in columns:
+                conn.execute("ALTER TABLE idempotency_records ADD COLUMN lease_token TEXT")
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_idempotency_expires
@@ -127,16 +134,18 @@ class IdempotencyStore:
                 (record_key,),
             ).fetchone()
             if row is None:
+                lease_token = secrets.token_hex(16)
                 conn.execute(
                     """
                     INSERT INTO idempotency_records
-                    (record_key, request_hash, state, locked_until, expires_at,
+                    (record_key, request_hash, state, lease_token, locked_until, expires_at,
                      created_at, updated_at)
-                    VALUES (?, ?, 'processing', ?, ?, ?, ?)
+                    VALUES (?, ?, 'processing', ?, ?, ?, ?, ?)
                     """,
                     (
                         record_key,
                         request_hash,
+                        lease_token,
                         now + self.config.lock_secs,
                         now + self.config.ttl_secs,
                         now,
@@ -144,7 +153,7 @@ class IdempotencyStore:
                     ),
                 )
                 conn.commit()
-                return Claim("claimed")
+                return Claim("claimed", lease_token=lease_token)
 
             stored_hash, state, status, body, content_type, locked_until = row
             if stored_hash != request_hash:
@@ -162,16 +171,17 @@ class IdempotencyStore:
                 conn.commit()
                 return Claim("in_progress")
 
+            lease_token = secrets.token_hex(16)
             conn.execute(
                 """
                 UPDATE idempotency_records
-                SET locked_until = ?, expires_at = ?, updated_at = ?
+                SET lease_token = ?, locked_until = ?, expires_at = ?, updated_at = ?
                 WHERE record_key = ?
                 """,
-                (now + self.config.lock_secs, now + self.config.ttl_secs, now, record_key),
+                (lease_token, now + self.config.lock_secs, now + self.config.ttl_secs, now, record_key),
             )
             conn.commit()
-            return Claim("claimed")
+            return Claim("claimed", lease_token=lease_token)
         except Exception:
             conn.rollback()
             raise
@@ -182,31 +192,57 @@ class IdempotencyStore:
         self,
         record_key: str,
         request_hash: str,
+        lease_token: str,
         status: int,
         body: bytes,
         content_type: str | None,
-    ) -> None:
+    ) -> bool:
         now = time.time()
         with self._connect() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 """
                 UPDATE idempotency_records
                 SET state = 'complete', response_status = ?, response_body = ?,
                     content_type = ?, locked_until = 0, updated_at = ?
-                WHERE record_key = ? AND request_hash = ? AND state = 'processing'
+                WHERE record_key = ? AND request_hash = ? AND lease_token = ?
+                  AND state = 'processing'
                 """,
-                (status, body, content_type, now, record_key, request_hash),
+                (status, body, content_type, now, record_key, request_hash, lease_token),
             )
+            return cursor.rowcount == 1
 
-    def abandon(self, record_key: str, request_hash: str) -> None:
+    def abandon(self, record_key: str, request_hash: str, lease_token: str) -> bool:
         with self._connect() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 """
                 DELETE FROM idempotency_records
-                WHERE record_key = ? AND request_hash = ? AND state = 'processing'
+                WHERE record_key = ? AND request_hash = ? AND lease_token = ?
+                  AND state = 'processing'
                 """,
-                (record_key, request_hash),
+                (record_key, request_hash, lease_token),
             )
+            return cursor.rowcount == 1
+
+    def renew(self, record_key: str, request_hash: str, lease_token: str) -> bool:
+        now = time.time()
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE idempotency_records
+                SET locked_until = ?, expires_at = ?, updated_at = ?
+                WHERE record_key = ? AND request_hash = ? AND lease_token = ?
+                  AND state = 'processing'
+                """,
+                (
+                    now + self.config.lock_secs,
+                    now + self.config.ttl_secs,
+                    now,
+                    record_key,
+                    request_hash,
+                    lease_token,
+                ),
+            )
+            return cursor.rowcount == 1
 
 
 def _canonical_request_hash(request: web.Request, body: bytes) -> str:
@@ -249,11 +285,12 @@ async def _abandon_safely(
     store: IdempotencyStore,
     record_key: str,
     request_hash: str,
+    lease_token: str,
 ) -> None:
     """Release a reservation without replacing the request's real failure."""
     try:
         await asyncio.shield(
-            asyncio.to_thread(store.abandon, record_key, request_hash)
+            asyncio.to_thread(store.abandon, record_key, request_hash, lease_token)
         )
     except (OSError, sqlite3.Error):
         logger.exception("could not release idempotency reservation")
@@ -345,15 +382,63 @@ def attach_idempotency_middleware(
                 headers=headers,
             )
 
+        lease_token = claim.lease_token
+        if not lease_token:
+            return web.json_response(
+                openai_error(
+                    "Idempotency lease could not be established",
+                    code="idempotency_unavailable",
+                    error_type="server_error",
+                ),
+                status=503,
+            )
+        renewal_stop = asyncio.Event()
+        lease_lost = asyncio.Event()
+
+        async def renew_lease() -> None:
+            interval = max(0.25, min(store.config.lock_secs / 3, 30.0))
+            while not renewal_stop.is_set():
+                try:
+                    await asyncio.wait_for(renewal_stop.wait(), timeout=interval)
+                    return
+                except asyncio.TimeoutError:
+                    pass
+                try:
+                    renewed = await asyncio.to_thread(
+                        store.renew, record_key, request_hash, lease_token
+                    )
+                except (OSError, sqlite3.Error):
+                    logger.exception("could not renew idempotency lease")
+                    renewed = False
+                if not renewed:
+                    lease_lost.set()
+                    return
+
+        renewal_task = asyncio.create_task(renew_lease(), name="idempotency-renewal")
+
         try:
             set_access_log_context(request, cache_status="idempotency_miss")
             response = await handler(request)
         except asyncio.CancelledError:
-            await _abandon_safely(store, record_key, request_hash)
+            await _abandon_safely(store, record_key, request_hash, lease_token)
             raise
         except Exception:
-            await _abandon_safely(store, record_key, request_hash)
+            await _abandon_safely(store, record_key, request_hash, lease_token)
             raise
+        finally:
+            renewal_stop.set()
+            await renewal_task
+
+        if lease_lost.is_set():
+            return web.json_response(
+                openai_error(
+                    "Idempotency lease was lost while processing the request",
+                    code="idempotency_lease_lost",
+                    error_type="server_error",
+                ),
+                status=409,
+                headers={"Idempotency-Key": key, "Retry-After": "1"},
+            )
 
         response_body = response.body if isinstance(response, web.Response) else None
         if (
@@ -363,10 +448,11 @@ def attach_idempotency_middleware(
         ):
             body_bytes = bytes(response_body)
             try:
-                await asyncio.to_thread(
+                completed = await asyncio.to_thread(
                     store.complete,
                     record_key,
                     request_hash,
+                    lease_token,
                     response.status,
                     body_bytes,
                     response.headers.get("Content-Type"),
@@ -381,11 +467,21 @@ def attach_idempotency_middleware(
                     status=503,
                     headers={"Idempotency-Key": key, "Retry-After": str(store.config.lock_secs)},
                 )
+            if not completed:
+                return web.json_response(
+                    openai_error(
+                        "Idempotency lease was lost before the response was persisted",
+                        code="idempotency_lease_lost",
+                        error_type="server_error",
+                    ),
+                    status=409,
+                    headers={"Idempotency-Key": key, "Retry-After": "1"},
+                )
             if not response.prepared:
                 response.headers["Idempotency-Key"] = key
                 response.headers["Idempotency-Replayed"] = "false"
         else:
-            await _abandon_safely(store, record_key, request_hash)
+            await _abandon_safely(store, record_key, request_hash, lease_token)
         return response
 
     app.middlewares.append(idempotency_middleware)

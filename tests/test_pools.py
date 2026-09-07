@@ -105,6 +105,49 @@ def test_pool_selection_logic():
         assert sel2 == sel3, f"stickiness broken: {sel2} vs {sel3}"
 
 
+def test_stickiness_expires_and_is_cardinality_bounded():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = PoolManager({
+            "pools": {
+                "test": PoolConfig(
+                    name="test",
+                    models=[
+                        {"provider": "groq", "model": "m1"},
+                        {"provider": "openai", "model": "m2"},
+                    ],
+                )
+            },
+            "quality_db_path": os.path.join(tmpdir, "quality.db"),
+            "provider_api_keys": {"groq": "k", "openai": "k"},
+        })
+        manager.STICKINESS_MAX_ENTRIES = 2
+        first = manager.select("test", session_id="expired")
+        manager._stickiness_expires[("expired", "test")] = 0
+        second = manager.select("test", session_id="expired")
+        assert second != first
+        manager.select("test", session_id="two")
+        manager.select("test", session_id="three")
+        assert len(manager._stickiness) <= 2
+        assert set(manager._stickiness) == set(manager._stickiness_expires)
+
+
+def test_readiness_reports_pool_with_only_unkeyed_routes_as_empty():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = PoolManager({
+            "pools": {
+                "code": PoolConfig(
+                    name="code",
+                    models=[{"provider": "openai", "model": "gpt-4o"}],
+                )
+            },
+            "quality_db_path": os.path.join(tmpdir, "quality.db"),
+            "provider_api_keys": {},
+        })
+        health, empty = manager.readiness_status()
+        assert empty == ["code"]
+        assert health["code"] == {"configured": 1, "selectable": 0, "unkeyed": 1}
+
+
 def test_equal_weight_candidates_round_robin():
     with tempfile.TemporaryDirectory() as tmpdir:
         manager = PoolManager({

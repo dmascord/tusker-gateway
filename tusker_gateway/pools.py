@@ -234,11 +234,32 @@ class PoolManager:
     # stop being free).
     _original_static: dict[str, frozenset[tuple[str, str]]] = field(default_factory=dict)
     _stickiness: dict[tuple[str, str], tuple[str, str]] = field(default_factory=dict)
+    _stickiness_expires: dict[tuple[str, str], float] = field(default_factory=dict)
     _round_robin: dict[str, int] = field(default_factory=dict)
     _disabled_providers: frozenset[str] = field(
         init=False, default_factory=frozenset
     )
     STICKINESS_TTL = 3600.0  # 1 hour
+    STICKINESS_MAX_ENTRIES = 10_000
+
+    def _drop_stickiness(self, key: tuple[str, str]) -> None:
+        self._stickiness.pop(key, None)
+        self._stickiness_expires.pop(key, None)
+
+    def _prune_stickiness(self, now: float) -> None:
+        for key, expires_at in list(self._stickiness_expires.items()):
+            if expires_at <= now:
+                self._drop_stickiness(key)
+        while len(self._stickiness) >= self.STICKINESS_MAX_ENTRIES:
+            self._drop_stickiness(next(iter(self._stickiness)))
+
+    def _remember_stickiness(
+        self, key: tuple[str, str], result: tuple[str, str]
+    ) -> None:
+        now = time.monotonic()
+        self._prune_stickiness(now)
+        self._stickiness[key] = result
+        self._stickiness_expires[key] = now + self.STICKINESS_TTL
 
     def _provider_zdr_ok(self, provider: str) -> bool:
         """Return the configured privacy/ZDR policy for one provider."""
@@ -917,23 +938,29 @@ class PoolManager:
         # 1. Session stickiness
         if session_id:
             key = (session_id, pool_name)
+            self._prune_stickiness(time.monotonic())
+            if key in self._stickiness:
+                if self._stickiness_expires.get(key, 0) <= time.monotonic():
+                    self._drop_stickiness(key)
+                else:
+                    prev = self._stickiness[key]
             if key in self._stickiness:
                 prev = self._stickiness[key]
                 for s in specs:
                     if (s.provider, s.model) == prev:
                         if (s.provider, s.model) in excluded:
-                            self._stickiness.pop(key, None)
+                            self._drop_stickiness(key)
                             break
                         if not is_general_chat_model(s.provider, s.model):
-                            self._stickiness.pop(key, None)
+                            self._drop_stickiness(key)
                             break
                         pool_config = self.pools.get(pool_name)
                         if pool_config and pool_config.zdr and not s.zdr_ok:
-                            self._stickiness.pop(key, None)
+                            self._drop_stickiness(key)
                             break
                         if context_tokens > 0 and s.context_window < context_tokens:
                             # Context doesn't fit; clear stickiness
-                            self._stickiness.pop(key, None)
+                            self._drop_stickiness(key)
                             break
                         modalities, tool_support = self._model_capabilities(
                             s, capability_cache
@@ -941,12 +968,12 @@ class PoolManager:
                         if not self._input_modalities_allowed(
                             s, required_modalities, modalities
                         ):
-                            self._stickiness.pop(key, None)
+                            self._drop_stickiness(key)
                             break
                         if requires_tools and tool_support is False and not (
                             allow_tool_compatibility_fallback and not s.auto_discovered
                         ):
-                            self._stickiness.pop(key, None)
+                            self._drop_stickiness(key)
                             break
                         if requires_tools and not self._tool_capability_allowed(
                             s,
@@ -954,7 +981,7 @@ class PoolManager:
                             allow_structured_tool_fallback=allow_structured_tool_fallback,
                             allow_tool_compatibility_fallback=allow_tool_compatibility_fallback,
                         ):
-                            self._stickiness.pop(key, None)
+                            self._drop_stickiness(key)
                             break
                         sticky_cooldown = (
                             self._cooldowns.is_capacity_cooldown(s.provider, s.model)
@@ -962,12 +989,12 @@ class PoolManager:
                             else self._cooldowns.is_cooldown(s.provider, s.model)
                         )
                         if sticky_cooldown:
-                            self._stickiness.pop(key, None)
+                            self._drop_stickiness(key)
                             break
                         # Don't return a sticky heavyweight if the pool
                         # no longer allows it (config changed mid-session).
                         if not heavyweight_ok and s.heavyweight:
-                            self._stickiness.pop(key, None)
+                            self._drop_stickiness(key)
                             break
                         return prev
         # 2. Filter candidates by context window, cooldown, and request-level exclusions
@@ -1129,7 +1156,7 @@ class PoolManager:
             result = (candidates[0].provider, candidates[0].model)
             if session_id:
                 key = (session_id, pool_name)
-                self._stickiness[key] = result
+                self._remember_stickiness(key, result)
             return result
 
         # Group candidates by quality tier (all with same score as the top)
@@ -1166,7 +1193,7 @@ class PoolManager:
 
         if session_id:
             key = (session_id, pool_name)
-            self._stickiness[key] = result
+            self._remember_stickiness(key, result)
         return result
 
     def status(self) -> dict[str, Any]:
@@ -1199,6 +1226,29 @@ class PoolManager:
                 ],
             }
         return result
+
+    def readiness_status(self) -> tuple[dict[str, Any], list[str]]:
+        """Report durable request-time eligibility without transient cooldowns."""
+        health: dict[str, Any] = {}
+        empty: list[str] = []
+        for name, specs in self.models.items():
+            pool = self.pools.get(name)
+            eligible = [
+                spec
+                for spec in specs
+                if spec.provider in self._providers
+                and is_general_chat_model(spec.provider, spec.model)
+                and (pool is None or not pool.zdr or spec.zdr_ok)
+                and (self.pool_keeps_heavyweight(name) or not spec.heavyweight)
+            ]
+            health[name] = {
+                "configured": len(specs) + len(self.unkeyed.get(name, ())),
+                "selectable": len(eligible),
+                "unkeyed": len(self.unkeyed.get(name, ())),
+            }
+            if not eligible:
+                empty.append(name)
+        return health, empty
 
     def _status_candidate(
         self,

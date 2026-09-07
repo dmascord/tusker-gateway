@@ -489,14 +489,47 @@ class TestIdempotency:
         store = IdempotencyStore(
             IdempotencyConfig(enabled=True, path=str(tmp_path / "idempotency.db"))
         )
-        assert store.claim("record", "hash-a").state == "claimed"
+        owner = store.claim("record", "hash-a")
+        assert owner.state == "claimed"
         assert store.claim("record", "hash-a").state == "in_progress"
         assert store.claim("record", "hash-b").state == "conflict"
-        store.complete("record", "hash-a", 201, b'{"ok":true}', "application/json")
+        assert store.complete(
+            "record",
+            "hash-a",
+            owner.lease_token,
+            201,
+            b'{"ok":true}',
+            "application/json",
+        )
         replay = store.claim("record", "hash-a")
         assert replay.state == "replay"
         assert replay.status == 201
         assert replay.body == b'{"ok":true}'
+
+    def test_stale_lease_cannot_complete_or_abandon_new_owner(self, tmp_path):
+        store = IdempotencyStore(
+            IdempotencyConfig(
+                enabled=True,
+                path=str(tmp_path / "idempotency.db"),
+                lock_secs=1,
+            )
+        )
+        stale = store.claim("record", "hash-a")
+        with store._connect() as conn:
+            conn.execute(
+                "UPDATE idempotency_records SET locked_until = 0 WHERE record_key = ?",
+                ("record",),
+            )
+        current = store.claim("record", "hash-a")
+        assert stale.lease_token != current.lease_token
+        assert not store.complete(
+            "record", "hash-a", stale.lease_token, 200, b"stale", "text/plain"
+        )
+        assert not store.abandon("record", "hash-a", stale.lease_token)
+        assert store.complete(
+            "record", "hash-a", current.lease_token, 200, b"current", "text/plain"
+        )
+        assert store.claim("record", "hash-a").body == b"current"
 
     @pytest.mark.asyncio
     async def test_middleware_executes_once_and_replays_response(self, tmp_path):

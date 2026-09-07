@@ -60,6 +60,7 @@ from tusker_gateway.providers.capabilities import (
 )
 from tusker_gateway.model_capability import ModelCapabilityDB
 from tusker_gateway.providers.rerank import RerankHandler
+from tusker_gateway.quality import QualityDB
 
 if TYPE_CHECKING:
     from tusker_gateway.passthrough import CodexTokenRotator
@@ -78,6 +79,7 @@ def create_app() -> web.Application:
 
     app = web.Application(client_max_size=10 * 1024 * 1024)
     app["config"] = load_config()
+    app["quality_db"] = QualityDB(app["config"]["quality_db_path"])
     app["model_capabilities"] = ModelCapabilityDB(
         app["config"].get("model_capability_db_path", "data/model_capability.db")
     )
@@ -158,6 +160,7 @@ def create_app() -> web.Application:
     # cooldown state are consistent across all request handlers.
     from tusker_gateway.pools import PoolManager
     app["pool_manager"] = PoolManager(app["config"])
+    app["pool_manager"]._quality = app["quality_db"]
 
     # Image generation handler (Phase: image/video generation support).
     from tusker_gateway.providers.image_generation import ImageGenerationHandler

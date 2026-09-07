@@ -4,9 +4,38 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from typing import AsyncIterator, Awaitable, Callable
 
 logger = logging.getLogger(__name__)
+
+_SSE_BOUNDARY_RE = re.compile(br"\r\n\r\n|\n\n|\r\r")
+
+
+def split_sse_frame(buffer: bytes | bytearray) -> tuple[bytes | None, bytes]:
+    """Pop one SSE event using any valid blank-line convention.
+
+    SSE permits CRLF, LF, or CR line endings.  Provider streams are not
+    required to use the LF-only framing emitted by this gateway.
+    """
+    raw = bytes(buffer)
+    boundary = _SSE_BOUNDARY_RE.search(raw)
+    if boundary is None:
+        return None, raw
+    return raw[: boundary.start()], raw[boundary.end() :]
+
+
+def sse_data_payload(frame: bytes) -> bytes | None:
+    """Return the joined payload of an SSE event's ``data`` fields."""
+    values: list[bytes] = []
+    for line in frame.splitlines():
+        if not line.startswith(b"data:"):
+            continue
+        value = line[5:]
+        if value.startswith(b" "):
+            value = value[1:]
+        values.append(value)
+    return b"\n".join(values) if values else None
 
 
 def sse_frame(data: dict) -> bytes:

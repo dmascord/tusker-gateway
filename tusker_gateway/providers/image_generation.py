@@ -20,6 +20,7 @@ from tusker_gateway.auth_strategies import get_auth_strategy
 from tusker_gateway.config import DEFAULT_PROVIDER_REGISTRY
 from tusker_gateway.errors import GatewayError
 from tusker_gateway.providers.capabilities import Capability
+from tusker_gateway.sse import split_sse_frame, sse_data_payload
 
 logger = logging.getLogger(__name__)
 MAX_IMAGE_RESPONSE_BYTES = 32 * 1024 * 1024
@@ -459,13 +460,13 @@ class ImageGenerationHandler:
                             code="upstream_error",
                         )
                     buffer += chunk
-                    while b"\n\n" in buffer:
-                        frame, buffer = buffer.split(b"\n\n", 1)
-                        for line in frame.splitlines():
-                            line = line.strip()
-                            if not line.startswith(b"data: "):
-                                continue
-                            data = line[len(b"data: "):]
+                    while True:
+                        frame, remainder = split_sse_frame(buffer)
+                        if frame is None:
+                            break
+                        buffer = remainder
+                        data = sse_data_payload(frame)
+                        if data is not None:
                             if data == b"[DONE]":
                                 continue
                             try:

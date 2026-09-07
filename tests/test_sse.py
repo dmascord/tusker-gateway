@@ -7,9 +7,14 @@ from typing import Any
 
 import pytest
 
+from tusker_gateway.endpoints import _normalize_stream, _prepare_stream_result
+from tusker_gateway.errors import ToolCallContractError
+
 from tusker_gateway.sse import (
     format_openai_chunk,
     format_openai_response,
+    split_sse_frame,
+    sse_data_payload,
     sse_comment,
     sse_done,
     sse_frame,
@@ -27,6 +32,55 @@ def test_sse_framing():
     frame = sse_frame(data)
     assert frame == b'data: {"foo": "bar"}\n\n'
     assert sse_done() == b"data: [DONE]\n\n"
+
+
+def test_sse_parser_accepts_crlf_and_multiline_data():
+    frame, remainder = split_sse_frame(
+        b"event: message\r\ndata: {\"a\":\r\ndata: 1}\r\n\r\nnext"
+    )
+    assert frame is not None
+    assert remainder == b"next"
+    assert sse_data_payload(frame) == b'{"a":\n1}'
+
+
+def test_sse_parser_waits_for_fragmented_boundary():
+    frame, remainder = split_sse_frame(b"data: one\r\n\r")
+    assert frame is None
+    assert remainder == b"data: one\r\n\r"
+    frame, remainder = split_sse_frame(remainder + b"\n")
+    assert frame == b"data: one"
+    assert remainder == b""
+
+
+@pytest.mark.asyncio
+async def test_tool_stream_preflight_rejects_oversized_buffer(monkeypatch):
+    monkeypatch.setenv("TUSKER_TOOL_STREAM_PREFLIGHT_MAX_BYTES", "16")
+
+    async def source():
+        yield b'data: {"choices":[{"delta":{"content":"too large"}}]}\n\n'
+
+    with pytest.raises(ToolCallContractError) as exc_info:
+        await _prepare_stream_result(
+            source(),
+            provider="test",
+            model="test",
+            request_id="rid",
+            tools_requested=True,
+            tools=[{"type": "function", "function": {"name": "run"}}],
+        )
+    assert exc_info.value.reason == "preflight_limit_exceeded"
+
+
+@pytest.mark.asyncio
+async def test_stream_normalizer_accepts_fragmented_crlf_frames():
+    async def source():
+        yield b'data: {"choices":[{"delta":{"content":"ok"},'
+        yield b'"finish_reason":"stop"}]}\r\n\r'
+        yield b'\ndata: [DONE]\r\n\r\n'
+
+    output = b"".join([chunk async for chunk in _normalize_stream(source())])
+    assert b'"content": "ok"' in output
+    assert b'"finish_reason": "stop"' in output
 
 
 def test_sse_comment_includes_colon_prefix():

@@ -56,6 +56,8 @@ from tusker_gateway.semantic_cache import make_semantic_scope, response_contains
 from tusker_gateway.model_capability import MODEL_CAPABILITY_PROBE_VERSION
 from tusker_gateway.sse import (
     format_openai_chunk,
+    split_sse_frame,
+    sse_data_payload,
     sse_done,
     sse_frame,
     sse_heartbeat_loop,
@@ -78,6 +80,17 @@ logger = logging.getLogger(__name__)
 # knob in production via the deployment manifest without a redeploy.
 def _sse_heartbeat_secs() -> float:
     return float(os.environ.get("TUSKER_SSE_HEARTBEAT_SECS", "15"))
+
+
+def _tool_stream_preflight_max_bytes() -> int:
+    """Maximum memory retained while validating a tool-bearing stream."""
+    try:
+        return max(
+            1,
+            int(os.environ.get("TUSKER_TOOL_STREAM_PREFLIGHT_MAX_BYTES", "8388608")),
+        )
+    except (TypeError, ValueError):
+        return 8 * 1024 * 1024
 
 
 _TOOL_CALL_XML_RE = re.compile(
@@ -628,13 +641,16 @@ async def _normalize_stream_legacy(raw_stream: AsyncIterator[bytes]) -> AsyncIte
 
     async for chunk in raw_stream:
         buffer += chunk
-        while b"\n\n" in buffer:
-            frame, buffer = buffer.split(b"\n\n", 1)
-            frame += b"\n\n"  # preserve terminator for yield
+        while True:
+            frame, remainder = split_sse_frame(buffer)
+            if frame is None:
+                break
+            buffer = remainder
+            framed = frame + b"\n\n"
             stripped = frame.strip()
             # Pass through non-data frames as-is (comments, empty)
             if not stripped.startswith(b"data: "):
-                yield frame
+                yield framed
                 continue
             # Pass through [DONE] sentinel as-is
             if stripped == b"data: [DONE]":
@@ -643,16 +659,17 @@ async def _normalize_stream_legacy(raw_stream: AsyncIterator[bytes]) -> AsyncIte
                 # Emit any pending blocks the upstream never got to close
                 # before [DONE]. If we accumulated an unclosed block, drop
                 # it (it never completed) but still pass [DONE] through.
-                yield frame
+                yield framed
                 continue
             try:
-                obj = json.loads(stripped[len(b"data: "):])
+                payload = sse_data_payload(frame)
+                obj = json.loads(payload) if payload is not None else None
             except (json.JSONDecodeError, UnicodeDecodeError):
-                yield frame
+                yield framed
                 continue
             choices = obj.get("choices")
             if not isinstance(choices, list) or not choices:
-                yield frame
+                yield framed
                 continue
             choice = choices[0]
             delta = choice.get("delta") or {}
@@ -998,12 +1015,15 @@ async def _normalize_stream(
 
     async for chunk in raw_stream:
         buffer += chunk
-        while b"\n\n" in buffer:
-            frame, buffer = buffer.split(b"\n\n", 1)
-            frame += b"\n\n"
+        while True:
+            frame, remainder = split_sse_frame(buffer)
+            if frame is None:
+                break
+            buffer = remainder
+            framed = frame + b"\n\n"
             stripped = frame.strip()
             if not stripped.startswith(b"data: "):
-                yield frame
+                yield framed
                 continue
             if stripped == b"data: [DONE]":
                 tool_stripper.flush()
@@ -1022,16 +1042,17 @@ async def _normalize_stream(
                 # forwarding those would produce duplicate sentinels.
                 continue
             try:
-                obj = json.loads(stripped[len(b"data: "):])
+                payload = sse_data_payload(frame)
+                obj = json.loads(payload) if payload is not None else None
             except (json.JSONDecodeError, UnicodeDecodeError):
                 # An invalid JSON event is not useful to an OpenAI client, but
                 # preserving it is still preferable to silently changing the
                 # provider stream.
-                yield frame
+                yield framed
                 continue
             choices = obj.get("choices")
             if not isinstance(choices, list) or not choices:
-                yield frame
+                yield framed
                 continue
             if tools_requested and len(choices) != 1:
                 # Tool-envelope parsing is stateful per completion. Until the
@@ -1383,10 +1404,13 @@ async def _prepend_stream(
     prefix: list[bytes],
     rest: AsyncIterator[bytes],
 ) -> AsyncIterator[bytes]:
-    for chunk in prefix:
-        yield chunk
-    async for chunk in rest:
-        yield chunk
+    try:
+        for chunk in prefix:
+            yield chunk
+        async for chunk in rest:
+            yield chunk
+    finally:
+        await _close_async_iterator(rest)
 
 
 def _stream_frame_signal(frame: bytes) -> tuple[bool, bool]:
@@ -1776,6 +1800,8 @@ async def _prepare_stream_result(
         async for frame in normalized:
             buffered.append(frame)
             buffered_bytes += len(frame)
+            if buffered_bytes > _tool_stream_preflight_max_bytes():
+                raise ToolCallContractError(reason="preflight_limit_exceeded")
             has_tool_call, has_terminal = _stream_frame_signal(frame)
             if has_tool_call:
                 saw_tool_call = True
@@ -1783,6 +1809,7 @@ async def _prepare_stream_result(
                 saw_terminal = True
     except Exception:
         await _close_async_iterator(normalized)
+        await _close_async_iterator(result)
         raise
     assembled_calls = _assemble_stream_tool_calls(buffered)
     _validate_tool_call_contract(
@@ -2241,7 +2268,11 @@ async def _call_with_pool_fallback(
     pool_name = _pool_name(body)
     if pool_name is None:
         provider, model = _route_target(config, body)
-        decision = breaker.check(provider, model) if breaker else BreakerDecision(allowed=True, state=None)
+        decision = (
+            await asyncio.to_thread(breaker.check, provider, model)
+            if breaker
+            else BreakerDecision(allowed=True, state=None)
+        )
         if not decision.allowed:
             raise BadRequestError(
                 f"circuit open for {provider}/{model}: {decision.reason}",
@@ -2271,12 +2302,13 @@ async def _call_with_pool_fallback(
                 tool_choice=body.get("tool_choice"),
             )
             if breaker is not None:
-                breaker.record_success(provider, model)
+                await asyncio.to_thread(breaker.record_success, provider, model)
             _clear_permanently_failed(provider, model)
             return provider, model, result
         except RateLimitError as exc:
             if breaker is not None:
-                breaker.record_failure(
+                await asyncio.to_thread(
+                    breaker.record_failure,
                     provider,
                     model,
                     cooldown_secs=_cooldown_for_exc(exc),
@@ -2285,7 +2317,8 @@ async def _call_with_pool_fallback(
         except Exception as exc:
             _quarantine_tool_response_failure(config, provider, model, exc)
             if breaker is not None:
-                breaker.record_failure(
+                await asyncio.to_thread(
+                    breaker.record_failure,
                     provider,
                     model,
                     cooldown_secs=(_cooldown_for_exc(exc) if isinstance(exc, GatewayError) else None),
@@ -2358,7 +2391,9 @@ async def _call_with_pool_fallback(
                     select_kwargs["allow_structured_tool_fallback"] = True
                     if tool_compatibility_probe:
                         select_kwargs["allow_tool_compatibility_fallback"] = True
-            selected = pool_mgr.select(active_pool, **select_kwargs)
+            selected = await asyncio.to_thread(
+                pool_mgr.select, active_pool, **select_kwargs
+            )
         if not selected:
             if pool_index + 1 < len(pool_names):
                 previous_pool = active_pool
@@ -2430,7 +2465,9 @@ async def _call_with_pool_fallback(
             if last_error is not None:
                 raise last_error
             raise NoHealthyModelsError(pool=pool_name)
-        if breaker is not None and not breaker.check(selected[0], selected[1]).allowed:
+        if breaker is not None and not (
+            await asyncio.to_thread(breaker.check, selected[0], selected[1])
+        ).allowed:
             excluded.add(selected)
             continue
         provider, model = selected
@@ -2470,12 +2507,13 @@ async def _call_with_pool_fallback(
                 tool_choice=body.get("tool_choice"),
             )
             if breaker is not None:
-                breaker.record_success(provider, model)
+                await asyncio.to_thread(breaker.record_success, provider, model)
             _clear_permanently_failed(provider, model)
             return provider, model, result
         except RateLimitError as exc:
             if breaker is not None:
-                breaker.record_failure(
+                await asyncio.to_thread(
+                    breaker.record_failure,
                     provider,
                     model,
                     cooldown_secs=_cooldown_for_exc(exc),
@@ -2498,7 +2536,8 @@ async def _call_with_pool_fallback(
         except Exception as exc:
             _quarantine_tool_response_failure(config, provider, model, exc)
             if breaker is not None:
-                breaker.record_failure(
+                await asyncio.to_thread(
+                    breaker.record_failure,
                     provider,
                     model,
                     cooldown_secs=(_cooldown_for_exc(exc) if isinstance(exc, GatewayError) else None),
@@ -3284,8 +3323,10 @@ def _responses_stream_from_chat(
                 if not raw:
                     continue
                 stream_buffer.extend(raw)
-                while b"\n\n" in stream_buffer:
-                    frame, remainder = bytes(stream_buffer).split(b"\n\n", 1)
+                while True:
+                    frame, remainder = split_sse_frame(stream_buffer)
+                    if frame is None:
+                        break
                     stream_buffer = bytearray(remainder)
                     async for output in process_frame(frame):
                         yield output
@@ -3628,6 +3669,8 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
     status = "ok"
     body: dict[str, Any] | None = None
     api_key = _resolve_api_key(request)
+    budget_recorded = False
+    budget_charged = 0
 
     def _emit(status_label: str, provider_label: str | None = None,
               model_label: str | None = None) -> None:
@@ -3638,7 +3681,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
         metrics.requests_total.inc({"pool": pool_name, "provider": pl, "model": ml, "status": status_label})
         metrics.request_duration.observe(time.monotonic() - started, {"pool": pool_name, "provider": pl, "model": ml})
 
-    def _record_cached_usage(cached: dict[str, Any]) -> None:
+    async def _record_cached_usage(cached: dict[str, Any]) -> None:
         """Count a cache response against the caller's budget as well."""
         if budget is None or not api_key:
             return
@@ -3647,7 +3690,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
         completion_tokens = int(usage.get("completion_tokens") or 0)
         reported_total = int(usage.get("total_tokens") or 0)
         used = max(prompt_estimate, prompt_estimate + completion_tokens, reported_total)
-        budget.record(api_key, pool_name, used)
+        await asyncio.to_thread(budget.record, api_key, pool_name, used)
 
     # Top-level span (synchronous context).
     span_cm = (
@@ -3670,7 +3713,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
             config = request.app["config"]
             client = PassthroughClient(
                 config,
-                QualityDB(config["quality_db_path"]),
+                request.app.get("quality_db") or QualityDB(config["quality_db_path"]),
                 request.app["http_session"],
                 catalog_registry=request.app.get("catalog_registry"),
                 credential_rotators=request.app.get("credential_rotators"),
@@ -3727,7 +3770,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
 
             # Rate-limit pre-flight (cheapest check, runs first).
             if ratelimit is not None and api_key:
-                rl = ratelimit.check(api_key)
+                rl = await asyncio.to_thread(ratelimit.check, api_key)
                 if not rl.allowed:
                     status = "ratelimit_blocked"
                     if metrics is not None:
@@ -3747,7 +3790,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
             # response; otherwise cached requests bypass quota enforcement.
             if budget is not None and api_key:
                 est = _estimated_tokens(body["messages"])
-                decision = budget.check(api_key, pool_name, est)
+                decision = await asyncio.to_thread(budget.check, api_key, pool_name, est)
                 if not decision.allowed:
                     status = "budget_blocked"
                     if metrics is not None:
@@ -3781,8 +3824,8 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                     zdr_pool=bool(getattr(pool_config, "zdr", False)),
                 )
                 if semantic_bypass_reason is None and not bypass_cache:
-                    semantic_target = _select_cache_route_target(
-                        config, body, request, breaker
+                    semantic_target = await asyncio.to_thread(
+                        _select_cache_route_target, config, body, request, breaker
                     )
                     if semantic_target is None:
                         semantic_bypass_reason = "route_unavailable"
@@ -3817,7 +3860,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                     provider=semantic_target[0] if semantic_target else None,
                     target_model=semantic_target[1] if semantic_target else None,
                 )
-                hit = cache.get(cache_key)
+                hit = await asyncio.to_thread(cache.get, cache_key)
                 if hit is not None:
                     if response_contains_tool_calls(hit):
                         logger.warning(
@@ -3825,9 +3868,9 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                             request_id,
                             cache_key[:12],
                         )
-                        cache.invalidate(cache_key)
+                        await asyncio.to_thread(cache.invalidate, cache_key)
                     else:
-                        _record_cached_usage(hit)
+                        await _record_cached_usage(hit)
                         logger.debug('cache hit key=%s', cache_key[:16])
                         if metrics is not None:
                             metrics.requests_total.inc(
@@ -3858,7 +3901,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                         embedding=semantic_embedding,
                     )
                 if sem_hit is not None:
-                    _record_cached_usage(sem_hit)
+                    await _record_cached_usage(sem_hit)
                     logger.info(
                         "semantic cache hit rid=%s model=%s pool=%s target=%s/%s",
                         request_id,
@@ -3909,7 +3952,9 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
             if budget is not None and api_key and isinstance(result, dict):
                 usage = result.get("usage") or {}
                 used = int(usage.get("total_tokens") or _estimated_tokens(body["messages"]))
-                budget.record(api_key, pool_name, used)
+                await asyncio.to_thread(budget.record, api_key, pool_name, used)
+                budget_recorded = True
+                budget_charged = used
 
             if (
                 cache is not None
@@ -3928,7 +3973,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                     provider=provider if semantic_target else None,
                     target_model=target_model if semantic_target else None,
                 )
-                cache.put(store_cache_key, result)
+                await asyncio.to_thread(cache.put, store_cache_key, result)
                 logger.debug('cache stored key=%s', store_cache_key[:16])
 
             # Store in semantic cache (non-streaming dict responses only).
@@ -3961,6 +4006,15 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                 )
 
             if body.get("stream", False):
+                if budget is not None and api_key and not budget_recorded:
+                    await asyncio.to_thread(
+                        budget.record,
+                        api_key,
+                        pool_name,
+                        _estimated_tokens(body["messages"]),
+                    )
+                    budget_recorded = True
+                    budget_charged = _estimated_tokens(body["messages"])
                 resp = web.StreamResponse(
                     status=200,
                     headers={
@@ -4024,27 +4078,38 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                             await resp.write(chunk)
                 except (ConnectionResetError, ConnectionError, BrokenPipeError) as exc:
                     stream_ok = False
+                    status = "client_disconnected"
+                    request["_stream_error"] = status
                     logger.info(
                         "stream client disconnected mid-flight rid=%s provider=%s model=%s err=%s",
                         request_id, provider, target_model, exc,
                     )
-                    if budget is not None and api_key and body is not None:
-                        budget.refund(api_key, pool_name, _estimated_tokens(body["messages"]))
+                    if budget_recorded and budget is not None and api_key and body is not None:
+                        await asyncio.to_thread(budget.refund, api_key, pool_name, budget_charged)
+                        budget_recorded = False
                 except asyncio.CancelledError:
                     stream_ok = False
+                    status = "stream_cancelled"
+                    request["_stream_error"] = status
                     logger.info(
                         "stream cancelled rid=%s provider=%s model=%s", request_id, provider, target_model,
                     )
+                    if budget_recorded and budget is not None and api_key and body is not None:
+                        await asyncio.to_thread(budget.refund, api_key, pool_name, budget_charged)
+                        budget_recorded = False
                     raise
                 except Exception as exc:  # noqa: BLE001
                     stream_ok = False
+                    status = "upstream_stream_error"
+                    request["_stream_error"] = status
                     logger.warning(
                         "stream pump failed rid=%s provider=%s model=%s err=%s",
                         request_id, provider, target_model, exc,
                         exc_info=True,
                     )
-                    if budget is not None and api_key and body is not None:
-                        budget.refund(api_key, pool_name, _estimated_tokens(body["messages"]))
+                    if budget_recorded and budget is not None and api_key and body is not None:
+                        await asyncio.to_thread(budget.refund, api_key, pool_name, budget_charged)
+                        budget_recorded = False
                 else:
                     # Best-effort: if the client is gone, [DONE] write will
                     # raise — swallow so we still record metrics.
@@ -4053,6 +4118,8 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                     except (ConnectionResetError, ConnectionError, BrokenPipeError):
                         stream_ok = False
                 finally:
+                    if 'stream_result' in locals():
+                        await _close_async_iterator(stream_result)
                     stop.set()
                     try:
                         await asyncio.wait_for(hb_task, timeout=hb_interval + 1.0)
@@ -4086,12 +4153,31 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
             )
             status = "provider_unavailable"
             _emit(status)
-            if budget is not None and api_key and body is not None:
-                budget.refund(api_key, pool_name, _estimated_tokens(body["messages"]))
+            if budget_recorded and budget is not None and api_key and body is not None:
+                await asyncio.to_thread(budget.refund, api_key, pool_name, budget_charged)
             return _public_provider_failure_response(exc)
 
 
 async def responses_handler(request: web.Request) -> web.Response | web.StreamResponse:
+    tracer: Tracer | None = request.app.get("tracer")
+    span_cm = (
+        tracer.span(
+            "responses",
+            attributes={"http.method": request.method, "http.path": "/v1/responses"},
+        )
+        if tracer is not None and tracer.enabled
+        else _noop_cm()
+    )
+    with span_cm:
+        return await _responses_handler_impl(request)
+
+
+async def _responses_handler_impl(request: web.Request) -> web.Response | web.StreamResponse:
+    budget_recorded = False
+    budget_charged = 0
+    budget_units = 0
+    budget_pool = "passthrough"
+    api_key = _resolve_api_key(request)
     try:
         body = await request.json()
         logger.info('responses request model=%s', body.get("model") if isinstance(body, dict) else None)
@@ -4130,10 +4216,24 @@ async def responses_handler(request: web.Request) -> web.Response | web.StreamRe
         chat_body = _validate_chat_body(chat_body)
         config = request.app["config"]
         pool_name = _pool_name(chat_body) or "passthrough"
+        budget_pool = pool_name
+        budget_units = _estimated_tokens(chat_body["messages"])
+        preflight_error = await _media_preflight(
+            request,
+            chat_body,
+            budget_units=budget_units,
+            budget_pool=pool_name,
+        )
+        if preflight_error is not None:
+            return preflight_error
+        chat_body = _validate_chat_body(chat_body)
+        pool_name = _pool_name(chat_body) or "passthrough"
+        budget_pool = pool_name
+        budget_units = _estimated_tokens(chat_body["messages"])
         set_access_log_context(request, pool=pool_name)
         client = PassthroughClient(
             config,
-            QualityDB(config["quality_db_path"]),
+            request.app.get("quality_db") or QualityDB(config["quality_db_path"]),
             request.app["http_session"],
             catalog_registry=request.app.get("catalog_registry"),
             credential_rotators=request.app.get("credential_rotators"),
@@ -4143,13 +4243,99 @@ async def responses_handler(request: web.Request) -> web.Response | web.StreamRe
             {**body, "messages": messages},
             _resolve_api_key(request),
         )
+        cache: ResponseCache | None = request.app.get("cache")
+        sem_cache = request.app.get("semantic_cache")
+        breaker: CircuitBreaker | None = request.app.get("breaker")
+        cache_key: str | None = None
+        cacheable = not chat_body.get("stream") and not chat_body.get("tools")
+        bypass_cache = request.headers.get("X-Tusker-Cache", "").strip().lower() == "bypass"
+        if cache is not None and cacheable and not bypass_cache:
+            cache_key = make_cache_key(
+                pool_name=pool_name,
+                model=chat_body.get("model"),
+                messages=chat_body["messages"],
+                tools=None,
+                extra_body=_build_extra_body(chat_body),
+                caller_scope=make_caller_scope(api_key),
+            )
+            hit = await asyncio.to_thread(cache.get, cache_key)
+            if hit is not None and not response_contains_tool_calls(hit):
+                budget = request.app.get("budget")
+                if budget is not None and api_key:
+                    await asyncio.to_thread(budget.record, api_key, pool_name, budget_units)
+                set_access_log_context(request, provider="cache", model=str(chat_body.get("model") or ""), cache_status="hit")
+                return web.json_response(
+                    _chat_result_to_responses(hit, body.get("model") or config["model_name"])
+                )
+            set_access_log_context(request, cache_status="miss")
+
+        semantic_scope: str | None = None
+        semantic_embedding: list[float] | None = None
+        semantic_target: tuple[str, str] | None = None
+        if sem_cache is not None and sem_cache.enabled and cacheable and not bypass_cache:
+            pool_config = config.get("pools", {}).get(pool_name)
+            reason = _semantic_cache_bypass_reason(
+                chat_body,
+                pool_name=pool_name,
+                api_key=api_key,
+                sem_cache=sem_cache,
+                zdr_pool=bool(getattr(pool_config, "zdr", False)),
+            )
+            if reason is None:
+                semantic_target = await asyncio.to_thread(
+                    _select_cache_route_target,
+                    config,
+                    chat_body,
+                    request,
+                    breaker,
+                )
+            if semantic_target is not None:
+                semantic_scope = make_semantic_scope(
+                    caller_scope=make_caller_scope(api_key),
+                    pool_name=pool_name,
+                    requested_model=chat_body.get("model"),
+                    provider=semantic_target[0],
+                    target_model=semantic_target[1],
+                    extra_body=_build_extra_body(chat_body),
+                )
+                semantic_embedding = await sem_cache.embed_messages(chat_body["messages"])
+                sem_hit = (
+                    await sem_cache.query(
+                        chat_body["messages"],
+                        scope=semantic_scope,
+                        embedding=semantic_embedding,
+                    )
+                    if semantic_embedding is not None
+                    else None
+                )
+                if sem_hit is not None and not response_contains_tool_calls(sem_hit):
+                    budget = request.app.get("budget")
+                    if budget is not None and api_key:
+                        await asyncio.to_thread(
+                            budget.record, api_key, pool_name, budget_units
+                        )
+                    set_access_log_context(
+                        request,
+                        provider="semantic_cache",
+                        model=str(chat_body.get("model") or ""),
+                        cache_status="hit",
+                    )
+                    return web.json_response(
+                        _chat_result_to_responses(
+                            sem_hit, body.get("model") or config["model_name"]
+                        )
+                    )
+
         provider, target_model, result = await _call_with_pool_fallback(
             config,
             chat_body,
             client,
             tools=chat_body.get("tools"),
+            breaker=breaker,
             request=request,
             metrics_registry=request.app.get("metrics"),
+            initial_selection=semantic_target,
+            request_id=request.get("_request_id"),
             conversation_id=conversation_id,
         )
         set_access_log_context(
@@ -4158,6 +4344,16 @@ async def responses_handler(request: web.Request) -> web.Response | web.StreamRe
             model=target_model,
             pool=pool_name,
         )
+        budget = request.app.get("budget")
+        if budget is not None and api_key:
+            if isinstance(result, dict):
+                usage = result.get("usage") or {}
+                charged = int(usage.get("total_tokens") or budget_units)
+            else:
+                charged = budget_units
+            await asyncio.to_thread(budget.record, api_key, pool_name, charged)
+            budget_recorded = True
+            budget_charged = charged
         if body.get("stream"):
             from tusker_gateway.tool_formats import normalize_response_tool_calls
 
@@ -4214,11 +4410,22 @@ async def responses_handler(request: web.Request) -> web.Response | web.StreamRe
                     await resp.write(chunk)
             except (ConnectionResetError, ConnectionError, BrokenPipeError):
                 logger.info("responses stream client disconnected")
+                request["_stream_error"] = "client_disconnected"
+                if budget_recorded and budget is not None and api_key:
+                    await asyncio.to_thread(budget.refund, api_key, pool_name, budget_charged)
             except asyncio.CancelledError:
+                request["_stream_error"] = "stream_cancelled"
+                if budget_recorded and budget is not None and api_key:
+                    await asyncio.to_thread(budget.refund, api_key, pool_name, budget_charged)
+                    budget_recorded = False
                 raise
             except Exception:
                 logger.warning("responses stream pump failed", exc_info=True)
+                request["_stream_error"] = "upstream_stream_error"
+                if budget_recorded and budget is not None and api_key:
+                    await asyncio.to_thread(budget.refund, api_key, pool_name, budget_charged)
             finally:
+                await _close_async_iterator(response_stream)
                 stop.set()
                 try:
                     await asyncio.wait_for(hb_task, timeout=hb_interval + 1.0)
@@ -4232,6 +4439,28 @@ async def responses_handler(request: web.Request) -> web.Response | web.StreamRe
                 result,
                 source=f"responses/{body.get('model') or config['model_name']}",
             )
+            if cache is not None and cache_key is not None and not response_contains_tool_calls(result):
+                await asyncio.to_thread(cache.put, cache_key, result)
+            if (
+                sem_cache is not None
+                and semantic_scope is not None
+                and semantic_embedding is not None
+                and not response_contains_tool_calls(result)
+            ):
+                store_scope = make_semantic_scope(
+                    caller_scope=make_caller_scope(api_key),
+                    pool_name=pool_name,
+                    requested_model=chat_body.get("model"),
+                    provider=provider,
+                    target_model=target_model,
+                    extra_body=_build_extra_body(chat_body),
+                )
+                await sem_cache.store(
+                    chat_body["messages"],
+                    result,
+                    scope=store_scope,
+                    embedding=semantic_embedding,
+                )
             return web.json_response(
                 _chat_result_to_responses(
                     result,
@@ -4256,6 +4485,10 @@ async def responses_handler(request: web.Request) -> web.Response | web.StreamRe
             "responses request failed summary=%s",
             _pool_failure_summary(exc),
         )
+        if budget_recorded:
+            budget = request.app.get("budget")
+            if budget is not None and api_key:
+                await asyncio.to_thread(budget.refund, api_key, budget_pool, budget_charged)
         return _public_provider_failure_response(exc)
 
 
@@ -4284,7 +4517,7 @@ async def _media_preflight(
     api_key = _resolve_api_key(request)
     ratelimit: RateLimiter | None = request.app.get("ratelimit")
     if ratelimit is not None and api_key:
-        decision = ratelimit.check(api_key)
+        decision = await asyncio.to_thread(ratelimit.check, api_key)
         if not decision.allowed:
             return web.json_response(
                 openai_error(
@@ -4302,7 +4535,9 @@ async def _media_preflight(
 
     budget: BudgetTracker | None = request.app.get("budget")
     if budget is not None and api_key:
-        decision = budget.check(api_key, budget_pool, budget_units)
+        decision = await asyncio.to_thread(
+            budget.check, api_key, budget_pool, budget_units
+        )
         if not decision.allowed:
             return web.json_response(
                 openai_error(
@@ -4338,7 +4573,7 @@ async def _media_preflight(
     return None
 
 
-def _record_media_budget(
+async def _record_media_budget(
     request: web.Request,
     *,
     budget_units: int,
@@ -4347,7 +4582,7 @@ def _record_media_budget(
     budget: BudgetTracker | None = request.app.get("budget")
     api_key = _resolve_api_key(request)
     if budget is not None and api_key:
-        budget.record(api_key, budget_pool, budget_units)
+        await asyncio.to_thread(budget.record, api_key, budget_pool, budget_units)
 
 
 def _record_media_capabilities(
@@ -4447,7 +4682,7 @@ async def images_handler(request: web.Request) -> web.Response:
             capabilities=("output_image", image_capability),
             started=started,
         )
-        _record_media_budget(request, budget_units=budget_units)
+        await _record_media_budget(request, budget_units=budget_units)
         return web.json_response(result)
 
     except GatewayError as exc:
@@ -4500,7 +4735,7 @@ async def tts_handler(request: web.Request) -> web.Response:
             capabilities=("output_audio", "tts_speech"),
             started=started,
         )
-        _record_media_budget(request, budget_units=budget_units)
+        await _record_media_budget(request, budget_units=budget_units)
         return web.Response(body=audio_bytes, content_type=content_type)
     except GatewayError as exc:
         logger.warning("TTS request failed: %s", exc)
@@ -4560,7 +4795,7 @@ async def video_handler(request: web.Request) -> web.Response:
             capabilities=("video_generations",),
             started=started,
         )
-        _record_media_budget(request, budget_units=budget_units)
+        await _record_media_budget(request, budget_units=budget_units)
         return web.json_response(result)
     except GatewayError as exc:
         logger.warning("Video request failed: %s", exc)
@@ -4647,7 +4882,7 @@ async def rerank_handler(request: web.Request) -> web.Response:
             provider=provider,
             model=model,
         )
-        _record_media_budget(
+        await _record_media_budget(
             request,
             budget_units=parsed.budget_units,
             budget_pool="rerank",
