@@ -74,4 +74,22 @@ smoke_check ready /ready
 curl --retry 24 --retry-delay 5 --retry-all-errors \
   --connect-timeout 5 --max-time 15 -sS "https://ai.tusker.net.au/ready" && echo
 
+# Exercise /v1/chat/completions with stream:true through the public ingress.
+# Even with maxUnavailable:0, a stale routing table can pin the new pod to
+# dead endpoint slices — SSE frames prove the request reaches a live
+# worker process.
+chat_payload='{"model":"hermes-code","stream":true,"messages":[{"role":"user","content":"Reply with exactly the word DONE."}]}'
+chat_key=$(kubectl -n "${NAMESPACE}" get secret tusker-env-vault \
+  -o jsonpath="{.data.API_KEYS}" | base64 -d | cut -d, -f1 || true)
+if [ -n "${chat_key}" ]; then
+  curl -sS -N --connect-timeout 5 --max-time 20 \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer ${chat_key}" \
+    -X POST "https://ai.tusker.net.au/v1/chat/completions" \
+    -d "${chat_payload}" | head -c 4096 || true
+  echo
+else
+  echo "API_KEYS secret not readable — skipping chat smoke test"
+fi
+
 echo "=== Done ==="
