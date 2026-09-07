@@ -40,6 +40,7 @@ class QualityDB:
     def _ensure_db(self) -> None:
         Path(self._path).parent.mkdir(parents=True, exist_ok=True)
         with sqlite3.connect(self._path) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS model_quality (
@@ -73,6 +74,7 @@ class QualityDB:
         now = time.time()
         logger.debug('record %s/%s success=%s latency=%.1fms', provider, model, success, latency_ms)
         with sqlite3.connect(self._path) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.execute(
                 """
                 INSERT OR IGNORE INTO model_quality (provider, model) VALUES (?, ?)
@@ -157,6 +159,7 @@ class QualityDB:
     def get_quality(self, provider: str, model: str) -> float | None:
         """Return quality score for (provider, model), or None if no data."""
         with sqlite3.connect(self._path) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
             row = conn.execute(
                 """
                 SELECT quality_score FROM model_quality WHERE provider = ? AND model = ?
@@ -203,6 +206,7 @@ class QualityDB:
     def status(self) -> dict[str, Any]:
         """Return summary status for /status endpoint."""
         with sqlite3.connect(self._path) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
             count = conn.execute("SELECT COUNT(*) FROM model_quality").fetchone()[0]
             healthy = conn.execute(
                 "SELECT COUNT(*) FROM model_quality WHERE quality_score >= 50.0"

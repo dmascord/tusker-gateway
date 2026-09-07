@@ -63,7 +63,9 @@ class PersistentCooldownStore:
             conn.commit()
 
     def _connect(self) -> sqlite3.Connection:
-        return sqlite3.connect(str(self.db_path), timeout=5)
+        connection = sqlite3.connect(str(self.db_path), timeout=5)
+        connection.execute("PRAGMA journal_mode=WAL")
+        return connection
 
     def record(self, provider: str, model: str, seconds: float) -> None:
         """Persist a (provider, model) cooldown until `seconds` from now."""

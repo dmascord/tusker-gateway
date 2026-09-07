@@ -112,6 +112,7 @@ class ToolCapabilityDB:
         self._memory_connection: sqlite3.Connection | None = None
         if path == ":memory:":
             self._memory_connection = sqlite3.connect(path)
+            self._memory_connection.execute("PRAGMA journal_mode=WAL")
         else:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
         self._ensure_db()
@@ -121,6 +122,7 @@ class ToolCapabilityDB:
         connection = self._memory_connection or sqlite3.connect(
             self.path, timeout=30
         )
+        connection.execute("PRAGMA journal_mode=WAL")
         try:
             yield connection
         finally:

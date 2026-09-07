@@ -121,6 +121,7 @@ class ModelCapabilityDB:
         self._memory_connection: sqlite3.Connection | None = None
         if self.path == ":memory:":
             self._memory_connection = sqlite3.connect(self.path)
+            self._memory_connection.execute("PRAGMA journal_mode=WAL")
         else:
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         self._ensure_db()
@@ -130,6 +131,7 @@ class ModelCapabilityDB:
         connection = self._memory_connection or sqlite3.connect(
             self.path, timeout=30
         )
+        connection.execute("PRAGMA journal_mode=WAL")
         try:
             connection.execute("PRAGMA busy_timeout=30000")
             yield connection

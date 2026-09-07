@@ -109,6 +109,7 @@ class RateLimiter:
 
     def _ensure_db(self) -> None:
         with sqlite3.connect(self._config.path) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS buckets (
@@ -144,6 +145,7 @@ class RateLimiter:
 
         self.stats.checks += 1
         with sqlite3.connect(self._config.path) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
             row = conn.execute(
                 "SELECT tokens, last_refill_at FROM buckets WHERE fingerprint = ?",
                 (fp,),
@@ -162,6 +164,7 @@ class RateLimiter:
         if tokens >= cost:
             tokens -= cost
             with sqlite3.connect(self._config.path) as conn:
+                conn.execute("PRAGMA journal_mode=WAL")
                 conn.execute(
                     """
                     INSERT INTO buckets (fingerprint, tokens, last_refill_at)
@@ -179,6 +182,7 @@ class RateLimiter:
         else:
             # Persist the refilled amount so we don't lose refill progress.
             with sqlite3.connect(self._config.path) as conn:
+                conn.execute("PRAGMA journal_mode=WAL")
                 conn.execute(
                     """
                     INSERT INTO buckets (fingerprint, tokens, last_refill_at)
@@ -209,6 +213,7 @@ class RateLimiter:
         if not self._config.enabled:
             return {}
         with sqlite3.connect(self._config.path) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
             rows = conn.execute(
                 "SELECT fingerprint, tokens, last_refill_at FROM buckets"
             ).fetchall()

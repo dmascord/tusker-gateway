@@ -119,6 +119,7 @@ class CircuitBreaker:
 
     def _ensure_db(self) -> None:
         with sqlite3.connect(self._config.path) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS breakers (
@@ -336,6 +337,7 @@ class CircuitBreaker:
         if not self._config.enabled:
             return {}
         with sqlite3.connect(self._config.path) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
             rows = conn.execute(
                 "SELECT provider, model, state, opened_at, window_failures, window_total, consecutive_failures FROM breakers"
             ).fetchall()
@@ -359,6 +361,7 @@ class CircuitBreaker:
 
     def _read(self, provider: str, model: str) -> dict[str, Any] | None:
         with sqlite3.connect(self._config.path) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.row_factory = sqlite3.Row
             row = conn.execute(
                 "SELECT * FROM breakers WHERE provider = ? AND model = ?",
@@ -372,6 +375,7 @@ class CircuitBreaker:
         values = [provider, model, *fields.values()]
         updates = ",".join(f"{k}=excluded.{k}" for k in fields.keys())
         with sqlite3.connect(self._config.path) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.execute(
                 f"INSERT INTO breakers ({','.join(cols)}) VALUES ({placeholders}) "
                 f"ON CONFLICT(provider, model) DO UPDATE SET {updates}",
@@ -385,6 +389,7 @@ class CircuitBreaker:
         sets = ",".join(f"{k}=?" for k in fields.keys())
         values = [*fields.values(), provider, model]
         with sqlite3.connect(self._config.path) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.execute(
                 f"UPDATE breakers SET {sets} WHERE provider = ? AND model = ?",
                 values,

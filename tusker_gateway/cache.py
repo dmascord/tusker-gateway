@@ -145,6 +145,7 @@ class ResponseCache:
 
     def _ensure_db(self) -> None:
         with sqlite3.connect(self._config.path) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS entries (
@@ -169,6 +170,7 @@ class ResponseCache:
             return None
         now = time.time()
         with sqlite3.connect(self._config.path) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
             row = conn.execute(
                 "SELECT body, expires_at FROM entries WHERE key = ?", (key,)
             ).fetchone()
@@ -180,6 +182,7 @@ class ResponseCache:
         if expires_at <= now:
             # Lazy eviction
             with sqlite3.connect(self._config.path) as conn:
+                conn.execute("PRAGMA journal_mode=WAL")
                 conn.execute("DELETE FROM entries WHERE key = ?", (key,))
                 conn.commit()
             self.stats.misses += 1
@@ -187,6 +190,7 @@ class ResponseCache:
             return None
         # Bump hit counter (best-effort)
         with sqlite3.connect(self._config.path) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.execute(
                 "UPDATE entries SET hits = hits + 1 WHERE key = ?", (key,)
             )
@@ -205,6 +209,7 @@ class ResponseCache:
         now = time.time()
         expires_at = now + self._config.ttl_secs
         with sqlite3.connect(self._config.path) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
             # Idempotent: same key overwrites in place and refreshes TTL.
             conn.execute(
                 """
@@ -229,6 +234,7 @@ class ResponseCache:
         if not self._config.enabled:
             return
         with sqlite3.connect(self._config.path) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("DELETE FROM entries WHERE key = ?", (key,))
             conn.commit()
         logger.debug('cache invalidate key=%s', key[:16])
@@ -243,6 +249,7 @@ class ResponseCache:
         if cap <= 0:
             return
         with sqlite3.connect(self._config.path) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
             count = conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
             if count <= cap:
                 return

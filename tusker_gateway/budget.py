@@ -129,6 +129,7 @@ class BudgetTracker:
 
     def _ensure_db(self) -> None:
         with sqlite3.connect(self._config.path) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS usage (
@@ -225,6 +226,7 @@ class BudgetTracker:
         fp = _key_fingerprint(api_key)
         now = time.time()
         with sqlite3.connect(self._config.path) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
             # Daily
             self._bump(conn, fp, "daily", now, self.DAILY_WINDOW, tokens)
             # Monthly
@@ -243,6 +245,7 @@ class BudgetTracker:
         fp = _key_fingerprint(api_key)
         now = time.time()
         with sqlite3.connect(self._config.path) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
             self._bump(conn, fp, "daily", now, self.DAILY_WINDOW, -tokens)
             self._bump(conn, fp, "monthly", now, self.MONTHLY_WINDOW, -tokens)
             if pool_name:
@@ -261,6 +264,7 @@ class BudgetTracker:
         fp = _key_fingerprint(api_key)
         now = time.time()
         with sqlite3.connect(self._config.path) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
             rows = conn.execute(
                 """
                 SELECT period, period_start, tokens FROM usage
@@ -278,6 +282,7 @@ class BudgetTracker:
     def _sum(self, fp: str, period: str, now: float, window: float) -> int:
         window_start = now - window
         with sqlite3.connect(self._config.path) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
             row = conn.execute(
                 """
                 SELECT COALESCE(SUM(tokens), 0) FROM usage
