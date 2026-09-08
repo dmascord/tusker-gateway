@@ -10,8 +10,14 @@ Status: **resolved 2026-09-08.** Section D executed: A5 code fix landed
 auto-free mode, regression test `test_poolmanager_auto_catalog_marks_heavyweight_entries`);
 A6 was already fixed before the audit session closed; A1–A3 manifest cleanup,
 Gemini recovery (option b), and A4 (`zdr_ok=True` for `xiaomi` + privacy
-`auto_catalog_providers` extended to `opencode-go`/`ollama-cloud`/`xiaomi`)
-landed in `k8s/deployment.yaml` and deployed. A7 remains a watch item.
+`auto_catalog_providers` extension)
+landed in `k8s/deployment.yaml` and deployed. A7 closed 2026-09-08 with no
+code change: `select()` forms the rotation tier from the exact top score
+only (pools.py "Group candidates by quality tier"), so floor-scored new
+entries sit at the bottom of the ranking (~185/213 live) and get traffic
+only via cooldown cascades; qualification + cooldown gates, not the floor,
+are what gate new models. Live evidence: zero models with `total_calls=0`,
+stable traffic distribution (top model 27 req/24h, rest single digits).
 A8 resolved by fixing the doc (no script existed).
 
 ## Pipeline as-built (for orientation)
