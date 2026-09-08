@@ -1140,6 +1140,62 @@ def test_poolmanager_auto_catalog_adds_opted_in_authenticated_models():
     assert all(spec.auto_discovered for spec in manager.models["code"])
 
 
+def test_poolmanager_auto_catalog_marks_heavyweight_entries():
+    """Catalog-mode auto-added entries carry the heavyweight marker.
+
+    A paid/heavy model published by an opted-in authenticated catalog must
+    not silently enter a cheap pool: the marker is what the cheap-tier
+    heavyweight gate (select()) filters on. Regression for audit A5.
+    """
+    from tusker_gateway.config import PoolConfig
+    from tusker_gateway.pools import PoolManager
+
+    cfg = {
+        "pools": {
+            "code": PoolConfig(
+                name="code",
+                models=[],
+                auto_free=True,
+                auto_catalog_providers=["zai"],
+            ),
+        },
+        "excluded_providers": [],
+        "provider_api_keys": {"zai": "k-zai"},
+        "quality_db_path": "/tmp/_unused.db",
+    }
+    manager = PoolManager(cfg)
+    registry = CatalogRegistry()
+    zai = ProviderModelsCatalog(
+        provider="zai",
+        endpoint="https://api.example.test/v4/models",
+    )
+    zai._entries = [
+        CatalogEntry(
+            provider="zai",
+            model="glm-heavy-pro",
+            cost_input=2.0,
+            cost_output=10.0,
+        ),
+        CatalogEntry(provider="zai", model="glm-lite"),
+    ]
+    registry.register("zai", zai)
+    manager.catalog_registry = registry
+
+    manager.extend_pools_with_free_catalog()
+
+    by_pair = {
+        (m["provider"], m["model"]): m
+        for m in manager.pools["code"].models
+    }
+    assert ("zai", "glm-heavy-pro") in by_pair
+    assert by_pair[("zai", "glm-heavy-pro")]["heavyweight"] is True
+    # Spec carries the marker; the pool-tier gate in select() drops the
+    # heavy entry while the lite entry still serves traffic.
+    specs = {(spec.provider, spec.model): spec for spec in manager.models["code"]}
+    assert specs[("zai", "glm-heavy-pro")].heavyweight is True
+    assert manager.select("code") == ("zai", "glm-lite")
+
+
 def test_poolmanager_auto_free_excludes_configured_provider():
     """An exhausted provider must not re-enter through dynamic discovery."""
     from tusker_gateway.config import PoolConfig

@@ -336,7 +336,7 @@ DEFAULT_PROVIDER_REGISTRY: dict[str, ProviderConfig] = {
     "groq": ProviderConfig("groq", "bearer", "https://api.groq.com/openai", "/v1/chat/completions", auth_env="GROQ_API_KEY", models_path="/v1/models"),
     "arcee": ProviderConfig("arcee", "bearer", "https://api.arcee.ai/api/v1", "/chat/completions", auth_env="ARCEEAI_API_KEY", models_path="/models"),
     "zai": ProviderConfig("zai", "bearer", "https://api.z.ai/api/coding/paas", "/v4/chat/completions", auth_env="GLM_API_KEY", models_path="/v4/models"),
-    "xiaomi": ProviderConfig("xiaomi", "bearer", "https://token-plan-sgp.xiaomimimo.com", "/v1/chat/completions", auth_env="XIAOMI_MIMO_API_KEY"),
+    "xiaomi": ProviderConfig("xiaomi", "bearer", "https://token-plan-sgp.xiaomimimo.com", "/v1/chat/completions", auth_env="XIAOMI_MIMO_API_KEY", zdr_ok=True),
     "arliai": ProviderConfig("arliai", "bearer", "https://api.arliai.com", "/v1/chat/completions", auth_env="ARLIAI_API_KEY", models_path="/v1/models"),
     "google": ProviderConfig("google", "bearer", "https://generativelanguage.googleapis.com", "/v1beta/openai/chat/completions", auth_env="GEMINI_API_KEY", models_path="/v1beta/openai/models"),
     "cerebras": ProviderConfig("cerebras", "bearer", "https://api.cerebras.ai", "/v1/chat/completions", auth_env="CEREBRAS_API_KEY", models_path="/v1/models"),

@@ -581,8 +581,7 @@ class PoolManager:
                         "model": entry.model,
                         "auto_discovered": True,
                     }
-                    if mode == "xiaomi":
-                        model_data["heavyweight"] = heavyweight
+                    model_data["heavyweight"] = heavyweight
                     modalities = advertised_input_modalities(entry)
                     if modalities is not None:
                         model_data["input_modalities"] = sorted(modalities)
