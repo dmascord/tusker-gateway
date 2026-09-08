@@ -105,6 +105,9 @@ spec:
           value: /home/tusker/.hermes/semantic_cache
         - name: TUSKER_COPILOT_BUSINESS
           value: "true"
+        # Local hardware routes use LAN endpoints, never pod loopback.
+        - name: PROVIDER_REGISTRY_JSON
+          value: '{"local-llm":{"kind":"local","base_url":"http://10.0.0.212:11434","chat_path":"/v1/chat/completions","models_path":"/api/tags","zdr_ok":true},"mlx-mac":{"kind":"local","base_url":"http://10.0.0.141:11435","chat_path":"/v1/chat/completions","models_path":"/v1/models","zdr_ok":true,"model_aliases":{"qwen3-coder-30b-a3b-instruct-4bit":"/Users/tusker/models/Qwen3-Coder-30B-A3B-Instruct-4bit"}}}'
         - name: TUSKER_AUTO_FREE_EXCLUDED_PROVIDERS
           value: nvidia
         # Do not poll provider catalogs that are intentionally unavailable;

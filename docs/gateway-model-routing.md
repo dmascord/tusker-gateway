@@ -175,13 +175,44 @@ database; response bodies and credentials are not retained.
 The privacy pool applies the provider policy before catalog pricing. The
 default registry currently allows local `local-llm`, Ollama Cloud, OpenCode
 Go, OpenAI Codex, GitHub Copilot Enterprise, Xiaomi MiMo, and the public
-Copilot route (via the `TUSKER_COPILOT_BUSINESS` opt-in below). The
-`local-llm` entry points at `localhost` inside the gateway pod; it is not the
-Orin Nano. An Orin route
-requires an explicit provider override with the Orin's reachable address.
+Copilot route (via the `TUSKER_COPILOT_BUSINESS` opt-in below). Deployment
+overrides register the local hardware routes explicitly; runtime provider
+configuration takes precedence over built-in endpoint defaults.
 Public GitHub Copilot,
 OpenRouter, NVIDIA trial endpoints, and other direct providers remain outside
 the privacy pool unless an explicit deployment policy enables them.
+
+### Local hardware routes
+
+`k8s/deployment.yaml` sets these endpoints in `PROVIDER_REGISTRY_JSON`:
+
+| Provider prefix | Backend | Catalog |
+|---|---|---|
+| `local-llm/` | Jetson Orin Nano Ollama, `http://10.0.0.212:11434` | `/api/tags` |
+| `mlx-mac/` | Mac M4 Max MLX, `http://10.0.0.141:11435` | `/v1/models` |
+
+Both use `/v1/chat/completions` and never substitute a gateway pool. Mac port
+11434 is a separate Ollama service, not MLX. Use these client-facing names:
+
+```text
+local-llm/qwopus-9b-coder-mtp:latest
+mlx-mac/qwen3-coder-30b-a3b-instruct-4bit
+```
+
+The MLX provider's `model_aliases` in `PROVIDER_REGISTRY_JSON` maps the friendly
+name to `/Users/tusker/models/Qwen3-Coder-30B-A3B-Instruct-4bit` only on the
+outbound chat request. Successful JSON and SSE model fields retain the friendly
+name; generated content is untouched. `mlx-mac::qwen3-coder-30b-a3b-instruct-4bit`
+is equivalent. `/v1/models` advertises configured provider aliases alongside
+the gateway's virtual models. Unmapped model IDs still pass through unchanged.
+These providers do not opt local hardware into automatic pool rotation.
+
+On 2026-09-08, x20-gateway (`10.0.0.1`) received a persistent DHCP reservation
+for `10.0.0.141`, name `mac-10-0-0-141`, en0 MAC `be:cf:90:06:f5:f6`.
+The Mac retained it across a reboot. Keep this network's private MAC stable;
+changing that identity requires updating the reservation. Router procedures
+live in the adjacent `openwrt` repository; no static address was set on macOS.
+
 
 The deployment sets `TUSKER_COPILOT_BUSINESS=true` because its public Copilot
 credentials belong to a Copilot Business account. That opt-in marks the public

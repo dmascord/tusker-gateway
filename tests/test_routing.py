@@ -55,7 +55,6 @@ def test_legacy_model_ids_have_gateway_compatibility_routes():
     for model_id in (
         "hermes-gateway/hermes-code",
         "hermes-gateway/hermes-balanced",
-        "mlx-mac/qwen3-coder-30b-a3b-instruct-4bit",
         "hermes-reranker",
     ):
         route = resolve_route(model_id, {})
@@ -68,3 +67,17 @@ def test_legacy_provider_model_ids_keep_passthrough_routing():
     assert route.kind == "passthrough"
     assert route.provider == "github-copilot-enterprise"
     assert route.model == "gpt-5.5"
+
+
+def test_local_hardware_routes_never_fall_back_to_pools():
+    for provider, model in (
+        ("mlx-mac", "qwen3-coder-30b-a3b-instruct-4bit"),
+        ("mlx-mac", "mlx-community/another-model"),
+        ("local-llm", "qwopus-9b-coder-mtp:latest"),
+    ):
+        for separator in ("/", "::"):
+            route = resolve_route(f"{provider}{separator}{model}", {})
+            assert route.kind == "passthrough"
+            assert route.provider == provider
+            assert route.model == model
+            assert route.pool_name is None

@@ -1179,23 +1179,82 @@ async def test_live_openrouter_stream():
         assert b"[DONE]" in body
         assert b"data:" in body
 
-
 # ---------------------------------------------------------------------------
-# Provider coverage summary (documents which providers were exercised)
+# Endpoint precedence: runtime config override wins over PROVIDER_ENDPOINTS
 # ---------------------------------------------------------------------------
 
-def test_provider_coverage_summary():
-    """Documents provider test coverage for audit trail."""
-    coverage = {}
-    for provider in PROVIDER_ENDPOINTS:
-        if provider == "openrouter" and OPENROUTER_KEY:
-            coverage[provider] = "live"
-        elif provider in ("github-copilot", "openai-codex"):
-            coverage[provider] = "mock_shape"
-        else:
-            coverage[provider] = "mock_shape"
-    # At minimum, all providers have shape coverage
-    assert len(coverage) == len(PROVIDER_ENDPOINTS)
-    # If OPENROUTER_KEY is set, openrouter is live-tested
-    if OPENROUTER_KEY:
-        assert coverage["openrouter"] == "live"
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_runtime_config_overrides_provider_endpoints(tmp_path, stream):
+    """Runtime config for an existing provider must win over PROVIDER_ENDPOINTS.
+    A real loopback server proves the override URL is contacted and that the
+    upstream body carries a bare model name (not provider-prefixed)."""
+    import aiohttp
+    from tusker_gateway.quality import QualityDB as QDB
+
+    seen_body: dict = {}
+
+    async def handler(request: aiohttp.web.Request) -> aiohttp.web.Response:
+        body = await request.json()
+        seen_body.update(body)
+        if stream:
+            return aiohttp.web.Response(
+                text='data: {"choices":[{"delta":{"content":"hi"}}]}\n\ndata: [DONE]\n\n',
+                content_type="text/event-stream",
+            )
+        return aiohttp.web.json_response({
+            "choices": [{"message": {"role": "assistant", "content": "hi"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        })
+
+    app = aiohttp.web.Application()
+    app.router.add_post("/v1/chat/completions", handler)
+
+    runner = aiohttp.web.AppRunner(app)
+    await runner.setup()
+    port = 0
+    for p in range(9100, 9200):
+        try:
+            site = aiohttp.web.TCPSite(runner, "127.0.0.1", p)
+            await site.start()
+            port = p
+            break
+        except OSError:
+            continue
+    else:
+        raise RuntimeError("no port available")
+
+    try:
+        config = _base_config(
+            providers={
+                "local-llm": {
+                    "base_url": f"http://127.0.0.1:{port}",
+                    "chat_path": "/v1/chat/completions",
+                    "auth_type": "bearer",
+                }
+            },
+            quality_db_path=str(tmp_path / "q.db"),
+        )
+        qdb = QDB(config["quality_db_path"])
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+            client = PassthroughClient(config, qdb, session)
+            if stream:
+                result = await client.chat(
+                    "local-llm", "llama3",
+                    [{"role": "user", "content": "hi"}],
+                    stream=True,
+                )
+                chunks = [chunk async for chunk in result]
+                assert b"hi" in chunks[0]
+            else:
+                result = await client.chat(
+                    "local-llm", "llama3",
+                    [{"role": "user", "content": "hi"}],
+                    stream=False,
+                )
+                assert result["choices"][0]["message"]["content"] == "hi"
+        # Server was contacted and received the bare model name
+        assert "model" in seen_body
+        assert seen_body["model"] == "llama3"
+    finally:
+        await runner.cleanup()

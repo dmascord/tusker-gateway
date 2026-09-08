@@ -5,7 +5,7 @@ import json
 import os
 import secrets
 from typing import Any
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Literal
 
 import logging
@@ -32,6 +32,11 @@ class ProviderConfig:
     # Optional provider-native rerank endpoint. Absolute URLs are allowed for
     # providers whose rerank API is not rooted at ``base_url``.
     rerank_path: str | None = None
+    # Mapping of friendly client-facing aliases → canonical upstream model names.
+    # Keys are what clients pass in requests; values are what is sent upstream.
+    # Used by mlx-mac (and similar local runs) where a short friendly name
+    # maps to a long absolute path on the local server.
+    model_aliases: dict[str, str] = field(default_factory=dict)
 
 
 class PoolConfig:
@@ -288,46 +293,6 @@ def _load_providers() -> dict[str, ProviderConfig]:
     return _provider_registry_from_env()
 
 
-def _provider_registry_from_env() -> dict[str, ProviderConfig]:
-    registry = dict(DEFAULT_PROVIDER_REGISTRY)
-    raw = os.environ.get("PROVIDER_REGISTRY_JSON", "").strip()
-    if raw:
-        try:
-            data = json.loads(raw)
-        except (TypeError, ValueError):
-            data = None
-        if isinstance(data, dict):
-            for name, value in data.items():
-                if not isinstance(value, dict):
-                    continue
-                merged = {
-                    "name": str(name).lower(),
-                    "kind": value.get("kind", value.get("auth_type", "bearer")),
-                    "base_url": value["base_url"],
-                    "chat_path": value.get("chat_path", "/v1/chat/completions"),
-                    "auth_env": value.get("auth_env"),
-                    "pool_env": value.get("pool_env"),
-                    "model_header": value.get("model_header"),
-                    "auth_type": value.get("auth_type", value.get("kind", "bearer")),
-                    "zdr_ok": bool(value.get("zdr_ok", False)),
-                    "heavyweight": bool(value.get("heavyweight", False)),
-                    "models_path": value.get("models_path", value.get("catalog_path")),
-                    "rerank_path": value.get("rerank_path"),
-                }
-                registry[str(name).lower()] = ProviderConfig(**merged)
-
-    # The deployment uses a Copilot Business account. Keep this opt-in
-    # explicit because the public Copilot endpoint can also be used by
-    # individual accounts with different data-handling terms.
-    business_copilot = os.environ.get("TUSKER_COPILOT_BUSINESS", "").strip().lower() in {
-        "1", "true", "yes", "on",
-    }
-    if business_copilot and "github-copilot" in registry:
-        registry["github-copilot"] = replace(
-            registry["github-copilot"],
-            zdr_ok=True,
-        )
-    return registry
 
 
 DEFAULT_PROVIDER_REGISTRY: dict[str, ProviderConfig] = {
@@ -392,6 +357,12 @@ def _provider_registry_from_env() -> dict[str, ProviderConfig]:
                     "models_path": value.get("models_path", value.get("catalog_path")),
                     "rerank_path": value.get("rerank_path"),
                 }
+                # Parse model aliases: {"qwen3-coder": "/Users/tusker/models/..."}
+                raw_aliases = value.get("model_aliases")
+                if isinstance(raw_aliases, dict):
+                    merged["model_aliases"] = {
+                        str(k): str(v) for k, v in raw_aliases.items() if k and v
+                    }
                 registry[str(name).lower()] = ProviderConfig(**merged)
     business_copilot = os.environ.get("TUSKER_COPILOT_BUSINESS", "").strip().lower() in {
         "1", "true", "yes", "on",

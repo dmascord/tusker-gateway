@@ -40,7 +40,7 @@ def _test_app(config: dict[str, Any]) -> web.Application:
     return app
 
 
-def _real_config(quality_path: str, *, api_keys: list[str] | None = None) -> dict[str, Any]:
+def _real_config(quality_path: str, *, api_keys: list[str] | None = None, openai_codex_port: int | None = None) -> dict[str, Any]:
     cfg = load_config()
     cfg["api_keys"] = api_keys or [SHARED_KEY]
     cfg["quality_db_path"] = quality_path
@@ -49,35 +49,45 @@ def _real_config(quality_path: str, *, api_keys: list[str] | None = None) -> dic
     # the codex patch reuses it via provider_api_keys["openai-codex"].
     if OPENROUTER_KEY:
         cfg["provider_api_keys"]["openai-codex"] = OPENROUTER_KEY
+    if openai_codex_port is not None:
+        cfg.setdefault("providers", {})["openai-codex"] = {
+            "base_url": f"http://127.0.0.1:{openai_codex_port}",
+            "chat_path": "/chat/completions",
+            "auth_type": "bearer",
+        }
     return cfg
-
-
-def _patch_openrouter() -> dict[str, Any]:
-    original = dict(PROVIDER_ENDPOINTS.get("openai-codex", {}))
-    PROVIDER_ENDPOINTS["openai-codex"] = {
-        "base_url": "https://openrouter.ai/api/v1",
-        "chat_path": "/chat/completions",
-        "auth_type": "bearer",
-    }
-    return original
-
-
-def _restore(original: dict[str, Any]) -> None:
-    PROVIDER_ENDPOINTS["openai-codex"] = original
 
 
 @pytest.mark.asyncio
 async def test_real_single_gateway_chat():
-    """Single tusker-gateway → OpenRouter → openai/gpt-4o-mini (real)."""
+    """Single tusker-gateway → fake OpenRouter-compatible capture server."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        cfg = _real_config(os.path.join(tmpdir, "quality.db"))
-        app = _test_app(cfg)
-        server = TestServer(app)
-        client = TestClient(server)
-        await client.start_server()
+        captured_requests = []
 
-        orig = _patch_openrouter()
+        async def capture_handler(request: web.Request) -> web.Response:
+            body = await request.json()
+            captured_requests.append(body)
+            return web.json_response({
+                "id": "test",
+                "object": "chat.completion",
+                "model": body.get("model", "unknown"),
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "E2E_TEST_OK"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            })
+
+        capture_app = web.Application()
+        capture_app.router.add_post("/chat/completions", capture_handler)
+        capture_server = TestServer(capture_app)
+        capture_client = TestClient(capture_server)
+        await capture_client.start_server()
+
         try:
+            cfg = _real_config(os.path.join(tmpdir, "quality.db"), openai_codex_port=capture_server.port)
+            app = _test_app(cfg)
+            server = TestServer(app)
+            client = TestClient(server)
+            await client.start_server()
+
             payload = {
                 "model": "hermes-privacy",
                 "messages": [{"role": "user", "content": "Say exactly: E2E_TEST_OK"}],
@@ -92,24 +102,53 @@ async def test_real_single_gateway_chat():
             data = await resp.json()
             content = data["choices"][0]["message"]["content"]
             assert "E2E_TEST_OK" in content, f"Unexpected content: {content}"
-            print(f"\n✅ Single gateway response: {content!r}")
-        finally:
-            _restore(orig)
-            await client.close()
 
+            assert len(captured_requests) == 1
+            model_sent = captured_requests[0].get("model", "")
+            assert model_sent != "hermes-privacy", f"Virtual alias leaked to provider: {model_sent}"
+            print(f"\n✅ Single gateway response: {content!r} (model sent: {model_sent!r})")
+
+            await client.close()
+        finally:
+            await capture_client.close()
 
 @pytest.mark.asyncio
 async def test_real_single_gateway_stream():
-    """Single tusker-gateway → OpenRouter → openai/gpt-4o-mini streaming."""
+    """Single tusker-gateway → fake OpenRouter-compatible capture server, streaming."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        cfg = _real_config(os.path.join(tmpdir, "quality.db"))
-        app = _test_app(cfg)
-        server = TestServer(app)
-        client = TestClient(server)
-        await client.start_server()
+        async def capture_handler(request: web.Request) -> web.StreamResponse:
+            body = await request.json()
+            stream = bool(body and body.get("stream", False))
+            if stream:
+                resp = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream"})
+                await resp.prepare(request)
+                chunk1 = {"id": "chatcmpl-fake1", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"role": "assistant", "content": "STREAM_OK"}, "finish_reason": None}]}
+                chunk2 = {"id": "chatcmpl-fake2", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": ""}, "finish_reason": "stop"}]}
+                await resp.write(f"data: {chunk1}\n\n".encode())
+                await resp.write(f"data: {chunk2}\n\n".encode())
+                await resp.write(b"data: [DONE]\n\n")
+                return resp
+            return web.json_response({
+                "id": "test",
+                "object": "chat.completion",
+                "model": body.get("model", "unknown") if body else "unknown",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "STREAM_OK"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            })
 
-        orig = _patch_openrouter()
+        capture_app = web.Application()
+        capture_app.router.add_post("/chat/completions", capture_handler)
+        capture_server = TestServer(capture_app)
+        capture_client = TestClient(capture_server)
+        await capture_client.start_server()
+
         try:
+            cfg = _real_config(os.path.join(tmpdir, "quality.db"), openai_codex_port=capture_server.port)
+            app = _test_app(cfg)
+            server = TestServer(app)
+            client = TestClient(server)
+            await client.start_server()
+
             payload = {
                 "model": "hermes-privacy",
                 "messages": [{"role": "user", "content": "Say exactly: STREAM_OK"}],
@@ -128,35 +167,46 @@ async def test_real_single_gateway_stream():
                 chunks.append(line)
             body = b"".join(chunks)
             assert b"[DONE]" in body, "Missing [DONE] sentinel"
-            # The model may split the response across chunks or return a tool
-            # call. Accept any of the substrings so the test isn't brittle to
-            # model tokenization.
-            assert (
-                b"STREAM_OK" in body
-                or b"STREAM" in body
-                or b"STREAM_O" in body
-            ), f"Missing expected text in stream: {body[:500]}"
+            assert b"STREAM_OK" in body, f"Missing expected text in stream: {body[:500]}"
             print(f"\n✅ Streaming response ({len(body)} bytes): received [DONE]")
-        finally:
-            _restore(orig)
-            await client.close()
 
+            await client.close()
+        finally:
+            await capture_client.close()
 
 @pytest.mark.asyncio
 async def test_real_chained_gateways():
-    """gateway-1 → gateway-2 → OpenRouter → openai/gpt-4o-mini (real)."""
+    """gateway-1 → gateway-2 → fake OpenRouter-compatible capture server."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        orig = _patch_openrouter()
+        captured_requests = []
+
+        async def capture_handler(request: web.Request) -> web.Response:
+            body = await request.json()
+            captured_requests.append(body)
+            return web.json_response({
+                "id": "test",
+                "object": "chat.completion",
+                "model": body.get("model", "unknown"),
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "CHAIN_OK"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            })
+
+        capture_app = web.Application()
+        capture_app.router.add_post("/chat/completions", capture_handler)
+        capture_server = TestServer(capture_app)
+        capture_client = TestClient(capture_server)
+        await capture_client.start_server()
+
         try:
-            # gateway-2: routes to OpenRouter
-            cfg2 = _real_config(os.path.join(tmpdir, "g2.db"))
+            # gateway-2: routes to fake OpenRouter on capture server
+            cfg2 = _real_config(os.path.join(tmpdir, "g2.db"), openai_codex_port=capture_server.port)
             g2_app = _test_app(cfg2)
             g2_server = TestServer(g2_app)
             g2_client = TestClient(g2_server)
             await g2_client.start_server()
 
             # gateway-1: routes to gateway-2
-            cfg1 = _real_config(os.path.join(tmpdir, "g1.db"))
+            cfg1 = _real_config(os.path.join(tmpdir, "g1.db"), openai_codex_port=capture_server.port)
             cfg1["upstream_gateway_url"] = f"http://127.0.0.1:{g2_server.port}"
             g1_app = _test_app(cfg1)
             g1_server = TestServer(g1_app)
@@ -177,12 +227,16 @@ async def test_real_chained_gateways():
             data = await resp.json()
             content = data["choices"][0]["message"]["content"]
             assert "CHAIN_OK" in content, f"Unexpected content: {content}"
-            print(f"\n✅ Chained gateway response: {content!r}")
+
+            assert len(captured_requests) == 1
+            model_sent = captured_requests[0].get("model", "")
+            assert model_sent != "hermes-privacy", f"Virtual alias leaked to provider: {model_sent}"
+            print(f"\n✅ Chained gateway response: {content!r} (model sent: {model_sent!r})")
 
             await g1_client.close()
             await g2_client.close()
         finally:
-            _restore(orig)
+            await capture_client.close()
 
 
 @pytest.mark.asyncio
@@ -208,15 +262,9 @@ async def test_real_virtual_alias_not_persisted():
         capture_client = TestClient(capture_server)
         await capture_client.start_server()
 
-        original = dict(PROVIDER_ENDPOINTS.get("openai-codex", {}))
-        PROVIDER_ENDPOINTS["openai-codex"] = {
-            "base_url": f"http://127.0.0.1:{capture_server.port}",
-            "chat_path": "/chat/completions",
-            "auth_type": "bearer",
-        }
-
         try:
-            cfg = _real_config(os.path.join(tmpdir, "quality.db"))
+            # Single gateway, route via fake OpenRouter-compatible server
+            cfg = _real_config(os.path.join(tmpdir, "quality.db"), openai_codex_port=capture_server.port)
             app = _test_app(cfg)
             server = TestServer(app)
             client = TestClient(server)
@@ -236,5 +284,5 @@ async def test_real_virtual_alias_not_persisted():
 
             await client.close()
         finally:
-            PROVIDER_ENDPOINTS["openai-codex"] = original
-        await capture_client.close()
+            await capture_client.close()
+

@@ -976,6 +976,38 @@ def _responses_tool_choice(tool_choice: Any) -> Any:
     return tool_choice
 
 
+async def _stream_with_model_alias(
+    upstream_model: str,
+    alias: str,
+    wrapped: AsyncIterator[bytes],
+) -> AsyncIterator[bytes]:
+    """Rewrite only model metadata, buffering fragmented SSE events."""
+    buffer = b""
+    try:
+        async for chunk in wrapped:
+            buffer += chunk
+            while True:
+                frame, remainder = split_sse_frame(buffer)
+                if frame is None:
+                    break
+                buffer = remainder
+                payload = sse_data_payload(frame)
+                try:
+                    data = json.loads(payload) if payload else None
+                except (ValueError, UnicodeDecodeError):
+                    data = None
+                if isinstance(data, dict) and data.get("model") == upstream_model:
+                    data["model"] = alias
+                    fields = [line for line in frame.splitlines() if not line.startswith(b"data:")]
+                    fields.append(b"data: " + json.dumps(data, ensure_ascii=False).encode())
+                    frame = b"\n".join(fields)
+                yield frame + b"\n\n"
+        if buffer:
+            yield buffer
+    finally:
+        await wrapped.aclose()
+
+
 class PassthroughClient:
     """HTTP client for provider passthrough requests."""
 
@@ -1228,9 +1260,11 @@ class PassthroughClient:
         if upstream_gateway:
             endpoint = {"base_url": upstream_gateway.rstrip("/"), "chat_path": "/v1/chat/completions", "auth_type": "bearer"}
         else:
-            endpoint = PROVIDER_ENDPOINTS.get(provider)
+            # Runtime config overrides (from PROVIDER_REGISTRY_JSON) take
+            # precedence over the built-in DEFAULT_PROVIDER_REGISTRY.
+            endpoint = _configured_endpoint(self._config, provider)
             if endpoint is None:
-                endpoint = _configured_endpoint(self._config, provider)
+                endpoint = PROVIDER_ENDPOINTS.get(provider)
             if not endpoint:
                 raise ProviderError(f"Unknown provider: {provider}")
 
@@ -1278,8 +1312,11 @@ class PassthroughClient:
         base_url = endpoint["base_url"]
         path = endpoint["chat_path"]
         url = f"{base_url}{path}"
+        provider_config = (self._config.get("providers") or {}).get(provider)
+        aliases = provider_config.get("model_aliases", {}) if isinstance(provider_config, dict) else getattr(provider_config, "model_aliases", {})
+        upstream_model = model if upstream_gateway else aliases.get(model, model)
         headers, body = await self._build_request(
-            provider, model, messages,
+            provider, upstream_model, messages,
             stream=stream, api_key=(self._config["api_keys"][0] if upstream_gateway else api_key),
             tools=tools, tool_choice=tool_choice,
             extra_headers=extra_headers, extra_body=extra_body,
@@ -1342,7 +1379,7 @@ class PassthroughClient:
                 self._release_capacity(capacity_lease)
                 resp.release()
                 raise
-            return self._stream_events(
+            stream_iter = self._stream_events(
                 resp,
                 provider=provider,
                 model=model,
@@ -1352,6 +1389,9 @@ class PassthroughClient:
                 capacity_group=capacity_group,
                 started=start,
             )
+            if upstream_model != model:
+                return _stream_with_model_alias(upstream_model, model, stream_iter)
+            return stream_iter
         try:
             async with self._http.request(
                 "POST", url, headers=headers, json=body,
@@ -1375,6 +1415,8 @@ class PassthroughClient:
                 await self._record_quality(provider, model, True, latency_ms)
                 logger.debug('quality recorded %s/%s success=True', provider, model)
                 global_tracker().clear_failures(provider)
+                if model != upstream_model and result.get("model") == upstream_model:
+                    result["model"] = model
                 return result
         except RateLimitError as exc:
             from tusker_gateway.cooldown import _cooldown_seconds_for_429

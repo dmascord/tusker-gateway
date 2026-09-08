@@ -3591,6 +3591,16 @@ async def models_handler(request: web.Request) -> web.Response:
     """GET /v1/models — list available models."""
     config = request.app["config"]
     data = [{"id": config["model_name"], "object": "model", "owned_by": "tusker-gateway"}]
+    for provider_name, provider_config in config.get("providers", {}).items():
+        if provider_route_is_disabled(config, provider_name):
+            continue
+        # Handle both dict and ProviderConfig-like object
+        aliases = provider_config.get("model_aliases") if isinstance(provider_config, dict) else getattr(provider_config, "model_aliases", {})
+        if aliases:
+            data.extend(
+                {"id": f"{provider_name}/{alias}", "object": "model", "owned_by": "tusker-gateway"}
+                for alias in aliases
+            )
     data.extend({"id": alias, "object": "model", "owned_by": "tusker-gateway"} for alias in ("hermes-code", "hermes-privacy", "hermes-premium", "hermes-swarm", "hermes-reranker"))
     existing = {item["id"] for item in data}
     data.extend(

@@ -29,9 +29,8 @@ POOL_ALIASES = {
 }
 
 # Model ids advertised by the legacy Hermes endpoint. Provider-prefixed ids
-# continue through the normal passthrough path; the legacy control-plane and
-# local-only ids below need a best-effort gateway pool equivalent after the
-# hostname migration because their original backends are not present here.
+# continue through the normal passthrough path; only legacy control-plane
+# aliases need a gateway pool equivalent after the hostname migration.
 LEGACY_MODEL_IDS = (
     "github-copilot-enterprise/claude-haiku-4.5",
     "github-copilot-enterprise/claude-opus-4.6",
@@ -62,7 +61,6 @@ LEGACY_MODEL_IDS = (
     "hermes-gateway/roo-ask",
     "hermes-gateway/roo-debug",
     "hermes-reranker",
-    "mlx-mac/qwen3-coder-30b-a3b-instruct-4bit",
 )
 
 LEGACY_POOL_COMPAT_ALIASES = {
@@ -80,7 +78,6 @@ LEGACY_POOL_COMPAT_ALIASES = {
     "hermes-gateway/roo-ask": "code",
     "hermes-gateway/roo-debug": "code",
     "hermes-reranker": "code",
-    "mlx-mac/qwen3-coder-30b-a3b-instruct-4bit": "code",
 }
 
 # Explicit provider prefix marker (e.g. "github-copilot::gpt-5.5").
