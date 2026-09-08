@@ -5,8 +5,14 @@ Full inspection of the pool rotation pipeline (`config.py` → `PoolManager`
 `k8s/deployment.yaml`). Goal: find rotation-logic gaps, models we could be
 using but aren't, and how to get the `google` (Gemini) provider working again.
 
-Status: **findings only, no code changes applied yet.** Section D is the
-approved-work queue; pick items from there next session.
+Status: **resolved 2026-09-08.** Section D executed: A5 code fix landed
+(`pools.py` sets `model_data["heavyweight"]` unconditionally for every
+auto-free mode, regression test `test_poolmanager_auto_catalog_marks_heavyweight_entries`);
+A6 was already fixed before the audit session closed; A1–A3 manifest cleanup,
+Gemini recovery (option b), and A4 (`zdr_ok=True` for `xiaomi` + privacy
+`auto_catalog_providers` extended to `opencode-go`/`ollama-cloud`/`xiaomi`)
+landed in `k8s/deployment.yaml` and deployed. A7 remains a watch item.
+A8 resolved by fixing the doc (no script existed).
 
 ## Pipeline as-built (for orientation)
 

@@ -161,19 +161,23 @@ routes automatically.
 Run the read-only audit on the cluster build host after a deployment:
 
 ```bash
-./k8s/audit-provider-pools.sh
-POOL=privacy ./k8s/audit-provider-pools.sh
+# There is no bundled audit script. Use the bounded qualification runner
+# (tusker_gateway/tool_qualification.py) against the gateway, then inspect
+# catalog diagnostics from the authenticated /status endpoint:
+kubectl -n hermes exec deploy/tusker-gateway -- \
+  curl -s -H "Authorization: Bearer $TUSKER_API_KEY" http://localhost:8642/status \
+  | jq '.catalog'
 ```
+Qualification results land in the gateway's persistent tool-capability
+database; response bodies and credentials are not retained.
 
-It runs the low-concurrency streaming tool qualification against the selected
-providers inside the gateway pod and then prints the authenticated catalog
-diagnostics from `/status`. Results are written to the gateway's persistent
-tool-capability database; response bodies and credentials are not retained.
 
 The privacy pool applies the provider policy before catalog pricing. The
 default registry currently allows local `local-llm`, Ollama Cloud, OpenCode
-Go, OpenAI Codex, and GitHub Copilot Enterprise. The `local-llm` entry points
-at `localhost` inside the gateway pod; it is not the Orin Nano. An Orin route
+Go, OpenAI Codex, GitHub Copilot Enterprise, Xiaomi MiMo, and the public
+Copilot route (via the `TUSKER_COPILOT_BUSINESS` opt-in below). The
+`local-llm` entry points at `localhost` inside the gateway pod; it is not the
+Orin Nano. An Orin route
 requires an explicit provider override with the Orin's reachable address.
 Public GitHub Copilot,
 OpenRouter, NVIDIA trial endpoints, and other direct providers remain outside
