@@ -90,6 +90,34 @@ capability claim: the response validator remains the hard boundary and failed
 calls are quarantined normally. `/status` exposes the active cooldown scopes
 and pool state for diagnosing the remaining cases, including missing keys.
 
+### Hindsight structured-output qualification
+
+Hindsight is configured to call `hermes-privacy`, so its JSON retention and
+consolidation requests stay inside the privacy policy. When a privacy-pool
+request includes `response_format` of `json_object` or `json_schema`, the
+gateway prefers candidates with a recent exact JSON-schema probe. A recent
+explicit rejection is excluded; an unavailable or untested candidate remains
+eligible so a provider can recover or be qualified on first use.
+
+The background qualification task refreshes a small batch every six hours,
+probing never-tested candidates first, then the oldest evidence. Each cycle
+refreshes provider catalogs and uses the same expanded pool for probing and
+coverage. Degradation means fewer than two currently selectable privacy routes
+have fresh passing evidence; cooldowns, privacy policy, and heavyweight gates
+still apply. Counting coverage does not advance traffic rotation.
+
+Probe version `structured-output-v2` requires exactly `{"ok":true}` with an
+actual JSON boolean: numeric `1` and extra properties fail. Earlier probe
+versions are not reused as passing evidence. The standalone check is:
+
+```bash
+tusker-gateway-qualify-structured --pool privacy --limit 4
+```
+
+Only status, latency, HTTP status, failure class, probe version, and timestamp
+are stored in the model-capability database; probe prompts and response bodies
+are not retained.
+
 ## Dynamic catalog refresh
 
 The gateway pulls live model catalogs from upstream providers at runtime to

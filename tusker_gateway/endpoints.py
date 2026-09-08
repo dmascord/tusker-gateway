@@ -2047,12 +2047,15 @@ def _select_cache_route_target(
     pool_name = route.pool_name or "code"
     pool_manager = request.app.get("pool_manager") or PoolManager(config)
     required_modalities = _required_input_modalities(body.get("messages"))
+    requires_structured_output = _requires_structured_output(body, pool_name)
     excluded: set[tuple[str, str]] = set()
     while True:
         select_kwargs: dict[str, Any] = {
             "excluded": set(excluded),
             "required_input_modalities": required_modalities,
         }
+        if requires_structured_output:
+            select_kwargs["requires_structured_output"] = True
         allowed_providers = provider_patterns_for_request(request)
         if allowed_providers is not None:
             select_kwargs["allowed_providers"] = allowed_providers
@@ -2249,6 +2252,22 @@ def _required_input_modalities(messages: Any) -> frozenset[str] | None:
     return frozenset(required) or None
 
 
+def _requires_structured_output(body: dict[str, Any], pool_name: str | None) -> bool:
+    """Return whether a pool request needs Hindsight-style JSON output.
+
+    Hindsight uses the privacy alias with a JSON response format. Restricting
+    the evidence gate to that pool preserves the existing fail-open behavior
+    for ordinary chat and explicitly selected provider routes.
+    """
+    if pool_name != "privacy":
+        return False
+    response_format = body.get("response_format")
+    return isinstance(response_format, dict) and response_format.get("type") in {
+        "json_object",
+        "json_schema",
+    }
+
+
 async def _call_with_pool_fallback(
     config: dict[str, Any],
     body: dict[str, Any],
@@ -2271,6 +2290,7 @@ async def _call_with_pool_fallback(
     required_input_modalities = _required_input_modalities(body.get("messages"))
     requires_tools = bool(tools)
     pool_name = _pool_name(body)
+    requires_structured_output = _requires_structured_output(body, pool_name)
     if pool_name is None:
         provider, model = _route_target(config, body)
         decision = (
@@ -2389,6 +2409,8 @@ async def _call_with_pool_fallback(
                 select_kwargs["allowed_models"] = allowed_models
             if requires_tools:
                 select_kwargs["requires_tools"] = True
+            if requires_structured_output:
+                select_kwargs["requires_structured_output"] = True
             if recovery_probe:
                 select_kwargs["allow_cooldown_probe"] = True
                 if requires_tools:
@@ -3573,12 +3595,14 @@ def _validate_chat_body(body: Any) -> dict[str, Any]:
 def _route_target(config: dict[str, Any], body: dict[str, Any]) -> tuple[str, str]:
     route = resolve_route(body.get("model"), body)
     if route.kind in {"pool", "code"}:
+        pool_name = route.pool_name or "code"
         selected = PoolManager(config).select(
-            route.pool_name or "code",
+            pool_name,
             required_input_modalities=_required_input_modalities(body.get("messages")),
+            requires_structured_output=_requires_structured_output(body, pool_name),
         )
         if not selected:
-            raise NoHealthyModelsError(pool=route.pool_name or "code")
+            raise NoHealthyModelsError(pool=pool_name)
         return selected
     if route.kind == "passthrough" and route.provider and route.model:
         if provider_route_is_disabled(config, route.provider):

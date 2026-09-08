@@ -6,6 +6,7 @@ import tempfile
 
 from tusker_gateway.config import PoolConfig, _load_pools, load_config
 from tusker_gateway.cooldown import CooldownTracker, _cooldown_seconds_for_429
+from tusker_gateway.model_capability import STRUCTURED_OUTPUT_PROBE_VERSION
 from tusker_gateway.pools import ModelSpec, PoolManager, is_general_chat_model
 
 
@@ -271,6 +272,71 @@ def test_verified_modality_evidence_controls_pool_selection():
             "groq",
             "vision-candidate",
         )
+
+
+def test_privacy_structured_output_gate_prefers_passes_and_excludes_rejections(tmp_path):
+    manager = PoolManager(
+        {
+            "pools": {
+                "privacy": PoolConfig(
+                    name="privacy",
+                    zdr=True,
+                    models=[
+                        {"provider": "synthetic", "model": "structured-good"},
+                        {"provider": "local-llm", "model": "structured-bad"},
+                    ],
+                ),
+            },
+            "quality_db_path": str(tmp_path / "quality.db"),
+            "model_capability_db_path": str(tmp_path / "model-capability.db"),
+            "excluded_providers": [],
+            "provider_api_keys": {"synthetic": "k-synthetic"},
+        }
+    )
+    manager._model_capability_db.record(
+        provider="synthetic",
+        model="structured-good",
+        capability="structured_output",
+        status="passed",
+        source="structured_probe",
+        probe_version=STRUCTURED_OUTPUT_PROBE_VERSION,
+    )
+    manager._model_capability_db.record(
+        provider="local-llm",
+        model="structured-bad",
+        capability="structured_output",
+        status="unsupported",
+        source="structured_probe",
+        probe_version=STRUCTURED_OUTPUT_PROBE_VERSION,
+    )
+
+    assert manager.select("privacy", requires_structured_output=True) == (
+        "synthetic",
+        "structured-good",
+    )
+
+
+def test_privacy_structured_output_gate_fails_open_for_unknown_candidates(tmp_path):
+    manager = PoolManager(
+        {
+            "pools": {
+                "privacy": PoolConfig(
+                    name="privacy",
+                    zdr=True,
+                    models=[{"provider": "synthetic", "model": "unqualified"}],
+                ),
+            },
+            "quality_db_path": str(tmp_path / "quality.db"),
+            "model_capability_db_path": str(tmp_path / "model-capability.db"),
+            "excluded_providers": [],
+            "provider_api_keys": {"synthetic": "k-synthetic"},
+        }
+    )
+
+    assert manager.select("privacy", requires_structured_output=True) == (
+        "synthetic",
+        "unqualified",
+    )
 
 
 def test_unrated_model_does_not_outrank_measured_model():

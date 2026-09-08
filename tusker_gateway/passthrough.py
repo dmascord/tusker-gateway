@@ -976,6 +976,42 @@ def _responses_tool_choice(tool_choice: Any) -> Any:
     return tool_choice
 
 
+def _chat_response_format_to_codex_text(value: Any) -> dict[str, Any] | None:
+    """Translate Chat Completions ``response_format`` to Responses ``text``.
+
+    The Codex backend is a Responses API endpoint. It rejects the Chat
+    Completions ``response_format`` field, while Hindsight and other OpenAI
+    clients legitimately send it for structured output. Responses carries
+    the equivalent contract under ``text.format``.
+    """
+    if not isinstance(value, dict):
+        raise ProviderError("response_format must be an object")
+    kind = value.get("type")
+    if kind == "text":
+        return None
+    if kind == "json_object":
+        return {"type": "json_object"}
+    if kind == "json_schema":
+        schema_value = value.get("json_schema")
+        if not isinstance(schema_value, dict):
+            raise ProviderError("response_format.json_schema must be an object")
+        schema = schema_value.get("schema")
+        if not isinstance(schema, dict):
+            raise ProviderError("response_format.json_schema.schema must be an object")
+        name = schema_value.get("name") or "response"
+        if not isinstance(name, str) or not name.strip():
+            raise ProviderError("response_format.json_schema.name must be a non-empty string")
+        strict = schema_value.get("strict")
+        return {
+            "type": "json_schema",
+            "name": name.strip(),
+            "schema": schema,
+            "strict": bool(strict) if strict is not None else False,
+        }
+    raise ProviderError(f"Unsupported response_format type for Codex: {kind!r}")
+
+
+
 async def _stream_with_model_alias(
     upstream_model: str,
     alias: str,
@@ -1087,6 +1123,51 @@ class PassthroughClient:
                 http_client=http_client,
                 provider="openai-codex",
             )
+
+
+    def _resolve_upstream_model(
+        self,
+        provider: str,
+        model: str,
+    ) -> str:
+        """Resolve a client-facing model alias to its canonical upstream name.
+        
+        If the model is not an alias for the given provider, return it unchanged.
+        Only applies to providers that do not use the Responses API adapter
+        (standard /v1/chat/completions passthrough).
+        """
+        # Only translate for providers without a Responses API adapter.
+        # Responses API models already carry their own identity.
+        endpoint = _configured_endpoint(self._config, provider)
+        if endpoint is None:
+            ep = PROVIDER_ENDPOINTS.get(provider)
+        else:
+            ep = endpoint
+        if ep and ep.get("chat_path", "").endswith("/responses"):
+            return model
+        try:
+            from tusker_gateway.config import _load_providers
+            registry = _load_providers()
+            pc = registry.get(provider)
+            if pc and pc.model_aliases and model in pc.model_aliases:
+                return pc.model_aliases[model]
+        except Exception:
+            pass
+        return model
+
+    def _alias_for_upstream(self, provider: str, upstream_model: str) -> str | None:
+        """Return the client-facing alias for a given upstream model, if one exists."""
+        try:
+            from tusker_gateway.config import _load_providers
+            registry = _load_providers()
+            pc = registry.get(provider)
+            if pc and pc.model_aliases:
+                for alias, upstream in pc.model_aliases.items():
+                    if upstream == upstream_model:
+                        return alias
+        except Exception:
+            pass
+        return None
 
     def _record_usage(
         self,
@@ -1732,6 +1813,17 @@ class PassthroughClient:
                 "stream_options",
             ):
                 mapped.pop(k, None)
+            # The Chat Completions response_format field maps to the
+            # Responses API's text.format object. Leaving it at top level
+            # makes Codex reject otherwise valid structured-output calls.
+            response_format = mapped.pop("response_format", None)
+            if response_format is not None:
+                codex_format = _chat_response_format_to_codex_text(response_format)
+                if codex_format is not None:
+                    text_config = body.get("text")
+                    text_config = dict(text_config) if isinstance(text_config, dict) else {}
+                    text_config["format"] = codex_format
+                    body["text"] = text_config
             # The Codex Responses API accepts reasoning as a nested object
             # ({effort, summary}) — not the flat chat-completions
             # `reasoning_effort` top-level field. Fold the client's value

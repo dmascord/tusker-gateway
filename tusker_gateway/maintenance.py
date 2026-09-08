@@ -15,11 +15,16 @@ from typing import Any
 
 from tusker_gateway.config import load_config
 from tusker_gateway.persistent_cooldown import PersistentCooldownStore
+from tusker_gateway.structured_qualification import (
+    qualified_count,
+    run_structured_qualification,
+)
 from tusker_gateway.tool_qualification import run_qualification
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_POOL_ORDER = ("code", "privacy", "premium", "swarm")
+_DEFAULT_STRUCTURED_POOL = "privacy"
 
 
 def _env_float(name: str, default: float, *, minimum: float = 0.0) -> float:
@@ -105,6 +110,72 @@ async def run_maintenance_cycle(
     }
 
 
+def _structured_qualification_enabled(config: dict[str, Any]) -> bool:
+    """Return whether the Hindsight JSON contract monitor is enabled."""
+    raw = os.environ.get("TUSKER_STRUCTURED_QUALIFICATION_ENABLED", "1")
+    if raw.strip().lower() in {"0", "false", "no", "off"}:
+        return False
+    return _structured_pool_name(config) in config.get("pools", {})
+
+
+def _structured_pool_name(config: dict[str, Any]) -> str:
+    return (
+        os.environ.get(
+            "TUSKER_STRUCTURED_QUALIFICATION_POOL",
+            _DEFAULT_STRUCTURED_POOL,
+        )
+        .strip()
+        .lower()
+        .replace("_", "-")
+    )
+
+
+async def run_structured_maintenance_cycle(
+    *,
+    pool_name: str = _DEFAULT_STRUCTURED_POOL,
+    base_url: str = "http://127.0.0.1:8642",
+    limit: int = 4,
+    timeout_secs: float = 45.0,
+    max_age_secs: float = 21_600.0,
+) -> dict[str, Any]:
+    """Refresh Hindsight-compatible candidates and report pool coverage."""
+    from tusker_gateway.pools import PoolManager
+
+    manager = PoolManager(load_config())
+    results = await run_structured_qualification(
+        pool_name=pool_name,
+        base_url=base_url,
+        max_concurrency=1,
+        timeout_secs=timeout_secs,
+        max_age_secs=max_age_secs,
+        limit=limit,
+        ignore_cooldowns=False,
+        manager=manager,
+    )
+    qualified = qualified_count(
+        manager=manager,
+        pool_name=pool_name,
+        max_age_secs=max_age_secs,
+    )
+    summary = {
+        "pool": pool_name,
+        "tested": len(results),
+        "passed": sum(1 for result in results if result.get("status") == "passed"),
+        "failed": sum(1 for result in results if result.get("status") != "passed"),
+        "qualified": qualified,
+        "minimum_required": 2,
+        "degraded": qualified < 2,
+    }
+    if summary["degraded"]:
+        logger.warning(
+            "structured qualification degraded pool=%s qualified=%d minimum_required=%d",
+            pool_name,
+            qualified,
+            summary["minimum_required"],
+        )
+    return summary
+
+
 async def qualification_maintenance_loop(stop_event: asyncio.Event) -> None:
     """Rotate small qualification batches without blocking gateway startup."""
     config = load_config()
@@ -142,6 +213,23 @@ async def qualification_maintenance_loop(stop_event: asyncio.Event) -> None:
         "TUSKER_TOOL_QUALIFICATION_BASE_URL",
         "http://127.0.0.1:8642",
     ).strip() or "http://127.0.0.1:8642"
+    structured_enabled = _structured_qualification_enabled(config)
+    structured_pool = _structured_pool_name(config)
+    structured_limit = _env_int(
+        "TUSKER_STRUCTURED_QUALIFICATION_LIMIT",
+        4,
+        minimum=1,
+    )
+    structured_timeout_secs = _env_float(
+        "TUSKER_STRUCTURED_QUALIFICATION_TIMEOUT_SECS",
+        45.0,
+        minimum=5.0,
+    )
+    structured_max_age_secs = _env_float(
+        "TUSKER_STRUCTURED_QUALIFICATION_MAX_AGE_SECS",
+        21_600.0,
+        minimum=60.0,
+    )
 
     logger.info(
         "qualification maintenance started interval=%.0fs initial_delay=%.0fs "
@@ -151,6 +239,14 @@ async def qualification_maintenance_loop(stop_event: asyncio.Event) -> None:
         limit,
         ",".join(pools),
     )
+    if structured_enabled:
+        logger.info(
+            "structured qualification enabled pool=%s limit=%d timeout=%.0fs max_age=%.0fs",
+            structured_pool,
+            structured_limit,
+            structured_timeout_secs,
+            structured_max_age_secs,
+        )
     first_cycle = True
     pool_index = 0
     while not stop_event.is_set():
@@ -169,6 +265,18 @@ async def qualification_maintenance_loop(stop_event: asyncio.Event) -> None:
                 max_age_secs=max_age_secs,
             )
             logger.info("qualification maintenance result=%s", summary)
+            if structured_enabled:
+                structured_summary = await run_structured_maintenance_cycle(
+                    pool_name=structured_pool,
+                    base_url=base_url,
+                    limit=structured_limit,
+                    timeout_secs=structured_timeout_secs,
+                    max_age_secs=structured_max_age_secs,
+                )
+                logger.info(
+                    "structured qualification result=%s",
+                    structured_summary,
+                )
         except asyncio.CancelledError:
             raise
         except Exception as exc:

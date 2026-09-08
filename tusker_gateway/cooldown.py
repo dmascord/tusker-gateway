@@ -17,6 +17,11 @@ logger = logging.getLogger(__name__)
 
 
 MAX_COOLDOWN_SECS = 30 * 86400.0 # 30 days
+# A provider may report a quota reset through a very large numeric
+# Retry-After value. Keep the explicit header useful for short outages, but
+# do not let one upstream response quarantine a route for weeks. Longer quota
+# windows are handled deliberately by the body heuristics below.
+MAX_RETRY_AFTER_SECS = 3600.0
 
 # Providers whose published rate limits are separated by model (or model
 # class). A 429 from one model on these providers must not evict the other
@@ -286,7 +291,7 @@ def _cooldown_seconds_for_429(exc: dict[str, Any]) -> float:
     ra = headers.get("Retry-After", "")
     if ra:
         try:
-            return float(ra)
+            return max(0.0, min(float(ra), MAX_RETRY_AFTER_SECS))
         except ValueError:
             pass
 

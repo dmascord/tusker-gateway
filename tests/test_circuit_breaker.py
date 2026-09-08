@@ -196,6 +196,15 @@ def test_quota_exhaustion_429_returns_long_cooldown():
     ) == 60.0
 
 
+def test_retry_after_is_capped_at_one_hour():
+    """A provider reset header must not create a multi-week quarantine."""
+    from tusker_gateway.cooldown import _cooldown_seconds_for_429
+
+    assert _cooldown_seconds_for_429(
+        {"body": "quota exceeded", "headers": {"Retry-After": "9999999"}}
+    ) == 3600.0
+
+
 def test_payment_required_non429_returns_long_cooldown():
     """Payment-required responses must quarantine the route like quota errors."""
     from types import SimpleNamespace

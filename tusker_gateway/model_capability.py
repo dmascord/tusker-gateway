@@ -33,6 +33,12 @@ from tusker_gateway.storage import shared_database
 
 
 MODEL_CAPABILITY_PROBE_VERSION = "model-capability-v1"
+# Hindsight and other memory clients depend on a stricter contract than a
+# generic successful chat: the response must contain parseable JSON. Keep
+# this evidence in the same durable capability store so privacy-pool routing
+# can prefer candidates that have passed the contract recently.
+STRUCTURED_OUTPUT_CAPABILITY = "structured_output"
+STRUCTURED_OUTPUT_PROBE_VERSION = "structured-output-v2"
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +65,7 @@ KNOWN_CAPABILITIES = (
     INPUT_MODALITY_CAPABILITIES
     | OUTPUT_MODALITY_CAPABILITIES
     | ENDPOINT_CAPABILITIES
+    | {STRUCTURED_OUTPUT_CAPABILITY}
 )
 CAPABILITY_STATUSES = frozenset({
     "advertised",

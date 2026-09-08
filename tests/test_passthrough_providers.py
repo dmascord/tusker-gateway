@@ -1116,6 +1116,83 @@ async def test_chat_codex_drops_max_tokens_params():
         assert field not in body
 
 
+@pytest.mark.parametrize(
+    ("response_format", "expected_format"),
+    [
+        (
+            {"type": "json_object"},
+            {"type": "json_object"},
+        ),
+        (
+            {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "properties": {"ok": {"type": "boolean"}},
+                        "required": ["ok"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "json_schema",
+                "name": "answer",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {"ok": {"type": "boolean"}},
+                    "required": ["ok"],
+                    "additionalProperties": False,
+                },
+            },
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_chat_codex_maps_response_format_to_responses_text(
+    response_format, expected_format
+):
+    """Chat structured-output requests must use Responses ``text.format``."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from tusker_gateway.passthrough import CodexTokenRotator, PassthroughClient
+
+    client = PassthroughClient.__new__(PassthroughClient)
+    client._codex_rotator = CodexTokenRotator([
+        {"access_token": "tok-a", "expires_at_ms": 9999999999999},
+    ])
+    client._config = {"quality_db_path": "/tmp/q.db"}
+    client._http = MagicMock()
+    captured: dict = {}
+
+    class FakeHTTPRequest:
+        async def __call__(self, _method, _url, *, headers=None, json=None, timeout=None, **_kw):
+            captured["json"] = json
+            resp = MagicMock()
+            resp.status = 400
+            resp.text = AsyncMock(return_value='{"detail":"ignored"}')
+            return resp
+
+    client._http.request = FakeHTTPRequest()
+
+    with pytest.raises(Exception):
+        await client._chat_codex(
+            provider="openai-codex",
+            model="gpt-5.6-luna",
+            messages=[{"role": "user", "content": "return JSON"}],
+            stream=False,
+            api_key=None,
+            extra_body={"response_format": response_format},
+        )
+
+    body = captured["json"]
+    assert "response_format" not in body
+    assert body["text"]["format"] == expected_format
+
+
 # ---------------------------------------------------------------------------
 # LIVE smoke: openrouter (requires OPENROUTER_API_KEY in env)
 # ---------------------------------------------------------------------------

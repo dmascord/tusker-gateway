@@ -24,6 +24,10 @@ from tusker_gateway.catalog import (
 from tusker_gateway.config import DEFAULT_PROVIDER_REGISTRY, PoolConfig
 from tusker_gateway.cooldown import CooldownTracker, global_tracker
 from tusker_gateway.heavyweight import is_heavyweight
+from tusker_gateway.model_capability import (
+    STRUCTURED_OUTPUT_CAPABILITY,
+    STRUCTURED_OUTPUT_PROBE_VERSION,
+)
 from tusker_gateway.quality import QualityDB
 from tusker_gateway.tool_capability import (
     ToolCapabilityDB,
@@ -764,6 +768,47 @@ class PoolManager:
                 return False
         return True
 
+    def _structured_output_status(
+        self,
+        spec: ModelSpec,
+        model_capability_records: dict[tuple[str, str], tuple[Any, ...]] | None,
+    ) -> str:
+        """Return recent structured-output evidence for one candidate.
+
+        Unknown and transiently unavailable candidates remain eligible so a
+        fresh deployment or provider recovery is not made empty by a stale
+        probe. A recent explicit unsupported result is the only hard deny;
+        when at least one recent pass exists, selection prefers those passes.
+        """
+        records = (
+            model_capability_records.get((spec.provider, spec.model), ())
+            if model_capability_records is not None
+            else ()
+        )
+        record = next(
+            (
+                item
+                for item in records
+                if item.capability == STRUCTURED_OUTPUT_CAPABILITY
+            ),
+            None,
+        )
+        if record is None or record.probe_version != STRUCTURED_OUTPUT_PROBE_VERSION:
+            return "unknown"
+        try:
+            max_age_secs = max(
+                60.0,
+                float(os.environ.get(
+                    "TUSKER_STRUCTURED_QUALIFICATION_MAX_AGE_SECS",
+                    "21600",
+                )),
+            )
+        except (TypeError, ValueError):
+            max_age_secs = 21_600.0
+        if time.time() - record.checked_at > max_age_secs:
+            return "unknown"
+        return str(record.status)
+
     def _effective_modalities_for_status(
         self,
         spec: ModelSpec,
@@ -881,6 +926,7 @@ class PoolManager:
         excluded: set[tuple[str, str]] | None = None,
         required_input_modalities: set[str] | frozenset[str] | None = None,
         requires_tools: bool = False,
+        requires_structured_output: bool = False,
         allow_cooldown_probe: bool = False,
         allow_unqualified_static_tools: bool = False,
         allow_structured_tool_fallback: bool = False,
@@ -905,6 +951,11 @@ class PoolManager:
         ``requires_tools`` applies the same rule to catalog-advertised tool
         support. Models that explicitly lack tools are excluded; models with
         unknown capability metadata remain eligible for compatibility.
+
+        ``requires_structured_output`` applies the Hindsight JSON contract.
+        Recent failed structured probes are excluded, while a recent passing
+        probe is preferred over an unqualified candidate. Unknown candidates
+        remain available for recovery and first-use qualification.
 
         ``allow_cooldown_probe`` is reserved for the bounded request-level
         recovery path. It ignores individual model/provider cooldowns while
@@ -1031,6 +1082,14 @@ class PoolManager:
                         ):
                             self._drop_stickiness(key)
                             break
+                        if (
+                            requires_structured_output
+                            and self._structured_output_status(
+                                s, model_capability_records
+                            ) == "unsupported"
+                        ):
+                            self._drop_stickiness(key)
+                            break
                         if requires_tools and tool_support is False and not (
                             allow_tool_compatibility_fallback and not s.auto_discovered
                         ):
@@ -1064,6 +1123,7 @@ class PoolManager:
         filtered_special_models: list[str] = []
         filtered_tool_models: list[str] = []
         filtered_tool_capability_models: list[str] = []
+        filtered_structured_models: list[str] = []
         filtered_modality_models: list[str] = []
         filtered_cooldown_models: list[str] = []
         filter_counts = {
@@ -1075,6 +1135,7 @@ class PoolManager:
             "input_modalities": 0,
             "advertised_tools": 0,
             "behavioral_tools": 0,
+            "structured_output": 0,
             "cooldown": 0,
             "zdr_policy": 0,
         }
@@ -1128,6 +1189,15 @@ class PoolManager:
                 filter_counts["behavioral_tools"] += 1
                 filtered_tool_capability_models.append(f"{s.provider}/{s.model}")
                 continue
+            if (
+                requires_structured_output
+                and self._structured_output_status(
+                    s, model_capability_records
+                ) == "unsupported"
+            ):
+                filter_counts["structured_output"] += 1
+                filtered_structured_models.append(f"{s.provider}/{s.model}")
+                continue
             cooldown_active = (
                 self._cooldowns.is_capacity_cooldown(s.provider, s.model)
                 if allow_cooldown_probe
@@ -1161,6 +1231,13 @@ class PoolManager:
                 len(filtered_tool_capability_models),
                 ",".join(filtered_tool_capability_models[:12]),
             )
+        if requires_structured_output and filtered_structured_models:
+            logger.info(
+                "pool '%s' structured-output filter filtered=%d models=%s",
+                pool_name,
+                len(filtered_structured_models),
+                ",".join(filtered_structured_models[:12]),
+            )
         if filtered_special_models:
             logger.info(
                 "pool '%s' special-purpose filter filtered=%d models=%s",
@@ -1184,6 +1261,22 @@ class PoolManager:
                 ",".join(filtered_modality_models[:12]),
             )
 
+        if requires_structured_output and candidates:
+            qualified_candidates = [
+                candidate
+                for candidate in candidates
+                if self._structured_output_status(
+                    candidate, model_capability_records
+                ) == "passed"
+            ]
+            if qualified_candidates:
+                candidates = qualified_candidates
+                logger.info(
+                    "pool '%s' structured-output qualification preferred=%d",
+                    pool_name,
+                    len(candidates),
+                )
+
         if not candidates:
             filters = ",".join(
                 f"{name}={count}"
@@ -1195,7 +1288,7 @@ class PoolManager:
                 "input_modalities=%s context_tokens=%d filters=%s cooldown_models=%s "
                 "cooldown_probe=%s unqualified_static_tools=%s "
                 "structured_tool_fallback=%s tool_compatibility_fallback=%s "
-                "unkeyed=%d",
+                "structured_output=%s unkeyed=%d",
                 pool_name,
                 len(specs),
                 requires_tools,
@@ -1207,6 +1300,7 @@ class PoolManager:
                 allow_unqualified_static_tools,
                 allow_structured_tool_fallback,
                 allow_tool_compatibility_fallback,
+                requires_structured_output,
                 len(self.unkeyed.get(pool_name, ())),
             )
             return None

@@ -13,66 +13,45 @@ Tusker Gateway runs alongside Hermes in the `hermes` namespace on the `visor` cl
 
 ## 1. Sync source to visor
 
-The build host is `visor`. The repo lives at `~/dev/tusker-ai-gateway/` locally and must be mirrored to `/srv/opencode/tusker-ai-gateway/` on `visor` before building.
+The build host is `visor`. Deploy a verified commit, not an rsync overlay of
+uncommitted files. Synchronize an exported tree to a dedicated build directory
+and pass the full local commit explicitly; visor's Git metadata is not authoritative.
 
 ```bash
-# from Mac
-rsync -a --delete --exclude='.venv' --exclude='__pycache__' --exclude='.pytest_cache' \
-  ~/dev/tusker-ai-gateway/ visor:/srv/opencode/tusker-ai-gateway/
+REV=$(git rev-parse HEAD)
+EXPORT=$(mktemp -d)
+git archive "$REV" | tar -x -C "$EXPORT"
+rsync -a --delete "$EXPORT/" "visor:/srv/opencode/tusker-ai-gateway-build-$REV/"
 ```
 
 ## 2. Build and deploy
 
-The convenience script `k8s/deploy.sh` does all of this in one shot:
+The convenience script builds and pushes the image, renders the intended image
+into a temporary deployment manifest, applies it once, and verifies the rollout.
+`TUSKER_COMMIT` must be the explicit full source SHA. The image embeds it;
+the deployment does not override it with an environment value.
 
 ```bash
-ssh visor
-cd /srv/opencode/tusker-ai-gateway
-./k8s/deploy.sh                # optional: ./k8s/deploy.sh 20260820180000
+ssh visor "cd /srv/opencode/tusker-ai-gateway-build-$REV && TUSKER_COMMIT=$REV ./k8s/deploy.sh $REV"
+rm -r "$EXPORT"
 ```
 
-Manual equivalent:
-
-```bash
-ssh visor
-cd /srv/opencode/tusker-ai-gateway
-
-# Build
-TAG=swarm-alpine-$(date +%Y%m%d%H%M%S)
-IMAGE=registry.tusker.net.au:5000/tusker-gateway:$TAG
-buildah bud -f Dockerfile -t "$IMAGE" .
-buildah push "$IMAGE"
-
-# Apply manifests. The gateway mounts ``tusker-home-rwx`` (ReadWriteMany,
-# cloned from the live ``tusker-home`` volume) so RollingUpdate with
-# maxSurge:1/maxUnavailable:0 can co-mount both pods during rollout.
-# ``pvc.yaml`` is the old RWO PVC, retained as an offline fall-back copy.
-kubectl -n hermes apply -f k8s/pvc-rwx.yaml
-kubectl -n hermes apply -f k8s/pvc.yaml
-kubectl -n hermes apply -f k8s/config.yaml
-kubectl -n hermes apply -f k8s/service.yaml
-kubectl -n hermes apply -f k8s/ingressroute.yaml
-
-# Deploy
-kubectl -n hermes set image deployment/tusker-gateway tusker-gateway="$IMAGE"
-kubectl -n hermes rollout status deployment/tusker-gateway --timeout=180s
-```
+Do not run concurrent deployments to the same gateway. Applying deployment or
+config manifests requires operator authorization. The script verifies the
+running ready pod's image digest against the pushed digest and checks the public
+`/health` revision before reporting success.
 
 ## 3. Smoke test
 
-The gateway is fronted by `ai.tusker.net.au` (same edge as Hermes):
+The gateway is fronted by `ai.tusker.net.au` (same edge as Hermes). The deployment
+script requires successful `/health` and `/ready` responses, then executes
+`k8s/smoke_chat.py` against `/v1/chat/completions`.
 
-```bash
-# Pod health
-kubectl -n hermes get pods -o wide | grep tusker-gateway
-
-# HTTP health
-curl -sS -o /dev/null -w 'health http=%{http_code} time=%{time_total}s\n' \
-  https://ai.tusker.net.au/health
-curl -sS -o /dev/null -w 'ready  http=%{http_code} time=%{time_total}s\n' \
-  https://ai.tusker.net.au/ready
-curl -sS https://ai.tusker.net.au/ready && echo
-```
+The chat smoke requires a successful HTTP response, nonempty assistant content,
+and a complete `[DONE]` stream without error or malformed events. HTTP errors,
+truncated streams, missing credentials, and time/size limits fail deployment.
+The gateway key is passed through `SMOKE_API_KEY`, not printed or passed on the
+helper's command line. Do not replace this check with a truncated `curl` preview.
 
 ## 4. DNS
 
