@@ -248,3 +248,37 @@ is raised so the existing fallback bookkeeping runs.
 - Commit `37eb397` on `main`.
 
 Verification: `pytest tests/ -p no:cacheprovider --ignore=tests/test_passthrough_providers.py` — 814 passed, 2 skipped.
+
+## F. Gemini recovery (C) — applied 2026-09-09
+
+Manifest-only recovery, no code change. `k8s/deployment.yaml` now:
+
+| Env var | Before | After |
+|---|---|---|
+| `TUSKER_DISABLED_PROVIDERS` | `arcee,cohere,cerebras,google` | `arcee,cohere,cerebras` |
+| `TUSKER_PASSTHROUGH_DISABLED_PROVIDERS` | `cerebras` | `cerebras` (unchanged) |
+| `TUSKER_CATALOG_DISABLED_PROVIDERS` | `arcee,arliai,cohere,openai,cerebras,google` | `arcee,arliai,cohere,openai,cerebras` |
+| `TUSKER_POOL_CODE.auto_catalog_providers` | `[..., "groq"]` | `[..., "groq", "google"]` |
+| `TUSKER_POOL_PREMIUM.models` | 14 entries | 15 entries, `{"provider":"google","model":"gemini-3-pro"}` appended |
+
+Catalog policy chosen: **(b)** — un-disable Google catalog so the
+authenticated `/v1beta/openai/models` refresh populates current Gemini
+slugs hourly; the static `gemini-3.1-flash-lite-preview` row is dropped
+(it was the only dead Google static row and is superseded by catalog
+discovery).
+
+`heavyweight.py` already classifies `gemini-2.5-pro`/`gemini-3-pro` as
+heavyweight and `pools.py` keeps the `-image`/`imagen-*` exclusion, so
+the premium route is the only place a heavy Gemini slug can land; flash
+variants remain cheap-tier eligible in `code`.
+
+### Blocked stage
+
+The cluster build host `visor` and the cluster API server
+(`10.0.0.224:6443`) are unreachable from this dev host — both `ssh visor`
+and direct `kubectl` time out. The manifest edit is complete and
+validated locally (YAML parses, all four pool JSON blobs decode, Google
+appears in code `auto_catalog_providers` and premium `models`), but the
+deploy-flow smoke (`rsync` → `./k8s/deploy.sh` → `/health` + `/ready` +
+Gemini probe) has **not** been executed. It must be run from a host
+with `visor` access.
