@@ -253,6 +253,18 @@ spec:
               optional: true
               name: tusker-env-vault
               key: OPENCODE_ZEN_API_KEY
+        - name: CF_ACCOUNT_ID
+          valueFrom:
+            secretKeyRef:
+              optional: true
+              name: tusker-env-vault
+              key: CF_ACCOUNT_ID
+        - name: CF_API_TOKEN
+          valueFrom:
+            secretKeyRef:
+              optional: true
+              name: tusker-env-vault
+              key: CF_API_TOKEN
         - name: HF_TOKEN
           valueFrom:
             secretKeyRef:

@@ -788,6 +788,60 @@ class XiaomiCatalog(CatalogClient):
         return out
 
 
+class WorkersAICatalog(CatalogClient):
+    """Cloudflare Workers AI catalog via GET /ai/models/search.
+
+    The search endpoint returns Cloudflare's native envelope
+    (``{"success": ..., "result": [...]}``) instead of an OpenAI-style
+    ``data`` list, and rows identify the model with ``name`` (``id`` is an
+    internal UUID). Only ``Text Generation`` rows are advertised: the
+    account also exposes image/speech/embedding tasks that the
+    OpenAI-compatible chat passthrough does not serve.
+    """
+
+    provider = "workers-ai"
+    ttl_secs = 3600.0
+
+    def __init__(self) -> None:
+        super().__init__()
+        from tusker_gateway.config import expand_env_placeholders
+        self.endpoint = expand_env_placeholders(
+            "https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}"
+            "/ai/models/search?per_page=1000"
+        )
+
+    async def fetch(self, session: aiohttp.ClientSession) -> list[CatalogEntry]:
+        headers = self._auth_headers({
+            "User-Agent": "tusker-gateway/1.0 (catalog-refresh)",
+            "accept": "application/json",
+        })
+        async with session.get(self.endpoint, headers=headers) as resp:
+            if resp.status != 200:
+                raise CatalogError(f"workers-ai models HTTP {resp.status}")
+            data = await resp.json()
+
+        models = data.get("result", []) if isinstance(data, dict) else data
+        out: list[CatalogEntry] = []
+        if not isinstance(models, list):
+            return out
+        for row in models:
+            if not isinstance(row, dict):
+                continue
+            if not isinstance(row.get("task"), dict):
+                continue
+            if str(row["task"].get("name", "")).strip().lower() != "text generation":
+                continue
+            model = row.get("name")
+            if not isinstance(model, str) or not model.strip():
+                continue
+            out.append(CatalogEntry(
+                provider=self.provider,
+                model=model.strip(),
+                raw=row,
+            ))
+        return out
+
+
 # ---------------------------------------------------------------------------
 # models.dev (pricing DB)
 # ---------------------------------------------------------------------------
@@ -1125,6 +1179,8 @@ class CatalogRegistry:
             reg.register("opencode-go", OpenCodeGoCatalog())
         if "xiaomi" in provider_registry:
             reg.register("xiaomi", XiaomiCatalog())
+        if "workers-ai" in provider_registry:
+            reg.register("workers-ai", WorkersAICatalog())
 
         special = {
             "openai-codex",
@@ -1134,6 +1190,7 @@ class CatalogRegistry:
             "opencode-zen",
             "opencode-go",
             "xiaomi",
+            "workers-ai",
             "models.dev",
         }
         for provider, config in provider_registry.items():

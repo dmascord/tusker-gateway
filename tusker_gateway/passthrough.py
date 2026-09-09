@@ -487,11 +487,11 @@ _UPSTREAM_STREAM_SOCK_READ_SECS = float(
 # Falls back to legacy hard-coded mapping if the registry is unavailable.
 def _init_provider_endpoints() -> dict[str, dict[str, Any]]:
     try:
-        from tusker_gateway.config import DEFAULT_PROVIDER_REGISTRY
+        from tusker_gateway.config import DEFAULT_PROVIDER_REGISTRY, expand_env_placeholders
         out: dict[str, dict[str, Any]] = {}
         for name, pc in DEFAULT_PROVIDER_REGISTRY.items():
             entry: dict[str, Any] = {
-                "base_url": pc.base_url,
+                "base_url": expand_env_placeholders(pc.base_url) or pc.base_url,
                 "chat_path": pc.chat_path,
                 "auth_type": pc.auth_type or pc.kind,
             }

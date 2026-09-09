@@ -399,6 +399,34 @@ def test_config_maps_manifest_provider_key_aliases():
     assert cfg["provider_api_keys"]["zai"] == "zai-key"
 
 
+def test_config_maps_cf_credentials_to_workers_ai():
+    env = {
+        "CF_API_TOKEN": "cf-token",
+        "CF_ACCOUNT_ID": "cf-account",
+        "API_KEYS": "k1",
+    }
+    with patch.dict(os.environ, env, clear=False):
+        cfg = load_config()
+    assert cfg["provider_api_keys"]["workers-ai"] == "cf-token"
+    provider = cfg["providers"]["workers-ai"]
+    assert provider.base_url == (
+        "https://api.cloudflare.com/client/v4/accounts/cf-account/ai"
+    )
+    assert provider.chat_path == "/v1/chat/completions"
+    # The built-in registry keeps the placeholder; only the runtime
+    # registry (what requests use) gets the account ID substituted.
+    from tusker_gateway.config import DEFAULT_PROVIDER_REGISTRY
+    assert "{CF_ACCOUNT_ID}" in DEFAULT_PROVIDER_REGISTRY["workers-ai"].base_url
+
+
+def test_provider_endpoints_expand_account_placeholder():
+    env = {"CF_ACCOUNT_ID": "cf-account"}
+    with patch.dict(os.environ, env, clear=False):
+        from tusker_gateway.passthrough import _init_provider_endpoints
+        endpoints = _init_provider_endpoints()
+    assert endpoints["workers-ai"]["base_url"].endswith("/accounts/cf-account/ai")
+
+
 def test_business_copilot_can_be_enabled_for_privacy_pool(monkeypatch):
     """Business Copilot credentials may opt into the privacy provider policy."""
     monkeypatch.setenv("TUSKER_COPILOT_BUSINESS", "true")

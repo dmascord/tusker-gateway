@@ -26,6 +26,7 @@ from tusker_gateway.catalog import (
     OpenCodeGoCatalog,
     OpenRouterCatalog,
     ProviderModelsCatalog,
+    WorkersAICatalog,
     XiaomiCatalog,
     _parse_cost_field,
     advertised_input_modalities,
@@ -601,6 +602,52 @@ def test_catalog_client_set_api_key_injects_auth():
     assert headers["User-Agent"] == "test"
     client.set_api_key(None)
     assert "Authorization" not in client._auth_headers({})
+
+
+@pytest.mark.asyncio
+async def test_workers_ai_catalog_parses_cf_envelope_and_filters_tasks():
+    body = {
+        "success": True,
+        "result": [
+            {
+                "id": "11111111-2222-3333-4444-555555555555",
+                "name": "@cf/meta/llama-3.1-8b-instruct",
+                "task": {"name": "Text Generation"},
+            },
+            {
+                "id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                "name": "@cf/stabilityai/stable-diffusion-xl-base-1.0",
+                "task": {"name": "Text-to-Image"},
+            },
+            {
+                "id": "ffff0000-1111-2222-3333-444444444444",
+                "name": "@cf/baai/bge-m3",
+                "task": {"name": "Text Embeddings"},
+            },
+            {"name": "@cf/broken/row-no-task", "task": None},
+        ],
+    }
+    catalog = WorkersAICatalog()
+    entries = await catalog.fetch(
+        FakeSession({"default": FakeResponse(200, body)})
+    )
+    # Slugs come from row["name"] — the UUID "id" must never leak as a model.
+    assert {e.model for e in entries} == {"@cf/meta/llama-3.1-8b-instruct"}
+    assert all(e.provider == "workers-ai" for e in entries)
+    for entry in entries:
+        assert entry.model.startswith("@cf/")
+
+
+@pytest.mark.asyncio
+async def test_workers_ai_catalog_sends_auth_and_errors_on_non_200():
+    session = RecordingSession({
+        "default": FakeResponse(403, {"success": False, "errors": []}),
+    })
+    catalog = WorkersAICatalog()
+    catalog.set_api_key("cf-test-token")
+    with pytest.raises(CatalogError, match="HTTP 403"):
+        await catalog.fetch(session)
+    assert session.requests[0][1]["headers"]["Authorization"] == "Bearer cf-test-token"
 
 
 # ---------------------------------------------------------------------------
@@ -1380,4 +1427,88 @@ def test_poolmanager_auto_free_disabled_is_noop():
     pm.catalog_registry = reg
 
     pm.extend_pools_with_free_catalog()
+    assert pm.pools["code"].models == []
+def test_auto_free_excludes_non_text_output_catalog_models():
+    """Catalog entries that advertise a non-text output modality (e.g. TTS,
+    transcription) are excluded from the auto_free merge regardless of price."""
+    from tusker_gateway.config import PoolConfig
+    from tusker_gateway.pools import PoolManager
+    cfg = {
+        "pools": {
+            "code": PoolConfig(name="code", models=[], auto_free=True),
+        },
+        "excluded_providers": [],
+        "provider_api_keys": {"groq": "k-groq"},
+        "quality_db_path": "/tmp/_unused.db",
+    }
+    pm = PoolManager(cfg)
+    reg = CatalogRegistry()
+    client = ProviderModelsCatalog(
+        provider="groq",
+        endpoint="https://api.example.test/v1/models",
+    )
+    # Manufacture catalog entries with advertised output modalities.
+    client._entries = [
+        CatalogEntry(provider="groq", model="good-chat",
+                    cost_input=0.0, cost_output=0.0,
+                    output_modalities=frozenset({"text"})),
+        CatalogEntry(provider="groq", model="tts-model",
+                    cost_input=0.0, cost_output=0.0,
+                    output_modalities=frozenset({"speech"})),
+        CatalogEntry(provider="groq", model="transcription-model",
+                    cost_input=0.0, cost_output=0.0,
+                    output_modalities=frozenset({"transcription"})),
+        CatalogEntry(provider="groq", model="multimodal-image",
+                    cost_input=0.0, cost_output=0.0,
+                    output_modalities=frozenset({"text", "image"})),
+        CatalogEntry(provider="groq", model="text-to-image",
+                    cost_input=0.0, cost_output=0.0,
+                    output_modalities=frozenset({"image"})),
+    ]
+    reg.register("groq", client)
+    pm.catalog_registry = reg
+    pm.extend_pools_with_free_catalog()
+    pool = pm.pools["code"]
+    models = {(m["provider"], m["model"]) for m in pool.models}
+    # text-only entries enter the pool
+    assert ("groq", "good-chat") in models
+    # Any non-text output modality (speech, transcription, image) is excluded —
+    # chat responses must be parseable JSON and the standard "content" field
+    # cannot carry arbitrary audio/image bytes alongside text.
+    assert ("groq", "tts-model") not in models
+    assert ("groq", "transcription-model") not in models
+    assert ("groq", "multimodal-image") not in models
+    assert ("groq", "text-to-image") not in models
+
+
+def test_auto_free_excludes_non_text_output_logged():
+    """Non-text-output exclusions are surfaced in the log output."""
+    from tusker_gateway.config import PoolConfig
+    from tusker_gateway.pools import PoolManager
+    cfg = {
+        "pools": {
+            "code": PoolConfig(name="code", models=[], auto_free=True),
+        },
+        "excluded_providers": [],
+        "provider_api_keys": {"groq": "k-groq"},
+        "quality_db_path": "/tmp/_unused.db",
+    }
+    pm = PoolManager(cfg)
+    reg = CatalogRegistry()
+    client = ProviderModelsCatalog(
+        provider="groq",
+        endpoint="https://api.example.test/v1/models",
+    )
+    client._entries = [
+        CatalogEntry(provider="groq", model="tts-model",
+                    cost_input=0.0, cost_output=0.0,
+                    output_modalities=frozenset({"speech"})),
+    ]
+    reg.register("groq", client)
+    pm.catalog_registry = reg
+    result = pm.extend_pools_with_free_catalog()
+    # The exclusion is reported in the log line; nothing enters the pool
+    assert ("groq", "tts-model") not in {
+        (m["provider"], m["model"]) for m in pm.pools["code"].models
+    }
     assert pm.pools["code"].models == []

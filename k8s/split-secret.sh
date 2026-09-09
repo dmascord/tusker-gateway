@@ -41,10 +41,18 @@ KEYS=(
     "OPENCODE_ZEN_API_KEY"
     "XIAOMI_API_KEY"
     "ZAI_API_KEY"
+    # Cloudflare Workers AI (workers-ai provider). Sourced from the repo
+    # .env; the gateway reads CF_API_TOKEN via _ENV_KEY_ALIASES and embeds
+    # CF_ACCOUNT_ID into the upstream base URL.
+    "CF_ACCOUNT_ID"
+    "CF_API_TOKEN"
     # Credential pools referenced by the deployment. These must remain
     # separate so Codex, public Copilot, and Enterprise Copilot never share
     # the wrong OAuth credential set.
     "CODEX_CREDENTIALS"
+    # Legacy codex pool key still present in the target secret; keep it
+    # listed so a re-run does not drop it.
+    "OPENAI_CODEX_CREDENTIALS"
     "OPENCODE_CODEX_CREDENTIALS"
     "GITHUB_COPILOT_CREDENTIALS"
     "GITHUB_COPILOT_ENTERPRISE_CREDENTIALS"
@@ -61,24 +69,28 @@ DRY_RUN=0
 if [[ "${1:-}" == "--dry-run" ]]; then
     DRY_RUN=1
 fi
-# Resolve the value for a single key. API_KEYS normally lives in the target
-# secret now; fall back to the deployment literal for an initial split from
-# an older checkout. Everything else is in hermes-env-vault, with a fallback
-# to the repo .env file for keys not (yet) seeded there (e.g. HF_TOKEN ↔
-# .env's HF_API_KEY).
+# Resolve the value for a single key. Existing target-secret values always
+# win: keys added directly to tusker-env-vault (or drained out of
+# hermes-env-vault since the last sync) must survive a re-run. API_KEYS
+# additionally falls back to the deployment literal for an initial split
+# from an older checkout, other keys fall back to hermes-env-vault, and
+# everything falls back to the repo .env file for keys not (yet) seeded in
+# a secret (e.g. HF_TOKEN ↔ .env's HF_API_KEY, CF_ACCOUNT_ID/CF_API_TOKEN).
 resolve_value() {
     local k="$1"
     local primary=""
-    if [[ "$k" == "API_KEYS" ]]; then
-        primary=$(kubectl -n "$NAMESPACE" get secret "$TARGET_SECRET" \
-            -o jsonpath="{.data.API_KEYS}" 2>/dev/null \
-            | base64 -d 2>/dev/null || true)
+    primary=$(kubectl -n "$NAMESPACE" get secret "$TARGET_SECRET" \
+        -o jsonpath="{.data.$k}" 2>/dev/null \
+        | base64 -d 2>/dev/null || true)
+    if [[ -n "$primary" ]]; then
+        echo "$primary"
+        return
     fi
-    if [[ -z "$primary" && "$k" == "API_KEYS" ]]; then
+    if [[ "$k" == "API_KEYS" ]]; then
         primary=$(kubectl -n "$NAMESPACE" get deploy tusker-gateway \
             -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="API_KEYS")].value}' \
             2>/dev/null || true)
-    elif [[ "$k" != "API_KEYS" ]]; then
+    else
         primary=$(kubectl -n "$NAMESPACE" get secret "$SOURCE_SECRET" \
             -o jsonpath="{.data.$k}" 2>/dev/null \
             | base64 -d 2>/dev/null || true)

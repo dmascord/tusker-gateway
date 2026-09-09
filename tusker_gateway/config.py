@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 from typing import Any
 from dataclasses import dataclass, field, replace
@@ -195,6 +196,7 @@ def load_config() -> dict[str, Any]:
         "ollama-cloud": ["OLLAMA_API_KEY", "OLLAMA_MAC_API_KEY"],
         "opencode-go": ["OPENCODE_GO_API_KEY"],
         "opencode-zen": ["OPENCODE_ZEN_API_KEY"],
+        "workers-ai": ["CF_API_TOKEN"],
         "github-copilot": ["GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN"],
         "github-copilot-enterprise": ["GITHUB_COPILOT_ENTERPRISE_TOKEN"],
 
@@ -302,6 +304,20 @@ def _load_providers() -> dict[str, ProviderConfig]:
     return _provider_registry_from_env()
 
 
+_ENV_PLACEHOLDER_RE = re.compile(r"\{([A-Z][A-Z0-9_]*)\}")
+
+
+def expand_env_placeholders(value: str | None) -> str | None:
+    """Substitute ``{ENV_VAR}`` tokens with matching environment variables.
+
+    Registry URLs need this for providers (e.g. Cloudflare Workers AI) whose
+    endpoint embeds an account identifier that only exists in the process
+    environment. Unset variables are replaced with an empty string, which
+    yields a syntactically valid URL that fails fast upstream.
+    """
+    if not value or "{" not in value:
+        return value
+    return _ENV_PLACEHOLDER_RE.sub(lambda match: os.environ.get(match.group(1), ""), value)
 
 
 DEFAULT_PROVIDER_REGISTRY: dict[str, ProviderConfig] = {
@@ -338,10 +354,23 @@ DEFAULT_PROVIDER_REGISTRY: dict[str, ProviderConfig] = {
     "github-copilot-enterprise": ProviderConfig("github-copilot-enterprise", "oauth", "https://copilot-api.sita.ghe.com", "/chat/completions", pool_env="GITHUB_COPILOT_ENTERPRISE_CREDENTIALS", auth_type="oauth", model_header="x-github-gpt-model", zdr_ok=True),
     "local-llm": ProviderConfig("local-llm", "local", "http://localhost:11434", "/v1/chat/completions", models_path="/api/tags", zdr_ok=True),
     "nvidia": ProviderConfig("nvidia", "bearer", "https://integrate.api.nvidia.com", "/v1/chat/completions", auth_env="NVIDIA_API_KEY", models_path="/v1/models"),
+    # Cloudflare Workers AI OpenAI-compatible API. The base URL embeds the
+    # account ID; ``{CF_ACCOUNT_ID}`` (and any other ``{ENV_VAR}`` tokens) are
+    # substituted from the process environment in _provider_registry_from_env.
+    "workers-ai": ProviderConfig("workers-ai", "bearer", "https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai", "/v1/chat/completions", auth_env="CF_API_TOKEN"),
 }
 
 def _provider_registry_from_env() -> dict[str, ProviderConfig]:
-    registry = dict(DEFAULT_PROVIDER_REGISTRY)
+    registry = {
+        name: replace(
+            provider_config,
+            base_url=expand_env_placeholders(provider_config.base_url) or provider_config.base_url,
+            chat_path=expand_env_placeholders(provider_config.chat_path) or provider_config.chat_path,
+            models_path=expand_env_placeholders(provider_config.models_path) or provider_config.models_path,
+            rerank_path=expand_env_placeholders(provider_config.rerank_path) or provider_config.rerank_path,
+        )
+        for name, provider_config in DEFAULT_PROVIDER_REGISTRY.items()
+    }
     raw = os.environ.get("PROVIDER_REGISTRY_JSON", "").strip()
     if raw:
         try:
@@ -381,6 +410,7 @@ def _provider_registry_from_env() -> dict[str, ProviderConfig]:
             registry["github-copilot"],
             zdr_ok=True,
         )
+
     return registry
 
 def _load_pools() -> dict[str, PoolConfig]:
