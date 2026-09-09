@@ -40,19 +40,21 @@ def setup_auth_file(tmp_path, monkeypatch):
 def reset_cooldown_tracker():
     """Clear the global cooldown tracker between tests so a 429 in one test
     doesn't poison subsequent tests' pool selection."""
-    from tusker_gateway.cooldown import global_tracker
+    from tusker_gateway.cooldown import global_tracker, PERMANENTLY_FAILED_MODELS
     tracker = global_tracker()
     tracker._cooldowns.clear()
     tracker._provider_default.clear()
     tracker._group_cooldowns.clear()
     tracker._recent_failures.clear()
     tracker._global = None
+    PERMANENTLY_FAILED_MODELS.clear()
     yield
     tracker._cooldowns.clear()
     tracker._provider_default.clear()
     tracker._group_cooldowns.clear()
     tracker._recent_failures.clear()
     tracker._global = None
+    PERMANENTLY_FAILED_MODELS.clear()
     from tusker_gateway.provider_usage import capacity_controller
     capacity_controller().reset()
 

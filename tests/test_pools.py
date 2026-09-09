@@ -1366,3 +1366,32 @@ def test_catalog_unavailable_excludes_only_when_provider_is_authoritative():
         assert manager.select("code") == ("groq", "llama-3.3-70b")
         health, _ = manager.readiness_status()
         assert health["code"]["selectable"] == 1
+
+
+def test_catalog_refresh_cannot_restore_permanently_failed_model(tmp_path):
+    from tusker_gateway.cooldown import mark_permanently_failed, clear_permanently_failed
+
+    route = ("google", "gemini-2.5-flash")
+    manager = PoolManager({
+        "pools": {"code": PoolConfig(
+            name="code", models=[], auto_free=True, auto_catalog_providers=["google"],
+        )},
+        "quality_db_path": str(tmp_path / "quality.db"),
+        "provider_api_keys": {"google": "test-key"},
+    })
+    registry = _CatalogRegistry({"google": [_CatalogEntry(*route)]})
+    registry.providers = lambda: ("google",)
+    manager.catalog_registry = registry
+    manager.extend_pools_with_free_catalog()
+    assert manager.select("code") == route
+
+    mark_permanently_failed(*route)
+    assert manager.select("code", allow_cooldown_probe=True) is None
+    manager.extend_pools_with_free_catalog()
+    assert manager.models["code"] == []
+    manager.extend_pools_with_free_catalog()
+    assert manager.select("code") is None
+
+    clear_permanently_failed(*route)
+    manager.extend_pools_with_free_catalog()
+    assert manager.select("code") == route

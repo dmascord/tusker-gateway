@@ -22,7 +22,7 @@ from tusker_gateway.catalog import (
     advertised_tool_support,
 )
 from tusker_gateway.config import DEFAULT_PROVIDER_REGISTRY, PoolConfig
-from tusker_gateway.cooldown import CooldownTracker, global_tracker
+from tusker_gateway.cooldown import CooldownTracker, global_tracker, is_permanently_failed
 from tusker_gateway.heavyweight import is_heavyweight
 from tusker_gateway.model_capability import (
     STRUCTURED_OUTPUT_CAPABILITY,
@@ -594,8 +594,6 @@ class PoolManager:
                     # would otherwise be re-added and fail on every refresh.
                     # Excluding them here also prunes previously auto-added
                     # dead models (they leave `eligible` → `new_models`).
-                    from tusker_gateway.cooldown import is_permanently_failed
-
                     if is_permanently_failed(entry.provider, entry.model):
                         continue
                     if mode == "pricing" and not (
@@ -1143,7 +1141,7 @@ class PoolManager:
                             if allow_cooldown_probe
                             else self._cooldowns.is_cooldown(s.provider, s.model)
                         )
-                        if sticky_cooldown:
+                        if sticky_cooldown or is_permanently_failed(s.provider, s.model):
                             self._drop_stickiness(key)
                             break
                         # Don't return a sticky heavyweight if the pool
@@ -1241,7 +1239,7 @@ class PoolManager:
                 if allow_cooldown_probe
                 else self._cooldowns.is_cooldown(s.provider, s.model)
             )
-            if cooldown_active:
+            if cooldown_active or is_permanently_failed(s.provider, s.model):
                 filter_counts["cooldown"] += 1
                 if len(filtered_cooldown_models) < 12:
                     filtered_cooldown_models.append(f"{s.provider}/{s.model}")
@@ -1411,6 +1409,7 @@ class PoolManager:
                 s for s in specs
                 if s.provider in self._providers
                 and (s.provider, s.model) not in catalog_unavailable
+                and not is_permanently_failed(s.provider, s.model)
             ]
             invalid = [s for s in specs if s.provider not in self._providers]
             result[name] = {
@@ -1464,6 +1463,7 @@ class PoolManager:
                 for spec in specs
                 if spec.provider in self._providers
                 and (spec.provider, spec.model) not in catalog_unavailable
+                and not is_permanently_failed(spec.provider, spec.model)
                 and is_general_chat_model(spec.provider, spec.model)
                 and (pool is None or not pool.zdr or spec.zdr_ok)
                 and (self.pool_keeps_heavyweight(name) or not spec.heavyweight)

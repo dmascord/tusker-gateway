@@ -1288,15 +1288,15 @@ class PassthroughClient:
             group=capacity_group,
         )
 
+        if getattr(exc, "upstream_status", None) in (404, 410):
+            from tusker_gateway.cooldown import mark_permanently_failed
+            mark_permanently_failed(provider, model)
+
         seconds = _upstream_failure_cooldown_seconds(exc)
         if seconds is not None:
             tracker = global_tracker()
             tracker.cooldown(provider, model, seconds)
             _persist_cooldown(self._config, provider, model, seconds)
-            status_code = getattr(exc, "upstream_status", None)
-            if status_code in (404, 410):
-                from tusker_gateway.cooldown import mark_permanently_failed
-                mark_permanently_failed(provider, model, seconds=seconds)
             if tracker.record_failure(provider):
                 provider_seconds = 300.0
                 tracker.cooldown(provider, "", provider_seconds)
@@ -1547,12 +1547,11 @@ class PassthroughClient:
                     store.record_provider(provider, 300.0)
                 except Exception:
                     pass
-            # 404/410: model unavailable to this account. Mark with expiry so
-            # the gateway leaves it alone but recovers after the cooldown.
+            # Model unavailable: exclude from rotation until explicitly cleared.
             status_code = getattr(exc, "upstream_status", None)
             if status_code in (404, 410):
-                from tusker_gateway.cooldown import mark_permanently_failed, PERMANENT_ERROR_COOLDOWN_SECS
-                mark_permanently_failed(provider, model, seconds=PERMANENT_ERROR_COOLDOWN_SECS)
+                from tusker_gateway.cooldown import mark_permanently_failed
+                mark_permanently_failed(provider, model)
             logger.warning('provider error %s/%s: %s', provider, model, exc)
             if isinstance(exc, ProviderError):
                 raise

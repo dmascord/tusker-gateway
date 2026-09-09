@@ -378,3 +378,51 @@ def test_tool_call_text_with_leading_text():
 def test_normalize_tools_strips_empty_name():
     tools = [{"function": {"name": "", "description": "empty"}}]
     assert normalize_tools(tools) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream,status", [(False, 404), (True, 404), (True, 410)])
+async def test_first_unavailable_response_excludes_pool_route(tmp_path, monkeypatch, stream, status):
+    from types import SimpleNamespace
+    from tusker_gateway import cooldown
+    from tusker_gateway.config import PoolConfig
+    from tusker_gateway.errors import ProviderError
+    from tusker_gateway.pools import PoolManager
+
+    monkeypatch.setattr(cooldown, "PERMANENTLY_FAILED_MODELS", {})
+    route = ("google", "gemini-2.5-pro")
+    calls = []
+
+    async def unavailable(request):
+        calls.append(await request.json())
+        return web.json_response({"error": {"message": "Model unavailable"}}, status=status)
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/chat/completions", unavailable)
+    config = _cfg(
+        quality_db_path=str(tmp_path / "quality.db"),
+        provider_api_keys={"google": "test-key"},
+        pools={"premium": PoolConfig(name="premium", models=[
+            {"provider": route[0], "model": route[1]},
+        ])},
+    )
+    manager = PoolManager(config)
+    assert manager.select("premium", session_id="sticky") == route
+    async with TestServer(upstream) as server, ClientSession() as http:
+        client = PassthroughClient(config, QualityDB(config["quality_db_path"]), http)
+        with pytest.raises(ProviderError) as failure:
+            await client.chat(*route, [{"role": "user", "content": "hello"}],
+                              stream=stream, upstream_gateway=str(server.make_url("/")))
+        assert failure.value.upstream_status == status
+
+    assert len(calls) == 1
+    # Neither ordinary selection, stickiness nor recovery may retry the dead route.
+    assert manager.select("premium") is None
+    assert manager.select("premium", session_id="sticky") is None
+    assert manager.select("premium", allow_cooldown_probe=True) is None
+    assert manager.readiness_status()[0]["premium"]["selectable"] == 0
+    assert manager.status()["premium"]["valid_candidates"] == 0
+    monkeypatch.setattr(cooldown, "time", SimpleNamespace(monotonic=lambda: 10**12))
+    assert manager.select("premium", allow_cooldown_probe=True) is None
+    cooldown.clear_permanently_failed(*route)
+    assert manager.select("premium", allow_cooldown_probe=True) == route

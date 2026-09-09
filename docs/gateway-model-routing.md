@@ -145,10 +145,16 @@ selection (including sticky sessions), status, and readiness. Configured
 leave the configured baseline eligible; static configuration is not deleted.
 Catalog presence does not prove account entitlement.
 
-Upstream 404/410 failures also temporarily exclude a model from auto-discovery.
-These markers expire after `TUSKER_RETRY_PERMANENT_COOLDOWN` (default one hour),
-allowing later catalog refreshes to reconsider the route. Google requests omit
-the unsupported OpenAI `store` field after request fields are merged.
+The first upstream 404/410 excludes that provider/model from pool rotation
+indefinitely, for both streaming and non-streaming chat. Normal selection,
+sticky sessions, recovery probes, status, and readiness respect the marker;
+catalog refresh cannot re-add it. `TUSKER_RETRY_PERMANENT_COOLDOWN` no longer
+sets an expiry for these markers. They remain process-local: restarting the
+gateway clears them. Explicit `clear_permanently_failed(provider, model)` or
+the existing successful explicit-request path can clear a marker; explicit
+provider/model requests bypass pool selection and can still probe the route.
+Google requests omit the unsupported OpenAI `store` field after request
+fields are merged.
 
 ## Auto-free catalog merge
 
