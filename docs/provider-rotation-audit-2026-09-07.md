@@ -272,13 +272,56 @@ heavyweight and `pools.py` keeps the `-image`/`imagen-*` exclusion, so
 the premium route is the only place a heavy Gemini slug can land; flash
 variants remain cheap-tier eligible in `code`.
 
-### Blocked stage
+### Earlier "Blocked stage" — superseded
 
-The cluster build host `visor` and the cluster API server
-(`10.0.0.224:6443`) are unreachable from this dev host — both `ssh visor`
-and direct `kubectl` time out. The manifest edit is complete and
-validated locally (YAML parses, all four pool JSON blobs decode, Google
-appears in code `auto_catalog_providers` and premium `models`), but the
-deploy-flow smoke (`rsync` → `./k8s/deploy.sh` → `/health` + `/ready` +
-Gemini probe) has **not** been executed. It must be run from a host
-with `visor` access.
+The original "Blocked stage" subsection below was written before the
+visor jump host route was known. Dev host reaches the cluster via
+`ssh -J tusker-duckdns`, so direct `kubectl` does work; it just took the
+wrong code path initially. See "Deploy-flow status (2026-09-09, blocked
+by node wyzard disk-full)" above for the current blocker.
+
+### Deploy-flow status (2026-09-09, blocked by node `wyzard` disk-full)
+
+Reached cluster via `ssh tusker-duckdns` jump. Mirrored source to visor
+via `git worktree` of `5642f6e` at
+`/srv/opencode/tusker-ai-gateway-build-5642f6e` and ran the documented
+deploy flow with `TUSKER_COMMIT=5642f6e750281126d93a493a2c30373d2449d2ea`.
+Build (`buildah bud`) and image push to
+`registry.tusker.net.au:5000/tusker-gateway:swarm-alpine-5642f6e`
+succeeded; `kubectl apply` updated the deployment to the new image.
+
+Rollout is **blocked by node `wyzard` disk-full**, not by the manifest
+change. The new pod `tusker-gateway-fbb596959-w7g5g` is stuck in
+`ContainerCreating`; kubelet event:
+`Failed to create pod sandbox: mkdir /var/log/pods/...: no space left on device`.
+
+`wyzard` `/var` volume is `3.2G / 3.2G (100%)`:
+
+| Consumer | Size |
+|---|---|
+| `/var/log/atop/` | 198M (7 daily files, ~34M each) |
+| `/var/log/journal/` | 193M |
+| `/var/log/pods/` | 44M |
+| `/var/log/calico/` | 64M |
+
+`DiskPressure=False` — node monitoring watches ephemeral-storage
+(`/var/lib/docker`, 99% full but a separate volume), not the small `/var`
+volume. Old pod `d3553af` on `wyvern` is still 1/1 Ready and serving
+traffic; the rollout's only side-effect so far is that the deployment's
+`spec.template.spec.containers[0].image` now points at the new image,
+so any node that has room will pick it up automatically once `wyzard`'s
+`/var` is freed.
+
+### Suggested unblock (needs user confirmation)
+
+On `wyzard` (10.0.0.218):
+
+1. `sudo journalctl --vacuum-size=64M` — drops journal from 193M to 64M.
+2. `sudo find /var/log/atop -mtime +3 -name 'atop_*' -delete` — keeps
+   the last 3 days of atop logs, frees ~135M.
+3. `sudo rm -f /var/log/calico/*` — frees 64M; calico can recreate.
+4. `sudo find /var/log/pods -mindepth 2 -mtime +1 -delete` — drops
+   1+ day-old pod logs (kubelet keeps recent ones).
+
+Total expected: ~450M freed on a 3.2G volume → ~14% headroom, enough for
+the kubelet pod sandbox to be created and the new pod to start.
