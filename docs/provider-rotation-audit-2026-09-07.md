@@ -342,12 +342,49 @@ configured pool entries. The list is the client-facing route and is
 intentionally curated; it is not the catalog. Do not read it as evidence
 that Gemini is absent — the catalog and premium pool both carry it.
 
-### Unresolved
+### Corrected root cause — 2026-09-09
 
-- `wyzard` `/var` is still 97% full. The cleanup bought headroom for the
-  pod sandbox; it is not a capacity fix. The VG has 960 MiB unallocated
-  for a possible online `ext4` growth, but sizing should be revisited.
-- The earlier `DiskPressure=False` observation on a full `/var` was not
-  explained. Node monitoring watches `ephemeral-storage` (the separate
-  `docker` LV), not the small `/var` filesystem, which is the likely
-  reason. Not confirmed.
+The earlier "grow /var" recommendation was based on a wrong premise.
+Inspection of `wyzard` (10.0.0.218) showed the kubelet root directory
+`/var/lib/kubelet` is **already** a bind mount onto `/home/kubelet`, which
+lives on the 32 GiB `wyzard--vg-home` filesystem with 6.8 GiB free. The
+kubelet's eviction thresholds (`nodefs.available`, `imagefs.available`,
+both default 10%) monitor that filesystem, which is why
+`DiskPressure=False` was correct as far as the kubelet is concerned.
+
+The actual failure path was a plain directory on the small filesystem:
+`/var/log/pods` is a normal directory on `wyzard--vg-var` (3.2 GiB, 98%
+full), and the kubelet creates the pod sandbox directory there. No
+kubelet flag, containerd setting, or eviction threshold covers that
+filesystem, so a full `/var` is invisible to the scheduler.
+
+**Fix applied:** moved the pod log directory off the small filesystem.
+
+1. Created `/home/kubelet/pod-logs/pods` on the home filesystem.
+2. Moved the existing `/var/log/pods` contents there.
+3. Replaced `/var/log/pods` with a bind mount of that directory.
+4. Persisted the bind mount in `/etc/fstab`:
+   `/home/kubelet/pod-logs/pods /var/log/pods none bind,defaults 0 0`
+   alongside the existing `/home/kubelet` and `/home/containerd` entries.
+
+`/var` is now 96% full with 137 MiB free; pod logs no longer write to it.
+A `busybox` test pod scheduled and started on `wyzard`, confirming the
+sandbox directory can now be created. The bind mount is fstab-persisted
+and survives reboot.
+
+### Remaining risks
+
+- `wyzard--vg-var` is still nearly full. The bind mount removes the pod-log
+  consumer, but `/var` also holds atop logs (134 MiB), systemd journals
+  (57 MiB), installer logs (16 MiB), and other system state. If any of
+  those grow, the sandbox failure can return. Consider capping atop and
+  journal retention, or growing the LV while the VG has 960 MiB
+  unallocated.
+- `wyzard--vg-home` is 78% full. Pod logs now live there alongside the
+  kubelet root. If the kubelet's own eviction thresholds
+  (`nodefs.available` default 10%, ~3.2 GiB) are ever hit, pods on
+  `wyzard` will be evicted. Not currently close.
+- The kubelet has no eviction thresholds configured at all, so it relies
+  entirely on Kubernetes defaults. A node with no thresholds will not
+  evict until it hits the defaults, and it will not alert on filesystems
+  it does not monitor. Worth a separate config review.
