@@ -41,6 +41,9 @@ KEYS=(
     "OPENCODE_ZEN_API_KEY"
     "XIAOMI_API_KEY"
     "ZAI_API_KEY"
+    # Alibaba Cloud Token Plan (alibaba provider). Sourced from the repo
+    # .env; the gateway reads PROVIDER_ALIBABA_API_KEY directly.
+    "PROVIDER_ALIBABA_API_KEY"
     # Cloudflare Workers AI (workers-ai provider). Sourced from the repo
     # .env; the gateway reads CF_API_TOKEN via _ENV_KEY_ALIASES and embeds
     # CF_ACCOUNT_ID into the upstream base URL.
