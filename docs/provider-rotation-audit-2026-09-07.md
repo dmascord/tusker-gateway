@@ -214,3 +214,37 @@ Verification checklist per change: `pytest tests/ -p no:cacheprovider`
 (skip `tests/test_passthrough_providers.py` offline), then manifest
 changes get the deploy-flow smoke (read-only `kubectl` checks are always
 allowed; `kubectl apply` needs user confirmation).
+
+## E. Status at 2026-09-09
+
+Items D1–D6 are all resolved in the working tree:
+
+| Item | Where | Evidence |
+|---|---|---|
+| A5 heavyweight marker | `pools.py:575-588` — `heavyweight` set unconditionally for every mode | `pytest tests/test_catalog.py` |
+| A6 router slugs | `pools.py:66-71` — `openrouter/free`, `openrouter/auto`, `free`, `auto` in `_PROVIDER_ROUTER_MODELS` | `pytest tests/test_pools.py` |
+| A1/A2/A3 manifest | `k8s/deployment.yaml` — dead `google`/`cerebras`/`cohere` rows gone; `auto_catalog_providers` aligned per pool | `pytest tests/test_pools.py` |
+| A4/B privacy | `config.py:304` — `xiaomi` `zdr_ok=True`; privacy `auto_catalog_providers` = `synthetic`, `github-copilot`, `opencode-go`, `ollama-cloud`, `xiaomi` | `pytest tests/test_pools.py` |
+| A8 audit script | `docs/gateway-model-routing.md` §Provider audit — references the bounded qualification runner instead of a missing script | doc |
+
+### New fix: per-attempt provider timeout (2026-09-09)
+
+A slow upstream (e.g. `ollama-cloud/minimax-m3` streaming reasoning for the
+full 120s deadline) consumed the entire request budget before the fallback
+loop could try the next candidate, returning a 502 instead of falling back.
+
+Each pool iteration is now wrapped in `asyncio.wait_for` bounded by
+`TUSKER_PROVIDER_ATTEMPT_TIMEOUT_SECS` (default 30s) and the request's
+remaining deadline (`request["_deadline_at"]` set by `deadline.py`). On
+timeout the iterator is closed (releasing the capacity lease via
+`_stream_events`'s `finally`) and a `ProviderError(code="provider_timeout")`
+is raised so the existing fallback bookkeeping runs.
+
+- `tusker_gateway/endpoints.py` — `_provider_attempt_timeout_secs()` helper;
+  `call_direct()`/`call_candidate()` wrappers in both call sites of
+  `_call_with_pool_fallback`.
+- `tests/test_chat.py` — `test_pool_fallback_bounded_per_attempt_timeout`,
+  `test_provider_attempt_timeout_helper_bounds_remaining_deadline`.
+- Commit `37eb397` on `main`.
+
+Verification: `pytest tests/ -p no:cacheprovider --ignore=tests/test_passthrough_providers.py` — 814 passed, 2 skipped.
