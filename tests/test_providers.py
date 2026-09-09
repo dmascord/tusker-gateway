@@ -26,6 +26,7 @@ OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 GROQ_KEY = os.environ.get("GROQ_API_KEY", "")
 LOCAL_LLM_KEY = os.environ.get("LOCAL_LLM_API_KEY", "")
 ZAI_KEY = os.environ.get("ZAI_API_KEY", "")
+ALIBABA_KEY = os.environ.get("PROVIDER_ALIBABA_API_KEY", "")
 
 
 REQUIRED_KEYS = {"base_url", "chat_path", "auth_type"}
@@ -319,3 +320,32 @@ async def test_live_local_llm():
 @pytest.mark.asyncio
 async def test_live_zai():
     pytest.skip("No confirmed ZAI endpoint/model mapping yet")
+@pytest.mark.skipif(not ALIBABA_KEY, reason="PROVIDER_ALIBABA_API_KEY not set")
+@pytest.mark.asyncio
+async def test_live_alibaba():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg = load_config()
+        cfg["api_keys"] = ["live-test-key"]
+        cfg["provider_api_keys"] = {"alibaba": ALIBABA_KEY}
+        cfg["quality_db_path"] = os.path.join(tmpdir, "quality.db")
+        app = create_app()
+        app.on_startup.clear()
+        app["config"] = cfg
+        app["http_session"] = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120))
+        server = TestServer(app)
+        client = TestClient(server)
+        await client.start_server()
+        try:
+            resp = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "alibaba/qwen3.8-max",
+                    "messages": [{"role": "user", "content": "Say exactly: ALIBABA_LIVE_OK"}],
+                },
+                headers={"Authorization": "Bearer live-test-key"},
+            )
+            assert resp.status == 200, await resp.text()
+            data = await resp.json()
+            assert "ALIBABA_LIVE_OK" in data["choices"][0]["message"]["content"]
+        finally:
+            await client.close()

@@ -358,6 +358,11 @@ DEFAULT_PROVIDER_REGISTRY: dict[str, ProviderConfig] = {
     # account ID; ``{CF_ACCOUNT_ID}`` (and any other ``{ENV_VAR}`` tokens) are
     # substituted from the process environment in _provider_registry_from_env.
     "workers-ai": ProviderConfig("workers-ai", "bearer", "https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai", "/v1/chat/completions", auth_env="CF_API_TOKEN"),
+    # Alibaba Cloud Model Studio "Token Plan" keys (``sk-sp-…`` prefix) are
+    # only valid against the region-scoped token-plan endpoint, not the
+    # standard DashScope compatible-mode API. Key is wired via
+    # PROVIDER_ALIBABA_API_KEY.
+    "alibaba": ProviderConfig("alibaba", "bearer", "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode", "/v1/chat/completions", auth_env="ALIBABA_API_KEY", models_path="/v1/models"),
 }
 
 def _provider_registry_from_env() -> dict[str, ProviderConfig]:
@@ -491,6 +496,7 @@ def _load_pools() -> dict[str, PoolConfig]:
                     "openai-codex",
                     "github-copilot",
                     "github-copilot-enterprise",
+                    "alibaba",
                     "opencode-go",
                     "ollama-cloud",
                     "groq",
