@@ -195,6 +195,85 @@ async def test_tool_pool_compatibility_probe_without_http_server():
     ]
 
 
+
+@pytest.mark.asyncio
+async def test_pool_fallback_bounded_per_attempt_timeout():
+    """A slow first candidate must not consume the whole request deadline.
+
+    Each pool iteration is wrapped in ``asyncio.wait_for`` bounded by
+    ``_provider_attempt_timeout_secs``. A candidate that never yields a
+    terminal frame must be abandoned so the next candidate can be tried.
+    """
+    import os
+
+    from tusker_gateway.endpoints import _provider_attempt_timeout_secs
+
+    os.environ["TUSKER_PROVIDER_ATTEMPT_TIMEOUT_SECS"] = "1"
+    try:
+        pool_manager = MagicMock()
+        pool_manager.fallback_pools.return_value = ()
+        pool_manager.select.side_effect = [
+            ("ollama-cloud", "minimax-m3"),
+            ("openai-codex", "recovery-model"),
+        ]
+        upstream = MagicMock()
+
+        async def slow_stream(*args, **kwargs):
+            # Never emit a terminal frame; the preflight in
+            # _prepare_stream_result will iterate forever.
+            while True:
+                await asyncio.sleep(0.05)
+                yield b'data: {"type":"delta","delta":{"content":"thinking"}}\n\n'
+
+        async def fast_chat(*args, **kwargs):
+            if args[1] == "minimax-m3":
+                return slow_stream()
+            return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+
+        upstream.chat = AsyncMock(side_effect=fast_chat)
+
+        provider, model, result = await _call_with_pool_fallback(
+            {"pools": {}},
+            {
+                "model": "hermes-code",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+            },
+            upstream,
+            tools=[{"type": "function", "function": {"name": "read"}}],
+            request=SimpleNamespace(app={"pool_manager": pool_manager}),
+        )
+    finally:
+        os.environ.pop("TUSKER_PROVIDER_ATTEMPT_TIMEOUT_SECS", None)
+
+    assert (provider, model) == ("openai-codex", "recovery-model")
+    assert result["choices"][0]["message"]["content"] == "ok"
+    assert pool_manager.select.call_count == 2
+    # The slow candidate was excluded from the second selection.
+    second_call_excluded = pool_manager.select.call_args_list[1].kwargs["excluded"]
+    assert ("ollama-cloud", "minimax-m3") in second_call_excluded
+
+
+@pytest.mark.asyncio
+async def test_provider_attempt_timeout_helper_bounds_remaining_deadline():
+    """The per-attempt budget never exceeds the request deadline."""
+    from tusker_gateway.endpoints import _provider_attempt_timeout_secs
+
+    now = asyncio.get_running_loop().time()
+    request = SimpleNamespace(
+        get=lambda key, default=None: (now + 30.0) if key == "_deadline_at" else default
+    )
+    budget = _provider_attempt_timeout_secs(request)
+    assert budget <= 30.0
+    assert budget >= 0.0
+    # When the deadline is nearly gone, the budget preserves the configured
+    # 0.25s middleware buffer rather than waiting past the request deadline.
+    request_near = SimpleNamespace(
+        get=lambda key, default=None: (now + 0.5) if key == "_deadline_at" else default
+    )
+    near_budget = _provider_attempt_timeout_secs(request_near)
+    assert 0.2 <= near_budget <= 0.3
+
 @pytest.mark.asyncio
 async def test_chat_completions_requires_auth(client):
     resp = await client.post("/v1/chat/completions", json={"model": "hermes-code", "messages": [{"role": "user", "content": "hi"}]})

@@ -26,6 +26,7 @@ from tusker_gateway.errors import (
     MalformedToolCallError,
     NoHealthyModelsError,
     ProviderCapacityError,
+    ProviderError,
     ProviderRouteDisabledError,
     RateLimitError,
     RequiredToolCallError,
@@ -2098,6 +2099,25 @@ def _max_pool_provider_attempts() -> int:
     except ValueError:
         return 6
 
+def _provider_attempt_timeout_secs(request: web.Request | None) -> float:
+    """Return the bounded budget for one pool candidate."""
+    try:
+        configured = max(
+            0.1,
+            float(os.environ.get("TUSKER_PROVIDER_ATTEMPT_TIMEOUT_SECS", "30")),
+        )
+    except (TypeError, ValueError):
+        configured = 30.0
+    if request is None or not hasattr(request, "get"):
+        return configured
+    deadline_at = request.get("_deadline_at")
+    if deadline_at is None:
+        return configured
+    remaining = max(0.0, deadline_at - asyncio.get_running_loop().time())
+    return max(0.0, min(configured, remaining - 0.25))
+
+
+
 
 def _tool_response_failure_cooldown_secs() -> float:
     """Return the quarantine window for a model that violates the tool contract."""
@@ -2304,32 +2324,58 @@ async def _call_with_pool_fallback(
                 code="circuit_open",
             )
         try:
-            result = await client.chat(
-                provider, model, body["messages"],
-                stream=bool(body.get("stream")),
-                tools=tools,
-                tool_choice=body.get("tool_choice"),
-                extra_body=extra_body or None,
-                conversation_id=conversation_id,
-                metrics_registry=metrics_registry,
-            )
-            result = await _prepare_stream_result(
-                result,
-                provider=provider,
-                model=model,
-                request_id=request_id,
-                tools_requested=(
-                    bool(body.get("stream"))
-                    and (bool(tools) or body.get("tool_choice") == "none")
-                ),
-                tools=tools,
-                require_tool_call=_tool_choice_requires_call(body.get("tool_choice")),
-                tool_choice=body.get("tool_choice"),
+            result = None
+
+            async def call_direct() -> Any:
+                nonlocal result
+                result = await client.chat(
+                    provider, model, body["messages"],
+                    stream=bool(body.get("stream")),
+                    tools=tools,
+                    tool_choice=body.get("tool_choice"),
+                    extra_body=extra_body or None,
+                    conversation_id=conversation_id,
+                    metrics_registry=metrics_registry,
+                )
+                return await _prepare_stream_result(
+                    result,
+                    provider=provider,
+                    model=model,
+                    request_id=request_id,
+                    tools_requested=(
+                        bool(body.get("stream"))
+                        and (bool(tools) or body.get("tool_choice") == "none")
+                    ),
+                    tools=tools,
+                    require_tool_call=_tool_choice_requires_call(body.get("tool_choice")),
+                    tool_choice=body.get("tool_choice"),
+                )
+
+            result = await asyncio.wait_for(
+                call_direct(),
+                timeout=_provider_attempt_timeout_secs(request),
             )
             if breaker is not None:
                 await asyncio.to_thread(breaker.record_success, provider, model)
             _clear_permanently_failed(provider, model)
             return provider, model, result
+        except asyncio.TimeoutError as exc:
+            await _close_async_iterator(result)
+            timeout_exc = ProviderError(
+                "Provider candidate exceeded its per-attempt timeout",
+                code="provider_timeout",
+            )
+            timeout_exc.upstream_status = 504
+            timeout_exc.upstream_body = str(exc) or "provider attempt timeout"
+            if breaker is not None:
+                await asyncio.to_thread(
+                    breaker.record_failure,
+                    provider,
+                    model,
+                    cooldown_secs=_cooldown_for_exc(timeout_exc),
+                )
+            _mark_permanently_failed(timeout_exc, provider, model)
+            raise timeout_exc from exc
         except RateLimitError as exc:
             if breaker is not None:
                 await asyncio.to_thread(
@@ -2511,32 +2557,72 @@ async def _call_with_pool_fallback(
             max_attempts,
         )
         try:
-            result = await client.chat(
-                provider, model, body["messages"],
-                stream=bool(body.get("stream")),
-                tools=tools,
-                tool_choice=body.get("tool_choice"),
-                extra_body=extra_body or None,
-                conversation_id=conversation_id,
-                metrics_registry=metrics_registry,
-            )
-            result = await _prepare_stream_result(
-                result,
-                provider=provider,
-                model=model,
-                request_id=request_id,
-                tools_requested=(
-                    bool(body.get("stream"))
-                    and (bool(tools) or body.get("tool_choice") == "none")
-                ),
-                tools=tools,
-                require_tool_call=_tool_choice_requires_call(body.get("tool_choice")),
-                tool_choice=body.get("tool_choice"),
+            result = None
+
+            async def call_candidate() -> Any:
+                nonlocal result
+                result = await client.chat(
+                    provider, model, body["messages"],
+                    stream=bool(body.get("stream")),
+                    tools=tools,
+                    tool_choice=body.get("tool_choice"),
+                    extra_body=extra_body or None,
+                    conversation_id=conversation_id,
+                    metrics_registry=metrics_registry,
+                )
+                return await _prepare_stream_result(
+                    result,
+                    provider=provider,
+                    model=model,
+                    request_id=request_id,
+                    tools_requested=(
+                        bool(body.get("stream"))
+                        and (bool(tools) or body.get("tool_choice") == "none")
+                    ),
+                    tools=tools,
+                    require_tool_call=_tool_choice_requires_call(body.get("tool_choice")),
+                    tool_choice=body.get("tool_choice"),
+                )
+
+            result = await asyncio.wait_for(
+                call_candidate(),
+                timeout=_provider_attempt_timeout_secs(request),
             )
             if breaker is not None:
                 await asyncio.to_thread(breaker.record_success, provider, model)
             _clear_permanently_failed(provider, model)
             return provider, model, result
+        except asyncio.TimeoutError as exc:
+            await _close_async_iterator(result)
+            timeout_exc = ProviderError(
+                "Provider candidate exceeded its per-attempt timeout",
+                code="provider_timeout",
+            )
+            timeout_exc.upstream_status = 504
+            timeout_exc.upstream_body = str(exc) or "provider attempt timeout"
+            _quarantine_tool_response_failure(config, provider, model, timeout_exc)
+            if breaker is not None:
+                await asyncio.to_thread(
+                    breaker.record_failure,
+                    provider,
+                    model,
+                    cooldown_secs=_cooldown_for_exc(timeout_exc),
+                )
+            _mark_permanently_failed(timeout_exc, provider, model)
+            last_error = timeout_exc
+            excluded.add(selected)
+            logger.warning(
+                "pool candidate timed out rid=%s requested_pool=%s active_pool=%s "
+                "candidate=%s/%s attempt=%d/%d timeout=%ss",
+                request_id or "unknown",
+                pool_name,
+                active_pool,
+                provider,
+                model,
+                attempts,
+                max_attempts,
+                _provider_attempt_timeout_secs(request),
+            )
         except RateLimitError as exc:
             if breaker is not None:
                 await asyncio.to_thread(
