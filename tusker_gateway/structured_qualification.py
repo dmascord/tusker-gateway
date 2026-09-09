@@ -31,7 +31,8 @@ from tusker_gateway.model_capability import (
     ModelCapabilityDB,
 )
 from tusker_gateway.persistent_cooldown import PersistentCooldownStore
-from tusker_gateway.pools import PoolManager, is_general_chat_model
+from tusker_gateway.pools import PoolManager
+from tusker_gateway.tool_qualification import _probes_text_chat_output
 
 logger = logging.getLogger(__name__)
 
@@ -377,11 +378,12 @@ async def run_structured_qualification(
         manager.catalog_registry = registry
         manager.extend_pools_with_free_catalog()
         pairs = sorted(
-            {
+            pair
+            for pair in (
                 (spec.provider, spec.model)
                 for spec in manager.models.get(pool_name, [])
-                if is_general_chat_model(spec.provider, spec.model)
-            }
+            )
+            if _probes_text_chat_output(manager, pair)
         )
         provider_filter = {
             str(provider).strip().lower().replace("_", "-")

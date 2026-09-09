@@ -16,6 +16,8 @@ from tusker_gateway.storage import shared_database
 
 logger = logging.getLogger(__name__)
 
+QUALITY_WINDOW = 20
+
 
 @dataclass
 class ModelQuality:
@@ -126,33 +128,28 @@ class QualityDB:
     def _recompute_score(self, conn: Any, provider: str, model: str) -> None:
         """Recompute quality_score = success_rate * 80 + latency_bonus * 20.
 
-        latency_bonus decays exponentially with the recent average latency.
+        Both factors are computed over the most recent events (a sliding
+        window), so old failures stop weighting the score once enough new
+        successes arrive. Lifetime totals in ``model_quality`` remain
+        observable but do not gate the score.
         """
-        row = conn.execute(
+        window = conn.execute(
             """
-            SELECT total_calls, success_calls FROM model_quality
-            WHERE provider = ? AND model = ?
-            """,
-            (provider, model),
-        ).fetchone()
-        if row is None:
-            return
-        total, success = row
-        if total == 0:
-            return
-        success_rate = success / total
-        # Average latency from last 20 events
-        lat_row = conn.execute(
-            """
-            SELECT AVG(latency_ms) FROM (
-                SELECT latency_ms FROM model_events
+            SELECT COUNT(*), AVG(success), AVG(latency_ms) FROM (
+                SELECT success, latency_ms FROM model_events
                 WHERE provider = ? AND model = ?
-                ORDER BY id DESC LIMIT 20
+                ORDER BY id DESC LIMIT ?
             )
             """,
-            (provider, model),
+            (provider, model, QUALITY_WINDOW),
         ).fetchone()
-        avg_latency = lat_row[0] if lat_row and lat_row[0] is not None else 1000.0
+        total_window, success_rate, avg_latency = (
+            window[0] if window else 0,
+            (window[1] if window and window[1] is not None else 0.0),
+            (window[2] if window and window[2] is not None else 1000.0),
+        )
+        if not total_window:
+            return
         # latency_bonus: 1.0 at 0ms, 0.5 at 1000ms, exp decay
         import math
         latency_bonus = math.exp(-avg_latency / 1500.0)

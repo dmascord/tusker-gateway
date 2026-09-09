@@ -111,6 +111,82 @@ async def test_tts_dispatches_xiaomi_models_and_pin():
 
 
 @pytest.mark.asyncio
+async def test_tts_dispatches_groq_models_and_pins():
+    h = TTSHandler({})
+    assert h.get_provider_for_tts_request("canopylabs/orpheus-v1-english") == "groq"
+    assert h.get_provider_for_tts_request("groq::canopylabs/orpheus-arabic-saudi") == "groq"
+    assert h.get_provider_for_tts_request("groq/canopylabs/orpheus-v1-english") == "groq"
+
+
+@pytest.mark.asyncio
+async def test_tts_groq_strips_prefix_and_posts_speech_payload():
+    h = TTSHandler({})
+    audio = _mp3_bytes()
+    session = _FakeSession().add(
+        _FakeResp(status=200, body=audio, headers={"Content-Type": "audio/mpeg"})
+    )
+    with patch("aiohttp.ClientSession", lambda *a, **kw: session):
+        out_bytes, content_type = await h._call_groq(
+            model="groq::canopylabs/orpheus-v1-english",
+            body={"input": "hello", "voice": "alloy", "response_format": "mp3"},
+            api_key="gsk-test",
+            extra_headers=None,
+        )
+    assert out_bytes == audio
+    assert content_type == "audio/mpeg"
+
+
+@pytest.mark.asyncio
+async def test_tts_groq_requires_api_key():
+    h = TTSHandler({})
+    with pytest.raises(GatewayError) as ei:
+        await h._call_groq(
+            model="canopylabs/orpheus-v1-english",
+            body={"input": "hi"},
+            api_key=None,
+            extra_headers=None,
+        )
+    assert "Groq API key" in str(ei.value)
+
+@pytest.mark.asyncio
+async def test_tts_groq_substitutes_orpheus_default_voice():
+    """OpenAI's default 'alloy' is not an Orpheus voice; the groq call must
+    substitute Groq's default while keeping explicit voices untouched."""
+    captured: list[dict] = []
+
+    class _CapturingSession(_FakeSession):
+        def post(self, url, headers=None, json=None, **kw):
+            captured.append(json)
+            return self._responses.pop(0)
+
+    h = TTSHandler({})
+    audio = _mp3_bytes()
+    session = _CapturingSession().add(
+        _FakeResp(status=200, body=audio, headers={"Content-Type": "audio/wav"})
+    )
+    with patch("aiohttp.ClientSession", lambda *a, **kw: session):
+        await h._call_groq(
+            model="canopylabs/orpheus-v1-english",
+            body={"input": "hi", "response_format": "wav"},
+            api_key="gsk-test",
+            extra_headers=None,
+        )
+    assert captured[0]["voice"] == "autumn"
+
+    session2 = _CapturingSession().add(
+        _FakeResp(status=200, body=audio, headers={"Content-Type": "audio/wav"})
+    )
+    with patch("aiohttp.ClientSession", lambda *a, **kw: session2):
+        await h._call_groq(
+            model="canopylabs/orpheus-v1-english",
+            body={"input": "hi", "voice": "daniel", "response_format": "wav"},
+            api_key="gsk-test",
+            extra_headers=None,
+        )
+    assert captured[1]["voice"] == "daniel"
+
+
+@pytest.mark.asyncio
 async def test_tts_openai_returns_audio_bytes():
     h = TTSHandler({})
     audio = _mp3_bytes()

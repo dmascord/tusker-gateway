@@ -589,6 +589,14 @@ class PoolManager:
                             f"{entry.provider}/{entry.model}"
                         )
                         continue
+                    advertised_output = advertised_output_modalities(entry)
+                    if advertised_output is not None and advertised_output - {"text"}:
+                        # Chat pools emit text; a TTS/transcription/image-only
+                        # route can only fail here (and poison quality stats).
+                        excluded_special_models.append(
+                            f"{entry.provider}/{entry.model}"
+                        )
+                        continue
                     # Skip models that have permanently failed (401/403:
                     # WAF-blocked, agentic-harness-only, wrong-tier). They
                     # would otherwise be re-added and fail on every refresh.

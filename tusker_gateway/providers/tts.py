@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 # Default voice for OpenAI-compatible speech providers.
 DEFAULT_VOICE = "alloy"
+GROQ_DEFAULT_VOICE = "autumn"
 SUPPORTED_FORMATS = {"mp3", "opus", "aac", "flac", "wav", "pcm"}
 
 XIAOMI_TTS_MODEL_PREFIX = "mimo-v2.5-tts"
@@ -63,10 +64,18 @@ class TTSHandler:
             return "xiaomi"
         if lower.startswith(("openrouter/", "openrouter::")):
             return "openrouter"
+        if lower.startswith(("groq/", "groq::")):
+            return "groq"
         if "::" in model:
             provider, _, _ = model.partition("::")
             if provider.lower() == "openai":
                 return "openai"
+
+        # Groq publishes speech models (canopylabs/orpheus-*) that are not
+        # routed through OpenRouter; route them natively even before the
+        # capability registry has refreshed.
+        if lower.startswith("canopylabs/orpheus"):
+            return "groq"
 
         registry = capability_registry or self.capability_registry
         if registry is not None:
@@ -101,7 +110,48 @@ class TTSHandler:
             return await self._call_openrouter(model, body, api_key, extra_headers)
         if provider == "xiaomi":
             return await self._call_xiaomi(model, body, api_key, extra_headers)
+        if provider == "groq":
+            return await self._call_groq(model, body, api_key, extra_headers)
         return await self._call_openai(model, body, api_key, extra_headers)
+
+    async def _call_groq(
+        self,
+        model: str,
+        body: Dict[str, Any],
+        api_key: Optional[str],
+        extra_headers: Optional[Dict[str, str]],
+    ) -> tuple[bytes, str]:
+        """Call Groq's OpenAI-compatible /v1/audio/speech endpoint."""
+        if not api_key:
+            raise GatewayError("Groq API key required for TTS", code="missing_api_key")
+        url = "https://api.groq.com/openai/v1/audio/speech"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        if extra_headers:
+            headers.update(extra_headers)
+        payload = self._normalise_request(self._strip_groq_prefix(model), body)
+        # Orpheus voices (autumn, diana, hannah, austin, daniel, troy) do not
+        # overlap OpenAI's set. When the caller omits 'voice' our normaliser
+        # injects OpenAI's default ('alloy'); substitute Groq's default so an
+        # OpenAI-shaped request still works against Orpheus. An explicit,
+        # invalid voice is forwarded so the caller sees the upstream 400.
+        if payload.get("voice") == DEFAULT_VOICE:
+            payload["voice"] = GROQ_DEFAULT_VOICE
+        timeout = aiohttp.ClientTimeout(total=120)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, headers=headers, json=payload) as resp:
+                if resp.status >= 400:
+                    err_text = (await resp.text())[:500]
+                    logger.warning("Groq TTS failed: %s %s", resp.status, err_text)
+                    raise GatewayError(
+                        f"Groq TTS error {resp.status}: {err_text}",
+                        code="upstream_error",
+                    )
+                audio = await resp.read()
+                content_type = resp.headers.get("Content-Type", "audio/mpeg")
+                return audio, content_type
 
     async def _call_openai(
         self,
@@ -318,6 +368,17 @@ class TTSHandler:
         if model.startswith(("openrouter/", "openrouter::")):
             return model.split("/", 1)[1] if "/" in model else model.split("::", 1)[1]
         return model
+
+    @staticmethod
+    def _strip_groq_prefix(model: str) -> str:
+        """Strip a leading 'groq/' or 'groq::' prefix before sending upstream."""
+        lower = model.lower()
+        if lower.startswith("groq::"):
+            return model.split("::", 1)[1]
+        if lower.startswith("groq/"):
+            return model.split("/", 1)[1]
+        return model
+
 
     @staticmethod
     def _normalise_request(model: str, body: Dict[str, Any]) -> Dict[str, Any]:

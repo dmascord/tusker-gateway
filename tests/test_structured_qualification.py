@@ -321,3 +321,48 @@ async def test_maintenance_probes_and_counts_catalog_added_models(monkeypatch, t
         assert catalog_requests == ["/models"]
         assert summary["qualified"] == 1
         assert summary["passed"] == 1
+@pytest.mark.asyncio
+async def test_structured_probes_skip_non_text_output_catalog_models(monkeypatch, tmp_path):
+    """A catalog model advertising a non-text output modality (e.g. TTS) is
+    never probed: the chat-shaped probe could only fail and poison stats."""
+    config = {
+        "pools": {"code": PoolConfig(name="code", models=[], auto_free=True)},
+        "quality_db_path": str(tmp_path / "quality.db"),
+        "provider_api_keys": {"openrouter": "key"},
+        "providers": {"openrouter": {"kind": "bearer"}},
+    }
+    probed = []
+
+    async def catalog(request):
+        return web.json_response({"data": [
+            {"id": "free-chat", "pricing": {"prompt": "0", "completion": "0"}},
+            {"id": "tts-model",
+             "pricing": {"prompt": "0", "completion": "0"},
+             "output_modalities": ["speech"]},
+        ]})
+
+    async def chat(request):
+        probed.append((await request.json())["model"])
+        return web.json_response({"choices": [{"message": {"content": '{"ok":true}'}}]})
+
+    app = web.Application()
+    app.router.add_get("/models", catalog)
+    app.router.add_post("/v1/chat/completions", chat)
+    async with TestServer(app) as server:
+        client = OpenRouterCatalog()
+        client.ENDPOINT = str(server.make_url("/models"))
+        registry = CatalogRegistry({"openrouter": client})
+        monkeypatch.setenv("API_KEYS", "gateway-key")
+        monkeypatch.setattr(
+            "tusker_gateway.structured_qualification.load_config",
+            lambda: config,
+        )
+        monkeypatch.setattr(
+            "tusker_gateway.tool_qualification._catalog_registry",
+            lambda *args, **kwargs: registry,
+        )
+        summary = await run_structured_qualification(
+            pool_name="code", base_url=str(server.make_url("")),
+        )
+        assert probed == ["openrouter::free-chat"]
+        assert all("tts-model" not in r for r in summary)

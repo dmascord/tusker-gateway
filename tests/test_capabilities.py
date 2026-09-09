@@ -18,6 +18,7 @@ from tusker_gateway.providers.capabilities import (
     CapabilityEntry,
     CapabilitiesRegistry,
     discover_openai_verified,
+    _discover_groq_tts,
     _discover_xiaomi,
     capabilities_refresh_loop,
     discover_openrouter,
@@ -318,6 +319,50 @@ async def test_discover_xiaomi_rejects_catalog_without_tts_models():
     )
 
     assert await _discover_xiaomi("tp-test", session) == []
+
+
+@pytest.mark.asyncio
+async def test_discover_groq_registers_speech_output_models():
+    session = _FakeSession()
+    catalog = {
+        "data": [
+            {"id": "openai/gpt-oss-20b", "output_modalities": ["text"]},
+            {"id": "canopylabs/orpheus-v1-english", "output_modalities": ["speech"]},
+            {"id": "canopylabs/orpheus-arabic-saudi", "output_modalities": ["speech"]},
+            {"id": "whisper-large-v3", "output_modalities": ["transcription"]},
+        ]
+    }
+    session.route(
+        "GET",
+        "api.groq.com/openai/v1/models",
+        lambda *_: (200, json.dumps(catalog).encode(), {}),
+    )
+
+    entries = await _discover_groq_tts("gsk-test", session)
+
+    assert {entry.model for entry in entries} == {
+        "canopylabs/orpheus-v1-english",
+        "canopylabs/orpheus-arabic-saudi",
+    }
+    assert all(entry.provider == "groq" for entry in entries)
+    assert all(entry.capability == Capability.TTS_SPEECH for entry in entries)
+
+
+@pytest.mark.asyncio
+async def test_discover_groq_returns_empty_without_key():
+    assert await _discover_groq_tts(None, _FakeSession()) == []
+
+
+@pytest.mark.asyncio
+async def test_discover_groq_swallows_http_error():
+    session = _FakeSession()
+    session.route(
+        "GET",
+        "api.groq.com/openai/v1/models",
+        lambda *_: (401, b'{"error":"bad key"}', {}),
+    )
+
+    assert await _discover_groq_tts("gsk-bad", session) == []
 
 
 # ---------- Lookup / normalisation ----------

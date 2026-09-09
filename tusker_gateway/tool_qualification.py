@@ -23,7 +23,7 @@ from typing import Any
 
 import aiohttp
 
-from tusker_gateway.catalog import CatalogRegistry
+from tusker_gateway.catalog import CatalogRegistry, advertised_output_modalities
 from tusker_gateway.config import load_config
 from tusker_gateway.cooldown import is_account_quota_exhausted as _is_account_quota_exhausted
 from tusker_gateway.pools import PoolManager, is_general_chat_model
@@ -52,6 +52,31 @@ PROBE_TOOL: dict[str, Any] = {
         },
     },
 }
+
+
+def _probes_text_chat_output(manager: PoolManager, pair: tuple[str, str]) -> bool:
+    """Return whether a pool candidate is worth a chat-shaped probe.
+
+    Slug-based screening first, then the catalog row's advertised output
+    modalities: TTS/transcription/image-only endpoints cannot satisfy a
+    chat contract and probing them only records misleading failures.
+    Models absent from the catalog keep the slug-based verdict.
+    """
+    provider, model = pair
+    if not is_general_chat_model(provider, model):
+        return False
+    entries_for = getattr(manager.catalog_registry, "entries_for", None)
+    if not callable(entries_for):
+        return True
+    try:
+        entries = entries_for(provider) or []
+    except Exception:
+        return True
+    for entry in entries:
+        if entry.model == model:
+            advertised = advertised_output_modalities(entry)
+            return advertised is None or not (advertised - {"text"})
+    return True
 
 
 def _catalog_registry(
@@ -472,11 +497,12 @@ async def run_qualification(
         manager.catalog_registry = registry
         manager.extend_pools_with_free_catalog()
         pairs = sorted(
-            {
+            pair
+            for pair in (
                 (spec.provider, spec.model)
                 for spec in manager.models.get(pool_name, [])
-                if is_general_chat_model(spec.provider, spec.model)
-            }
+            )
+            if _probes_text_chat_output(manager, pair)
         )
         provider_filter = {
             str(provider).strip().lower().replace("_", "-")

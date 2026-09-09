@@ -149,7 +149,7 @@ class CapabilitiesRegistry:
                 ("openai", _discover_openai_via_probe(session, self.provider_keys.get("openai"))),
                 ("codex", _discover_codex_capability(self.codex_rotator)),
                 ("zai", _discover_zai(self.provider_keys.get("zai") or self.provider_keys.get("glm"), session)),
-                ("xiaomi", _discover_xiaomi(self.provider_keys.get("xiaomi"), session)),
+                ("groq", _discover_groq_tts(self.provider_keys.get("groq"), session)),
                 ("minimax", _discover_minimax(self.provider_keys.get("minimax"))),
                 ("google", _discover_google(self.provider_keys.get("google") or self.provider_keys.get("gemini"), session)),
             ]
@@ -563,6 +563,65 @@ async def _discover_google(
                     provider="google",
                     model=model_id,
                     capability=Capability.VIDEO_GENERATIONS,
+                )
+            )
+    return out
+
+
+# Groq TTS
+# ---------------------------------------------------------------------------
+
+
+async def _discover_groq_tts(
+    api_key: str | None,
+    session: aiohttp.ClientSession,
+) -> list[CapabilityEntry]:
+    """Discover Groq's speech-output models for /v1/audio/speech dispatch.
+
+    Groq exposes an OpenAI-compatible ``/v1/audio/speech`` endpoint and
+    marks speech models in its model catalog via
+    ``output_modalities == ["speech"]`` (e.g. ``canopylabs/orpheus-*``).
+    Terms acceptance is enforced per-org upstream on first use; discovery
+    itself stays read-only against the model list.
+    """
+    if not api_key:
+        return []
+    try:
+        async with session.get(
+            "https://api.groq.com/openai/v1/models",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "User-Agent": "tusker-gateway/capabilities",
+            },
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as response:
+            if response.status != 200:
+                logger.warning("groq capability probe: http %s", response.status)
+                return []
+            data = await response.json()
+    except Exception as exc:
+        logger.warning("groq capability probe failed: %s", exc)
+        return []
+
+    out: list[CapabilityEntry] = []
+    for model in (data or {}).get("data", []):
+        if not isinstance(model, dict):
+            continue
+        slug = model.get("id")
+        if not isinstance(slug, str) or not slug.strip():
+            continue
+        output_modalities = model.get("output_modalities") or []
+        if not isinstance(output_modalities, list):
+            continue
+        if any(
+            isinstance(modality, str) and modality.strip().lower() == "speech"
+            for modality in output_modalities
+        ):
+            out.append(
+                CapabilityEntry(
+                    provider="groq",
+                    model=slug,
+                    capability=Capability.TTS_SPEECH,
                 )
             )
     return out
