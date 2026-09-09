@@ -261,67 +261,93 @@ Manifest-only recovery, no code change. `k8s/deployment.yaml` now:
 | `TUSKER_POOL_CODE.auto_catalog_providers` | `[..., "groq"]` | `[..., "groq", "google"]` |
 | `TUSKER_POOL_PREMIUM.models` | 14 entries | 15 entries, `{"provider":"google","model":"gemini-3-pro"}` appended |
 
-Catalog policy chosen: **(b)** — un-disable Google catalog so the
-authenticated `/v1beta/openai/models` refresh populates current Gemini
-slugs hourly; the static `gemini-3.1-flash-lite-preview` row is dropped
-(it was the only dead Google static row and is superseded by catalog
-discovery).
+Google catalog discovery is enabled; authenticated refreshes supply current
+Gemini slugs. This change did not remove a static Flash row: it was already
+absent from the parent manifest.
 
 `heavyweight.py` already classifies `gemini-2.5-pro`/`gemini-3-pro` as
 heavyweight and `pools.py` keeps the `-image`/`imagen-*` exclusion, so
 the premium route is the only place a heavy Gemini slug can land; flash
 variants remain cheap-tier eligible in `code`.
 
-### Earlier "Blocked stage" — superseded
+### Deployment and disk recovery — 2026-09-09
 
-The original "Blocked stage" subsection below was written before the
-visor jump host route was known. Dev host reaches the cluster via
-`ssh -J tusker-duckdns`, so direct `kubectl` does work; it just took the
-wrong code path initially. See "Deploy-flow status (2026-09-09, blocked
-by node wyzard disk-full)" above for the current blocker.
+The build used the clean `5642f6e750281126d93a493a2c30373d2449d2ea`
+worktree at `/srv/opencode/tusker-ai-gateway-build-5642f6e`. However,
+the initial invocation ran the older deploy script from visor's dirty
+checkout. That script applied stale environment settings: Google remained
+disabled and `TUSKER_COMMIT` overrode the baked revision. The image tag alone
+did not prove correct deployment configuration.
 
-### Deploy-flow status (2026-09-09, blocked by node `wyzard` disk-full)
+The first rollout also stalled on `wyzard` (10.0.0.218): its separate
+3.2 GiB `/var` filesystem was full and kubelet could not create
+`/var/log/pods/...`. `DiskPressure=False` was observed; the reason that
+condition missed this filesystem was not established.
 
-Reached cluster via `ssh tusker-duckdns` jump. Mirrored source to visor
-via `git worktree` of `5642f6e` at
-`/srv/opencode/tusker-ai-gateway-build-5642f6e` and ran the documented
-deploy flow with `TUSKER_COMMIT=5642f6e750281126d93a493a2c30373d2449d2ea`.
-Build (`buildah bud`) and image push to
-`registry.tusker.net.au:5000/tusker-gateway:swarm-alpine-5642f6e`
-succeeded; `kubectl apply` updated the deployment to the new image.
+With user approval, cleanup performed:
 
-Rollout is **blocked by node `wyzard` disk-full**, not by the manifest
-change. The new pod `tusker-gateway-fbb596959-w7g5g` is stuck in
-`ContainerCreating`; kubelet event:
-`Failed to create pod sandbox: mkdir /var/log/pods/...: no space left on device`.
+- Vacuumed archived systemd journals to a 64 MiB target; command reported
+  136 MiB freed (active journals are not covered by the target).
+- Removed two old atop files, `atop_20260903` and `atop_20260904`, about
+  64 MiB combined. The earlier 135 MiB estimate was incorrect.
+- Truncated `/var/log/calico/cni/cni.log` in place, reclaiming about 64 MiB.
+- Removed 14 pod log files older than one day; their total size was small.
+  Age alone does not prove a pod log is inactive; do not reuse this as a
+  general retention procedure.
 
-`wyzard` `/var` volume is `3.2G / 3.2G (100%)`:
+After cleanup `/var` had 94 MiB available (97% used), with 15% inode use.
+The previously blocked container started and that rollout completed.
+This is temporary headroom, not a durable capacity fix. `/var/log` did not
+account for all of `/var` usage; the earlier claim that all consumers were
+logs was unsupported. The VG has 960 MiB unallocated, so a modest online
+ext4 expansion is possible, though longer-term sizing needs more capacity.
 
-| Consumer | Size |
+The registry and running pod agreed on image digest
+`sha256:f991ff9828df41feefcdb1ed2e2e3d3b30927b0085d95972cf913a7cdd0afa31`.
+The clean worktree's deployment manifest was then rendered locally with
+that digest and applied, removing the stale environment override and
+enabling Google. Visor's dirty checkout was not modified.
+
+### Final provenance and smoke — 2026-09-09
+
+Rollout 307 completed: one Ready pod on `wyvern` (192.168.239.227), the
+old `d3553af` pod terminated. `/health` reports
+`commit=5642f6e750281126d93a493a2c30373d2449d2ea`, matching the intended
+revision.
+
+| Check | Result |
 |---|---|
-| `/var/log/atop/` | 198M (7 daily files, ~34M each) |
-| `/var/log/journal/` | 193M |
-| `/var/log/pods/` | 44M |
-| `/var/log/calico/` | 64M |
+| Deployment image | `registry.tusker.net.au:5000/tusker-gateway@sha256:f991ff9828df41feefcdb1ed2e2e3d3b30927b0085d95972cf913a7cdd0afa31` |
+| Registry digest | `sha256:f991ff9828df41feefcdb1ed2e2e3d3b30927b0085d95972cf913a7cdd0afa31` |
+| `TUSKER_DISABLED_PROVIDERS` | `arcee,cohere,cerebras` (Google removed) |
+| `TUSKER_CATALOG_DISABLED_PROVIDERS` | `arcee,arliai,cohere,openai,cerebras` (Google removed) |
+| `TUSKER_COMMIT` | absent |
+| Premium pool | 15 configured, 15 selectable, includes `gemini-3-pro` |
+| Code pool | 219 configured, 205 selectable, `google` in `auto_catalog_providers` |
+| Privacy pool | 111 configured, 105 selectable |
+| Degraded pools | none |
+| Chat SSE smoke | `{"ok": true, "reason": "ok", "http_status": 200}` |
 
-`DiskPressure=False` — node monitoring watches ephemeral-storage
-(`/var/lib/docker`, 99% full but a separate volume), not the small `/var`
-volume. Old pod `d3553af` on `wyvern` is still 1/1 Ready and serving
-traffic; the rollout's only side-effect so far is that the deployment's
-`spec.template.spec.containers[0].image` now points at the new image,
-so any node that has room will pick it up automatically once `wyzard`'s
-`/var` is freed.
+Google catalog refresh is live: the authenticated `/status` shows
+`google` with 55 entries, endpoint
+`https://generativelanguage.googleapis.com/v1beta/openai/models`, status
+`ok`, and no error. OpenRouter reports 431 entries. The public
+`/v1/models` list returns 35 models and includes
+`github-copilot-enterprise/gemini-3.1-pro-preview`.
 
-### Suggested unblock (needs user confirmation)
+### Notes on the public model list
 
-On `wyzard` (10.0.0.218):
+`/v1/models` returned 35 entries, which is far fewer than the 219+111
+configured pool entries. The list is the client-facing route and is
+intentionally curated; it is not the catalog. Do not read it as evidence
+that Gemini is absent — the catalog and premium pool both carry it.
 
-1. `sudo journalctl --vacuum-size=64M` — drops journal from 193M to 64M.
-2. `sudo find /var/log/atop -mtime +3 -name 'atop_*' -delete` — keeps
-   the last 3 days of atop logs, frees ~135M.
-3. `sudo rm -f /var/log/calico/*` — frees 64M; calico can recreate.
-4. `sudo find /var/log/pods -mindepth 2 -mtime +1 -delete` — drops
-   1+ day-old pod logs (kubelet keeps recent ones).
+### Unresolved
 
-Total expected: ~450M freed on a 3.2G volume → ~14% headroom, enough for
-the kubelet pod sandbox to be created and the new pod to start.
+- `wyzard` `/var` is still 97% full. The cleanup bought headroom for the
+  pod sandbox; it is not a capacity fix. The VG has 960 MiB unallocated
+  for a possible online `ext4` growth, but sizing should be revisited.
+- The earlier `DiskPressure=False` observation on a full `/var` was not
+  explained. Node monitoring watches `ephemeral-storage` (the separate
+  `docker` LV), not the small `/var` filesystem, which is the likely
+  reason. Not confirmed.
