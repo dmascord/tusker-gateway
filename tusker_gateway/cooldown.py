@@ -67,25 +67,35 @@ PERMANENT_ERROR_COOLDOWN_SECS = float(
     os.environ.get("TUSKER_RETRY_PERMANENT_COOLDOWN", "3600")
 )
 
-# (provider, model) pairs observed returning a permanent 401/403. The
-# auto-free pool skips these so genuinely-dead models (agentic-harness-only,
-# WAF-blocked, wrong-tier) don't re-enter rotation.
-PERMANENTLY_FAILED_MODELS: set[tuple[str, str]] = set()
+# (provider, model) pairs observed returning a permanent 401/403/404/410.
+# The auto-free pool skips these so genuinely-dead models
+# (agentic-harness-only, WAF-blocked, wrong-tier) don't re-enter rotation.
+# Values are expiry timestamps (monotonic) or None for indefinite.
+PERMANENTLY_FAILED_MODELS: dict[tuple[str, str], float | None] = {}
 
 
-def mark_permanently_failed(provider: str, model: str) -> None:
-    """Record a (provider, model) that returned a permanent 401/403."""
-    PERMANENTLY_FAILED_MODELS.add((provider, model))
+def mark_permanently_failed(provider: str, model: str, *, seconds: float | None = None) -> None:
+    """Mark an unavailable model, optionally allowing retry after a cooldown."""
+    PERMANENTLY_FAILED_MODELS[(provider, model)] = (
+        time.monotonic() + min(seconds, MAX_COOLDOWN_SECS) if seconds is not None else None
+    )
 
 
 def clear_permanently_failed(provider: str, model: str) -> None:
     """Clear a permanent-failure marker once the model recovers."""
-    PERMANENTLY_FAILED_MODELS.discard((provider, model))
+    PERMANENTLY_FAILED_MODELS.pop((provider, model), None)
 
 
 def is_permanently_failed(provider: str, model: str) -> bool:
-    """Return True if this (provider, model) is known to be permanently dead."""
-    return (provider, model) in PERMANENTLY_FAILED_MODELS
+    """Return whether an active permanent-failure marker exists for this model."""
+    key = (provider, model)
+    if key not in PERMANENTLY_FAILED_MODELS:
+        return False
+    expires = PERMANENTLY_FAILED_MODELS[key]
+    if expires is not None and expires <= time.monotonic():
+        PERMANENTLY_FAILED_MODELS.pop(key, None)
+        return False
+    return True
 
 
 

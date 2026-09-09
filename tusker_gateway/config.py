@@ -143,6 +143,15 @@ def load_config() -> dict[str, Any]:
         for p in _parse_env_list("TUSKER_PASSTHROUGH_DISABLED_PROVIDERS")
         if p.strip()
     ]
+    # Providers whose catalog is considered a complete authoritative list for
+    # negative discovery (route exclusion when absent from catalog). Default
+    # empty: catalog presence/absence is never a selection gate without this.
+    # Opt in only after confirming that the provider catalog is complete.
+    config["authoritative_catalog_providers"] = [
+        p.strip()
+        for p in _parse_env_list("TUSKER_AUTHORITATIVE_CATALOG_PROVIDERS")
+        if p.strip()
+    ]
 
     # Normalized provider registry and API-key map.
     config["providers"] = _load_providers()

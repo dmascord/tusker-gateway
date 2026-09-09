@@ -137,6 +137,19 @@ Static `TUSKER_POOL_*` entries remain operator-curated baselines. Pools with
 refresh. Catalog-only entries are pruned when they disappear or become
 ineligible; static entries are never pruned.
 
+`TUSKER_AUTHORITATIVE_CATALOG_PROVIDERS` optionally lists providers whose
+catalog is complete enough to exclude missing routes. It defaults to empty.
+For opted-in providers, a successful, current, nonempty snapshot gates
+selection (including sticky sessions), status, and readiness. Configured
+`model_aliases` are resolved before lookup. Failed, stale, or empty snapshots
+leave the configured baseline eligible; static configuration is not deleted.
+Catalog presence does not prove account entitlement.
+
+Upstream 404/410 failures also temporarily exclude a model from auto-discovery.
+These markers expire after `TUSKER_RETRY_PERMANENT_COOLDOWN` (default one hour),
+allowing later catalog refreshes to reconsider the route. Google requests omit
+the unsupported OpenAI `store` field after request fields are merged.
+
 ## Auto-free catalog merge
 
 Pools can opt in to **automatic free-tier discovery** by setting

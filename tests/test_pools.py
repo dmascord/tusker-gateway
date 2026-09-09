@@ -1062,3 +1062,307 @@ def test_concurrent_selects_distribute_without_dropping_increments():
         # (m1, m2, m3) interleaved: any distribution where one candidate
         # was chosen more than ceil(N/3) * 2 times would indicate lost
         # increments.
+def test_catalog_unavailable_routes_drop_from_selection():
+    """Models absent from an authoritative catalog are excluded from selection."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = PoolManager({
+            "pools": {
+                "code": PoolConfig(
+                    name="code",
+                    models=[
+                        {"provider": "google", "model": "gemini-3-pro"},
+                        {"provider": "nvidia", "model": "nvidia/llama-3.1-nemotron-70b"},
+                    ],
+                )
+            },
+            "quality_db_path": os.path.join(tmpdir, "q.db"),
+            "provider_api_keys": {"google": "k-g", "nvidia": "k-n"},
+            "authoritative_catalog_providers": ["google"],
+        })
+
+        class _FakeClient:
+            provider = "google"
+
+            def diagnostics(self):
+                return {"last_refresh_status": "ok", "stale": False}
+
+        class _FakeRegistry:
+            def get_client(self, p):
+                return _FakeClient() if p == "google" else None
+
+            def known_models(self, p):
+                if p == "google":
+                    return {"gemini-2.5-pro"}
+                return None
+
+        manager.catalog_registry = _FakeRegistry()
+        # gemini-3-pro absent from authoritative catalog -> excluded; nvidia remains
+        assert manager.select("code", heavyweight_ok=True) == (
+            "nvidia",
+            "nvidia/llama-3.1-nemotron-70b",
+        )
+
+
+def test_catalog_unavailable_respects_alias_outbound_id():
+    """The outbound model ID (alias resolution) is matched against catalog."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = PoolManager({
+            "pools": {
+                "code": PoolConfig(
+                    name="code",
+                    models=[
+                        {"provider": "google", "model": "gemini-3-pro"},
+                    ],
+                )
+            },
+            "quality_db_path": os.path.join(tmpdir, "q.db"),
+            "provider_api_keys": {"google": "k-g"},
+            "authoritative_catalog_providers": ["google"],
+            "providers": {
+                "google": {
+                    "model_aliases": {"gemini-3-pro": "gemini-3.5-pro"},
+                }
+            },
+        })
+
+        class _FakeClient:
+            provider = "google"
+
+            def diagnostics(self):
+                return {"last_refresh_status": "ok", "stale": False}
+
+        class _FakeRegistry:
+            def get_client(self, p):
+                return _FakeClient() if p == "google" else None
+
+            def known_models(self, p):
+                if p == "google":
+                    return {"gemini-3.5-pro"}
+                return None
+
+        manager.catalog_registry = _FakeRegistry()
+        # gemini-3-pro static -> outbound gemini-3.5-pro -> present in catalog -> NOT excluded
+        assert manager.select("code", heavyweight_ok=True) == ("google", "gemini-3-pro")
+
+
+def test_catalog_unavailable_empty_or_stale_preserves_routes():
+    """Catalog failures, stale snapshots, or empty results restore the static baseline."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cases = [
+            {"last_refresh_status": "error", "stale": False},
+            {"last_refresh_status": "ok", "stale": True},
+            None,
+        ]
+        for case in cases:
+            manager = PoolManager({
+                "pools": {
+                    "code": PoolConfig(
+                        name="code",
+                        models=[{"provider": "google", "model": "gemini-3-pro"}],
+                    )
+                },
+                "quality_db_path": os.path.join(tmpdir, "q.db"),
+                "provider_api_keys": {"google": "k-g"},
+                "authoritative_catalog_providers": ["google"],
+            })
+
+            class _FakeClient:
+                provider = "google"
+
+                def diagnostics(self):
+                    return case or {}
+
+            class _FakeRegistry:
+                def get_client(self, p):
+                    return _FakeClient() if p == "google" and case is not None else None
+
+                def known_models(self, p):
+                    if p == "google" and case is not None:
+                        return set()
+                    return None
+
+            manager.catalog_registry = _FakeRegistry()
+            # No gate applied when catalog is uncertain -> route is selectable
+            assert manager.select("code", heavyweight_ok=True) == (
+                "google",
+                "gemini-3-pro",
+            ), f"failed case {case}"
+
+
+def test_catalog_unavailable_stickiness_drops_on_exclusion():
+    """A sticky route that becomes catalog-unavailable is cleared and re-selected."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = PoolManager({
+            "pools": {
+                "code": PoolConfig(
+                    name="code",
+                    models=[
+                        {"provider": "google", "model": "gemini-3-pro"},
+                        {"provider": "nvidia", "model": "nvidia/llama-3.1-nemotron-70b"},
+                    ],
+                )
+            },
+            "quality_db_path": os.path.join(tmpdir, "q.db"),
+            "provider_api_keys": {"google": "k-g", "nvidia": "k-n"},
+            "authoritative_catalog_providers": ["google"],
+        })
+
+        class _FakeClient:
+            provider = "google"
+
+            def diagnostics(self):
+                return {"last_refresh_status": "ok", "stale": False}
+
+        class _FakeRegistry:
+            def get_client(self, p):
+                return _FakeClient() if p == "google" else None
+
+            def known_models(self, p):
+                if p == "google":
+                    return {"gemini-2.5-pro"}
+                return None
+
+        manager.catalog_registry = _FakeRegistry()
+        # Record explicit stickiness for the google route
+        manager._stickiness[("session-x", "code")] = ("google", "gemini-3-pro")
+        manager._stickiness_expires[("session-x", "code")] = float("inf")
+        # Catalog says gemini-3-pro is unavailable -> stickiness dropped
+        # Fall-through to nvidia
+        result = manager.select("code", session_id="session-x", heavyweight_ok=True)
+        assert result == ("nvidia", "nvidia/llama-3.1-nemotron-70b")
+
+
+def test_catalog_unavailable_readiness_excludes_unavailable():
+    """readiness_status reports catalog-unavailable routes as not selectable."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = PoolManager({
+            "pools": {
+                "code": PoolConfig(
+                    name="code",
+                    models=[
+                        {"provider": "google", "model": "gemini-3-pro"},
+                        {"provider": "groq", "model": "llama-3.3-70b"},
+                    ],
+                )
+            },
+            "quality_db_path": os.path.join(tmpdir, "q.db"),
+            "provider_api_keys": {"google": "k-g", "groq": "k-groq"},
+            "authoritative_catalog_providers": ["google"],
+        })
+
+        class _FakeClient:
+            provider = "google"
+
+            def diagnostics(self):
+                return {"last_refresh_status": "ok", "stale": False}
+
+        class _FakeRegistry:
+            def get_client(self, p):
+                return _FakeClient() if p == "google" else None
+
+            def known_models(self, p):
+                if p == "google":
+                    return {"gemini-2.5-pro"}
+                return None
+
+        manager.catalog_registry = _FakeRegistry()
+        health, empty = manager.readiness_status()
+        # google: heavyweight AND catalog-unavailable; groq: lightweight, not authoritative
+        assert health["code"]["selectable"] == 1
+
+
+def test_authoritative_catalog_providers_default_empty():
+    """Without TUSKER_AUTHORITATIVE_CATALOG_PROVIDERS, no catalog exclusion applies."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = PoolManager({
+            "pools": {
+                "code": PoolConfig(
+                    name="code",
+                    models=[{"provider": "groq", "model": "llama-3.3-70b"}],
+                )
+            },
+            "quality_db_path": os.path.join(tmpdir, "q.db"),
+            "provider_api_keys": {"groq": "k-groq"},
+        })
+        # No catalog registry at all
+        assert manager.select("code") == ("groq", "llama-3.3-70b")
+        health, _ = manager.readiness_status()
+        assert health["code"]["selectable"] == 1
+
+
+def test_extend_pools_with_catalog_resolves_outbound_alias():
+    """extend_pools_with_catalog counts a static route when its outbound alias
+    matches a catalog model."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = PoolManager({
+            "pools": {
+                "code": PoolConfig(
+                    name="code",
+                    models=[{"provider": "google", "model": "gemini-3-pro"}],
+                )
+            },
+            "quality_db_path": os.path.join(tmpdir, "q.db"),
+            "provider_api_keys": {"google": "k-g"},
+            "providers": {
+                "google": {
+                    "model_aliases": {"gemini-3-pro": "gemini-3.5-pro"},
+                }
+            },
+        })
+
+        class _FakeClient:
+            provider = "google"
+
+            def diagnostics(self):
+                return {"last_refresh_status": "ok", "stale": False}
+
+        class _FakeRegistry:
+            def get_client(self, p):
+                return _FakeClient() if p == "google" else None
+
+            def known_models(self, p):
+                if p == "google":
+                    return {"gemini-3.5-pro"}
+                return None
+
+        manager.catalog_registry = _FakeRegistry()
+        confirmed = manager.extend_pools_with_catalog()
+        # gemini-3-pro -> outbound gemini-3.5-pro -> present in catalog -> confirmed
+        assert confirmed["code"] == 1
+
+
+def test_catalog_unavailable_excludes_only_when_provider_is_authoritative():
+    """Only providers in authoritative_catalog_providers are gated."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = PoolManager({
+            "pools": {
+                "code": PoolConfig(
+                    name="code",
+                    models=[{"provider": "groq", "model": "llama-3.3-70b"}],
+                )
+            },
+            "quality_db_path": os.path.join(tmpdir, "q.db"),
+            "provider_api_keys": {"groq": "k-groq"},
+            "authoritative_catalog_providers": [],
+        })
+
+        class _FakeClient:
+            provider = "groq"
+
+            def diagnostics(self):
+                return {"last_refresh_status": "ok", "stale": False}
+
+        class _FakeRegistry:
+            def get_client(self, p):
+                return _FakeClient() if p == "groq" else None
+
+            def known_models(self, p):
+                if p == "groq":
+                    return {"other-model"}
+                return None
+
+        manager.catalog_registry = _FakeRegistry()
+        # groq not authoritative -> llama-3.3-70b remains selectable despite catalog absence
+        assert manager.select("code") == ("groq", "llama-3.3-70b")
+        health, _ = manager.readiness_status()
+        assert health["code"]["selectable"] == 1

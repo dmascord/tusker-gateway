@@ -1293,6 +1293,10 @@ class PassthroughClient:
             tracker = global_tracker()
             tracker.cooldown(provider, model, seconds)
             _persist_cooldown(self._config, provider, model, seconds)
+            status_code = getattr(exc, "upstream_status", None)
+            if status_code in (404, 410):
+                from tusker_gateway.cooldown import mark_permanently_failed
+                mark_permanently_failed(provider, model, seconds=seconds)
             if tracker.record_failure(provider):
                 provider_seconds = 300.0
                 tracker.cooldown(provider, "", provider_seconds)
@@ -1543,6 +1547,12 @@ class PassthroughClient:
                     store.record_provider(provider, 300.0)
                 except Exception:
                     pass
+            # 404/410: model unavailable to this account. Mark with expiry so
+            # the gateway leaves it alone but recovers after the cooldown.
+            status_code = getattr(exc, "upstream_status", None)
+            if status_code in (404, 410):
+                from tusker_gateway.cooldown import mark_permanently_failed, PERMANENT_ERROR_COOLDOWN_SECS
+                mark_permanently_failed(provider, model, seconds=PERMANENT_ERROR_COOLDOWN_SECS)
             logger.warning('provider error %s/%s: %s', provider, model, exc)
             if isinstance(exc, ProviderError):
                 raise
@@ -1693,6 +1703,10 @@ class PassthroughClient:
                 body["tool_choice"] = tool_choice
         if extra_body:
             body.update(extra_body)
+        if provider.lower() == "google":
+            # Gemini's OpenAI compatibility endpoint rejects the `store` field
+            # even when explicitly disabled; drop it so valid requests succeed.
+            body.pop("store", None)
         if provider.lower() == _OPENCODE_GO_PROVIDER:
             effort = body.get("reasoning_effort")
             if isinstance(effort, str):

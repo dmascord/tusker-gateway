@@ -5,6 +5,10 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 import pytest
 from tusker_gateway.passthrough import PassthroughClient
+from aiohttp import ClientSession, web
+from aiohttp.test_utils import TestServer
+from .conftest import HEADERS_AUTH
+
 from tusker_gateway.quality import QualityDB
 from tusker_gateway.tool_formats import (
     normalize_tools, normalize_tool_calls, openai_messages_to_anthropic,
@@ -136,7 +140,92 @@ async def test_request_body_preserves_explicit_tool_choice():
     assert body["tool_choice"] == "required"
 
 
-@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["google", "openai"])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("endpoint", ["/v1/chat/completions", "/v1/responses"])
+async def test_google_store_compatibility_at_upstream(app, client, provider, stream, endpoint):
+    """Both API surfaces must reach upstream without losing tools or images."""
+    received = []
+
+    async def upstream(request):
+        body = await request.json()
+        received.append(body)
+        if provider == "google" and "store" in body:
+            return web.json_response({"error": {"message": "Unknown field: store"}}, status=400)
+        if stream:
+            return web.Response(
+                content_type="text/event-stream",
+                text='data: {"choices":[{"index":0,"delta":{"content":"compatible"},"finish_reason":null}]}\n\n'
+                     'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+                     'data: [DONE]\n\n',
+            )
+        return web.json_response({
+            "choices": [{"message": {"role": "assistant", "content": "compatible"}, "finish_reason": "stop"}],
+        })
+
+    upstream_app = web.Application()
+    upstream_app.router.add_post("/chat/completions", upstream)
+    model = "gemini-3.1-flash-lite" if provider == "google" else "gpt-4o"
+    image_url = "data:image/png;base64,aW1hZ2U="
+    function = {"name": "describe", "parameters": {"type": "object", "properties": {}}}
+    payload = {
+        "model": f"{provider}::{model}",
+        "store": False,
+        "stream": stream,
+        "reasoning_effort": "low",
+        "tool_choice": "auto",
+        "stream_options": {"include_usage": True},
+        "response_format": {"type": "json_object"},
+    }
+    if endpoint == "/v1/responses":
+        payload["input"] = [{"role": "user", "content": [
+            {"type": "input_text", "text": "Describe this image"},
+            {"type": "input_image", "image_url": image_url},
+        ]}]
+        payload["tools"] = [{"type": "function", **function}]
+    else:
+        payload["messages"] = [{"role": "user", "content": [
+            {"type": "text", "text": "Describe this image"},
+            {"type": "image_url", "image_url": {"url": image_url}},
+        ]}]
+        payload["tools"] = [{"type": "function", "function": function}]
+
+    async with TestServer(upstream_app) as server, ClientSession() as session:
+        app["config"]["providers"] = {provider: {
+            "base_url": str(server.make_url("/")).rstrip("/"),
+            "chat_path": "/chat/completions",
+            "auth_type": "bearer",
+        }}
+        app["config"]["provider_api_keys"] = {provider: "upstream-test-key"}
+        app["config"]["quality_db_path"] = ":memory:"
+        app["http_session"] = session
+        response = await client.post(endpoint, json=payload, headers=HEADERS_AUTH)
+        result = await response.text()
+
+    assert response.status == 200, result
+    assert "compatible" in result
+    assert len(received) == 1
+    body = received[0]
+    if provider == "google":
+        assert "store" not in body
+    else:
+        assert body["store"] is False
+    assert body["model"] == model
+    assert body["stream"] is stream
+    assert body["messages"] == [{"role": "user", "content": [
+        {"type": "text", "text": "Describe this image"},
+        {"type": "image_url", "image_url": {"url": image_url}},
+    ]}]
+    assert body["tools"] == [{"type": "function", "function": {
+        "name": "describe",
+        "description": "",
+        "parameters": {"type": "object", "properties": {}},
+    }}]
+    assert body["tool_choice"] == "auto"
+    assert body["reasoning_effort"] == "low"
+    assert body["stream_options"] == {"include_usage": True}
+    assert body["response_format"] == {"type": "json_object"}
+
 async def test_opencode_go_sets_conversation_session_header():
     http = _mock_http({"choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]})
     client = PassthroughClient(

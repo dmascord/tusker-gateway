@@ -431,33 +431,64 @@ class PoolManager:
             if not self._provider_is_disabled(m.get("provider", ""))
         }
 
+    def _outbound_model(self, provider: str, model: str) -> str:
+        """Resolve the configured model alias used by upstream requests."""
+        endpoint = self._providers.get(provider)
+        aliases = (
+            endpoint.get("model_aliases", {})
+            if isinstance(endpoint, dict)
+            else getattr(endpoint, "model_aliases", {})
+        )
+        return aliases.get(model, model)
+
+    def _catalog_unavailable_routes(
+        self, specs: list[ModelSpec]
+    ) -> set[tuple[str, str]]:
+        """Return static routes absent from successful authoritative catalogs."""
+        registry = self.catalog_registry
+        get_client = getattr(registry, "get_client", None)
+        known_models = getattr(registry, "known_models", None)
+        if not callable(get_client) or not callable(known_models):
+            return set()
+        providers = {
+            str(provider).strip().lower().replace("_", "-")
+            for provider in self.config.get("authoritative_catalog_providers", ())
+        }
+        unavailable: set[tuple[str, str]] = set()
+        for provider in providers.intersection(spec.provider for spec in specs):
+            client = get_client(provider)
+            if client is None:
+                continue
+            try:
+                diagnostics = client.diagnostics()
+                if diagnostics.get("last_refresh_status") != "ok" or diagnostics.get("stale", True):
+                    continue
+                catalog_models = known_models(provider)
+            except Exception:
+                continue
+            if not catalog_models:
+                continue
+            unavailable.update(
+                (spec.provider, spec.model)
+                for spec in specs
+                if spec.provider == provider
+                and self._outbound_model(provider, spec.model) not in catalog_models
+            )
+        return unavailable
+
     def extend_pools_with_catalog(self) -> dict[str, int]:
-        """Merge catalog-known models into every pool.
-
-        For each (provider, model) in the static allowlist, if the catalog
-        also knows about that (provider, model) pair, ensure the pool has
-        a fresh entry for it. Useful when an upstream model is renamed
-        and the operator updates the static entry but the catalog still
-        has the old slug — the catalog confirms the model is live.
-
-        Returns a mapping of pool_name -> number of catalog-confirmed
-        entries.
-        """
+        """Count catalog-confirmed configured routes, resolving outbound aliases."""
         if self.catalog_registry is None:
             return {}
         confirmed: dict[str, int] = {}
         for pool_name in self.pools:
-            allowlist = self.static_allowlist(pool_name)
             count = 0
-            for provider, model in allowlist:
+            for provider, model in self.static_allowlist(pool_name):
                 if not provider or not model:
                     continue
                 catalog_models = self.catalog_registry.known_models(provider)
-                if catalog_models is None:
-                    continue  # provider not catalog-covered
-                if model not in catalog_models:
-                    continue  # catalog doesn't have it; static stays
-                count += 1
+                if catalog_models is not None and self._outbound_model(provider, model) in catalog_models:
+                    count += 1
             confirmed[pool_name] = count
         logger.info("catalog confirmed %s pool entries", confirmed)
         return confirmed
@@ -1046,7 +1077,7 @@ class PoolManager:
         # Resolve heavyweight gate from pool tier if not explicitly set.
         if heavyweight_ok is None:
             heavyweight_ok = self.pool_keeps_heavyweight(pool_name)
-
+        catalog_unavailable = self._catalog_unavailable_routes(specs)
         # 1. Session stickiness
         if session_id:
             key = (session_id, pool_name)
@@ -1060,6 +1091,9 @@ class PoolManager:
                 prev = self._stickiness[key]
                 for s in specs:
                     if (s.provider, s.model) == prev:
+                        if (s.provider, s.model) in catalog_unavailable:
+                            self._drop_stickiness(key)
+                            break
                         if (s.provider, s.model) in excluded:
                             self._drop_stickiness(key)
                             break
@@ -1129,6 +1163,7 @@ class PoolManager:
         filter_counts = {
             "request_excluded": 0,
             "unregistered_provider": 0,
+            "catalog_unavailable": 0,
             "special_purpose": 0,
             "context_window": 0,
             "heavyweight": 0,
@@ -1147,6 +1182,9 @@ class PoolManager:
             # Skip providers that are not in the registry — avoids ProviderError cascade
             if s.provider not in self._providers:
                 filter_counts["unregistered_provider"] += 1
+                continue
+            if (s.provider, s.model) in catalog_unavailable:
+                filter_counts["catalog_unavailable"] += 1
                 continue
             if not is_general_chat_model(s.provider, s.model):
                 filter_counts["special_purpose"] += 1
@@ -1368,7 +1406,12 @@ class PoolManager:
             tuple[str, str], tuple[frozenset[str] | None, bool | None]
         ] = {}
         for name, specs in self.models.items():
-            valid = [s for s in specs if s.provider in self._providers]
+            catalog_unavailable = self._catalog_unavailable_routes(specs)
+            valid = [
+                s for s in specs
+                if s.provider in self._providers
+                and (s.provider, s.model) not in catalog_unavailable
+            ]
             invalid = [s for s in specs if s.provider not in self._providers]
             result[name] = {
                 "models": len(specs),
@@ -1380,6 +1423,14 @@ class PoolManager:
                 "invalid_entries": [
                     {"provider": s.provider, "model": s.model}
                     for s in invalid
+                ],
+                "catalog_unavailable_entries": [
+                    {
+                        "provider": provider,
+                        "model": model,
+                        "reason": "absent_from_authoritative_catalog",
+                    }
+                    for provider, model in sorted(catalog_unavailable)
                 ],
                 "unkeyed_entries": [
                     {"provider": s.provider, "model": s.model, "reason": reason}
@@ -1407,10 +1458,12 @@ class PoolManager:
         empty: list[str] = []
         for name, specs in self.models.items():
             pool = self.pools.get(name)
+            catalog_unavailable = self._catalog_unavailable_routes(specs)
             eligible = [
                 spec
                 for spec in specs
                 if spec.provider in self._providers
+                and (spec.provider, spec.model) not in catalog_unavailable
                 and is_general_chat_model(spec.provider, spec.model)
                 and (pool is None or not pool.zdr or spec.zdr_ok)
                 and (self.pool_keeps_heavyweight(name) or not spec.heavyweight)
