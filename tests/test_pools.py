@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import json
 import tempfile
 
 from tusker_gateway.config import PoolConfig, _load_pools, load_config
@@ -50,6 +51,51 @@ def test_synthetic_is_eligible_for_privacy_pool(monkeypatch):
         ("synthetic", "syn:small:vision"),
     } <= routes
 
+
+def test_new_privacy_eligible_providers_load(monkeypatch):
+    """groq, workers-ai, and alibaba are eligible for the privacy pool
+    when PROVIDER_REGISTRY_JSON overrides zdr_ok=True.
+    """
+    for key in tuple(os.environ):
+        if key.startswith("TUSKER_POOL_") or key == "TUSKER_CONFIG_DATABASE_ENABLED":
+            monkeypatch.delenv(key, raising=False)
+        if key == "PROVIDER_REGISTRY_JSON":
+            monkeypatch.delenv(key, raising=False)
+
+    monkeypatch.setenv(
+        "PROVIDER_REGISTRY_JSON",
+        '{"groq":{"kind":"bearer","base_url":"https://api.groq.com/openai","chat_path":"/v1/chat/completions","zdr_ok":true},'
+        '"workers-ai":{"kind":"bearer","base_url":"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai","chat_path":"/v1/chat/completions","zdr_ok":true},'
+        '"alibaba":{"kind":"bearer","base_url":"https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode","chat_path":"/v1/chat/completions","zdr_ok":true}}',
+    )
+    privacy_models = [
+        {"provider": "groq", "model": "qwen/qwen3.8-27b"},
+        {"provider": "groq", "model": "openai/gpt-oss-20b"},
+        {"provider": "workers-ai", "model": "@cf/meta/llama-3.3-70b-instruct-fp8-fast", "input_modalities": ["text", "image"]},
+        {"provider": "workers-ai", "model": "@cf/meta/llama-4-scout-17b-16e-instruct", "input_modalities": ["text", "image"]},
+        {"provider": "workers-ai", "model": "@cf/nvidia/nemotron-3-120b-a12b", "input_modalities": ["text"]},
+        {"provider": "alibaba", "model": "deepseek-v4-flash-0731"},
+    ]
+    monkeypatch.setenv(
+        "TUSKER_POOL_PRIVACY",
+        '{"models":' + json.dumps(privacy_models) + ',"zdr":true,"auto_free":true,"auto_catalog_providers":["groq","workers-ai","alibaba"]}',
+    )
+
+    from tusker_gateway.config import _provider_registry_from_env
+
+    registry = _provider_registry_from_env()
+    assert registry["groq"].zdr_ok is True
+    assert registry["workers-ai"].zdr_ok is True
+    assert registry["alibaba"].zdr_ok is True
+
+    pool = _load_pools()["privacy"]
+    routes = {
+        (model["provider"], model["model"])
+        for model in pool.models
+    }
+    assert {("groq", "qwen/qwen3.8-27b"), ("groq", "openai/gpt-oss-20b")} <= routes
+    assert {("workers-ai", "@cf/meta/llama-3.3-70b-instruct-fp8-fast")} <= routes
+    assert {("alibaba", "deepseek-v4-flash-0731")} <= routes
 
 def test_business_copilot_is_available_to_privacy_catalog(monkeypatch):
     for key in tuple(os.environ):
