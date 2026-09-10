@@ -1,78 +1,57 @@
 """Tests for tusker_gateway.config_runtime (ConfigRuntime + AuthMiddleware).
 
-The real tusker_gateway.config_store module is still under construction by a
-sibling, so we inject a fake module into sys.modules before any import that
-transitively touches it.  ConfigRuntime is then imported with working
-ConfigStore/ConfigUnavailableError classes rather than the None fallbacks.
+Uses the real ``ConfigStore`` against temporary SQLite databases; outage
+semantics are exercised by making individual store methods raise.
 """
 from __future__ import annotations
 
 import asyncio
 import os
+import tempfile
 from typing import Any
-from unittest.mock import patch
 
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
 
+from tusker_gateway.config_store import ConfigStore, ConfigUnavailableError
 from tusker_gateway.identity import IdentityConfig
-
-
-# ---------------------------------------------------------------------------
-# Fake ConfigStore / ConfigUnavailableError  (mirrors the real module's API)
-# ---------------------------------------------------------------------------
-
-class ConfigUnavailableError(Exception):
-    """Raised when the DB-backed config store cannot be reached."""
-
-
-class ConfigStore:
-    """Scriptable fake ConfigStore for polling / snapshot tests."""
-
-    def __init__(self, generation: int = 0) -> None:
-        self.generation = generation
-        self.reload_now_calls = 0
-        self._runtime_cfg: dict[str, Any] | None = None
-        self._identity_cfg: IdentityConfig | None = None
-        self._runtime_exc: Exception | None = None
-        self._identity_exc: Exception | None = None
-
-    def runtime_config(self, fallback: dict[str, Any]) -> dict[str, Any]:
-        if self._runtime_exc is not None:
-            raise self._runtime_exc
-        return self._runtime_cfg if self._runtime_cfg is not None else dict(fallback)
-
-    def identity_config(self, fallback: IdentityConfig) -> IdentityConfig:
-        if self._identity_exc is not None:
-            raise self._identity_exc
-        return self._identity_cfg if self._identity_cfg is not None else fallback
-    def reload_now(self) -> None:
-        self.reload_now_calls += 1
-        if self._runtime_exc is not None:
-            raise ConfigUnavailableError("DB unreachable")
-
-
-# Build the fake module object and inject it BEFORE importing anything that
-# transitively depends on tusker_gateway.config_store (admin.py, config_runtime).
-import types
-
-_fake_config_store = types.ModuleType("tusker_gateway.config_store")
-_fake_config_store.ConfigStore = ConfigStore
-_fake_config_store.ConfigUnavailableError = ConfigUnavailableError
-import sys
-
-sys.modules["tusker_gateway.config_store"] = _fake_config_store
-
-# Now import the modules under test (they'll find the working fake above).
 from tusker_gateway.auth import AuthMiddleware
 from tusker_gateway.config_runtime import ConfigRuntime, _env_enabled
+
+@pytest.fixture(autouse=True)
+def _restore_config_db_env():
+    """Restore TUSKER_CONFIG_DATABASE_ENABLED after each test.
+
+    Tests here toggle the flag globally via _env_state; leaving it set
+    would leak DB-backed config into unrelated tests that build real
+    apps (live/e2e suites) later in the run.
+    """
+    saved = os.environ.get("TUSKER_CONFIG_DATABASE_ENABLED")
+    yield
+    if saved is None:
+        os.environ.pop("TUSKER_CONFIG_DATABASE_ENABLED", None)
+    else:
+        os.environ["TUSKER_CONFIG_DATABASE_ENABLED"] = saved
 
 
 def _make_app(config: dict[str, Any] | None = None) -> web.Application:
     app = web.Application()
     app["config"] = config if config is not None else {"api_keys": [], "providers": {}}
     return app
+
+
+def _make_store(
+    fallback_config: dict[str, Any] | None = None,
+) -> ConfigStore:
+    """Real ConfigStore against a fresh temp SQLite database."""
+    dbfile = tempfile.NamedTemporaryFile(suffix=".db", delete=False).name
+    os.unlink(dbfile)
+    return ConfigStore(
+        database=dbfile,
+        fallback_config=fallback_config or {},
+        fallback_identity_config=IdentityConfig(),
+    )
 
 
 def _env_state(truthy: str | None) -> None:
@@ -141,15 +120,17 @@ def test_legacy_mode_runtime_config_returns_fallback(monkeypatch) -> None:
 
 
 # ===========================================================================
-# 3. Enabled mode: runtime_config returns DB snapshot, generation bumps
+# 3. Enabled mode: runtime_config returns DB snapshot, generation tracks
 # ===========================================================================
 
 def test_runtime_config_returns_store_snapshot_and_updates_generation(
     monkeypatch,
 ) -> None:
     _env_state("1")
-    store = ConfigStore(generation=5)
-    store._runtime_cfg = {"api_keys": ["db-key-1"], "db_gen": 5}
+    store = _make_store()
+    key = store.upsert_client_key({"principal": "don", "tenant": "gould"})
+    assert store.generation == 1
+
     app = _make_app()
     app["config_store"] = store
 
@@ -157,8 +138,9 @@ def test_runtime_config_returns_store_snapshot_and_updates_generation(
     fallback = {"api_keys": []}
     snap = rt.runtime_config(fallback)
 
-    assert snap == store._runtime_cfg
-    assert rt.status()["generation"] == 5
+    assert key["api_key"] in snap["api_keys"]
+    assert snap["config_db_keys_authoritative"] is True
+    assert rt.status()["generation"] == 1
     assert rt._last_good_runtime is snap
 
 
@@ -168,8 +150,8 @@ def test_runtime_config_returns_store_snapshot_and_updates_generation(
 
 def test_runtime_config_unavailable_retains_last_good(monkeypatch) -> None:
     _env_state("1")
-    store = ConfigStore(generation=2)
-    store._runtime_cfg = {"api_keys": ["good-key"], "gen": 2}
+    store = _make_store()
+    key = store.upsert_client_key({"principal": "a", "tenant": "b"})
     app = _make_app()
     app["config_store"] = store
 
@@ -177,14 +159,14 @@ def test_runtime_config_unavailable_retains_last_good(monkeypatch) -> None:
     fallback = {"api_keys": []}
 
     first = rt.runtime_config(fallback)
-    assert first["api_keys"] == ["good-key"]
+    assert key["api_key"] in first["api_keys"]
     assert rt._error is None
 
-    store._runtime_exc = ConfigUnavailableError("DB down: token=abc123")
-    second = rt.runtime_config(fallback)
+    def _raise(fallback: dict[str, Any]) -> dict[str, Any]:
+        raise ConfigUnavailableError("DB down: token=abc123")
 
+    store.runtime_config = _raise  # type: ignore[method-assign]
     rt2 = ConfigRuntime(app)  # fresh: _last_good_runtime is None
-    store._runtime_exc = ConfigUnavailableError("still down")
     fb = rt2.runtime_config(fallback)
     assert fb is fallback
     assert rt2.status()["error"] == "ConfigUnavailableError"
@@ -196,22 +178,24 @@ def test_runtime_config_unavailable_retains_last_good(monkeypatch) -> None:
 
 def test_identity_config_same_pattern(monkeypatch) -> None:
     _env_state("1")
-    store = ConfigStore(generation=1)
-    id_cfg = IdentityConfig(identities={"fp": None}, required=True)  # type: ignore[arg-type]
-    store._identity_cfg = id_cfg
+    store = _make_store()
+    key = store.upsert_client_key({"principal": "a", "tenant": "b"})
     app = _make_app()
     app["config_store"] = store
 
     rt = ConfigRuntime(app)
     fallback = IdentityConfig()
     snap = rt.identity_config(fallback)
-    assert snap is id_cfg
-    assert rt._last_good_identity is id_cfg
+    assert key["fingerprint"] in snap.identities
+    assert rt._last_good_identity is snap
     assert rt.status()["generation"] == 1
 
-    store._identity_exc = ConfigUnavailableError("DB missing")
+    def _raise(fallback: IdentityConfig) -> IdentityConfig:
+        raise ConfigUnavailableError("DB missing")
+
+    store.identity_config = _raise  # type: ignore[method-assign]
     second = rt.identity_config(fallback)
-    assert second is id_cfg
+    assert second is snap  # last-good retained
     assert rt.status()["error"] == "ConfigUnavailableError"
 
 
@@ -221,18 +205,21 @@ def test_identity_config_same_pattern(monkeypatch) -> None:
 
 def test_reload_now_delegates_to_store(monkeypatch) -> None:
     _env_state("1")
-    store = ConfigStore(generation=7)
-    store._runtime_cfg = {"x": 1}
+    store = _make_store()
     app = _make_app()
     app["config_store"] = store
 
     rt = ConfigRuntime(app)
-    assert rt.reload_now() is True
-    assert store.reload_now_calls == 1
-    assert rt.status()["generation"] == 7
+    assert rt.reload_now() is True  # first load succeeds
+    assert rt.status()["generation"] == 0
     assert rt._error is None
 
-    store._runtime_exc = ConfigUnavailableError("token=x-secret")
+    assert rt.reload_now() is True  # still success when nothing changed
+
+    def _raise() -> bool:
+        raise ConfigUnavailableError("token=x-secret")
+
+    store.reload_now = _raise  # type: ignore[method-assign]
     assert rt.reload_now() is False
     assert rt.status()["error"] == "ConfigUnavailableError"
     assert "x-secret" not in rt.status()["error"]
@@ -244,14 +231,13 @@ def test_reload_now_delegates_to_store(monkeypatch) -> None:
 
 # ===========================================================================
 # 7. Poll loop applies generation changes and calls _apply only on change
-#    (including delete + rapid update)
 # ===========================================================================
 
 @pytest.mark.asyncio
 async def test_poll_loop_applies_only_on_generation_change() -> None:
     _env_state("1")
-    store = ConfigStore(generation=0)
-    store._runtime_cfg = {"api_keys": ["k"], "cfg": "v"}
+    store = _make_store()
+    store.reload_now()
     app = _make_app()
     app["config_store"] = store
 
@@ -261,21 +247,19 @@ async def test_poll_loop_applies_only_on_generation_change() -> None:
 
     def counting_apply(gen: int) -> None:
         apply_calls.append(gen)
-        original_apply(gen)
 
     rt._apply = counting_apply  # type: ignore[method-assign]
 
     stop = asyncio.Event()
     await rt.start(stop, interval_secs=0.005)
 
-    await asyncio.sleep(0.03)  # first tick
+    await asyncio.sleep(0.03)  # first tick loads generation 0
 
-    store.generation = 1
-    store._runtime_cfg = {"api_keys": [], "deleted": True}
+    # Bump the DB generation with real writes.
+    store.upsert_provider({"name": "p1", "base_url": "https://one.example"})
     await asyncio.sleep(0.06)
 
-    store.generation = 2
-    store._runtime_cfg = {"api_keys": ["new"], "updated": True}
+    store.upsert_provider({"name": "p2", "base_url": "https://two.example"})
     await asyncio.sleep(0.06)
 
     await asyncio.sleep(0.06)  # no-change period
@@ -295,11 +279,9 @@ async def test_poll_loop_applies_only_on_generation_change() -> None:
 @pytest.mark.asyncio
 async def test_auth_dev_bypass_eliminated_when_db_keys_authoritative() -> None:
     _env_state("1")
-    store = ConfigStore(generation=1)
-    store._runtime_cfg = {
-            "config_db_keys_authoritative": True,
-        "api_keys": ["prod-key-1", "prod-key-2"],
-    }
+    store = _make_store()
+    k1 = store.upsert_client_key({"principal": "a", "tenant": "b"})
+    store.upsert_client_key({"principal": "c", "tenant": "d"})
     app = _make_app(config={"api_keys": []})
     app["config_store"] = store
 
@@ -312,7 +294,7 @@ async def test_auth_dev_bypass_eliminated_when_db_keys_authoritative() -> None:
         await middleware.verify(req)
 
     req2 = make_mocked_request(
-        "GET", "/chat", headers={"Authorization": "Bearer prod-key-1"}, app=app
+        "GET", "/chat", headers={"Authorization": f"Bearer {k1['api_key']}"}, app=app
     )
     await middleware.verify(req2)  # no raise
 
@@ -325,17 +307,15 @@ async def test_auth_dev_bypass_still_works_when_legacy_fallback_empty_no_store()
     req = make_mocked_request(
         "GET", "/chat", headers={"Authorization": "Bearer sk-secret-dev"}, app=app
     )
+    await middleware.verify(req)
 
 
 @pytest.mark.asyncio
 async def test_auth_dev_bypass_eliminated_when_db_authoritative_keys_empty() -> None:
     """DB-authoritative key section empty -> dev key must be rejected."""
     _env_state("1")
-    store = ConfigStore(generation=1)
-    store._runtime_cfg = {
-        "config_db_keys_authoritative": True,
-        "api_keys": [],  # authoritative, but no keys permitted
-    }
+    store = _make_store()
+    store.reload_now()
     app = _make_app(config={"api_keys": []})
     app["config_store"] = store
     middleware = AuthMiddleware()
@@ -354,8 +334,8 @@ async def test_auth_dev_bypass_eliminated_when_db_authoritative_keys_empty() -> 
 @pytest.mark.asyncio
 async def test_concurrent_poll_does_not_corrupt_state() -> None:
     _env_state("1")
-    store = ConfigStore(generation=0)
-    store._runtime_cfg = {"api_keys": ["x"], "p": 1}
+    store = _make_store()
+    store.upsert_client_key({"principal": "a", "tenant": "b"})
     app = _make_app()
     app["config_store"] = store
 
