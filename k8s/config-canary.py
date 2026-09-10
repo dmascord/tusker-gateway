@@ -115,6 +115,25 @@ def _kubectl(args: list[str], *, input_: bytes | None = None, check: bool = True
     return _run(["kubectl", "-n", NAMESPACE, *args], input_=input_, check=check)
 
 
+def _isolate_volumes(volumes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Replace PVC volumes with emptyDir so canary writes don't land on prod PVC.
+
+    Projected service-account tokens and ConfigMap/Secret volumes are kept
+    unchanged; only ``persistentVolumeClaim`` entries are swapped.
+    """
+    out: list[dict[str, Any]] = []
+    for v in volumes:
+        if "persistentVolumeClaim" in v:
+            out.append({
+                "name": v["name"],
+                "emptyDir": {"sizeLimit": "1Gi"},
+            })
+        else:
+            out.append(v)
+    return out
+
+
+
 # ---------------------------------------------------------------------------
 # render
 # ---------------------------------------------------------------------------
@@ -312,7 +331,7 @@ def _build_canary_deployment(live: dict[str, Any], image_with_digest: str) -> di
                         "terminationGracePeriodSeconds", 90
                     ),
                     "containers": [canary_container],
-                    "volumes": pod_template_spec.get("volumes", []),
+                    "volumes": _isolate_volumes(pod_template_spec.get("volumes", [])),
                 },
             },
         },
@@ -545,7 +564,33 @@ def cmd_smoke(args: argparse.Namespace) -> int:
         print("pgcrypto roundtrip FAILED", file=sys.stderr)
         return 1
     print("pgcrypto roundtrip OK")
-    print(f"start port-forward with: kubectl -n {NAMESPACE} port-forward svc/{CANARY_DEPLOYMENT} 18642:{CANARY_PORT}")
+
+    # HTTP smoke: /health (expect 200 + config_runtime_status) and /ready (expect 200)
+    import json as _json
+    import urllib.request as _urllib
+
+    pf = _run(
+        ["kubectl", "-n", NAMESPACE, "port-forward", f"svc/{CANARY_DEPLOYMENT}", "18642:{CANARY_PORT}"],
+        check=False,
+    )
+    try:
+        for path, expect in (("/health", "config_runtime_status"), ("/ready", "status")):
+            with _urllib.urlopen(f"http://127.0.0.1:18642{path}", timeout=15) as resp:
+                body = resp.read().decode()
+                if resp.status != 200:
+                    print(f"{path} FAILED: HTTP {resp.status}", file=sys.stderr)
+                    return 1
+                data = _json.loads(body)
+                if expect not in data:
+                    print(f"{path} FAILED: missing '{expect}' in body", file=sys.stderr)
+                    return 1
+            print(f"{path} OK (HTTP 200, {expect}={data[expect]})")
+    finally:
+        pf.terminate()
+        try:
+            pf.wait(timeout=5)
+        except Exception:
+            pf.kill()
     return 0
 
 

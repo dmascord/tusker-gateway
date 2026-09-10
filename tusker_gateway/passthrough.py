@@ -639,6 +639,11 @@ class CodexTokenRotator:
         self._creds = list(credentials)
         self._index = min(self._index, max(len(self._creds) - 1, 0))
         self._refresh_failed_until.clear()
+        self._initial_refresh_tokens = frozenset(
+            str(c.get("refresh_token"))
+            for c in self._creds
+            if c.get("refresh_token")
+        )
 
     @staticmethod
     def _credential_label(cred: dict[str, Any], index: int) -> str:

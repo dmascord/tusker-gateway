@@ -140,6 +140,7 @@ def health_handler(request: web.Request) -> web.Response:
             semantic_cache is not None and semantic_cache.enabled
         ),
         "state_store": storage_status(),
+        "config_runtime_status": request.app.get("config_runtime_status"),
     })
 
 
