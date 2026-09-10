@@ -44,9 +44,14 @@ from tusker_gateway.admin import (
     admin_cooldowns,
     admin_diagnostics,
     admin_keys,
+    admin_login,
+    admin_logout,
+    admin_page,
     admin_pools,
     admin_providers,
+    admin_session,
     admin_usage,
+    attach_admin_access_middleware,
 )
 from tusker_gateway.guardrails import init_guard_pipeline, load_guardrails_config_from_env
 from tusker_gateway.deadline import attach_deadline_middleware, load_deadline_config_from_env
@@ -462,6 +467,11 @@ def create_app() -> web.Application:
     async def auth_middleware(request, handler):
         if request.path in ("/health", "/ready"):
             return await handler(request)
+        # /admin/* enforces its own session-cookie-or-Bearer auth; the
+        # gateway Bearer check would reject cookie-only console requests
+        # and block open /admin/login.
+        if request.path == "/admin" or request.path.startswith("/admin/"):
+            return await handler(request)
         # /metrics + /dashboard are opt-in authenticated.
         if request.path in ("/metrics", "/dashboard") or request.path.startswith("/dashboard/"):
             if metrics_token:
@@ -487,11 +497,17 @@ def create_app() -> web.Application:
     attach_audit_middleware(app, audit)
     app.middlewares.append(auth_middleware)
     attach_authorization_middleware(app)
-    attach_deadline_middleware(app, deadline_cfg)
-    attach_idempotency_middleware(app, idempotency)
-
+    # Admin console + read-only admin API. The access middleware (session
+    # cookie or Bearer key for /admin/*) runs after gateway auth middleware
+    # so Bearer callers still get identity resolution.
+    attach_admin_access_middleware(app)
     app.router.add_get("/health", health_handler)
     app.router.add_get("/ready", ready_handler)
+    app.router.add_get("/admin", admin_page)
+    app.router.add_get("/admin/", admin_page)
+    app.router.add_post("/admin/login", admin_login)
+    app.router.add_post("/admin/logout", admin_logout)
+    app.router.add_get("/admin/session", admin_session)
     app.router.add_get("/admin/diagnostics", admin_diagnostics)
     app.router.add_get("/admin/providers", admin_providers)
     app.router.add_get("/admin/pools", admin_pools)

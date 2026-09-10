@@ -13,10 +13,16 @@ from tusker_gateway.admin import (
     admin_cooldowns,
     admin_diagnostics,
     admin_keys,
+    admin_login,
+    admin_logout,
+    admin_page,
     admin_pools,
     admin_providers,
+    admin_session,
     admin_usage,
+    attach_admin_access_middleware,
 )
+from tusker_gateway.admin import SessionManager, _login_limiter
 from tusker_gateway.auth import AuthMiddleware
 from tusker_gateway.config import DEFAULT_PROVIDER_REGISTRY
 from tusker_gateway.errors import GatewayError, openai_error
@@ -33,6 +39,8 @@ def _auth_middleware(store: IdentityStore | None = None):
 
     @web.middleware
     async def middleware(request, handler):
+        if request.path == "/admin" or request.path.startswith("/admin/"):
+            return await handler(request)
         try:
             await auth.verify(request)
         except GatewayError as exc:
@@ -69,6 +77,12 @@ def _admin_app(api_key: str, identities=None):
     app["identity_store"] = store
     app.middlewares.append(_auth_middleware(store))
     attach_authorization_middleware(app)
+    attach_admin_access_middleware(app)
+    app.router.add_get("/admin", admin_page)
+    app.router.add_get("/admin/", admin_page)
+    app.router.add_post("/admin/login", admin_login)
+    app.router.add_post("/admin/logout", admin_logout)
+    app.router.add_get("/admin/session", admin_session)
     app.router.add_get("/admin/diagnostics", admin_diagnostics)
     app.router.add_get("/admin/providers", admin_providers)
     app.router.add_get("/admin/pools", admin_pools)
@@ -268,5 +282,146 @@ async def test_admin_diagnostics_aggregates_subsystems():
             "state_store",
         ):
             assert section in data, section
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_admin_console_page_served():
+    app = _admin_app("sk-admin-test")
+    client = await _client(app)
+    try:
+        resp = await client.get("/admin/")
+        assert resp.status == 200
+        assert resp.content_type == "text/html"
+        body = await resp.text()
+        assert "Tusker Gateway Admin" in body
+        # The SPA must never inline a key.
+        assert "sk-admin-test" not in body
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_login_sets_session_cookie_and_grants_data_routes():
+    app = _admin_app("sk-admin-test")
+    client = await _client(app)
+    try:
+        resp = await client.post(
+            "/admin/login", json={"api_key": "sk-admin-test"}
+        )
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["ok"] is True
+        assert "sk-admin-test" not in await resp.text()
+        set_cookie = resp.headers.get("Set-Cookie", "")
+        assert "HttpOnly" in set_cookie
+        assert "Path=/admin" in set_cookie
+        assert "tusker_admin_session=" in set_cookie
+
+        # Cookie-authenticated data access (no Bearer header).
+        resp = await client.get("/admin/providers")
+        assert resp.status == 200
+        # Data routes with a cookie never leak the raw key either.
+        assert "sk-admin-test" not in await resp.text()
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_login_rejects_wrong_key_and_non_admin_scope():
+    # Wrong key -> 401
+    app = _admin_app("sk-admin-test")
+    client = await _client(app)
+    try:
+        resp = await client.post("/admin/login", json={"api_key": "nope"})
+        assert resp.status == 401
+
+        # Scoped key without admin:read -> 403
+        scoped_fp = fingerprint_api_key("sk-app-key")
+        scoped = load_identity_config_from_env(
+            {
+                "TUSKER_IDENTITIES_JSON": json.dumps(
+                    {
+                        scoped_fp: {
+                            "principal": "svc-app",
+                            "tenant": "engineering",
+                            "scopes": ["inference:chat"],
+                        }
+                    }
+                )
+            }
+        )
+        app2 = _admin_app("sk-app-key", identities=scoped)
+        client2 = await _client(app2)
+        try:
+            resp = await client2.post("/admin/login", json={"api_key": "sk-app-key"})
+            assert resp.status == 403
+        finally:
+            await client2.close()
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_logout_revokes_session():
+    app = _admin_app("sk-admin-test")
+    client = await _client(app)
+    try:
+        await client.post("/admin/login", json={"api_key": "sk-admin-test"})
+        resp = await client.post("/admin/logout")
+        assert resp.status == 200
+        # The revoked cookie must no longer grant access.
+        resp = await client.get("/admin/providers")
+        assert resp.status == 401
+    finally:
+        await client.close()
+
+
+def test_session_rejects_forged_and_expired_cookies():
+    manager = SessionManager(["sk-admin-test"])
+    cookie, _ = manager.issue()
+    assert manager.validate(cookie) is not None
+    # Tampered signature
+    sid, expiry, sig = cookie.split(".")
+    assert manager.validate(f"{sid}.{expiry}.{'0' * 64}") is None
+    # Wrong signing key
+    other = SessionManager(["another-key"])
+    assert other.validate(cookie) is None
+    # Expired
+    short = SessionManager(["sk-admin-test"], ttl_secs=-1)
+    expired_cookie, _ = short.issue()
+    assert short.validate(expired_cookie) is None
+    # Restart scenario: fresh manager doesn't honor another manager's SID.
+    fresh = SessionManager(["sk-admin-test"])
+    assert fresh.validate(cookie) is None
+
+
+@pytest.mark.asyncio
+async def test_login_rate_limited_after_repeated_failures():
+    _login_limiter.reset()
+    app = _admin_app("sk-admin-test")
+    client = await _client(app)
+    try:
+        statuses = []
+        for _ in range(7):
+            resp = await client.post("/admin/login", json={"api_key": "nope"})
+            statuses.append(resp.status)
+        assert statuses[:5] == [401] * 5
+        assert 429 in statuses
+    finally:
+        _login_limiter.reset()
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_bearer_still_works_alongside_sessions():
+    app = _admin_app("sk-admin-test")
+    client = await _client(app)
+    try:
+        resp = await client.get(
+            "/admin/providers", headers={"Authorization": "Bearer sk-admin-test"}
+        )
+        assert resp.status == 200
     finally:
         await client.close()
