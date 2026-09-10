@@ -574,11 +574,13 @@ def cmd_smoke(args: argparse.Namespace) -> int:
     import urllib.request as _req
 
     pf = _sp.Popen(
-        ["kubectl", "-n", NAMESPACE, "port-forward",
-         f"svc/{CANARY_DEPLOYMENT}", "18642:{CANARY_PORT}"],
-        stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+        f"kubectl -n {NAMESPACE} port-forward svc/{CANARY_DEPLOYMENT} "
+        f"18642:{CANARY_PORT}",
+        shell=True, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
     )
     try:
+        # Give port-forward a moment to start before probing
+        _time.sleep(2)
         # Wait for the port to accept connections (try both v4 and v6)
         bound = False
         for _ in range(60):
