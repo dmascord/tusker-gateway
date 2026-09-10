@@ -34,6 +34,14 @@ _ROUTE_SCOPES = {
     ("POST", "/v1/audio/speech"): "inference:audio",
     ("POST", "/v1/videos"): "inference:video",
     ("POST", "/v1/rerank"): "inference:rerank",
+    ("GET", "/admin/diagnostics"): "admin:read",
+    ("GET", "/admin/providers"): "admin:read",
+    ("GET", "/admin/pools"): "admin:read",
+    ("GET", "/admin/catalog"): "admin:read",
+    ("GET", "/admin/cooldowns"): "admin:read",
+    ("GET", "/admin/breakers"): "admin:read",
+    ("GET", "/admin/keys"): "admin:read",
+    ("GET", "/admin/usage"): "admin:read",
 }
 _CHAT_ROUTES = frozenset({
     "/v1/chat/completions",

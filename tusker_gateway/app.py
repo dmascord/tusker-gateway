@@ -38,6 +38,16 @@ from tusker_gateway.anthropic_adapter import anthropic_messages_handler
 
 from tusker_gateway.errors import GatewayError, openai_error
 from tusker_gateway.health import health_handler, ready_handler, status_handler
+from tusker_gateway.admin import (
+    admin_breakers,
+    admin_catalog,
+    admin_cooldowns,
+    admin_diagnostics,
+    admin_keys,
+    admin_pools,
+    admin_providers,
+    admin_usage,
+)
 from tusker_gateway.guardrails import init_guard_pipeline, load_guardrails_config_from_env
 from tusker_gateway.deadline import attach_deadline_middleware, load_deadline_config_from_env
 from tusker_gateway.idempotency import (
@@ -482,6 +492,14 @@ def create_app() -> web.Application:
 
     app.router.add_get("/health", health_handler)
     app.router.add_get("/ready", ready_handler)
+    app.router.add_get("/admin/diagnostics", admin_diagnostics)
+    app.router.add_get("/admin/providers", admin_providers)
+    app.router.add_get("/admin/pools", admin_pools)
+    app.router.add_get("/admin/catalog", admin_catalog)
+    app.router.add_get("/admin/cooldowns", admin_cooldowns)
+    app.router.add_get("/admin/breakers", admin_breakers)
+    app.router.add_get("/admin/keys", admin_keys)
+    app.router.add_get("/admin/usage", admin_usage)
     app.router.add_get("/status", status_handler)
     app.router.add_get("/metrics", metrics_handler)
     app.router.add_get("/dashboard", dashboard_handler)

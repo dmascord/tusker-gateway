@@ -41,6 +41,7 @@ Available scopes are:
 | `inference:rerank` | Reranking |
 | `models:read` | Model catalog |
 | `status:read` | Detailed runtime status |
+| `admin:read` | Read-only admin API (`/admin/*`) |
 | `*` | Every capability |
 
 Allowlist entries use shell-style patterns. Omitted lists default to `*`; an
@@ -123,6 +124,28 @@ Canonical request identity includes normalized query keys and values, so query
 ordering does not affect replay while a changed query conflicts. A cancelled or
 timed-out operation releases its processing reservation before propagating the
 cancellation.
+
+## 4a. Read-only admin API
+
+`tusker_gateway/admin.py` serves an authenticated, read-only JSON view of the
+running gateway under `/admin/*`:
+
+| Endpoint | Content |
+|---|---|
+| `GET /admin/diagnostics` | Aggregated subsystem snapshot (pools, catalog, quality, usage, cooldowns, breakers, state store) |
+| `GET /admin/providers` | Provider registry: base URLs, auth kind, whether a key is configured + key fingerprint (never the key) |
+| `GET /admin/pools` | Live pool model lists with validity and unkeyed/catalog-unavailable diagnostics |
+| `GET /admin/catalog` | Per-provider catalog refresh state (status, entry count, staleness) |
+| `GET /admin/cooldowns` | Active model/provider cooldowns |
+| `GET /admin/breakers` | Circuit-breaker states |
+| `GET /admin/keys` | API-key fingerprints + identity principals/allowlists (never raw keys) |
+| `GET /admin/usage` | Provider usage counters, capacity state, rate-limiter buckets |
+
+Authentication matches `/status`: a valid `Authorization: Bearer <key>`.
+Identity-profiled callers additionally need the `admin:read` scope; legacy
+keys (no profile) get access as with every other unscoped route. The routes
+are read-only — there is deliberately no write path here yet; key rotation
+still happens through the `tusker-env-vault` secret plus a rollout restart.
 
 ## 5. Automated quality and dependency gates
 
