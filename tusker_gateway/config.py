@@ -366,6 +366,13 @@ DEFAULT_PROVIDER_REGISTRY: dict[str, ProviderConfig] = {
     # only valid against the region-scoped token-plan endpoint, not the
     # standard DashScope compatible-mode API. Key is wired via
     # PROVIDER_ALIBABA_API_KEY.
+    #
+    # PRIVACY POSTURE: NOT ZDR. The Personal (token-plan) tier explicitly
+    # trains on Member Content by default.
+    # https://help.aliyun.com/en/model-studio/token-plan-personal-overview
+    # Must NOT be added to the privacy pool; must NOT carry zdr_ok=True.
+    # Enterprise/business tiers may have separate terms — review before
+    # changing this annotation.
     "alibaba": ProviderConfig("alibaba", "bearer", "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode", "/v1/chat/completions", auth_env="ALIBABA_API_KEY", models_path="/v1/models"),
 }
 
