@@ -1,10 +1,16 @@
-"""Authenticated read-only admin API for Tusker Gateway operators.
+"""Authenticated admin API (read + write) for Tusker Gateway operators.
 
-All endpoints require a valid API key (``Authorization: Bearer <key>``).
-The caller's identity is resolved through the existing identity store, so
-legacy keys (no identity profile) are accepted — they get full admin access
-as they would for ``/status``.  Operators should treat admin API output as
-operational data; no raw credentials are ever returned.
+All endpoints require a valid API key (``Authorization: Bearer <key>``) or a
+session cookie.  The caller's identity is re-resolved on every request so
+key revocation and scope changes take effect immediately.
+
+Write operations (``POST``, ``PUT``, ``DELETE``) additionally require:
+  - ``admin:write`` scope (in addition to ``admin:read``)
+  - For cookie-session callers: a valid CSRF token via
+    ``X-CSRF-Token`` request header matching the value embedded in the
+    session cookie (``/admin/session`` returns the current token).
+  - ``Origin`` header must match the request host or configured proxy
+    host; cross-site requests are rejected with 403.
 
 Routes
 -------
@@ -16,6 +22,17 @@ GET  /admin/cooldowns    — active per-model/provider cooldowns
 GET  /admin/breakers    — circuit breaker states
 GET  /admin/keys         — API key fingerprints, principals, and identity metadata
 GET  /admin/usage        — per-provider usage counters and capacity state
+GET  /admin/config       — full editable config snapshot (credentials redacted)
+POST /admin/keys         — create a new managed identity API key
+PUT  /admin/keys/{fp}    — update an identity profile
+DELETE /admin/keys/{fp}  — revoke/delete an identity
+POST /admin/keys/{fp}/rotate — rotate an identity's raw key
+PUT  /admin/providers/{provider}       — create or replace a provider definition
+DELETE /admin/providers/{provider}     — remove a provider
+PUT  /admin/providers/{provider}/settings  — update provider runtime settings
+PUT  /admin/providers/{provider}/credentials — update provider API key/credentials
+PUT  /admin/pools/{pool}         — create or replace a pool definition
+DELETE /admin/pools/{pool}       — remove a pool
 
 Response format
 ---------------
@@ -25,21 +42,70 @@ All endpoints return JSON. Errors use the OpenAI error shape::
 """
 from __future__ import annotations
 
+import functools
 import hashlib
 import hmac as hmac_mod
+import json
 import logging
 import os
 import secrets
 import time
+from http import HTTPStatus
 from typing import Any
+from urllib.parse import urlsplit
 
 from aiohttp import web
 
-from tusker_gateway.errors import GatewayError
+from tusker_gateway.config_store import ConfigUnavailableError
+from tusker_gateway.errors import AuthorizationError, BadRequestError, GatewayError, NotFoundError
 from tusker_gateway.identity import CallerIdentity, fingerprint_api_key
 from tusker_gateway.storage import storage_status
 
+
+# ─── Security helpers ────────────────────────────────────────────────────────
+
+
+def _validate_csrf(record: dict[str, Any], request: web.Request) -> None:
+    """Raise AuthorizationError if the CSRF header mismatches the session."""
+    token = request.headers.get("X-CSRF-Token", "")
+    expected = str(record.get("csrf_token") or "")
+    if not token or not expected or not secrets.compare_digest(token, expected):
+        raise AuthorizationError("Missing or invalid CSRF token", code="invalid_csrf")
+
+
+def _validate_origin(request: web.Request) -> None:
+    """Require and validate Origin header for cookie-session writes."""
+    origin = request.headers.get("Origin")
+    if not origin:
+        raise AuthorizationError("Origin header required", code="missing_origin")
+    try:
+        parsed = urlsplit(origin)
+        origin_host = parsed.netloc.rsplit("@", 1)[-1].lower()
+    except ValueError:
+        raise AuthorizationError("Invalid Origin header", code="invalid_origin")
+    if not origin_host:
+        raise AuthorizationError("Invalid Origin header", code="invalid_origin")
+    request_host = (request.host or "").lower()
+    if origin_host == request_host:
+        return
+    proxy = os.environ.get("TUSKER_PROXY_HOST", "").strip().lower()
+    if proxy and origin_host == proxy:
+        return
+    raise AuthorizationError("Origin host not allowed", code="origin_mismatch")
+
+
+def _require_write_scope(identity: CallerIdentity) -> None:
+    """Ensure an explicit identity allows both admin:read and admin:write."""
+    if identity is None or not getattr(identity, "managed", False):
+        raise AuthorizationError("Explicit managed admin identity required", code="insufficient_scope")
+    if not identity.allows_scope("admin:read"):
+        raise AuthorizationError("Identity does not allow admin:read", code="insufficient_scope")
+    if not identity.allows_scope("admin:write"):
+        raise AuthorizationError("Identity does not allow admin:write", code="insufficient_scope")
+
+
 logger = logging.getLogger(__name__)
+
 
 # ─── Session management ────────────────────────────────────────────────────────
 
@@ -74,14 +140,30 @@ class SessionManager:
         material = "|".join(sorted(self._keys)).encode("utf-8")
         return hmac_mod.new(material, message.encode("utf-8"), hashlib.sha256).hexdigest()
 
-    def issue(self, principal: str = "", tenant: str = "") -> tuple[str, float]:
-        """Return ``(cookie_value, expiry_epoch)`` for a fresh session."""
+    def issue(
+        self,
+        principal: str = "",
+        tenant: str = "",
+        *,
+        fingerprint: str = "",
+        scopes: tuple[str, ...] = (),
+    ) -> tuple[str, float]:
+        """Return ``(cookie_value, expiry_epoch)`` for a fresh session.
+
+        The session record captures the issuing key fingerprint and the
+        scopes at issuance so the middleware can re-resolve the identity
+        on every request (revocation / scope removal take effect
+        immediately) and so write routes can require ``admin:write``.
+        """
         sid = secrets.token_hex(16)
         expiry = time.time() + self._ttl
         self._issued[sid] = {
             "expiry": expiry,
             "principal": principal,
             "tenant": tenant,
+            "fingerprint": fingerprint,
+            "scopes": list(scopes),
+            "csrf_token": secrets.token_urlsafe(32),
         }
         self._gc()
         return f"{sid}.{int(expiry)}.{self._sign(f'{sid}.{int(expiry)}')}", expiry
@@ -419,7 +501,10 @@ async def admin_login(request: web.Request) -> web.Response:
 
     manager = get_session_manager(request.app)
     cookie_value, expiry = manager.issue(
-        principal=identity.principal, tenant=identity.tenant
+        principal=identity.principal,
+        tenant=identity.tenant,
+        fingerprint=identity.key_fingerprint,
+        scopes=tuple(identity.scopes),
     )
     resp = web.json_response({
         "ok": True,
@@ -451,8 +536,27 @@ async def admin_logout(request: web.Request) -> web.Response:
     return resp
 
 async def admin_session(request: web.Request) -> web.Response:
-    """GET /admin/session — report the caller's login state for the SPA."""
+    """GET /admin/session — report the caller's login state for the SPA.
+
+    Session callers receive their CSRF token here; every write request from
+    the console must echo it back in the ``X-CSRF-Token`` header.
+    """
+    record = request.get("admin_session_record")
     identity = request.get("identity")
+    if isinstance(record, dict):
+        # Session-cookie caller: expose the CSRF token and the identity's
+        # CURRENT scopes (re-resolved by the middleware, not the stale
+        # scopes captured at issuance).
+        scopes = list(identity.scopes) if isinstance(identity, CallerIdentity) else list(record.get("scopes") or [])
+        return web.json_response({
+            "authenticated": True,
+            "principal": identity.principal if isinstance(identity, CallerIdentity) else (record.get("principal") or "admin"),
+            "tenant": identity.tenant if isinstance(identity, CallerIdentity) else (record.get("tenant") or "default"),
+            "scopes": scopes,
+            "via": "session",
+            "csrf_token": record.get("csrf_token") or "",
+            "can_write": identity.allows_scope("admin:write") if isinstance(identity, CallerIdentity) else ("admin:write" in scopes),
+        })
     if isinstance(identity, CallerIdentity):
         return web.json_response({
             "authenticated": True,
@@ -460,21 +564,18 @@ async def admin_session(request: web.Request) -> web.Response:
             "tenant": identity.tenant,
             "scopes": list(identity.scopes),
             "via": "api_key",
-        })
-    record = request.get("admin_session_record")
-    if isinstance(record, dict):
-        return web.json_response({
-            "authenticated": True,
-            "principal": record.get("principal") or "admin",
-            "tenant": record.get("tenant") or "default",
-            "scopes": ["admin:read"],
-            "via": "session",
+            "can_write": identity.allows_scope("admin:write"),
         })
     return web.json_response({"authenticated": False})
 
 
 def openai_error_shape(message: str, code: str) -> dict[str, Any]:
     return {"error": {"message": message, "code": code, "type": "invalid_request_error"}}
+
+
+def _store_unavailable_shape() -> dict[str, Any]:
+    """Sanitized 503 body for any config-store failure (no exception detail)."""
+    return openai_error_shape("configuration store unavailable", "store_unavailable")
 
 
 async def admin_page(request: web.Request) -> web.Response:
@@ -548,6 +649,8 @@ ADMIN_CONSOLE_HTML = """<!DOCTYPE html>
       <section class="card"><h2>Circuit Breakers</h2><div id="breakers">loading…</div></section>
       <section class="card"><h2>Cooldowns</h2><div id="cooldowns">loading…</div></section>
       <section class="card"><h2>API Keys (identities)</h2><div id="keys">loading…</div></section>
+      <section class="card"><h2>Config (Providers / Pools / Settings)</h2><div id="config-matrix">loading…</div></section>
+      <section class="card"><h2>Key Management</h2><div id="keys-admin">loading…</div></section>
       <section class="card wide"><h2>Usage &amp; Capacity</h2><div id="usage">loading…</div></section>
       <section class="card wide"><h2>State Store</h2><div id="diagnostics">loading…</div></section>
     </main>
@@ -594,10 +697,15 @@ ADMIN_CONSOLE_HTML = """<!DOCTYPE html>
       showLogin();
     });
 
+    let csrfToken = '';
+    let canWrite = false;
+
     async function boot() {
       try {
         const sess = await api('/admin/session');
-        $('who').textContent = `${sess.principal} @ ${sess.tenant}`;
+        $('who').textContent = `${sess.principal} @ ${sess.tenant} — scopes: ${(sess.scopes || []).join(', ') || 'none'}`;
+        csrfToken = sess.csrf_token || '';
+        canWrite = !!sess.can_write;
         showConsole();
       } catch { showLogin(); return; }
       loadAll();
@@ -677,7 +785,181 @@ ADMIN_CONSOLE_HTML = """<!DOCTYPE html>
       } catch (err) {
         if (String(err) !== 'Error: unauthenticated') console.error(err);
       }
+      await loadConfigMatrix();
+      await loadKeysAdmin();
     }
+
+    // ─── write-side UI ───
+    async function writeJSON(method, path, body) {
+      const resp = await fetch(path, {
+        method,
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
+        body: JSON.stringify(body),
+      });
+      if (resp.status === 401) { showLogin(); throw new Error('unauthenticated'); }
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(data?.error?.message || resp.statusText);
+      return data;
+    }
+
+    function textArea(id, value, rows) {
+      return `<textarea id="${id}" rows="${rows}" style="width:100%;font-family:monospace;font-size:11px;background:#0d1117;color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:8px">${esc(value)}</textarea>`;
+    }
+
+    async function loadConfigMatrix() {
+      const box = $('config-matrix');
+      if (!canWrite) {
+        box.innerHTML = '<span class="meta">read-only session — admin:write scope required for config changes</span>';
+        $('keys-admin').innerHTML = box.innerHTML;
+        return;
+      }
+      let cfg;
+      try { cfg = await api('/admin/config'); }
+      catch (e) { box.innerHTML = `<span class="err">${esc(e.message)}</span>`; return; }
+
+      // Provider matrix
+      const prov = cfg.providers || {};
+      const pools = cfg.pools || {};
+      const settings = cfg.settings || {};
+      let html = '<h3 class="meta">Provider definitions</h3>';
+      for (const name of Object.keys(prov)) {
+        html += `<details><summary><b>${esc(name)}</b></summary>
+          ${textArea('prov-json-' + esc(name), JSON.stringify(prov[name], null, 2), 8)}
+          <div style="display:flex;gap:8px;margin:6px 0">
+            <button data-act="prov-save" data-name="${esc(name)}">Save</button>
+            <button data-act="prov-del" data-name="${esc(name)}">Delete</button>
+          </div>
+          <div class="error" id="prov-err-${esc(name)}"></div>
+          <h4 class="meta">Runtime settings</h4>
+          ${textArea('prov-set-' + esc(name), JSON.stringify(settings[name] || {}, null, 2), 4)}
+          <div style="margin:6px 0"><button data-act="prov-set-save" data-name="${esc(name)}">Save settings</button></div>
+          <h4 class="meta">Credentials (write-only — never displayed)</h4>
+          <input type="password" id="prov-cred-${esc(name)}" placeholder="api_key (leave blank to keep)" style="width:70%">
+          <div style="margin:6px 0"><button data-act="prov-cred-save" data-name="${esc(name)}">Save credentials</button>
+          <div class="error" id="prov-cred-err-${esc(name)}"></div></div>
+        </details>`;
+      }
+      html += `<details><summary><b>+ New provider</b></summary>
+        <input id="new-prov-name" placeholder="provider name" style="width:40%">
+        ${textArea('new-prov-json', '{\n  "base_url": "",\n  "chat_path": "/chat/completions"\n}', 5)}
+        <div style="margin:6px 0"><button data-act="prov-new">Create</button><div class="error" id="new-prov-err"></div></div>
+      </details>`;
+
+      html += '<h3 class="meta">Pool definitions</h3>';
+      for (const name of Object.keys(pools)) {
+        html += `<details><summary><b>${esc(name)}</b></summary>
+          ${textArea('pool-json-' + esc(name), JSON.stringify(pools[name], null, 2), 8)}
+          <div style="display:flex;gap:8px;margin:6px 0">
+            <button data-act="pool-save" data-name="${esc(name)}">Save</button>
+            <button data-act="pool-del" data-name="${esc(name)}">Delete</button>
+          </div>
+          <div class="error" id="pool-err-${esc(name)}"></div>
+        </details>`;
+      }
+      html += `<details><summary><b>+ New pool</b></summary>
+        <input id="new-pool-name" placeholder="pool name" style="width:40%">
+        ${textArea('new-pool-json', '{\n  "models": []\n}', 4)}
+        <div style="margin:6px 0"><button data-act="pool-new">Create</button><div class="error" id="new-pool-err"></div></div>
+      </details>`;
+      box.innerHTML = html;
+
+      box.addEventListener('click', async (ev) => {
+        const act = ev.target?.dataset?.act;
+        if (!act) return;
+        const name = ev.target.dataset.name || '';
+        const errBox = (id, msg) => { const e = $(id); if (e) e.textContent = msg || ''; };
+        try {
+          if (act === 'prov-save') {
+            const body = JSON.parse($('prov-json-' + name).value);
+            await writeJSON('PUT', `/admin/providers/${encodeURIComponent(name)}`, body);
+            errBox('prov-err-' + name, 'saved'); await loadAll();
+          } else if (act === 'prov-del') {
+            await writeJSON('DELETE', `/admin/providers/${encodeURIComponent(name)}`);
+            await loadAll();
+          } else if (act === 'prov-set-save') {
+            const body = JSON.parse($('prov-set-' + name).value);
+            await writeJSON('PUT', `/admin/providers/${encodeURIComponent(name)}/settings`, body);
+            errBox('prov-err-' + name, 'saved');
+          } else if (act === 'prov-cred-save') {
+            const v = $('prov-cred-' + name).value.trim();
+            const body = v ? { api_key: v } : {};
+            await writeJSON('PUT', `/admin/providers/${encodeURIComponent(name)}/credentials`, body);
+            $('prov-cred-' + name).value = '';
+            errBox('prov-cred-err-' + name, 'saved');
+          } else if (act === 'prov-new') {
+            const n = $('new-prov-name').value.trim();
+            const body = JSON.parse($('new-prov-json').value);
+            await writeJSON('PUT', `/admin/providers/${encodeURIComponent(n)}`, body);
+            await loadAll();
+          } else if (act === 'pool-save') {
+            const body = JSON.parse($('pool-json-' + name).value);
+            await writeJSON('PUT', `/admin/pools/${encodeURIComponent(name)}`, body);
+            errBox('pool-err-' + name, 'saved'); await loadAll();
+          } else if (act === 'pool-del') {
+            await writeJSON('DELETE', `/admin/pools/${encodeURIComponent(name)}`);
+            await loadAll();
+          } else if (act === 'pool-new') {
+            const n = $('new-pool-name').value.trim();
+            const body = JSON.parse($('new-pool-json').value);
+            await writeJSON('PUT', `/admin/pools/${encodeURIComponent(n)}`, body);
+            await loadAll();
+          }
+        } catch (e) {
+          const errId = act.startsWith('pool') ? (act === 'pool-new' ? 'new-pool-err' : 'pool-err-' + name)
+            : (act === 'prov-new' ? 'new-prov-err' : act === 'prov-cred-save' ? 'prov-cred-err-' + name : 'prov-err-' + name);
+          errBox(errId, e.message);
+        }
+      });
+    }
+
+    async function loadKeysAdmin() {
+      const box = $('keys-admin');
+      if (!canWrite) { box.innerHTML = '<span class="meta">read-only session</span>'; return; }
+      let cfg;
+      try { cfg = await api('/admin/config'); }
+      catch (e) { box.innerHTML = `<span class="err">${esc(e.message)}</span>`; return; }
+      const keys = cfg.keys || [];
+      let html = '<h3 class="meta">Existing keys</h3>';
+      for (const k of keys) {
+        html += `<div style="margin:6px 0">
+          <code>${esc(String(k.fingerprint || '').slice(0, 12))}…</code>
+          ${esc(k.principal || '')} @ ${esc(k.tenant || '')} — ${(k.scopes || []).map(esc).join(', ')}
+          ${k.revoked ? '<span class="err">revoked</span>' : ''}
+          <button data-act="key-rot" data-fp="${esc(k.fingerprint)}">Rotate</button>
+          <button data-act="key-del" data-fp="${esc(k.fingerprint)}">Revoke</button>
+        </div>`;
+      }
+      html += `<h3 class="meta">Create new key</h3>
+        ${textArea('new-key-json', JSON.stringify({ principal: "svc-new", tenant: "default", scopes: ["inference:chat"] }, null, 2), 6)}
+        <div style="margin:6px 0"><button data-act="key-new">Create key</button><div class="error" id="new-key-err"></div></div>
+        <div id="new-key-once" style="word-break:break-all"></div>`;
+      box.innerHTML = html;
+
+      box.addEventListener('click', async (ev) => {
+        const act = ev.target?.dataset?.act;
+        if (!act) return;
+        const fp = ev.target.dataset.fp || '';
+        const err = (id, m) => { const e = $(id); if (e) e.textContent = m || ''; };
+        try {
+          if (act === 'key-rot') {
+            const out = await writeJSON('POST', `/admin/keys/${encodeURIComponent(fp)}/rotate`, {});
+            $('new-key-once').innerHTML = `<span class="warn">New key (shown once): <code>${esc(out.api_key || '')}</code></span>`;
+          } else if (act === 'key-del') {
+            await writeJSON('DELETE', `/admin/keys/${encodeURIComponent(fp)}`);
+            await loadAll();
+          } else if (act === 'key-new') {
+            const body = JSON.parse($('new-key-json').value);
+            const out = await writeJSON('POST', '/admin/keys', body);
+            $('new-key-once').innerHTML = `<span class="warn">API key (shown once): <code>${esc(out.api_key || '')}</code></span>`;
+          }
+        } catch (e) {
+          err('new-key-err', e.message);
+        }
+      });
+    }
+
+
 
     boot();
     setInterval(() => { if ($('console').style.display !== 'none') loadAll(); }, 15000);
@@ -696,9 +978,17 @@ def attach_admin_access_middleware(app: web.Application) -> None:
 
     ``/admin/login`` and ``/admin/logout`` are open.  Data routes accept
     either a valid admin session cookie (browser console) or the usual
-    ``Authorization: Bearer <key>`` (scripts/curl).  Bearer callers still
-    pass through identity authorization (admin:read scope) downstream.
+    ``Authorization: Bearer <key>`` (scripts/curl).
+
+    Session callers are re-authorized on EVERY request: the session record
+    carries the issuing key fingerprint and the identity is re-resolved
+    from the current identity store, so revoking a key or removing a
+    scope immediately invalidates outstanding admin sessions.  Write
+    methods from cookie sessions additionally require a valid CSRF token
+    header and a same-origin (or configured proxy) ``Origin`` header.
     """
+    _WRITE_METHODS = frozenset({"POST", "PUT", "DELETE", "PATCH"})
+
     @web.middleware
     async def admin_access_middleware(request, handler):
         path = request.path
@@ -713,6 +1003,30 @@ def attach_admin_access_middleware(app: web.Application) -> None:
         record = manager.validate(request.cookies.get(manager.cookie_name))
         if record is not None:
             request["admin_session_record"] = record
+            # Re-resolve the identity for this request so revocation and
+            # scope removal take effect without waiting for re-login.
+            identity_store = request.app.get("identity_store")
+            fingerprint = record.get("fingerprint") or ""
+            current = None
+            if identity_store is not None and fingerprint:
+                current = identity_store.config.identities.get(fingerprint)
+            if current is None or not _admin_identity_has_access(current):
+                return web.json_response(
+                    openai_error_shape(
+                        "admin session is no longer authorized", "insufficient_scope"
+                    ),
+                    status=403,
+                )
+            request["identity"] = current
+            if request.method in _WRITE_METHODS:
+                try:
+                    _validate_origin(request)
+                    _validate_csrf(record, request)
+                    _require_write_scope(current)
+                except AuthorizationError as exc:
+                    return web.json_response(
+                        openai_error_shape(exc.message, exc.code), status=403
+                    )
             return await handler(request)
 
         # Fall back to the standard Bearer path: resolve identity, then
@@ -735,8 +1049,377 @@ def attach_admin_access_middleware(app: web.Application) -> None:
                 ),
                 status=403,
             )
+        if request.method in _WRITE_METHODS:
+            try:
+                _require_write_scope(identity)
+            except AuthorizationError as exc:
+                return web.json_response(
+                    openai_error_shape(exc.message, exc.code), status=403
+                )
         return await handler(request)
 
     app.middlewares.append(admin_access_middleware)
+
+
+# ─── Config store write handlers ─────────────────────────────────────────────
+
+_PROVIDER_DEF_FIELDS = frozenset({
+    "name", "kind", "auth_type", "base_url", "chat_path",
+    "auth_env", "pool_env", "model_header", "models_path",
+    "rerank_path", "model_aliases", "zdr_ok", "heavyweight",
+})
+_PROVIDER_SETTINGS_FIELDS = frozenset({
+    "enabled", "disabled", "passthrough_disabled",
+    "authoritative_catalog", "heavyweight", "notes",
+})
+_POOL_FIELDS = frozenset({
+    "name", "models", "context_window", "zdr",
+    "provider_warmup_secs", "auto_free", "heavyweight_only",
+    "auto_catalog_providers", "fallback_pools",
+})
+_IDENTITY_PROFILE_FIELDS = frozenset({
+    "api_key", "name", "principal", "tenant", "scopes",
+    "allowed_pools", "allowed_models", "allowed_providers",
+    "revoked", "fingerprint",
+})
+
+
+def _get_config_store(request: web.Request) -> Any:
+    store = request.app.get("config_store")
+    if store is None:
+        raise ConfigUnavailableError("configuration store unavailable")
+    return store
+
+
+def _reject_unknown_fields(body: dict, allowed: set[str], label: str) -> None:
+    unknown = set(body) - allowed
+    if unknown:
+        raise BadRequestError(
+            f"Unknown {label} fields: {', '.join(sorted(unknown))}",
+            code="unknown_fields",
+        )
+
+
+async def _json_body(request: web.Request) -> dict:
+    try:
+        data = await request.json()
+    except Exception:
+        raise BadRequestError("Invalid JSON body", code="malformed_payload")
+    if not isinstance(data, dict):
+        raise BadRequestError("JSON body must be an object", code="malformed_payload")
+    return data
+
+
+def _admin_error_guard(handler):
+    """Convert escaped GatewayErrors on config-store handlers to JSON.
+
+    ``/admin`` routes bypass the gateway auth middleware that converts
+    ``GatewayError`` for chat routes, so the config-store handlers wrap
+    themselves here (payload validation, missing resources, unexpected
+    store failures all get a sanitized OpenAI-shaped response).
+    """
+    @functools.wraps(handler)
+    async def wrapper(request: web.Request) -> web.Response:
+        try:
+            return await handler(request)
+        except GatewayError as exc:
+            return web.json_response(
+                openai_error_shape(exc.message, exc.code or "invalid_request"),
+                status=exc.status,
+            )
+        except ConfigUnavailableError:
+            return web.json_response(_store_unavailable_shape(), status=503)
+        except Exception:
+            logger.exception("admin config handler failed")
+            return web.json_response(_store_unavailable_shape(), status=503)
+
+    return wrapper
+
+
+# ─── Read config snapshot ────────────────────────────────────────────
+
+
+@_admin_error_guard
+async def admin_config(request: web.Request) -> web.Response:
+    """GET /admin/config — full editable config snapshot; credentials are redacted."""
+    try:
+        store = _get_config_store(request)
+        snapshot = store.snapshot()
+    except ConfigUnavailableError:
+        return web.json_response(_store_unavailable_shape(), status=503)
+    except Exception:
+        logger.exception("config snapshot failed")
+        return web.json_response(
+            openai_error_shape("configuration unavailable", "store_unavailable"), status=503
+        )
+    if not isinstance(snapshot, dict):
+        return web.json_response(
+            openai_error_shape("invalid config snapshot", "store_error"), status=503
+        )
+    return web.json_response(snapshot)
+
+
+# ─── Identity / client key CRUD ───────────────────────────────────────
+
+
+@_admin_error_guard
+async def admin_keys_create(request: web.Request) -> web.Response:
+    """POST /admin/keys — create a new managed identity API key.
+
+    Body is a JSON object with identity profile fields.  The store
+    returns ``api_key`` only in this response; it is never stored
+    or repeated by any other endpoint.
+    """
+    body = await _json_body(request)
+    _reject_unknown_fields(body, _IDENTITY_PROFILE_FIELDS, "identity")
+    try:
+        store = _get_config_store(request)
+        result = store.upsert_client_key(body)
+    except ConfigUnavailableError:
+        return web.json_response(_store_unavailable_shape(), status=503)
+    except KeyError as exc:
+        return web.json_response(openai_error_shape(str(exc), "not_found"), status=404)
+    except ValueError as exc:
+        return web.json_response(openai_error_shape(str(exc), "malformed_payload"), status=400)
+    except Exception:
+        logger.exception("create client key failed")
+        return web.json_response(
+            openai_error_shape("configuration unavailable", "store_unavailable"), status=503
+        )
+    return web.json_response(result, status=201)
+
+
+@_admin_error_guard
+async def admin_keys_update(request: web.Request) -> web.Response:
+    """PUT /admin/keys/{fingerprint} — update an identity profile (no raw key)."""
+    fingerprint = request.match_info.get("fingerprint", "")
+    if not fingerprint:
+        return web.json_response(openai_error_shape("fingerprint required", "bad_request"), status=400)
+    body = await _json_body(request)
+    _reject_unknown_fields(body, _IDENTITY_PROFILE_FIELDS - {"api_key", "fingerprint"}, "identity")
+    try:
+        store = _get_config_store(request)
+        result = store.upsert_client_key({**body, "fingerprint": fingerprint})
+    except ConfigUnavailableError:
+        return web.json_response(_store_unavailable_shape(), status=503)
+    except KeyError as exc:
+        return web.json_response(openai_error_shape(str(exc), "not_found"), status=404)
+    except ValueError as exc:
+        return web.json_response(openai_error_shape(str(exc), "malformed_payload"), status=400)
+    except Exception:
+        logger.exception("update client key failed")
+        return web.json_response(
+            openai_error_shape("configuration unavailable", "store_unavailable"), status=503
+        )
+    return web.json_response(result)
+
+
+@_admin_error_guard
+async def admin_keys_delete(request: web.Request) -> web.Response:
+    """DELETE /admin/keys/{fingerprint} — revoke and delete an identity."""
+    fingerprint = request.match_info.get("fingerprint", "")
+    if not fingerprint:
+        return web.json_response(openai_error_shape("fingerprint required", "bad_request"), status=400)
+    try:
+        store = _get_config_store(request)
+        store.revoke_client_key(fingerprint)
+    except ConfigUnavailableError:
+        return web.json_response(_store_unavailable_shape(), status=503)
+    except KeyError as exc:
+        return web.json_response(openai_error_shape(str(exc), "not_found"), status=404)
+    except ValueError as exc:
+        return web.json_response(openai_error_shape(str(exc), "forbidden"), status=400)
+    except Exception:
+        logger.exception("revoke client key failed")
+        return web.json_response(
+            openai_error_shape("configuration unavailable", "store_unavailable"), status=503
+        )
+    return web.json_response({"ok": True, "fingerprint": fingerprint})
+
+
+@_admin_error_guard
+async def admin_keys_rotate(request: web.Request) -> web.Response:
+    """POST /admin/keys/{fingerprint}/rotate — rotate an identity's raw key."""
+    fingerprint = request.match_info.get("fingerprint", "")
+    if not fingerprint:
+        return web.json_response(openai_error_shape("fingerprint required", "bad_request"), status=400)
+    try:
+        store = _get_config_store(request)
+        result = store.rotate_client_key(fingerprint)
+    except ConfigUnavailableError:
+        return web.json_response(_store_unavailable_shape(), status=503)
+    except KeyError as exc:
+        return web.json_response(openai_error_shape(str(exc), "not_found"), status=404)
+    except ValueError as exc:
+        return web.json_response(openai_error_shape(str(exc), "malformed_payload"), status=400)
+    except Exception:
+        logger.exception("rotate client key failed")
+        return web.json_response(
+            openai_error_shape("configuration unavailable", "store_unavailable"), status=503
+        )
+    return web.json_response(result)
+
+
+# ─── Provider CRUD ────────────────────────────────────────────────────
+
+
+@_admin_error_guard
+async def admin_providers_put(request: web.Request) -> web.Response:
+    """PUT /admin/providers/{provider} — create or replace a provider definition."""
+    provider = request.match_info.get("provider", "")
+    if not provider:
+        return web.json_response(openai_error_shape("provider name required", "bad_request"), status=400)
+    body = await _json_body(request)
+    if not isinstance(body, dict):
+        return web.json_response(openai_error_shape("JSON body must be an object", "malformed_payload"), status=400)
+    _reject_unknown_fields(body, _PROVIDER_DEF_FIELDS, "provider")
+    try:
+        store = _get_config_store(request)
+        result = store.upsert_provider(body)
+    except ConfigUnavailableError:
+        return web.json_response(_store_unavailable_shape(), status=503)
+    except (KeyError, ValueError) as exc:
+        code = "not_found" if isinstance(exc, KeyError) else "malformed_payload"
+        return web.json_response(openai_error_shape(str(exc), code), status=400 if isinstance(exc, ValueError) else 404)
+    except Exception:
+        logger.exception("upsert provider failed")
+        return web.json_response(openai_error_shape("configuration unavailable", "store_unavailable"), status=503)
+    return web.json_response(result)
+
+
+@_admin_error_guard
+async def admin_providers_delete(request: web.Request) -> web.Response:
+    """DELETE /admin/providers/{provider} — remove a provider definition."""
+    provider = request.match_info.get("provider", "")
+    if not provider:
+        return web.json_response(openai_error_shape("provider name required", "bad_request"), status=400)
+    try:
+        store = _get_config_store(request)
+        store.delete_provider(provider)
+    except ConfigUnavailableError:
+        return web.json_response(_store_unavailable_shape(), status=503)
+    except KeyError as exc:
+        return web.json_response(openai_error_shape(str(exc), "not_found"), status=404)
+    except ValueError as exc:
+        return web.json_response(openai_error_shape(str(exc), "forbidden"), status=400)
+    except Exception:
+        logger.exception("delete provider failed")
+        return web.json_response(openai_error_shape("configuration unavailable", "store_unavailable"), status=503)
+    return web.json_response({"ok": True, "provider": provider})
+
+
+@_admin_error_guard
+async def admin_providers_settings_put(request: web.Request) -> web.Response:
+    """PUT /admin/providers/{provider}/settings — update provider runtime toggles."""
+    provider = request.match_info.get("provider", "")
+    if not provider:
+        return web.json_response(openai_error_shape("provider name required", "bad_request"), status=400)
+    body = await _json_body(request)
+    if not isinstance(body, dict):
+        return web.json_response(openai_error_shape("JSON body must be an object", "malformed_payload"), status=400)
+    _reject_unknown_fields(body, _PROVIDER_SETTINGS_FIELDS, "settings")
+    try:
+        store = _get_config_store(request)
+        result = store.upsert_provider_settings(provider, body)
+    except ConfigUnavailableError:
+        return web.json_response(_store_unavailable_shape(), status=503)
+    except (KeyError, ValueError) as exc:
+        code = "not_found" if isinstance(exc, KeyError) else "malformed_payload"
+        return web.json_response(openai_error_shape(str(exc), code), status=400 if isinstance(exc, ValueError) else 404)
+    except Exception:
+        logger.exception("provider settings update failed")
+        return web.json_response(openai_error_shape("configuration unavailable", "store_unavailable"), status=503)
+    return web.json_response(result)
+
+
+@_admin_error_guard
+async def admin_providers_credentials_put(request: web.Request) -> web.Response:
+    """PUT /admin/providers/{provider}/credentials — update provider API key/credentials."""
+    provider = request.match_info.get("provider", "")
+    if not provider:
+        return web.json_response(openai_error_shape("provider name required", "bad_request"), status=400)
+    body = await _json_body(request)
+    if not isinstance(body, dict):
+        return web.json_response(openai_error_shape("JSON body must be an object", "malformed_payload"), status=400)
+    try:
+        store = _get_config_store(request)
+        result = store.upsert_provider_credentials(provider, body)
+    except ConfigUnavailableError:
+        return web.json_response(_store_unavailable_shape(), status=503)
+    except (KeyError, ValueError) as exc:
+        code = "not_found" if isinstance(exc, KeyError) else "malformed_payload"
+        return web.json_response(openai_error_shape(str(exc), code), status=400 if isinstance(exc, ValueError) else 404)
+    except Exception:
+        logger.exception("provider credentials update failed")
+        return web.json_response(openai_error_shape("configuration unavailable", "store_unavailable"), status=503)
+    return web.json_response(result)
+
+
+# ─── Pool CRUD ────────────────────────────────────────────────────────
+
+
+@_admin_error_guard
+async def admin_pools_put(request: web.Request) -> web.Response:
+    """PUT /admin/pools/{pool} — create or replace a pool definition."""
+    pool = request.match_info.get("pool", "")
+    if not pool:
+        return web.json_response(openai_error_shape("pool name required", "bad_request"), status=400)
+    body = await _json_body(request)
+    if not isinstance(body, dict):
+        return web.json_response(openai_error_shape("JSON body must be an object", "malformed_payload"), status=400)
+    _reject_unknown_fields(body, _POOL_FIELDS, "pool")
+    try:
+        store = _get_config_store(request)
+        result = store.upsert_pool(body)
+    except ConfigUnavailableError:
+        return web.json_response(_store_unavailable_shape(), status=503)
+    except (KeyError, ValueError) as exc:
+        code = "not_found" if isinstance(exc, KeyError) else "malformed_payload"
+        return web.json_response(openai_error_shape(str(exc), code), status=400 if isinstance(exc, ValueError) else 404)
+    except Exception:
+        logger.exception("upsert pool failed")
+        return web.json_response(openai_error_shape("configuration unavailable", "store_unavailable"), status=503)
+    return web.json_response(result)
+
+
+@_admin_error_guard
+async def admin_pools_delete(request: web.Request) -> web.Response:
+    """DELETE /admin/pools/{pool} — remove a pool definition."""
+    pool = request.match_info.get("pool", "")
+    if not pool:
+        return web.json_response(openai_error_shape("pool name required", "bad_request"), status=400)
+    try:
+        store = _get_config_store(request)
+        store.delete_pool(pool)
+    except ConfigUnavailableError:
+        return web.json_response(_store_unavailable_shape(), status=503)
+    except KeyError as exc:
+        return web.json_response(openai_error_shape(str(exc), "not_found"), status=404)
+    except ValueError as exc:
+        return web.json_response(openai_error_shape(str(exc), "forbidden"), status=400)
+    except Exception:
+        logger.exception("delete pool failed")
+        return web.json_response(openai_error_shape("configuration unavailable", "store_unavailable"), status=503)
+    return web.json_response({"ok": True, "pool": pool})
+
+
+def register_admin_config_routes(app: web.Application) -> None:
+    """Register the read/write admin config endpoints on ``app``.
+
+    Call from your application factory after ``attach_admin_access_middleware``
+    so every route is protected by session/Bearer auth.  The caller's
+    identity is re-resolved on every request (see the middleware).
+    """
+    app.router.add_get("/admin/config", admin_config)
+    app.router.add_post("/admin/keys", admin_keys_create)
+    app.router.add_put("/admin/keys/{fingerprint}", admin_keys_update)
+    app.router.add_delete("/admin/keys/{fingerprint}", admin_keys_delete)
+    app.router.add_post("/admin/keys/{fingerprint}/rotate", admin_keys_rotate)
+    app.router.add_put("/admin/providers/{provider}", admin_providers_put)
+    app.router.add_delete("/admin/providers/{provider}", admin_providers_delete)
+    app.router.add_put("/admin/providers/{provider}/settings", admin_providers_settings_put)
+    app.router.add_put("/admin/providers/{provider}/credentials", admin_providers_credentials_put)
+    app.router.add_put("/admin/pools/{pool}", admin_pools_put)
+    app.router.add_delete("/admin/pools/{pool}", admin_pools_delete)
 
 

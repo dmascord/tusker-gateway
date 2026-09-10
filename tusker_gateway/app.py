@@ -14,6 +14,7 @@ from tusker_gateway.budget import BudgetTracker, load_budget_config_from_env
 from tusker_gateway.cache import ResponseCache, load_cache_config_from_env
 from tusker_gateway.circuit_breaker import CircuitBreaker, load_circuit_config_from_env
 from tusker_gateway.config import load_config
+from tusker_gateway.config_runtime import ConfigRuntime
 from tusker_gateway.dashboard import (
     dashboard_breakers,
     dashboard_cooldowns,
@@ -61,6 +62,7 @@ from tusker_gateway.idempotency import (
     load_idempotency_config_from_env,
 )
 from tusker_gateway.identity import (
+    IdentityConfig,
     IdentityStore,
     attach_authorization_middleware,
     load_identity_config_from_env,
@@ -94,6 +96,31 @@ def create_app() -> web.Application:
 
     app = web.Application(client_max_size=10 * 1024 * 1024)
     app["config"] = load_config()
+    # DB-backed config store (opt-in). When enabled, provides runtime_config
+    # and identity_config that can override static config on generation change.
+    if os.environ.get("TUSKER_CONFIG_DATABASE_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}:
+        try:
+            from tusker_gateway.config_store import ConfigStore
+            store = ConfigStore(
+                database=None,
+                fallback_config=app["config"],
+                fallback_identity_config=IdentityConfig(),
+            )
+            app["config_store"] = store
+
+            async def _reload_config() -> bool:
+                runtime = app.get("config_runtime")
+                if runtime is not None:
+                    return await runtime.apply_reload()
+                return bool(store.reload_now())
+            app["reload_config"] = _reload_config
+
+            app["config_runtime_status"] = {}
+            app["config_generation"] = 0
+            app["config"]["_persist_credentials"] = getattr(store, "persist_credentials", None)
+            app["config_runtime"] = ConfigRuntime(app)
+        except Exception as exc:
+            log.warning("config store init failed (legacy config will be used): %s", exc)
     app["quality_db"] = QualityDB(app["config"]["quality_db_path"])
     app["model_capabilities"] = ModelCapabilityDB(
         app["config"].get("model_capability_db_path", "data/model_capability.db")
@@ -431,8 +458,24 @@ def create_app() -> web.Application:
                 name="qualification-maintenance",
             )
             startup_log.info("qualification maintenance task started")
+        # Start config store live-reload poller when DB-backed config is enabled.
+        config_runtime = app.get("config_runtime")
+        if config_runtime is not None and config_runtime.enabled():
+            interval = float(os.environ.get("TUSKER_CONFIG_REFRESH_SECS") or 30)
+            await config_runtime.start(stop_event, interval_secs=interval)
+            startup_log.info("config runtime started (interval=%.0fs)", interval)
+            try:
+                from tusker_gateway.admin import register_admin_config_routes
+                register_admin_config_routes(app)
+            except (ImportError, AttributeError):
+                pass
 
     async def on_cleanup(app):
+        # Stop the config store poller and any runtime tasks it spawned before
+        # tearing down the shared HTTP session.
+        config_runtime = app.get("config_runtime")
+        if config_runtime is not None:
+            await config_runtime.stop()
         # Stop refresh tasks before closing the shared HTTP session.
         stop_event = app.get("refresh_stop_event")
         if stop_event is not None:
@@ -460,7 +503,7 @@ def create_app() -> web.Application:
         from tusker_gateway.storage import close_shared_pools
         close_shared_pools()
 
-    auth = AuthMiddleware(identity_store)
+    auth = AuthMiddleware()
     metrics_token = os.environ.get("TUSKER_METRICS_TOKEN", "").strip()
 
     @web.middleware

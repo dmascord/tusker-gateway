@@ -21,6 +21,7 @@ from tusker_gateway.admin import (
     admin_session,
     admin_usage,
     attach_admin_access_middleware,
+    register_admin_config_routes,
 )
 from tusker_gateway.admin import SessionManager, _login_limiter
 from tusker_gateway.auth import AuthMiddleware
@@ -107,8 +108,8 @@ def _admin_app(api_key: str, identities=None):
     app.router.add_get("/admin/breakers", admin_breakers)
     app.router.add_get("/admin/keys", admin_keys)
     app.router.add_get("/admin/usage", admin_usage)
+    register_admin_config_routes(app)
     return app
-
 
 ADMIN_PATHS = [
     "/admin/diagnostics",

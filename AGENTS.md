@@ -19,6 +19,9 @@ Read in order when picking up the repo:
 | `docs/migrations/2026-08-21-codex-migration/` | Codex OAuth endpoint move + token-rotation tooling. |
 | `docs/zero-downtime-deploys.md` | Why `strategy: Recreate` and the planned RWX migration. |
 | `docs/incidents/2026-08-26-usb-ssd-flap.md` | USB-SSD flap postmortem, storage migration, and Longhorn v1.12.1 upgrade notes. |
+| `docs/migrations/2026-09-09-config-db/` | DB-backed config store — plan, schema, rollout (in progress). |
+| `TODO.md` | Active cross-session work items (DB-backed config store lives here). |
+
 
 Topic-specific:
 

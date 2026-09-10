@@ -604,6 +604,8 @@ class CodexTokenRotator:
         auth_file: str | None = None,
         http_client: Any | None = None,
         provider: str = "openai-codex",
+        persist_credentials: Any | None = None,
+        secrets_authoritative: bool = False,
     ):
         self._creds: list[dict[str, Any]] = list(credentials)
         self._index = 0
@@ -612,6 +614,21 @@ class CodexTokenRotator:
         self._http = http_client  # aiohttp.ClientSession for OAuth calls
         self._provider = str(provider or "openai-codex").lower()
         self._refresh_failed_until: dict[int, float] = {}
+        # Optional DB-backed persistence:
+        #   persist_credentials(provider, expected, replacement) -> bool CAS.
+        # When set, refreshed credentials persist to the encrypted DB instead
+        # of the legacy auth.json file (auth_file is ignored).
+        self._persist_credentials = persist_credentials
+        self._secrets_authoritative = bool(secrets_authoritative)
+        self._canary_mode = bool(
+            os.environ.get("TUSKER_CONFIG_CANARY", "").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        self._initial_refresh_tokens: frozenset[str] = frozenset(
+            str(c.get("refresh_token"))
+            for c in self._creds
+            if c.get("refresh_token")
+        )
 
     @property
     def size(self) -> int:
@@ -659,34 +676,49 @@ class CodexTokenRotator:
                     continue
 
                 if self._http and self._is_near_expiry(cred):
-                    retry_at = self._refresh_failed_until.get(idx, 0.0)
-                    if retry_at <= now:
-                        try:
-                            refreshed = await self._refresh_one(cred)
-                        except Exception as exc:
-                            self._refresh_failed_until[idx] = (
-                                time.time() + self._refresh_failure_cooldown_seconds()
-                            )
-                            self._log_refresh_failure(idx, exc)
-                            if self._is_expired(cred):
-                                continue
-                        else:
-                            self._creds[idx] = refreshed
-                            self._refresh_failed_until.pop(idx, None)
-                            self._persist()
-                            token = _creds_access_token(refreshed)
-                            logger.info(
-                                "oauth refresh succeeded provider=%s credential_index=%d/%d "
-                                "expires_in_s=%.0f",
+                    if self._canary_skip_rotation(cred):
+                        # Canary policy: never rotate a refresh token that
+                        # production also holds. A still-valid access token
+                        # remains usable; a dead one is skipped.
+                        if self._is_expired(cred):
+                            logger.warning(
+                                "oauth refresh skipped by canary policy provider=%s "
+                                "credential_index=%d/%d refresh_token_held_by_prod=true",
                                 self._provider,
                                 idx + 1,
                                 count,
-                                max(0.0, _creds_expires_at(refreshed) - time.time()),
                             )
-                    elif self._is_expired(cred):
-                        # Do not retry a known-bad refresh on every request and
-                        # do not forward an access token that is already dead.
-                        continue
+                            continue
+                    else:
+                        retry_at = self._refresh_failed_until.get(idx, 0.0)
+                        if retry_at <= now:
+                            pre_refresh = dict(cred)
+                            try:
+                                refreshed = await self._refresh_one(cred)
+                            except Exception as exc:
+                                self._refresh_failed_until[idx] = (
+                                    time.time() + self._refresh_failure_cooldown_seconds()
+                                )
+                                self._log_refresh_failure(idx, exc)
+                                if self._is_expired(cred):
+                                    continue
+                            else:
+                                self._creds[idx] = refreshed
+                                self._refresh_failed_until.pop(idx, None)
+                                self._persist(pre_refresh, refreshed)
+                                token = _creds_access_token(refreshed)
+                                logger.info(
+                                    "oauth refresh succeeded provider=%s credential_index=%d/%d "
+                                    "expires_in_s=%.0f",
+                                    self._provider,
+                                    idx + 1,
+                                    count,
+                                    max(0.0, _creds_expires_at(refreshed) - time.time()),
+                                )
+                        elif self._is_expired(cred):
+                            # Do not retry a known-bad refresh on every request
+                            # and do not forward an access token that is dead.
+                            continue
 
                 if token:
                     # Reserve the next slot before releasing the lock. This
@@ -807,8 +839,48 @@ class CodexTokenRotator:
         expires_at = _creds_expires_at(cred)
         return bool(expires_at and time.time() >= expires_at)
 
-    def _persist(self) -> None:
-        """Write the current pool back to the auth file (Hermes format)."""
+    def _persist(self, expected: dict[str, Any], replacement: dict[str, Any]) -> None:
+        """Persist a refreshed credential.
+
+        DB-authoritative mode (``persist_credentials`` callback set):
+        compare-and-swap write of the refreshed credential into the
+        encrypted store, offloaded to a worker thread so the request path
+        never blocks on DB I/O. A CAS failure means an admin replaced the
+        row concurrently — the in-memory refreshed credential is kept for
+        this process, but the admin replacement is NOT overwritten.
+
+        Legacy mode: write the pool back to the Hermes auth file.
+        """
+        persist = self._persist_credentials
+        if persist is not None:
+            expected_snap = dict(expected)
+            replacement_snap = dict(replacement)
+            provider = self._provider
+
+            def _cas() -> None:
+                try:
+                    # CAS contract: persist_credentials(provider, expected,
+                    # replacement) -> bool, single credential dicts. False
+                    # means an admin replaced the row concurrently — keep
+                    # the in-memory refreshed credential but do NOT
+                    # overwrite the admin replacement.
+                    if not persist(provider, expected_snap, replacement_snap):
+                        logger.info(
+                            "oauth credential CAS skipped (row replaced "
+                            "concurrently) provider=%s",
+                            provider,
+                        )
+                except Exception:
+                    logger.exception(
+                        "oauth credential DB persistence failed provider=%s",
+                        provider,
+                    )
+
+            # DB I/O must never block the request path: offload to a worker
+            # thread. to_thread returns a future we do not await (fire-and-
+            # forget) which is safe: _cas swallows all exceptions.
+            asyncio.get_running_loop().run_in_executor(None, _cas)
+            return
         if not self._auth_file:
             return
         try:
@@ -823,6 +895,20 @@ class CodexTokenRotator:
                 "oauth credential persistence failed provider=%s",
                 self._provider,
             )
+
+    def _canary_skip_rotation(self, cred: dict[str, Any]) -> bool:
+        """Return True when canary policy forbids rotating this credential.
+
+        With ``TUSKER_CONFIG_CANARY=true``, a refresh token identical to a
+        production copy (captured at rotator construction) must not be
+        rotated: production also holds it and a rotation would invalidate
+        the production credential. Valid, unexpired access tokens remain
+        usable without rotation.
+        """
+        if not self._canary_mode:
+            return False
+        refresh = _creds_refresh_token(cred)
+        return bool(refresh and refresh in self._initial_refresh_tokens)
 
 
 def _chat_content_to_responses(content: Any) -> str | list[dict[str, Any]]:
@@ -1064,6 +1150,7 @@ class PassthroughClient:
                 config.get("quality_db_path", "data/quality.db")
             )
         )
+        secrets_authoritative = bool(config.get("config_db_credentials_authoritative"))
         auth_file = config.get("auth_file")
         if not auth_file:
             import os
@@ -1072,12 +1159,23 @@ class PassthroughClient:
             from pathlib import Path
             auth_file = str(Path.home() / ".hermes" / "auth.json")
         codex_creds = config.get("codex_credentials", [])
-        if not codex_creds:
+        if not codex_creds and not secrets_authoritative:
+            # Legacy fallback: hydrate from the shared Hermes auth file.
+            # In DB-authoritative credential mode the store snapshot is the
+            # only credential source — never resurrect deleted keys from the
+            # disk file.
             try:
                 from tusker_gateway.copilot_enroll import load_auth_file
                 codex_creds = load_auth_file(auth_file)
             except Exception:
                 codex_creds = []
+        # DB-authoritative credentials must never resurrect deleted keys from
+        # the disk file, and must never write refreshed tokens back over it.
+        if secrets_authoritative:
+            auth_file = None
+        persist_callback = config.get("_persist_credentials")
+        if persist_callback is not None and not callable(persist_callback):
+            persist_callback = None
         # Request handlers are short-lived, but credential cursors must be
         # process-wide. Reuse the rotators assembled during app startup when
         # available; otherwise retain the standalone/test fallback below.
@@ -1094,6 +1192,8 @@ class PassthroughClient:
                     auth_file=auth_file,
                     http_client=http_client,
                     provider="openai-codex",
+                    persist_credentials=persist_callback,
+                    secrets_authoritative=secrets_authoritative,
                 )
                 self._credential_rotators["openai-codex"] = self._codex_rotator
             return
@@ -1113,6 +1213,8 @@ class PassthroughClient:
                     auth_file=pool_auth_file,
                     http_client=http_client,
                     provider=provider_key,
+                    persist_credentials=persist_callback,
+                    secrets_authoritative=secrets_authoritative,
                 )
 
         self._codex_rotator = self._credential_rotators.get("openai-codex")
@@ -1122,11 +1224,11 @@ class PassthroughClient:
                 auth_file=auth_file,
                 http_client=http_client,
                 provider="openai-codex",
+                persist_credentials=persist_callback,
+                secrets_authoritative=secrets_authoritative,
             )
 
-
     def _resolve_upstream_model(
-        self,
         provider: str,
         model: str,
     ) -> str:
