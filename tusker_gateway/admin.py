@@ -352,8 +352,14 @@ async def admin_usage(request: web.Request) -> web.Response:
 
 
 def _admin_identity_has_access(identity: Any) -> bool:
-    """Return whether a resolved identity may use the admin console."""
-    if identity is None:
+    """Return whether a resolved identity may use the admin console.
+
+    Admin access requires an explicit identity profile with the
+    ``admin:read`` scope.  Legacy unscoped keys (no profile) are
+    intentionally rejected so the admin console has a dedicated key
+    rather than inheriting every chat key in the pool.
+    """
+    if identity is None or not identity.managed:
         return False
     return identity.allows_scope("admin:read")
 

@@ -53,6 +53,22 @@ def _auth_middleware(store: IdentityStore | None = None):
     return middleware
 
 
+_ADMIN_IDENTITY_KEY = "sk-admin-test"
+
+
+def _admin_identities():
+    fingerprint = fingerprint_api_key(_ADMIN_IDENTITY_KEY)
+    return load_identity_config_from_env({
+        "TUSKER_IDENTITIES_JSON": json.dumps({
+            fingerprint: {
+                "principal": "admin-test",
+                "tenant": "operations",
+                "scopes": ["admin:read"],
+            }
+        })
+    })
+
+
 async def _client(app: web.Application) -> TestClient:
     client = TestClient(TestServer(app))
     await client.start_server()
@@ -134,8 +150,8 @@ async def test_admin_rejects_wrong_key():
 
 
 @pytest.mark.asyncio
-async def test_admin_legacy_key_grants_all_routes():
-    """A valid key without an identity profile behaves like /status access."""
+async def test_admin_legacy_key_denied_without_admin_profile():
+    """A valid key with no identity profile is rejected — admin console needs a dedicated key."""
     app = _admin_app("sk-admin-test")
     client = await _client(app)
     try:
@@ -143,7 +159,10 @@ async def test_admin_legacy_key_grants_all_routes():
             resp = await client.get(
                 path, headers={"Authorization": "Bearer sk-admin-test"}
             )
-            assert resp.status == 200, path
+            assert resp.status == 403, path
+        # Login is also blocked for unscoped keys
+        resp = await client.post("/admin/login", json={"api_key": "sk-admin-test"})
+        assert resp.status == 403
     finally:
         await client.close()
 
@@ -205,7 +224,7 @@ async def test_admin_scoped_identity_with_admin_scope_allowed():
 
 @pytest.mark.asyncio
 async def test_admin_providers_never_returns_raw_keys():
-    app = _admin_app("sk-admin-test")
+    app = _admin_app("sk-admin-test", identities=_admin_identities())
     client = await _client(app)
     try:
         resp = await client.get(
@@ -264,7 +283,7 @@ async def test_admin_keys_reports_identity_metadata_not_raw_keys():
 
 @pytest.mark.asyncio
 async def test_admin_diagnostics_aggregates_subsystems():
-    app = _admin_app("sk-admin-test")
+    app = _admin_app("sk-admin-test", identities=_admin_identities())
     client = await _client(app)
     try:
         resp = await client.get(
@@ -304,7 +323,7 @@ async def test_admin_console_page_served():
 
 @pytest.mark.asyncio
 async def test_login_sets_session_cookie_and_grants_data_routes():
-    app = _admin_app("sk-admin-test")
+    app = _admin_app("sk-admin-test", identities=_admin_identities())
     client = await _client(app)
     try:
         resp = await client.post(
@@ -365,7 +384,7 @@ async def test_login_rejects_wrong_key_and_non_admin_scope():
 
 @pytest.mark.asyncio
 async def test_logout_revokes_session():
-    app = _admin_app("sk-admin-test")
+    app = _admin_app("sk-admin-test", identities=_admin_identities())
     client = await _client(app)
     try:
         await client.post("/admin/login", json={"api_key": "sk-admin-test"})
@@ -416,7 +435,7 @@ async def test_login_rate_limited_after_repeated_failures():
 
 @pytest.mark.asyncio
 async def test_bearer_still_works_alongside_sessions():
-    app = _admin_app("sk-admin-test")
+    app = _admin_app("sk-admin-test", identities=_admin_identities())
     client = await _client(app)
     try:
         resp = await client.get(
