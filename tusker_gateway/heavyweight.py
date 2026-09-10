@@ -47,6 +47,12 @@ HEAVYWEIGHT_SLUG_OVERRIDES: frozenset[str] = frozenset({
     # Misc big models
     "mistral-large-3:675b",
     "deepseek-v4-pro",
+    # Ollama Cloud "extra high usage" tier (Ollama's own label for kimi-k3;
+    # $3/M in, $15/M out per ollama.com/library/kimi-k3). Auto-catalog
+    # entries are classified by pricing via the catalog's OLLAMA_CLOUD_PRICING
+    # overlay, but static pool lists carry no cost data — this slug entry
+    # keeps kimi-k3 out of cheap pools on that path too.
+    "kimi-k3",
 })
 
 

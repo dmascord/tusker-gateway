@@ -35,6 +35,18 @@ The slug override set is curated and currently includes:
 | Google (paid) | `gemini-2.5-pro`, `gemini-3-pro` |
 | Cohere (paid) | `command-a-plus-05-2026`, `command-a-03-2025` |
 | Other | `mistral-large-3:675b`, `deepseek-v4-pro` |
+| Ollama Cloud (usage-heavy) | `kimi-k3` |
+
+**Ollama Cloud pricing overlay.** Neither ollama's `/v1/models` payload nor
+models.dev carries cost data for ollama-cloud, so pricing-based detection
+would classify every model as cheap. `OLLAMA_CLOUD_PRICING`
+(`tusker_gateway/catalog.py`) overlays ollama.com's published per-1M-token
+prices onto catalog entries. Under the $1/$8 thresholds this marks
+`glm-5.1`, `glm-5.2`, `glm-5.3`, and `kimi-k3` heavyweight (plus
+`kimi-k3`'s slug entry, which also covers static pool lists that carry no
+cost data); `glm-5.3-flash`, `kimi-k2.6`, and the minimax/nemotron
+variants stay cheap-tier. Slugs with no published price stay
+non-heavyweight (conservative default).
 
 **Not** in the override set (cheap-tier codex slugs):
 
@@ -360,3 +372,8 @@ candidate's stored records.
 - **2026-08-21**: Heavyweight slug override + per-pool tier gate added
   (`tusker_gateway/heavyweight.py`, mirror of hermes-agent's
   `_HERMES_HEAVY_MODEL_OVERRIDES`).
+- **2026-09-10**: Ollama Cloud pricing overlay (`OLLAMA_CLOUD_PRICING`)
+  added — models.dev has no ollama-cloud costs, so `glm-5.1`/`glm-5.2`/
+  `glm-5.3`/`kimi-k3` previously passed the cheap-pool heavyweight gate
+  and burned session quota (`kimi-k3` also added to
+  `HEAVYWEIGHT_SLUG_OVERRIDES` for static pool lists).

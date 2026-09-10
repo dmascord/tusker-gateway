@@ -115,6 +115,69 @@ def test_code_pool_drops_heavyweights():
     assert selected == ("openai-codex", "gpt-5.6-luna")
 
 
+def test_ollama_cloud_pricing_overlay_filters_heavyweight_from_code_pool():
+    """Regression: ollama-cloud auto-catalog entries priced above the
+    $1/M-in or $8/M-out thresholds must be filtered from the cheap code
+    pool. kimi-k3 is heavy by slug override; glm-5.1/5.2/5.3 are heavy by
+    pricing; glm-5.3-flash, kimi-k2.6, minimax-m3 stay light."""
+    from tusker_gateway.catalog import (
+        CatalogEntry,
+        CatalogRegistry,
+        ProviderModelsCatalog,
+    )
+
+    cfg = {
+        "pools": {
+            "code": PoolConfig(name="code", models=[], auto_free=True,
+                               auto_catalog_providers=["ollama-cloud"]),
+        },
+        "excluded_providers": [],
+        "provider_api_keys": {"ollama-cloud": "k"},
+        "quality_db_path": tempfile.mktemp(suffix=".db"),
+    }
+    pm = PoolManager(cfg)
+    registry = CatalogRegistry()
+    ollama = ProviderModelsCatalog(
+        provider="ollama-cloud",
+        endpoint="https://ollama.com/v1/models",
+    )
+    # Entries with overlay pricing applied (fetch() behaviour covered in
+    # test_catalog.py); the pool gate must act on the costs.
+    ollama._entries = [
+        CatalogEntry(provider="ollama-cloud", model="kimi-k3",
+                     cost_input=3.00, cost_output=15.00),
+        CatalogEntry(provider="ollama-cloud", model="glm-5.1",
+                     cost_input=1.00, cost_output=3.20),
+        CatalogEntry(provider="ollama-cloud", model="glm-5.2",
+                     cost_input=1.40, cost_output=4.40),
+        CatalogEntry(provider="ollama-cloud", model="glm-5.3",
+                     cost_input=1.40, cost_output=4.40),
+        CatalogEntry(provider="ollama-cloud", model="glm-5.3-flash",
+                     cost_input=0.15, cost_output=0.50),
+        CatalogEntry(provider="ollama-cloud", model="kimi-k2.6",
+                     cost_input=0.95, cost_output=4.00),
+        CatalogEntry(provider="ollama-cloud", model="minimax-m3",
+                     cost_input=0.60, cost_output=2.40),
+    ]
+    registry.register("ollama-cloud", ollama)
+    pm.catalog_registry = registry
+    pm.extend_pools_with_free_catalog()
+
+    pool_by_pair = {
+        (m["provider"], m["model"]): m
+        for m in pm.pools["code"].models
+    }
+    heavy = {"kimi-k3", "glm-5.1", "glm-5.2", "glm-5.3"}
+    light = {"glm-5.3-flash", "kimi-k2.6", "minimax-m3"}
+    for m in heavy | light:
+        assert ("ollama-cloud", m) in pool_by_pair
+        assert pool_by_pair[("ollama-cloud", m)]["heavyweight"] is (m in heavy)
+    # select() drops heavies; a light candidate serves the request.
+    selected = pm.select("code")
+    assert selected is not None
+    assert selected[0] == "ollama-cloud"
+    assert selected[1] in light
+
 def test_privacy_pool_drops_heavyweights():
     """Privacy pool = cheap tier + ZDR. Heavy slugs are filtered out."""
     pm = _make_pool_manager("privacy", [

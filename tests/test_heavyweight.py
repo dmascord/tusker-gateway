@@ -44,6 +44,21 @@ def test_free_openrouter_models_are_not_heavyweight():
     assert is_heavyweight_slug("google/gemma-4-31b-it:free") is False
 
 
+def test_ollama_cloud_usage_heavy_slugs():
+    """kimi-k3 burns Ollama Cloud session quota ("extra high usage" per
+    ollama.com). Auto-catalog entries get classified via the catalog's
+    pricing overlay; the slug entry covers static pool lists, which carry
+    no cost data. glm-5.3 is heavy by pricing ($1.40/M in > $1 threshold),
+    not by slug."""
+    assert is_heavyweight_slug("kimi-k3") is True
+    assert is_heavyweight("kimi-k3") is True  # no pricing data needed
+    assert is_heavyweight_slug("glm-5.3") is False
+    assert is_heavyweight("glm-5.3", cost_input=1.40, cost_output=4.40) is True
+    assert is_heavyweight(
+        "glm-5.3-flash", cost_input=0.15, cost_output=0.50
+    ) is False
+
+
 # ---------------------------------------------------------------------------
 # is_heavyweight_pricing
 # ---------------------------------------------------------------------------

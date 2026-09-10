@@ -235,6 +235,39 @@ async def test_provider_models_catalog_applies_default_modalities_only_when_unkn
 
 
 @pytest.mark.asyncio
+async def test_provider_models_catalog_applies_pricing_overrides():
+    """Unpriced payloads get costs from the overlay (e.g. Ollama Cloud's
+    published prices — /v1/models and models.dev carry no cost data), so
+    the pricing-based heavyweight classifier can act. Payload-priced rows
+    keep their own values."""
+    session = _CapturingSession(FakeResponse(200, {
+        "models": [
+            {"id": "glm-5.3"},
+            {"id": "glm-5.3-flash"},
+            {"id": "priced-in-payload", "pricing": {"input": "0", "output": "0"}},
+        ],
+    }))
+    catalog = ProviderModelsCatalog(
+        provider="ollama-cloud",
+        endpoint="https://api.example.test/v1/models",
+        pricing_overrides={
+            "glm-5.3": (1.40, 4.40),
+            "glm-5.3-flash": (0.15, 0.50),
+        },
+    )
+
+    entries = {e.model: e for e in await catalog.fetch(session)}
+
+    assert entries["glm-5.3"].cost_input == 1.40
+    assert entries["glm-5.3"].cost_output == 4.40
+    assert entries["glm-5.3-flash"].cost_input == 0.15
+    assert entries["glm-5.3-flash"].cost_output == 0.50
+    # Payload-provided pricing wins; unknown slugs stay unpriced.
+    assert entries["priced-in-payload"].cost_input == 0.0
+    assert entries["priced-in-payload"].cost_output == 0.0
+
+
+@pytest.mark.asyncio
 async def test_catalog_refresh_records_safe_diagnostics():
     session = _CapturingSession(FakeResponse(200, {"models": [{"id": "m1"}]}))
     catalog = ProviderModelsCatalog(

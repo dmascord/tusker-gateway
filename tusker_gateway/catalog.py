@@ -79,6 +79,31 @@ DEFAULT_TTLS: dict[str, float] = {
 }
 
 
+# Ollama Cloud publishes per-1M-token prices on ollama.com/library pages but
+# neither its /v1/models payload nor models.dev carries cost data, so the
+# pricing-based heavyweight classifier ($1/M in, $8/M out) would see None
+# and treat every model as cheap. Verified 2026-09-09; base tier for
+# deepseek (peak varies). Slugs not listed here (gemma4, gpt-oss, kimi-k2.5,
+# minimax-m2.5, nemotron-3-nano/super, qwen3.5:397b, mistral-large-3:675b)
+# publish no price and stay non-heavyweight by the conservative default.
+OLLAMA_CLOUD_PRICING: dict[str, tuple[float, float]] = {
+    "deepseek-v4-flash": (0.22, 0.66),
+    "deepseek-v4-flash:0731": (0.22, 0.66),
+    "deepseek-v4-pro": (0.66, 1.98),
+    "deepseek-v4-pro:0813": (0.66, 1.98),
+    "glm-5.1": (1.00, 3.20),
+    "glm-5.2": (1.40, 4.40),
+    "glm-5.3": (1.40, 4.40),
+    "glm-5.3-flash": (0.15, 0.50),
+    "kimi-k2.6": (0.95, 4.00),
+    "kimi-k2.7-code": (0.95, 4.00),
+    "kimi-k3": (3.00, 15.00),
+    "minimax-m2.7": (0.30, 1.20),
+    "minimax-m3": (0.60, 2.40),
+    "nemotron-3-ultra": (0.10, 3.00),
+}
+
+
 @dataclass
 class CatalogEntry:
     """A single model advertised by an upstream catalog."""
@@ -577,6 +602,7 @@ class ProviderModelsCatalog(CatalogClient):
         ttl_secs: float = 3600.0,
         default_input_modalities: frozenset[str] | None = None,
         default_output_modalities: frozenset[str] | None = None,
+        pricing_overrides: dict[str, tuple[float, float]] | None = None,
     ) -> None:
         super().__init__()
         self.provider = provider
@@ -584,6 +610,10 @@ class ProviderModelsCatalog(CatalogClient):
         self.ttl_secs = ttl_secs
         self.default_input_modalities = default_input_modalities
         self.default_output_modalities = default_output_modalities
+        # Slug → (cost_input, cost_output) per 1M tokens for providers whose
+        # model list carries no pricing (e.g. Ollama Cloud). Only fills
+        # entries the payload itself doesn't price.
+        self.pricing_overrides = pricing_overrides
 
     async def fetch(self, session: aiohttp.ClientSession) -> list[CatalogEntry]:
         headers = {
@@ -635,6 +665,10 @@ class ProviderModelsCatalog(CatalogClient):
             if slug.startswith("models/"):
                 slug = slug[len("models/") :]
             cost_input, cost_output = _extract_catalog_pricing(raw)
+            if cost_input is None and cost_output is None and self.pricing_overrides:
+                pricing = self.pricing_overrides.get(slug)
+                if pricing is not None:
+                    cost_input, cost_output = pricing
             entry = CatalogEntry(
                 provider=self.provider,
                 model=slug,
@@ -1225,6 +1259,9 @@ class CatalogRegistry:
                         frozenset({"text"})
                         if provider in {"ollama-cloud", "cerebras"}
                         else None
+                    ),
+                    pricing_overrides=(
+                        OLLAMA_CLOUD_PRICING if provider == "ollama-cloud" else None
                     ),
                 ),
             )
