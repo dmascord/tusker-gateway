@@ -550,14 +550,13 @@ def cmd_smoke(args: argparse.Namespace) -> int:
     pg_pod = _resolve_pg_pod()
     print(f"pgcrypto roundtrip on {pg_pod} ...")
     sql = (
-        f"SELECT encode(encrypt('canary-probe'::bytea, digest('k1','md5'),'aes'), 'hex') "
-        f"= encode(decrypt(encrypt('canary-probe'::bytea, digest('k1','md5'),'aes'), "
-        f"digest('k1','md5'),'aes'), 'hex');"
+        f"SELECT decrypt(encrypt('canary-probe'::bytea, digest('k1','md5'),'aes'), "
+        f"digest('k1','md5'),'aes') = 'canary-probe'::bytea;"
     ).encode()
     proc = _run(
         ["kubectl", "-n", NAMESPACE, "exec", "-i", pg_pod, "--",
-         "psql", "-U", CANARY_DB_USER, "-d", CANARY_DB, "-Atc"],
-        input_=sql,
+         "psql", "-U", CANARY_DB_USER, "-d", CANARY_DB,
+         "-At", "-c", sql.decode()],
         check=True,
     )
     if proc.stdout.decode().strip() != "t":
@@ -567,15 +566,38 @@ def cmd_smoke(args: argparse.Namespace) -> int:
 
     # HTTP smoke: /health (expect 200 + config_runtime_status) and /ready (expect 200)
     import json as _json
-    import urllib.request as _urllib
+    import os as _os
+    import signal as _signal
+    import socket as _socket
+    import subprocess as _sp
+    import time as _time
+    import urllib.request as _req
 
-    pf = _run(
-        ["kubectl", "-n", NAMESPACE, "port-forward", f"svc/{CANARY_DEPLOYMENT}", "18642:{CANARY_PORT}"],
-        check=False,
+    pf = _sp.Popen(
+        ["kubectl", "-n", NAMESPACE, "port-forward",
+         f"svc/{CANARY_DEPLOYMENT}", "18642:{CANARY_PORT}"],
+        stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
     )
     try:
+        # Wait for the port to accept connections (try both v4 and v6)
+        bound = False
+        for _ in range(60):
+            for host in ("127.0.0.1", "::1"):
+                try:
+                    with _socket.create_connection((host, 18642), timeout=0.5):
+                        bound = True
+                        break
+                except OSError:
+                    continue
+            if bound:
+                break
+            _time.sleep(0.5)
+        if not bound:
+            print("port-forward failed to bind", file=sys.stderr)
+            return 1
+
         for path, expect in (("/health", "config_runtime_status"), ("/ready", "status")):
-            with _urllib.urlopen(f"http://127.0.0.1:18642{path}", timeout=15) as resp:
+            with _req.urlopen(f"http://127.0.0.1:18642{path}", timeout=15) as resp:
                 body = resp.read().decode()
                 if resp.status != 200:
                     print(f"{path} FAILED: HTTP {resp.status}", file=sys.stderr)
@@ -586,13 +608,18 @@ def cmd_smoke(args: argparse.Namespace) -> int:
                     return 1
             print(f"{path} OK (HTTP 200, {expect}={data[expect]})")
     finally:
-        pf.terminate()
+        if hasattr(_os, "killpg"):
+            try:
+                _os.killpg(_os.getpgid(pf.pid), _signal.SIGTERM)
+            except (ProcessLookupError, OSError):
+                pass
+        else:
+            pf.terminate()
         try:
             pf.wait(timeout=5)
         except Exception:
             pf.kill()
     return 0
-
 
 def cmd_cleanup(args: argparse.Namespace) -> int:
     """Emit the teardown commands for every canary resource."""
