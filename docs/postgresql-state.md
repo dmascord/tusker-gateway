@@ -7,8 +7,11 @@ switch are quality, capability evidence, tool qualification, provider usage,
 cooldowns, circuit breakers, rate limits, budgets, and idempotency records.
 
 Response caching and the optional semantic cache remain separate because they
-are disposable acceleration data. OAuth credentials and provider secrets also
-remain in their existing protected stores.
+are disposable acceleration data. OAuth credentials, provider API keys, and
+managed identity API keys also live in the same PG cluster under the
+DB-backed config store (`TUSKER_CONFIG_DATABASE_ENABLED=1`, shipped
+2026-09-10).  These rows are encrypted at rest with `pgcrypto`; the
+`TUSKER_KEY_ENCRYPTION_KEY` secret is the symmetric cipher key.
 
 ## Bootstrap
 

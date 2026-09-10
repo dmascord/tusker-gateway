@@ -3,7 +3,7 @@
 Active work items that span multiple sessions / PRs. Items live here
 until they ship and then move to a release-notes doc.
 
-## DB-backed config store (in progress)
+## DB-backed config store (shipped)
 
 Migrate gateway static config (provider registry, pool definitions, API
 keys, provider credentials, OAuth token rotation) from env-var / Python
@@ -19,27 +19,27 @@ body remains stubbed.
 
 ### Open items (in dependency order)
 
-- [ ] Implement `ConfigStore` body (SQLite + PG paths, idempotent schema,
-      encryption, snapshot/reload/CRUD).  See `IMPLEMENTATION_PLAN.md` §1.
-- [ ] Fix `ConfigUnavailableError` to accept `code=` kwarg
+- [x] Implement `ConfigStore` body (SQLite + PG paths, idempotent schema,
+      encryption, snapshot/reload/CRUD). See `IMPLEMENTATION_PLAN.md` §1.
+- [x] Fix `ConfigUnavailableError` to accept `code=` kwarg
       (currently raises `TypeError` at module import in the stub).
-- [ ] Implement `persist_credentials` as a CAS callback
+- [x] Implement `persist_credentials` as a CAS callback
       `(provider, expected, replacement) -> bool` (currently returns
       `False`, which would silently break OAuth token refresh).
-- [ ] Add `tusker_gateway/tools/migrate_config_to_db.py` — idempotent
+- [x] Add `tusker_gateway/tools/migrate_config_to_db.py` — idempotent
       env-to-DB migration. See `IMPLEMENTATION_PLAN.md` §2.
-- [ ] Drop the fake-module injection from `tests/test_config_runtime.py`
+- [x] Drop the fake-module injection from `tests/test_config_runtime.py`
       once the real store exists. See `IMPLEMENTATION_PLAN.md` §3.
-- [ ] Canary smoke-test against `tusker-gateway-c` pod via
+- [x] Canary smoke-test against `tusker-gateway-c` pod via
       `k8s/config-canary.py smoke --execute`. See `IMPLEMENTATION_PLAN.md`
       §4.
-- [ ] Flip `TUSKER_CONFIG_DATABASE_ENABLED=1` in `k8s/deployment.yaml`,
+- [x] Flip `TUSKER_CONFIG_DATABASE_ENABLED=1` in `k8s/deployment.yaml`,
       run migration, `rsync`, `./k8s/deploy.sh`.
-- [ ] Live admin write round-trip: `POST /admin/keys` for Don Gould,
+- [x] Live admin write round-trip: `POST /admin/keys` for Don Gould,
       verify request through `https://ai.tusker.net.au/v1/chat/completions`.
-- [ ] Update `docs/postgresql-state.md` to list OAuth credentials and
+- [x] Update `docs/postgresql-state.md` to list OAuth credentials and
       provider secrets as state-DB managed.
-- [ ] Update `AGENTS.md` doc index.
+- [x] Update `AGENTS.md` doc index.
 
 ### Test commands
 
