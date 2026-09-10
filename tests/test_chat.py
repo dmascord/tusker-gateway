@@ -198,11 +198,13 @@ async def test_tool_pool_compatibility_probe_without_http_server():
 
 @pytest.mark.asyncio
 async def test_pool_fallback_bounded_per_attempt_timeout():
-    """A slow first candidate must not consume the whole request deadline.
+    """A candidate that produces no upstream progress is abandoned.
 
-    Each pool iteration is wrapped in ``asyncio.wait_for`` bounded by
-    ``_provider_attempt_timeout_secs``. A candidate that never yields a
-    terminal frame must be abandoned so the next candidate can be tried.
+    Each pool attempt is bounded by ``_provider_attempt_timeout_secs`` as an
+    *idle* budget: a candidate that never yields any upstream byte must be
+    abandoned so the next candidate can be tried, while a stream that keeps
+    producing bytes is allowed to run past the wall-clock budget (see
+    ``test_pool_candidate_survives_slow_but_active_stream``).
     """
     import os
 
@@ -218,16 +220,15 @@ async def test_pool_fallback_bounded_per_attempt_timeout():
         ]
         upstream = MagicMock()
 
-        async def slow_stream(*args, **kwargs):
-            # Never emit a terminal frame; the preflight in
-            # _prepare_stream_result will iterate forever.
-            while True:
-                await asyncio.sleep(0.05)
-                yield b'data: {"type":"delta","delta":{"content":"thinking"}}\n\n'
+        async def silent_stream(*args, **kwargs):
+            # Never yields anything: the idle timeout must fire before the
+            # stream produces its first byte.
+            await asyncio.sleep(30)
+            yield b""  # pragma: no cover - never reached
 
         async def fast_chat(*args, **kwargs):
             if args[1] == "minimax-m3":
-                return slow_stream()
+                return silent_stream()
             return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
 
         upstream.chat = AsyncMock(side_effect=fast_chat)
@@ -249,9 +250,57 @@ async def test_pool_fallback_bounded_per_attempt_timeout():
     assert (provider, model) == ("openai-codex", "recovery-model")
     assert result["choices"][0]["message"]["content"] == "ok"
     assert pool_manager.select.call_count == 2
-    # The slow candidate was excluded from the second selection.
+    # The silent candidate was excluded from the second selection.
     second_call_excluded = pool_manager.select.call_args_list[1].kwargs["excluded"]
     assert ("ollama-cloud", "minimax-m3") in second_call_excluded
+
+
+@pytest.mark.asyncio
+async def test_pool_candidate_survives_slow_but_active_stream():
+    """A stream that keeps producing bytes must not be killed by the budget.
+
+    The per-attempt timeout is an idle budget: upstream progress (SSE bytes
+    arriving) extends it, so a tool-stream preflight that takes longer than
+    ``TUSKER_PROVIDER_ATTEMPT_TIMEOUT_SECS`` in total still completes.
+    """
+    import os
+
+    os.environ["TUSKER_PROVIDER_ATTEMPT_TIMEOUT_SECS"] = "1"
+    try:
+        pool_manager = MagicMock()
+        pool_manager.fallback_pools.return_value = ()
+        pool_manager.select.side_effect = [("ollama-cloud", "minimax-m3")]
+        upstream = MagicMock()
+
+        async def slow_but_active_stream(*args, **kwargs):
+            # Emit a chunk every 0.2s for ~2.2s in total: far past the 1s
+            # wall-clock budget, but never idle for more than 0.2s.
+            for _ in range(11):
+                await asyncio.sleep(0.2)
+                yield b'data: {"choices":[{"delta":{"content":"x"}}]}\n\n'
+            yield b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+            yield b"data: [DONE]\n\n"
+
+        upstream.chat = AsyncMock(return_value=slow_but_active_stream())
+
+        provider, model, result = await _call_with_pool_fallback(
+            {"pools": {}},
+            {
+                "model": "hermes-code",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+            },
+            upstream,
+            tools=[{"type": "function", "function": {"name": "read"}}],
+            request=SimpleNamespace(app={"pool_manager": pool_manager}),
+        )
+    finally:
+        os.environ.pop("TUSKER_PROVIDER_ATTEMPT_TIMEOUT_SECS", None)
+
+    assert (provider, model) == ("ollama-cloud", "minimax-m3")
+    assert hasattr(result, "__aiter__")
+    # The candidate succeeded on the first selection; no fallback needed.
+    assert pool_manager.select.call_count == 1
 
 
 @pytest.mark.asyncio

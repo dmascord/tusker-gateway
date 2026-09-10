@@ -2117,6 +2117,79 @@ def _provider_attempt_timeout_secs(request: web.Request | None) -> float:
     return max(0.0, min(configured, remaining - 0.25))
 
 
+class _AttemptActivity:
+    """Tracks upstream stream progress so a candidate is only failed on idle.
+
+    Tool-stream preflight consumes the whole upstream stream inside the
+    per-attempt timeout. A fixed wall-clock timeout kills candidates that are
+    streaming fine but need longer than the budget in total (long reasoning
+    phases, big tool-call payloads). The activity timestamp is bumped on
+    every upstream chunk; the attempt budget applies to the *idle gap* since
+    the last chunk (and to the initial connect/headers phase) instead of
+    total elapsed time.
+    """
+
+    __slots__ = ("last", "started")
+
+    def __init__(self) -> None:
+        self.started = asyncio.get_running_loop().time()
+        self.last: float | None = None
+
+
+def _attempt_touch_iterator(
+    stream: Any,
+    activity: _AttemptActivity,
+) -> Any:
+    """Wrap an upstream async iterator, bumping ``activity`` per chunk."""
+
+    async def _wrapped() -> AsyncIterator[Any]:
+        async for chunk in stream:
+            activity.last = asyncio.get_running_loop().time()
+            yield chunk
+
+    return _wrapped()
+
+
+def _request_deadline_at(request: Any) -> float | None:
+    """Return the request-level deadline timestamp, if one is attached."""
+    if request is None or not hasattr(request, "get"):
+        return None
+    return request.get("_deadline_at")
+
+
+async def _await_attempt(
+    task: "asyncio.Task[Any]",
+    *,
+    budget: float,
+    deadline_at: float | None,
+    activity: _AttemptActivity,
+) -> Any:
+    """Wait for an attempt task with idle-based timeout extension.
+
+    The task is failed with ``asyncio.TimeoutError`` when it produces no
+    upstream progress for ``budget`` seconds (or when the overall request
+    deadline would be exceeded), never merely because total elapsed time
+    crossed ``budget`` while bytes kept arriving.
+    """
+    loop = asyncio.get_running_loop()
+    while True:
+        now = loop.time()
+        last_progress = activity.last if activity.last is not None else activity.started
+        wait = budget - (now - last_progress)
+        if deadline_at is not None:
+            wait = min(wait, deadline_at - now - 0.25)
+        if wait <= 0:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+            raise asyncio.TimeoutError("provider attempt idle timeout")
+        done, _ = await asyncio.wait({task}, timeout=wait)
+        if done:
+            return task.result()
+
+
 
 
 def _tool_response_failure_cooldown_secs() -> float:
@@ -2325,6 +2398,7 @@ async def _call_with_pool_fallback(
             )
         try:
             result = None
+            activity = _AttemptActivity()
 
             async def call_direct() -> Any:
                 nonlocal result
@@ -2337,6 +2411,8 @@ async def _call_with_pool_fallback(
                     conversation_id=conversation_id,
                     metrics_registry=metrics_registry,
                 )
+                if hasattr(result, "__aiter__"):
+                    result = _attempt_touch_iterator(result, activity)
                 return await _prepare_stream_result(
                     result,
                     provider=provider,
@@ -2351,9 +2427,11 @@ async def _call_with_pool_fallback(
                     tool_choice=body.get("tool_choice"),
                 )
 
-            result = await asyncio.wait_for(
-                call_direct(),
-                timeout=_provider_attempt_timeout_secs(request),
+            result = await _await_attempt(
+                asyncio.create_task(call_direct()),
+                budget=_provider_attempt_timeout_secs(request),
+                deadline_at=_request_deadline_at(request),
+                activity=activity,
             )
             if breaker is not None:
                 await asyncio.to_thread(breaker.record_success, provider, model)
@@ -2558,6 +2636,7 @@ async def _call_with_pool_fallback(
         )
         try:
             result = None
+            activity = _AttemptActivity()
 
             async def call_candidate() -> Any:
                 nonlocal result
@@ -2570,6 +2649,8 @@ async def _call_with_pool_fallback(
                     conversation_id=conversation_id,
                     metrics_registry=metrics_registry,
                 )
+                if hasattr(result, "__aiter__"):
+                    result = _attempt_touch_iterator(result, activity)
                 return await _prepare_stream_result(
                     result,
                     provider=provider,
@@ -2584,9 +2665,11 @@ async def _call_with_pool_fallback(
                     tool_choice=body.get("tool_choice"),
                 )
 
-            result = await asyncio.wait_for(
-                call_candidate(),
-                timeout=_provider_attempt_timeout_secs(request),
+            result = await _await_attempt(
+                asyncio.create_task(call_candidate()),
+                budget=_provider_attempt_timeout_secs(request),
+                deadline_at=_request_deadline_at(request),
+                activity=activity,
             )
             if breaker is not None:
                 await asyncio.to_thread(breaker.record_success, provider, model)
@@ -2613,7 +2696,7 @@ async def _call_with_pool_fallback(
             excluded.add(selected)
             logger.warning(
                 "pool candidate timed out rid=%s requested_pool=%s active_pool=%s "
-                "candidate=%s/%s attempt=%d/%d timeout=%ss",
+                "candidate=%s/%s attempt=%d/%d idle_budget=%ss",
                 request_id or "unknown",
                 pool_name,
                 active_pool,
