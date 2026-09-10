@@ -91,6 +91,12 @@ def test_pool_config_normalizes_auto_catalog_providers():
     assert pool.auto_catalog_providers == ("github-copilot", "zai")
 
 
+def test_pool_config_heavyweight_only_flag():
+    """heavyweight_only defaults False and parses from the pool JSON env
+    (TUSKER_POOL_*), so premium can auto-adopt heavyweight catalog entries."""
+    assert PoolConfig(name="code", models=[]).heavyweight_only is False
+    assert PoolConfig(name="premium", models=[], heavyweight_only=True).heavyweight_only is True
+
 def test_pool_selection_logic():
     # Use real providers from DEFAULT_PROVIDER_REGISTRY (pools require known providers).
     with tempfile.TemporaryDirectory() as tmpdir:

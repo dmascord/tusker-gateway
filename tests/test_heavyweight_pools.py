@@ -178,6 +178,63 @@ def test_ollama_cloud_pricing_overlay_filters_heavyweight_from_code_pool():
     assert selected[0] == "ollama-cloud"
     assert selected[1] in light
 
+
+def test_premium_heavyweight_only_adopts_heavy_catalog_entries():
+    """Regression: a premium-tier pool with heavyweight_only=True opt-in
+    auto-adopts only heavyweight catalog entries (docs/solution.md:
+    "heavyweight or premium candidates"). Static entries — including
+    normally-light ones like syn:large:text — are unaffected."""
+    from tusker_gateway.catalog import (
+        CatalogEntry,
+        CatalogRegistry,
+        ProviderModelsCatalog,
+    )
+
+    cfg = {
+        "pools": {
+            "premium": PoolConfig(
+                name="premium",
+                models=[
+                    {"provider": "openai-codex", "model": "gpt-5.6-sol"},
+                    {"provider": "synthetic", "model": "syn:large:text"},
+                ],
+                auto_free=True,
+                auto_catalog_providers=["ollama-cloud"],
+                heavyweight_only=True,
+            ),
+        },
+        "provider_api_keys": {"ollama-cloud": "k", "synthetic": "s"},
+        "quality_db_path": tempfile.mktemp(suffix=".db"),
+    }
+    pm = PoolManager(cfg)
+    registry = CatalogRegistry()
+    ollama = ProviderModelsCatalog(
+        provider="ollama-cloud",
+        endpoint="https://ollama.com/v1/models",
+    )
+    ollama._entries = [
+        CatalogEntry(provider="ollama-cloud", model="kimi-k3",
+                     cost_input=3.00, cost_output=15.00),
+        CatalogEntry(provider="ollama-cloud", model="glm-5.3",
+                     cost_input=1.40, cost_output=4.40),
+        CatalogEntry(provider="ollama-cloud", model="glm-5.3-flash",
+                     cost_input=0.15, cost_output=0.50),
+        CatalogEntry(provider="ollama-cloud", model="kimi-k2.6",
+                     cost_input=0.95, cost_output=4.00),
+    ]
+    registry.register("ollama-cloud", ollama)
+    pm.catalog_registry = registry
+    pm.extend_pools_with_free_catalog()
+
+    premium = {(s.provider, s.model): s for s in pm.models["premium"]}
+    assert ("openai-codex", "gpt-5.6-sol") in premium  # static kept
+    assert ("synthetic", "syn:large:text") in premium  # static kept (light)
+    assert ("ollama-cloud", "kimi-k3") in premium      # heavy adopted
+    assert ("ollama-cloud", "glm-5.3") in premium      # heavy adopted
+    assert ("ollama-cloud", "glm-5.3-flash") not in premium  # light skipped
+    assert ("ollama-cloud", "kimi-k2.6") not in premium      # light skipped
+    assert pm.select("premium") is not None
+
 def test_privacy_pool_drops_heavyweights():
     """Privacy pool = cheap tier + ZDR. Heavy slugs are filtered out."""
     pm = _make_pool_manager("privacy", [

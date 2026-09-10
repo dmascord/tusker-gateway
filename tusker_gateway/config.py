@@ -53,6 +53,7 @@ class PoolConfig:
         provider_warmup_secs: int = 300,
         auto_free: bool = False,
         auto_catalog_providers: list[str] | tuple[str, ...] | str = (),
+        heavyweight_only: bool = False,
         fallback_pools: list[str] | tuple[str, ...] = (),
     ):
         self.name = name
@@ -61,6 +62,9 @@ class PoolConfig:
         self.zdr = zdr
         self.provider_warmup_secs = provider_warmup_secs
         self.auto_free = auto_free
+        # When True, auto-catalog discovery only adds entries the
+        # heavyweight classifier marks heavy. Static entries are unaffected.
+        self.heavyweight_only = heavyweight_only
         if isinstance(auto_catalog_providers, str):
             auto_catalog_providers = auto_catalog_providers.split(",")
         elif not isinstance(auto_catalog_providers, (list, tuple)):
@@ -456,6 +460,7 @@ def _load_pools() -> dict[str, PoolConfig]:
                 context_window=data.get("context_window", 128_000),
                 zdr=data.get("zdr", False),
                 auto_free=bool(data.get("auto_free", False)),
+                heavyweight_only=bool(data.get("heavyweight_only", False)),
                 auto_catalog_providers=data.get(
                     "auto_catalog_providers",
                     default_auto_catalog_providers,

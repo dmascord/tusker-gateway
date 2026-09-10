@@ -627,6 +627,12 @@ class PoolManager:
                     )
                     if mode == "xiaomi" and heavyweight:
                         continue
+                    if pool.heavyweight_only and not heavyweight:
+                        # Premium-tier auto-adoption: only heavyweight
+                        # entries enter (docs/solution.md: "heavyweight or
+                        # premium candidates"). Static entries are
+                        # unaffected — they are outside this loop.
+                        continue
 
                     model_data: dict[str, Any] = {
                         "provider": entry.provider,
