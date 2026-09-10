@@ -752,6 +752,16 @@ def test_live_audio_models_are_not_general_chat_candidates():
     assert is_general_chat_model("openrouter", "tool-image") is True
 
 
+def test_language_restricted_chat_models_are_not_general_candidates():
+    """allam-2-7b is Arabic-first and returns empty content on English
+    prompts, so it must not be admitted to general chat pools."""
+    assert is_general_chat_model("groq", "allam-2-7b") is False
+    # Arabic prompts work fine — the filter is about general-chat usability,
+    # not about dropping the provider entirely.
+    assert is_general_chat_model("groq", "openai/gpt-oss-120b") is True
+    assert is_general_chat_model("groq", "groq/compound-mini") is True
+
+
 def test_selection_filters_catalog_models_without_tools_or_images():
     with tempfile.TemporaryDirectory() as tmpdir:
         manager = PoolManager({

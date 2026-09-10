@@ -69,6 +69,14 @@ _PROVIDER_ROUTER_MODELS: frozenset[tuple[str, str]] = frozenset({
     ("openrouter", "free"),
     ("openrouter", "auto"),
 })
+_LANGUAGE_RESTRICTED_MODELS: frozenset[tuple[str, str]] = frozenset({
+    # allam-2-7b is an Arabic-first model from SDAIA. It serves Arabic
+    # prompts well but returns empty content on English prompts (verified
+    # live: "Say exactly: OK" -> content=null, finish_reason=stop), so it
+    # is not a usable general-chat backend. Kept explicit rather than
+    # slug-matched because "allam" is not a modality keyword.
+    ("groq", "allam-2-7b"),
+})
 
 
 def _provider_registry(config: dict[str, Any]) -> dict[str, Any]:
@@ -90,6 +98,9 @@ def is_general_chat_model(provider: str, model: str) -> bool:
     normalized_provider = str(provider).strip().lower()
     normalized_model = str(model).strip().lower()
     if (normalized_provider, normalized_model) in _PROVIDER_ROUTER_MODELS:
+        return False
+    # Language-restricted chat models are not usable general backends.
+    if (normalized_provider, normalized_model) in _LANGUAGE_RESTRICTED_MODELS:
         return False
     # Google's image-output model IDs use a bare ``-image`` suffix, which is
     # distinct from ordinary multimodal chat models whose slugs may merely
