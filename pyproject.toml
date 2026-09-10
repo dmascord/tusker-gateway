@@ -11,7 +11,7 @@ dependencies = [
     "psycopg[binary,pool]>=3.2,<4",
 ]
 [project.optional-dependencies]
-semantic-cache = ["chromadb==1.5.9", "sentence-transformers==6.0.0"]
+semantic-cache = ["chromadb==1.5.9", "sentence-transformers==6.0.1"]
 dev = [
     "pip-audit>=2.9,<3",
     "pytest>=9.0.3,<10",
