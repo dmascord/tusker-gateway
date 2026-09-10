@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from tusker_gateway.config import DEFAULT_PROVIDER_REGISTRY
 from tusker_gateway.errors import GatewayError
 from tusker_gateway.providers.image_generation import (
     ImageGenerationHandler,
@@ -859,3 +860,125 @@ async def test_zai_routes_image_and_video_via_registry():
     assert vid_handler.get_provider_for_video_request(
         "cogvideox-3", capability_registry=reg
     ) == "zai"
+
+
+def test_get_provider_for_image_request_alibaba_pin():
+    h = ImageGenerationHandler({})
+    assert (
+        h.get_provider_for_image_request(
+            "alibaba/wan2.7-image", "/v1/images/generations"
+        )
+        == "alibaba"
+    )
+
+
+@pytest.mark.asyncio
+async def test_alibaba_posts_qwen_agent_shape_and_normalizes_urls():
+    captured: dict = {}
+
+    class FakeResponse:
+        status = 200
+        headers = {}
+
+        async def read(self):
+            return json.dumps(
+                {
+                    "output": {
+                        "choices": [
+                            {
+                                "message": {
+                                    "role": "assistant",
+                                    "content": [
+                                        {
+                                            "type": "image",
+                                            "image": "https://signed.example/image.png",
+                                        }
+                                    ],
+                                }
+                            }
+                        ]
+                    },
+                    "usage": {"image_count": 1},
+                }
+            ).encode()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class FakeSession:
+        def post(self, url, headers=None, json=None, timeout=None):
+            captured["url"] = url
+            captured["headers"] = headers
+            captured["body"] = json
+            return FakeResponse()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    config = {
+        "providers": {
+            "alibaba": DEFAULT_PROVIDER_REGISTRY["alibaba"],
+        }
+    }
+    h = ImageGenerationHandler(config)
+    with patch(
+        "tusker_gateway.providers.image_generation.aiohttp.ClientSession",
+        return_value=FakeSession(),
+    ):
+        result = await h.handle_request(
+            model="alibaba/wan2.7-image",
+            path="/v1/images/generations",
+            body={"model": "alibaba/wan2.7-image", "prompt": "A red circle"},
+            api_key="alibaba-key",
+        )
+
+    assert captured["url"] == (
+        "https://token-plan.ap-southeast-1.maas.aliyuncs.com"
+        "/compatible-mode/v1/chat/completions"
+    )
+    assert captured["headers"]["Authorization"] == "Bearer alibaba-key"
+    assert captured["body"] == {
+        "model": "wan2.7-image",
+        "input": {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "A red circle"}],
+                }
+            ]
+        },
+    }
+    assert result["data"] == [{"url": "https://signed.example/image.png"}]
+    assert isinstance(result["created"], int)
+
+
+@pytest.mark.asyncio
+async def test_alibaba_rejects_missing_key_and_unsupported_edit():
+    h = ImageGenerationHandler(
+        {"providers": {"alibaba": DEFAULT_PROVIDER_REGISTRY["alibaba"]}}
+    )
+    with pytest.raises(GatewayError) as missing:
+        await h._call_alibaba(
+            "wan2.7-image",
+            "/v1/images/generations",
+            {"prompt": "x"},
+            None,
+            None,
+        )
+    assert missing.value.code == "missing_api_key"
+
+    with pytest.raises(GatewayError) as edit:
+        await h._call_alibaba(
+            "wan2.7-image",
+            "/v1/images/edits",
+            {"prompt": "x"},
+            "alibaba-key",
+            None,
+        )
+    assert edit.value.code == "unsupported_endpoint"

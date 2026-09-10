@@ -31,7 +31,7 @@ _IMAGE_CAPABILITY_BY_PATH = {
     "/v1/images/edits": Capability.IMAGE_EDITS,
     "/v1/images/variations": Capability.IMAGE_VARIATIONS,
 }
-_IMAGE_DISPATCH_PROVIDERS = frozenset({"openai", "openrouter", "google", "zai", "minimax"})
+_IMAGE_DISPATCH_PROVIDERS = frozenset({"openai", "openrouter", "google", "zai", "minimax", "alibaba"})
 _IMAGE_NON_GENERATION_PATHS = frozenset(
     {"/v1/images/edits", "/v1/images/variations"}
 )
@@ -274,7 +274,7 @@ class ImageGenerationHandler:
             )
         if pin_provider in {"codex", "openai-codex"}:
             return "openai"
-        if pin_provider in {"openai", "openrouter", "google", "zai", "minimax"}:
+        if pin_provider in {"openai", "openrouter", "google", "zai", "minimax", "alibaba"}:
             return pin_provider
         if pin_provider is not None:
             raise GatewayError(
@@ -334,6 +334,8 @@ class ImageGenerationHandler:
             return await self._call_zai(model, path, body, api_key, extra_headers)
         if provider == "minimax":
             return await self._call_minimax(model, path, body, api_key, extra_headers)
+        if provider == "alibaba":
+            return await self._call_alibaba(model, path, body, api_key, extra_headers)
         raise GatewayError(
             f"Provider {provider} does not support image generation",
             code="unsupported_model",
@@ -973,6 +975,126 @@ class ImageGenerationHandler:
         if not images:
             raise GatewayError(
                 "MiniMax image generation returned no images",
+                code="upstream_error",
+            )
+        return {"created": int(time.time()), "data": images}
+
+    @staticmethod
+    def _strip_alibaba_prefix(model: str) -> str:
+        """Strip an explicit alibaba gateway pin from the upstream model id."""
+        if model.lower().startswith("alibaba::"):
+            return model[len("alibaba::") :]
+        if model.lower().startswith("alibaba/"):
+            return model[len("alibaba/") :]
+        return model
+
+    async def _call_alibaba(
+        self,
+        model: str,
+        path: str,
+        body: Dict[str, Any],
+        api_key: Optional[str],
+        extra_headers: Optional[Dict[str, str]],
+    ) -> Dict[str, Any]:
+        """Call Alibaba Cloud Model Studio (Token Plan) image models.
+
+        ``wan2.7-image*`` are served through the Chat Completions endpoint
+        using the Qwen-Agent request shape (``input.messages``). The
+        generated image is returned as a time-limited OSS URL inside
+        ``output.choices[*].message.content`` and is normalized to the
+        OpenAI ``{"data": [{"url": ...}]}`` shape; callers must fetch the
+        URL before it expires.
+        """
+        _require_generation_path(path, "Alibaba")
+        if not api_key:
+            raise GatewayError("Alibaba API key required", code="missing_api_key")
+
+        provider_config = self.config.get("providers", {}).get("alibaba")
+        base_url = (
+            getattr(provider_config, "base_url", None)
+            or "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode"
+        )
+        chat_path = (
+            getattr(provider_config, "chat_path", None) or "/v1/chat/completions"
+        )
+        url = base_url.rstrip("/") + chat_path
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        if extra_headers:
+            headers.update(extra_headers)
+
+        payload: Dict[str, Any] = {
+            "model": self._strip_alibaba_prefix(model),
+            "input": {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [{"type": "text", "text": body["prompt"]}],
+                    }
+                ]
+            },
+        }
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=120),
+            ) as resp:
+                text = await _read_capped_text(resp)
+                if resp.status >= 400:
+                    logger.warning(
+                        "Alibaba image generation failed: %s %s",
+                        resp.status,
+                        text[:200],
+                    )
+                    raise GatewayError(
+                        f"Alibaba error {resp.status}: {text[:200]}",
+                        code="upstream_error",
+                    )
+                try:
+                    response = json.loads(text)
+                except json.JSONDecodeError as exc:
+                    raise GatewayError(
+                        "Alibaba image generation returned invalid JSON",
+                        code="upstream_error",
+                    ) from exc
+
+        images: list[Dict[str, str]] = []
+        output = response.get("output") if isinstance(response, dict) else None
+        choices = output.get("choices") if isinstance(output, dict) else None
+        for choice in choices if isinstance(choices, list) else []:
+            if not isinstance(choice, dict):
+                continue
+            message = choice.get("message")
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "image":
+                    continue
+                value = block.get("image") or block.get("url")
+                if not isinstance(value, str) or not value:
+                    continue
+                if len(value.encode("utf-8")) > MAX_IMAGE_RESPONSE_BYTES:
+                    raise GatewayError(
+                        "Alibaba image generation returned an oversized image result",
+                        code="upstream_error",
+                    )
+                if len(images) >= MAX_IMAGE_RESULTS:
+                    raise GatewayError(
+                        "Alibaba image generation returned too many images",
+                        code="upstream_error",
+                    )
+                images.append({"url": value})
+        if not images:
+            raise GatewayError(
+                "Alibaba image generation returned no images",
                 code="upstream_error",
             )
         return {"created": int(time.time()), "data": images}
