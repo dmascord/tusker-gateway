@@ -28,7 +28,7 @@ import threading
 import time
 from typing import Any, Callable
 
-from tusker_gateway.config import PoolConfig, ProviderConfig
+from tusker_gateway.config import PoolConfig, ProviderConfig, expand_env_placeholders
 from tusker_gateway.identity import CallerIdentity, IdentityConfig, fingerprint_api_key
 from tusker_gateway.storage import Database, shared_database
 
@@ -205,13 +205,13 @@ class ConfigStore:
                 providers[str(name).lower()] = ProviderConfig(
                     name=str(name).lower(),
                     kind="bearer",
-                    base_url=str(base_url or ""),
-                    chat_path=str(chat_path or "/v1/chat/completions"),
+                    base_url=expand_env_placeholders(str(base_url or "")) or str(base_url or ""),
+                    chat_path=expand_env_placeholders(str(chat_path or "/v1/chat/completions")) or str(chat_path or "/v1/chat/completions"),
                     auth_env=str(auth_env) if auth_env else None,
                     pool_env=str(pool_env) if pool_env else None,
                     model_header=str(model_header) if model_header else None,
-                    models_path=str(models_path) if models_path else None,
-                    rerank_path=str(rerank_path) if rerank_path else None,
+                    models_path=expand_env_placeholders(str(models_path) if models_path else None),
+                    rerank_path=expand_env_placeholders(str(rerank_path) if rerank_path else None),
                     model_aliases=aliases,
                     zdr_ok=bool(zdr_ok),
                     heavyweight=bool(heavyweight),
@@ -393,13 +393,13 @@ class ConfigStore:
                 name = str(row[0]).lower()
                 result["providers"][name] = {
                     "name": name,
-                    "base_url": str(row[1] or ""),
-                    "chat_path": str(row[2] or "/v1/chat/completions"),
+                    "base_url": expand_env_placeholders(str(row[1] or "")) or str(row[1] or ""),
+                    "chat_path": expand_env_placeholders(str(row[2] or "/v1/chat/completions")) or str(row[2] or "/v1/chat/completions"),
                     "auth_env": str(row[3]) if row[3] else None,
                     "pool_env": str(row[4]) if row[4] else None,
                     "model_header": str(row[5]) if row[5] else None,
-                    "models_path": str(row[6]) if row[6] else None,
-                    "rerank_path": str(row[7]) if row[7] else None,
+                    "models_path": expand_env_placeholders(str(row[6]) if row[6] else None),
+                    "rerank_path": expand_env_placeholders(str(row[7]) if row[7] else None),
                     "model_aliases": _try_json(row[8]),
                     "zdr_ok": bool(row[9]),
                     "heavyweight": bool(row[10]),
@@ -751,8 +751,11 @@ class ConfigStore:
     def upsert_client_key(self, body: dict[str, Any]) -> dict[str, Any]:
         """Create or update a managed identity key.
 
-        On create (no fingerprint in body): generates a new raw key.
-        On update (fingerprint in body): updates profile fields only.
+        On create (no fingerprint in body): a user-provided ``api_key`` is
+        honoured (fingerprint is recomputed from it); otherwise a new raw
+        key is generated.  On update (fingerprint in body): profile fields
+        only — supply ``api_key`` would change the credential, which is
+        ``rotate_client_key``'s job, so it is rejected.
         Returns ``api_key`` only in the create response.
         """
         if not self._managed:
@@ -765,13 +768,26 @@ class ConfigStore:
                 raise ValueError("principal and tenant are required")
 
             # Determine fingerprint and raw key
+            provided_key = body.get("api_key")
+            if isinstance(provided_key, str) and provided_key.strip():
+                provided_key = provided_key.strip()
+            else:
+                provided_key = None
+
             if "fingerprint" in body:
                 fp = str(body["fingerprint"]).strip().lower()
                 raw_key: str | None = None
+                if provided_key is not None:
+                    raise ValueError(
+                        "api_key is not accepted when fingerprint is provided; "
+                        "use POST /admin/keys/{fp}/rotate to change the raw key"
+                    )
             else:
-                raw_key = "sk-" + secrets.token_hex(24)
+                if provided_key is not None:
+                    raw_key = provided_key
+                else:
+                    raw_key = "sk-" + secrets.token_hex(24)
                 fp = fingerprint_api_key(raw_key)
-
             scopes_raw = json.dumps(_normalise_patterns(body.get("scopes")))
             pools_raw = json.dumps(_normalise_patterns(body.get("allowed_pools", ["*"])))
             models_raw = json.dumps(_normalise_patterns(body.get("allowed_models", ["*"])))

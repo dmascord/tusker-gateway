@@ -393,16 +393,16 @@ def _provider_registry_from_env() -> dict[str, ProviderConfig]:
                 merged = {
                     "name": str(name).lower(),
                     "kind": value.get("kind", value.get("auth_type", "bearer")),
-                    "base_url": value["base_url"],
-                    "chat_path": value.get("chat_path", "/v1/chat/completions"),
+                    "base_url": expand_env_placeholders(value.get("base_url")) or value["base_url"],
+                    "chat_path": expand_env_placeholders(value.get("chat_path")) or value.get("chat_path", "/v1/chat/completions"),
                     "auth_env": value.get("auth_env"),
                     "pool_env": value.get("pool_env"),
                     "model_header": value.get("model_header"),
                     "auth_type": value.get("auth_type", value.get("kind", "bearer")),
                     "zdr_ok": bool(value.get("zdr_ok", False)),
                     "heavyweight": bool(value.get("heavyweight", False)),
-                    "models_path": value.get("models_path", value.get("catalog_path")),
-                    "rerank_path": value.get("rerank_path"),
+                    "models_path": expand_env_placeholders(value.get("models_path", value.get("catalog_path"))) or value.get("models_path", value.get("catalog_path")),
+                    "rerank_path": expand_env_placeholders(value.get("rerank_path")) or value.get("rerank_path"),
                 }
                 # Parse model aliases: {"qwen3-coder": "/Users/tusker/models/..."}
                 raw_aliases = value.get("model_aliases")
