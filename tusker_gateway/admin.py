@@ -1089,6 +1089,16 @@ def _get_config_store(request: web.Request) -> Any:
     if store is None:
         raise ConfigUnavailableError("configuration store unavailable")
     return store
+async def _apply_reload(request: web.Request) -> None:
+    """Trigger config-runtime reload so writes take effect without restart."""
+    runtime = request.app.get("config_runtime")
+    if runtime is None:
+        return
+    try:
+        await runtime.apply_reload()
+    except Exception:
+        logger.debug("post-write apply_reload failed", exc_info=True)
+
 
 
 def _reject_unknown_fields(body: dict, allowed: set[str], label: str) -> None:
@@ -1186,6 +1196,7 @@ async def admin_keys_create(request: web.Request) -> web.Response:
         return web.json_response(
             openai_error_shape("configuration unavailable", "store_unavailable"), status=503
         )
+    await _apply_reload(request)
     return web.json_response(result, status=201)
 
 
@@ -1211,6 +1222,7 @@ async def admin_keys_update(request: web.Request) -> web.Response:
         return web.json_response(
             openai_error_shape("configuration unavailable", "store_unavailable"), status=503
         )
+    await _apply_reload(request)
     return web.json_response(result)
 
 
@@ -1234,6 +1246,7 @@ async def admin_keys_delete(request: web.Request) -> web.Response:
         return web.json_response(
             openai_error_shape("configuration unavailable", "store_unavailable"), status=503
         )
+    await _apply_reload(request)
     return web.json_response({"ok": True, "fingerprint": fingerprint})
 
 
@@ -1257,6 +1270,7 @@ async def admin_keys_rotate(request: web.Request) -> web.Response:
         return web.json_response(
             openai_error_shape("configuration unavailable", "store_unavailable"), status=503
         )
+    await _apply_reload(request)
     return web.json_response(result)
 
 
@@ -1284,6 +1298,7 @@ async def admin_providers_put(request: web.Request) -> web.Response:
     except Exception:
         logger.exception("upsert provider failed")
         return web.json_response(openai_error_shape("configuration unavailable", "store_unavailable"), status=503)
+    await _apply_reload(request)
     return web.json_response(result)
 
 
@@ -1305,6 +1320,7 @@ async def admin_providers_delete(request: web.Request) -> web.Response:
     except Exception:
         logger.exception("delete provider failed")
         return web.json_response(openai_error_shape("configuration unavailable", "store_unavailable"), status=503)
+    await _apply_reload(request)
     return web.json_response({"ok": True, "provider": provider})
 
 
@@ -1329,6 +1345,7 @@ async def admin_providers_settings_put(request: web.Request) -> web.Response:
     except Exception:
         logger.exception("provider settings update failed")
         return web.json_response(openai_error_shape("configuration unavailable", "store_unavailable"), status=503)
+    await _apply_reload(request)
     return web.json_response(result)
 
 
@@ -1352,6 +1369,7 @@ async def admin_providers_credentials_put(request: web.Request) -> web.Response:
     except Exception:
         logger.exception("provider credentials update failed")
         return web.json_response(openai_error_shape("configuration unavailable", "store_unavailable"), status=503)
+    await _apply_reload(request)
     return web.json_response(result)
 
 
@@ -1379,6 +1397,7 @@ async def admin_pools_put(request: web.Request) -> web.Response:
     except Exception:
         logger.exception("upsert pool failed")
         return web.json_response(openai_error_shape("configuration unavailable", "store_unavailable"), status=503)
+    await _apply_reload(request)
     return web.json_response(result)
 
 
@@ -1400,6 +1419,7 @@ async def admin_pools_delete(request: web.Request) -> web.Response:
     except Exception:
         logger.exception("delete pool failed")
         return web.json_response(openai_error_shape("configuration unavailable", "store_unavailable"), status=503)
+    await _apply_reload(request)
     return web.json_response({"ok": True, "pool": pool})
 
 

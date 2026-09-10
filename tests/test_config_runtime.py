@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import secrets
 import tempfile
 from typing import Any
 
@@ -15,7 +16,8 @@ from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
 
 from tusker_gateway.config_store import ConfigStore, ConfigUnavailableError
-from tusker_gateway.identity import IdentityConfig
+from tusker_gateway.identity import IdentityConfig, fingerprint_api_key
+
 from tusker_gateway.auth import AuthMiddleware
 from tusker_gateway.config_runtime import ConfigRuntime, _env_enabled
 
@@ -358,3 +360,61 @@ async def test_concurrent_poll_does_not_corrupt_state() -> None:
     assert isinstance(status["generation"], int)
     assert status["generation"] >= 0
     assert status["error"] is None
+def test_upsert_client_key_honours_user_provided_api_key() -> None:
+    _env_state("1")
+    store = _make_store()
+    known_key = "sk-" + secrets.token_hex(24)
+    expected_fp = fingerprint_api_key(known_key)
+    result = store.upsert_client_key({
+        "api_key": known_key,
+        "principal": "provided",
+        "tenant": "ops",
+        "scopes": ["inference:chat"],
+    })
+    assert result["api_key"] == known_key
+    assert result["fingerprint"] == expected_fp
+
+    snap = store.runtime_config({"api_keys": []})
+    assert known_key in snap["api_keys"]
+
+
+def test_upsert_client_key_rejects_api_key_with_fingerprint() -> None:
+    _env_state("1")
+    store = _make_store()
+    existing = store.upsert_client_key({"principal": "x", "tenant": "y"})
+    fp = existing["fingerprint"]
+    with pytest.raises(ValueError, match="rotate"):
+        store.upsert_client_key({
+            "fingerprint": fp,
+            "api_key": "sk-" + secrets.token_hex(24),
+            "principal": "x",
+            "tenant": "y",
+        })
+
+
+@pytest.mark.asyncio
+async def test_rebuild_identity_store_picks_up_new_keys() -> None:
+    _env_state("1")
+    store = _make_store()
+    app = _make_app()
+    app["config_store"] = store
+    from tusker_gateway.identity import IdentityStore
+    app["identity_store"] = IdentityStore(IdentityConfig())
+    rt = ConfigRuntime(app)
+
+    # Manually drive identity-store rebuild (avoids the full PoolManager rebuild
+    # which needs quality_db_path and other config the runtime fixture lacks).
+    rt._rebuild_identity_store()
+
+    new_key = store.upsert_client_key({
+        "principal": "post-reload",
+        "tenant": "ops",
+        "scopes": ["inference:chat"],
+    })["api_key"]
+
+    # Before second rebuild, identity store doesn't know this key.
+    pre = app["identity_store"].resolve(new_key)
+    assert pre.principal.startswith("key:")  # legacy fallback
+
+    rt._rebuild_identity_store()
+    assert app["identity_store"].resolve(new_key).principal == "post-reload"
