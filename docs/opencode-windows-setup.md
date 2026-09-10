@@ -38,7 +38,7 @@ Create/edit `%USERPROFILE%\.config\opencode\opencode.json`:
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "model": "tusker/tusker-gateway",
+  "model": "tusker/hermes-code",
   "provider": {
     "tusker": {
       "npm": "@ai-sdk/openai-compatible",
@@ -48,11 +48,10 @@ Create/edit `%USERPROFILE%\.config\opencode\opencode.json`:
         "apiKey": "{env:TUSKER_API_KEY}"
       },
       "models": {
-        "tusker-gateway": { "name": "Tusker (auto-routing)" },
-        "hermes-code": { "name": "Hermes Code (auto-routing)" },
-        "mlx-mac/qwen3-coder-30b-a3b-instruct-4bit": { "name": "Qwen3 Coder 30B (local MLX)" },
-        "github-copilot-enterprise/gpt-5.4-mini": { "name": "GPT-5.4 Mini" },
-        "github-copilot-enterprise/claude-sonnet-4.6": { "name": "Claude Sonnet 4.6" }
+        "hermes-code": { "name": "Hermes Code", "attachment": true, "modalities": { "input": ["text", "image"] } },
+        "hermes-privacy": { "name": "Hermes Privacy (ZDR)", "attachment": true, "modalities": { "input": ["text", "image"] } },
+        "hermes-premium": { "name": "Hermes Premium", "attachment": true, "modalities": { "input": ["text", "image"] } },
+        "tusker-gateway": { "name": "Tusker (auto-routing)", "attachment": true, "modalities": { "input": ["text", "image"] } }
       }
     }
   }
@@ -65,11 +64,16 @@ Notes:
   `@ai-sdk/openai-compatible` is required for any OpenAI-compatible endpoint.
 - Model keys must exactly match IDs from `GET /v1/models`
   (`curl -H "Authorization: Bearer $TUSKER_API_KEY" https://ai.tusker.net.au/v1/models`).
-  The list changes as pool catalogs refresh; the five above are a safe base.
-- `tusker-gateway` and `hermes-code` are virtual auto-routing models: the
-  gateway picks a backend per request.
+- All listed models are virtual auto-routing aliases: the gateway picks a
+  backend per request. `hermes-code` rotates through cheap coding models,
+  `hermes-privacy` uses ZDR-only backends, `hermes-premium` uses heavyweight
+  models, and `tusker-gateway` mixes across all pools.
 - `{env:TUSKER_API_KEY}` substitution reads the user environment variable at
   startup.
+- `"attachment": true` and `"modalities": { "input": ["text", "image"] }` enable
+  image attachment support. Without these, OpenCode blocks images client-side
+  with "this model does not support image input" even if the gateway and
+  upstream model fully support vision.
 
 ## 3. Verify
 
