@@ -17,7 +17,7 @@ from typing import Any, Dict, Optional
 import aiohttp
 
 from tusker_gateway.auth_strategies import get_auth_strategy
-from tusker_gateway.config import DEFAULT_PROVIDER_REGISTRY
+from tusker_gateway.config import DEFAULT_PROVIDER_REGISTRY, expand_env_placeholders
 from tusker_gateway.errors import GatewayError
 from tusker_gateway.providers.capabilities import Capability
 from tusker_gateway.sse import split_sse_frame, sse_data_payload
@@ -31,9 +31,19 @@ _IMAGE_CAPABILITY_BY_PATH = {
     "/v1/images/edits": Capability.IMAGE_EDITS,
     "/v1/images/variations": Capability.IMAGE_VARIATIONS,
 }
-_IMAGE_DISPATCH_PROVIDERS = frozenset({"openai", "openrouter", "google", "zai", "minimax", "alibaba"})
+_IMAGE_DISPATCH_PROVIDERS = frozenset({"openai", "openrouter", "google", "zai", "minimax", "alibaba", "workers-ai"})
 _IMAGE_NON_GENERATION_PATHS = frozenset(
     {"/v1/images/edits", "/v1/images/variations"}
+)
+
+# Workers AI text-to-image model families (from the /ai/models/search task
+# list). Anything outside these families is rejected before hitting upstream.
+_WORKERS_AI_IMAGE_FAMILIES = (
+    "@cf/black-forest-labs/",
+    "@cf/stabilityai/",
+    "@cf/lykon/",
+    "@cf/leonardo/",
+    "@cf/runwayml/",
 )
 
 
@@ -274,7 +284,7 @@ class ImageGenerationHandler:
             )
         if pin_provider in {"codex", "openai-codex"}:
             return "openai"
-        if pin_provider in {"openai", "openrouter", "google", "zai", "minimax", "alibaba"}:
+        if pin_provider in {"openai", "openrouter", "google", "zai", "minimax", "alibaba", "workers-ai"}:
             return pin_provider
         if pin_provider is not None:
             raise GatewayError(
@@ -336,6 +346,8 @@ class ImageGenerationHandler:
             return await self._call_minimax(model, path, body, api_key, extra_headers)
         if provider == "alibaba":
             return await self._call_alibaba(model, path, body, api_key, extra_headers)
+        if provider == "workers-ai":
+            return await self._call_workers_ai_image(model, path, body, api_key, extra_headers)
         raise GatewayError(
             f"Provider {provider} does not support image generation",
             code="unsupported_model",
@@ -1098,6 +1110,113 @@ class ImageGenerationHandler:
                 code="upstream_error",
             )
         return {"created": int(time.time()), "data": images}
+
+    @staticmethod
+    def _strip_workers_ai_prefix(model: str) -> str:
+        """Strip a leading 'workers-ai/' or 'workers-ai::' gateway pin."""
+        lower = model.lower()
+        if lower.startswith("workers-ai::"):
+            return model.split("::", 1)[1]
+        if lower.startswith("workers-ai/"):
+            return model.split("/", 1)[1]
+        return model
+
+    def _workers_ai_run_url(self, model: str) -> str:
+        configured = self.config.get("providers", {})
+        provider = configured.get("workers-ai") if isinstance(configured, dict) else None
+        provider = provider or DEFAULT_PROVIDER_REGISTRY["workers-ai"]
+        if isinstance(provider, dict):
+            base_url = provider.get("base_url")
+        else:
+            base_url = expand_env_placeholders(provider.base_url)
+        return f"{str(base_url).rstrip('/')}/run/{model}"
+
+    async def _call_workers_ai_image(
+        self,
+        model: str,
+        path: str,
+        body: Dict[str, Any],
+        api_key: Optional[str],
+        extra_headers: Optional[Dict[str, str]],
+    ) -> Dict[str, Any]:
+        """Call Cloudflare Workers AI /ai/run for text-to-image models.
+
+        Workers AI has no OpenAI-compatible images route; generation goes
+        through ``/ai/run/{model}`` with ``{"prompt": ...}`` and returns
+        ``{"result": {"image": "<base64 JPEG>"}}``, normalized here to the
+        OpenAI ``{"data": [{"b64_json": ...}]}`` shape.
+        """
+        _require_generation_path(path, "Workers AI")
+        if not api_key:
+            raise GatewayError(
+                "Cloudflare API token required for image generation",
+                code="missing_api_key",
+            )
+        upstream_model = self._strip_workers_ai_prefix(model)
+        if not upstream_model.lower().startswith(_WORKERS_AI_IMAGE_FAMILIES):
+            raise GatewayError(
+                f"Workers AI model {upstream_model!r} is not a supported "
+                "text-to-image model",
+                code="unsupported_model",
+            )
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        if extra_headers:
+            headers.update(extra_headers)
+        payload: Dict[str, Any] = {"prompt": body["prompt"]}
+        size = body.get("size")
+        if isinstance(size, str) and "x" in size.lower():
+            width_text, _, height_text = size.lower().partition("x")
+            try:
+                payload["width"] = int(width_text)
+                payload["height"] = int(height_text)
+            except ValueError:
+                pass
+        steps = body.get("steps")
+        if isinstance(steps, int) and not isinstance(steps, bool):
+            payload["steps"] = steps
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                self._workers_ai_run_url(upstream_model),
+                headers=headers,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=120),
+            ) as resp:
+                text = await _read_capped_text(resp)
+                if resp.status >= 400:
+                    logger.warning(
+                        "Workers AI image generation failed: %s %s",
+                        resp.status,
+                        text[:200],
+                    )
+                    raise GatewayError(
+                        f"Workers AI error {resp.status}: {text[:200]}",
+                        code="upstream_error",
+                    )
+                try:
+                    response = json.loads(text)
+                except json.JSONDecodeError as exc:
+                    raise GatewayError(
+                        "Workers AI image generation returned invalid JSON",
+                        code="upstream_error",
+                    ) from exc
+
+        result = response.get("result") if isinstance(response, dict) else None
+        image = result.get("image") if isinstance(result, dict) else None
+        if not isinstance(image, str) or not image:
+            raise GatewayError(
+                "Workers AI image generation returned no image",
+                code="upstream_error",
+            )
+        if len(image.encode("utf-8")) > MAX_IMAGE_RESPONSE_BYTES:
+            raise GatewayError(
+                "Workers AI image generation returned an oversized image",
+                code="upstream_error",
+            )
+        return {"created": int(time.time()), "data": [{"b64_json": image}]}
 
 
 def get_image_generation_handler(

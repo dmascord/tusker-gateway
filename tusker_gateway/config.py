@@ -498,6 +498,7 @@ def _load_pools() -> dict[str, PoolConfig]:
                     "github-copilot-enterprise",
                     "alibaba",
                     "opencode-go",
+                    "workers-ai",
                     "ollama-cloud",
                     "groq",
                     "google",

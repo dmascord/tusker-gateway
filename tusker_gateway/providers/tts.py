@@ -16,7 +16,7 @@ from typing import Any, Dict, Optional
 
 import aiohttp
 
-from tusker_gateway.config import DEFAULT_PROVIDER_REGISTRY
+from tusker_gateway.config import DEFAULT_PROVIDER_REGISTRY, expand_env_placeholders
 from tusker_gateway.errors import GatewayError
 
 logger = logging.getLogger(__name__)
@@ -66,6 +66,8 @@ class TTSHandler:
             return "openrouter"
         if lower.startswith(("groq/", "groq::")):
             return "groq"
+        if lower.startswith(("workers-ai/", "workers-ai::")):
+            return "workers-ai"
         if "::" in model:
             provider, _, _ = model.partition("::")
             if provider.lower() == "openai":
@@ -90,6 +92,8 @@ class TTSHandler:
 
         if lower.startswith(XIAOMI_TTS_MODEL_PREFIX):
             return "xiaomi"
+        if lower.startswith("@cf/"):
+            return "workers-ai"
         if "/" in model:
             return "openrouter"
         return "openai"
@@ -106,6 +110,8 @@ class TTSHandler:
         Raises GatewayError on upstream failure.
         """
         provider = self.get_provider_for_tts_request(model)
+        if provider == "workers-ai":
+            return await self._call_workers_ai(model, body, api_key, extra_headers)
         if provider == "openrouter":
             return await self._call_openrouter(model, body, api_key, extra_headers)
         if provider == "xiaomi":
@@ -379,6 +385,120 @@ class TTSHandler:
             return model.split("/", 1)[1]
         return model
 
+
+    @staticmethod
+    def _strip_workers_ai_prefix(model: str) -> str:
+        """Strip a leading 'workers-ai/' or 'workers-ai::' gateway pin."""
+        lower = model.lower()
+        if lower.startswith("workers-ai::"):
+            return model.split("::", 1)[1]
+        if lower.startswith("workers-ai/"):
+            return model.split("/", 1)[1]
+        return model
+
+    def _workers_ai_run_url(self, model: str) -> str:
+        configured = self.config.get("providers", {})
+        provider = configured.get("workers-ai") if isinstance(configured, dict) else None
+        provider = provider or DEFAULT_PROVIDER_REGISTRY["workers-ai"]
+        if isinstance(provider, dict):
+            base_url = provider.get("base_url")
+        else:
+            base_url = expand_env_placeholders(provider.base_url)
+        return f"{str(base_url).rstrip('/')}/run/{model}"
+
+    async def _call_workers_ai(
+        self,
+        model: str,
+        body: Dict[str, Any],
+        api_key: Optional[str],
+        extra_headers: Optional[Dict[str, str]],
+    ) -> tuple[bytes, str]:
+        """Call Cloudflare Workers AI /ai/run for speech models.
+
+        Two upstream response shapes are handled:
+          - ``@cf/deepgram/aura-*`` returns raw ``audio/mpeg`` bytes.
+          - ``@cf/myshell-ai/melotts`` returns JSON
+            ``{"result": {"audio": "<base64 WAV>"}}`` and only accepts
+            ``prompt`` + ``lang`` (not the OpenAI ``input``/``voice`` fields).
+        There is no OpenAI-compatible /audio/speech route on Workers AI.
+        """
+        if not api_key:
+            raise GatewayError(
+                "Cloudflare API token required for TTS", code="missing_api_key"
+            )
+        upstream_model = self._strip_workers_ai_prefix(model)
+        lower = upstream_model.lower()
+        if lower.startswith("@cf/deepgram/aura"):
+            payload: Dict[str, Any] = {"text": body.get("input", "")}
+        elif lower.startswith("@cf/myshell-ai/melotts"):
+            payload = {"prompt": body.get("input", ""), "lang": body.get("lang", "en")}
+        else:
+            raise GatewayError(
+                f"Workers AI model {upstream_model!r} does not support "
+                "text-to-speech; supported families are @cf/deepgram/aura-* "
+                "and @cf/myshell-ai/melotts",
+                code="unsupported_model",
+            )
+        if not payload.get("text") and not payload.get("prompt"):
+            raise GatewayError(
+                "TTS request missing required 'input'", code="bad_request"
+            )
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        if extra_headers:
+            headers.update(extra_headers)
+        timeout = aiohttp.ClientTimeout(total=120)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                self._workers_ai_run_url(upstream_model),
+                headers=headers,
+                json=payload,
+            ) as resp:
+                content_type = resp.headers.get("Content-Type", "")
+                if resp.status >= 400:
+                    err_text = (await resp.text())[:500]
+                    logger.warning(
+                        "Workers AI TTS failed: %s %s", resp.status, err_text
+                    )
+                    raise GatewayError(
+                        f"Workers AI TTS error {resp.status}: {err_text}",
+                        code="upstream_error",
+                    )
+                if content_type.startswith("audio/"):
+                    audio = await resp.read()
+                    if len(audio) > MAX_TTS_AUDIO_BYTES:
+                        raise GatewayError(
+                            "Workers AI TTS audio exceeds the gateway size limit",
+                            code="upstream_error",
+                        )
+                    return audio, content_type
+                raw = await resp.read()
+        if len(raw) > MAX_XIAOMI_RESPONSE_BYTES:
+            raise GatewayError(
+                "Workers AI TTS response exceeds the gateway size limit",
+                code="upstream_error",
+            )
+        try:
+            result = json.loads(raw)
+            encoded = result["result"]["audio"]
+            if not isinstance(encoded, str) or not encoded:
+                raise KeyError("result.audio")
+            audio = base64.b64decode(encoded, validate=True)
+        except GatewayError:
+            raise
+        except (KeyError, IndexError, TypeError, json.JSONDecodeError, binascii.Error) as exc:
+            raise GatewayError(
+                "Workers AI TTS returned an invalid audio response",
+                code="upstream_error",
+            ) from exc
+        if len(audio) > MAX_TTS_AUDIO_BYTES:
+            raise GatewayError(
+                "Workers AI TTS audio exceeds the gateway size limit",
+                code="upstream_error",
+            )
+        return audio, "audio/wav"
 
     @staticmethod
     def _normalise_request(model: str, body: Dict[str, Any]) -> Dict[str, Any]:

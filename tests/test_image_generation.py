@@ -982,3 +982,102 @@ async def test_alibaba_rejects_missing_key_and_unsupported_edit():
             None,
         )
     assert edit.value.code == "unsupported_endpoint"
+
+
+def test_get_provider_for_image_request_workers_ai_pin():
+    h = ImageGenerationHandler({})
+    assert (
+        h.get_provider_for_image_request(
+            "workers-ai/@cf/black-forest-labs/flux-1-schnell",
+            "/v1/images/generations",
+        )
+        == "workers-ai"
+    )
+
+
+@pytest.mark.asyncio
+async def test_workers_ai_image_posts_run_and_normalizes_base64():
+    captured: dict = {}
+
+    class FakeResponse:
+        status = 200
+        headers = {}
+
+        async def read(self):
+            return json.dumps(
+                {"result": {"image": "BASE64JPEG"}}
+            ).encode()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class FakeSession:
+        def post(self, url, headers=None, json=None, timeout=None):
+            captured["url"] = url
+            captured["headers"] = headers
+            captured["body"] = json
+            return FakeResponse()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    config = {"providers": {"workers-ai": DEFAULT_PROVIDER_REGISTRY["workers-ai"]}}
+    h = ImageGenerationHandler(config)
+    with patch(
+        "tusker_gateway.providers.image_generation.aiohttp.ClientSession",
+        return_value=FakeSession(),
+    ):
+        result = await h.handle_request(
+            model="workers-ai/@cf/black-forest-labs/flux-1-schnell",
+            path="/v1/images/generations",
+            body={"model": "flux-1-schnell", "prompt": "A red circle"},
+            api_key="cf-token",
+        )
+
+    assert captured["url"].endswith("/ai/run/@cf/black-forest-labs/flux-1-schnell")
+    assert captured["headers"]["Authorization"] == "Bearer cf-token"
+    assert captured["body"] == {"prompt": "A red circle"}
+    assert result["data"] == [{"b64_json": "BASE64JPEG"}]
+    assert isinstance(result["created"], int)
+
+
+@pytest.mark.asyncio
+async def test_workers_ai_image_rejects_missing_key_and_bad_model():
+    h = ImageGenerationHandler(
+        {"providers": {"workers-ai": DEFAULT_PROVIDER_REGISTRY["workers-ai"]}}
+    )
+    with pytest.raises(GatewayError) as missing:
+        await h._call_workers_ai_image(
+            "@cf/black-forest-labs/flux-1-schnell",
+            "/v1/images/generations",
+            {"prompt": "x"},
+            None,
+            None,
+        )
+    assert missing.value.code == "missing_api_key"
+
+    with pytest.raises(GatewayError) as edit:
+        await h._call_workers_ai_image(
+            "@cf/black-forest-labs/flux-1-schnell",
+            "/v1/images/edits",
+            {"prompt": "x"},
+            "cf-token",
+            None,
+        )
+    assert edit.value.code == "unsupported_endpoint"
+
+    with pytest.raises(GatewayError) as not_image:
+        await h._call_workers_ai_image(
+            "@cf/openai/whisper",
+            "/v1/images/generations",
+            {"prompt": "x"},
+            "cf-token",
+            None,
+        )
+    assert not_image.value.code == "unsupported_model"

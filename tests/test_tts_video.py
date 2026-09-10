@@ -909,3 +909,92 @@ async def test_video_minimax_poll_upstream_failure_is_not_masked():
             )
     assert ei.value.code == "upstream_error"
     assert "poll 401" in str(ei.value)
+
+
+@pytest.mark.asyncio
+async def test_tts_dispatches_workers_ai_models_and_pins():
+    h = TTSHandler({})
+    assert h.get_provider_for_tts_request("workers-ai/@cf/deepgram/aura-1") == "workers-ai"
+    assert h.get_provider_for_tts_request("workers-ai::@cf/myshell-ai/melotts") == "workers-ai"
+    assert h.get_provider_for_tts_request("@cf/deepgram/aura-2-en") == "workers-ai"
+
+
+@pytest.mark.asyncio
+async def test_tts_workers_ai_aura_returns_binary_audio():
+    captured: dict = {}
+
+    class _CapturingSession(_FakeSession):
+        def post(self, url, headers=None, json=None, **kw):
+            captured["url"] = url
+            captured["json"] = json
+            return self._responses.pop(0)
+
+    h = TTSHandler({})
+    audio = _mp3_bytes()
+    session = _CapturingSession().add(
+        _FakeResp(status=200, body=audio, headers={"Content-Type": "audio/mpeg"})
+    )
+    with patch("aiohttp.ClientSession", lambda *a, **kw: session):
+        out, content_type = await h._call_workers_ai(
+            model="workers-ai/@cf/deepgram/aura-1",
+            body={"input": "hello"},
+            api_key="cf-token",
+            extra_headers=None,
+        )
+    assert out == audio
+    assert content_type == "audio/mpeg"
+    assert captured["url"].endswith("/ai/run/@cf/deepgram/aura-1")
+    assert captured["json"] == {"text": "hello"}
+
+
+@pytest.mark.asyncio
+async def test_tts_workers_ai_melotts_decodes_base64_wav():
+    captured: dict = {}
+
+    class _CapturingSession(_FakeSession):
+        def post(self, url, headers=None, json=None, **kw):
+            captured["url"] = url
+            captured["json"] = json
+            return self._responses.pop(0)
+
+    h = TTSHandler({})
+    wav = b"RIFF" + b"\x00" * 32
+    session = _CapturingSession().add(
+        _FakeResp(
+            status=200,
+            body=json.dumps({"result": {"audio": base64.b64encode(wav).decode()}}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+    )
+    with patch("aiohttp.ClientSession", lambda *a, **kw: session):
+        out, content_type = await h._call_workers_ai(
+            model="@cf/myshell-ai/melotts",
+            body={"input": "hello"},
+            api_key="cf-token",
+            extra_headers=None,
+        )
+    assert out == wav
+    assert content_type == "audio/wav"
+    assert captured["json"] == {"prompt": "hello", "lang": "en"}
+
+
+@pytest.mark.asyncio
+async def test_tts_workers_ai_rejects_non_speech_model_and_missing_key():
+    h = TTSHandler({})
+    with pytest.raises(GatewayError) as ei:
+        await h._call_workers_ai(
+            model="@cf/openai/whisper",
+            body={"input": "hello"},
+            api_key="cf-token",
+            extra_headers=None,
+        )
+    assert ei.value.code == "unsupported_model"
+
+    with pytest.raises(GatewayError) as ei:
+        await h._call_workers_ai(
+            model="@cf/deepgram/aura-1",
+            body={"input": "hello"},
+            api_key=None,
+            extra_headers=None,
+        )
+    assert ei.value.code == "missing_api_key"
