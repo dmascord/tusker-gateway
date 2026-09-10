@@ -119,11 +119,19 @@ def _section_counts(store: ConfigStore, config: dict, *, dry_run: bool) -> list[
                 continue
             if not dry_run:
                 with store._conn as conn:
-                    conn.execute(
-                        "INSERT OR IGNORE INTO tusker_config_oauth_credentials "
-                        "(provider, credentials) VALUES (?, ?)",
-                        (name.lower(), store._encrypt(conn, json.dumps(list(creds)))),
-                    )
+                    if store._db_connect().is_postgres:
+                        conn.execute(
+                            "INSERT INTO tusker_config_oauth_credentials "
+                            "(provider, credentials) VALUES (?, ?) "
+                            "ON CONFLICT (provider) DO NOTHING",
+                            (name.lower(), store._encrypt(conn, json.dumps(list(creds)))),
+                        )
+                    else:
+                        conn.execute(
+                            "INSERT OR IGNORE INTO tusker_config_oauth_credentials "
+                            "(provider, credentials) VALUES (?, ?)",
+                            (name.lower(), store._encrypt(conn, json.dumps(list(creds)))),
+                        )
                     conn.execute(
                         "UPDATE tusker_config_meta SET generation = generation + 1, "
                         "updated_at = CURRENT_TIMESTAMP WHERE id = 1"

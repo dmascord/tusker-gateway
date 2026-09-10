@@ -226,6 +226,9 @@ def _build_canary_deployment(live: dict[str, Any], image_with_digest: str) -> di
             },
         }
     )
+    # The whole point of the canary: activate the DB-backed config store.
+    canary_env.append({"name": "TUSKER_CONFIG_DATABASE_ENABLED", "value": "1"})
+
 
     # Single flag gates canary behavior: disables autonomous OAuth refresh
     # rotation, marks pod as canary for config store activation/logging.
@@ -283,9 +286,9 @@ def _build_canary_deployment(live: dict[str, Any], image_with_digest: str) -> di
                 "app": CANARY_LABEL,
                 "tusker.gateway.io/canary": "true",
                 "tusker.gateway.io/source-deployment": PROD_DEPLOYMENT,
-                "tusker.gateway.io/rendered-at": _now(),
             },
             "annotations": {
+                "tusker.gateway.io/rendered-at": _now(),
                 "tusker.gateway.io/image-digest": image_with_digest.rsplit("@", 1)[-1]
                 if "@" in image_with_digest
                 else "",
@@ -385,16 +388,16 @@ def _image_with_digest(live: dict[str, Any], digest: str) -> str:
     """Return a fully qualified image reference using the live registry/name."""
     if not digest:
         raise ValueError("--image-digest is required")
-    if ":" in digest and "@" not in digest:
-        # digest is a tag; accept it, but warn it is not immutable.
+    if "@" in digest:
+        # Already a full digest reference (name@sha256:...); accept as-is.
         return digest
-    live_image = live["spec"]["template"]["spec"]["containers"][0].get("image", "")
-    base = live_image.rsplit(":", 1)[0]
-    if "@" in base:
-        base = base.split("@")[0]
-    if digest.startswith("sha256:"):
+    import re as _re
+    if _re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+        live_image = live["spec"]["template"]["spec"]["containers"][0].get("image", "")
+        base = live_image.rsplit("@", 1)[0].rsplit(":", 1)[0]
         return f"{base}@{digest}"
-    return f"{base}:{digest}"
+    # A bare tag; accept it, but warn it is not immutable.
+    return digest
 
 
 def cmd_render(args: argparse.Namespace) -> int:
@@ -560,3 +563,33 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
     print("These are printed only; use --execute on provision to create, and")
     print("run the SQL above manually to drop.")
     return 0
+
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    render = sub.add_parser("render", help="Render canary Deployment+Service+NetworkPolicy YAML")
+    render.add_argument("--image-digest", required=True,
+                        help="sha256:... digest of the pushed canary image")
+    render.set_defaults(func=cmd_render)
+
+    for name, help_text in (
+        ("provision", "Create the canary PG role/database/pgcrypto extension"),
+        ("seed", "Print the canary DB seeding procedure"),
+        ("smoke", "pgcrypto roundtrip + HTTP health check"),
+        ("cleanup", "Print the teardown commands"),
+    ):
+        p = sub.add_parser(name, help=help_text)
+        p.add_argument("--pod", default=None, help="target pod name (provision/smoke)")
+        p.add_argument("--execute", action="store_true",
+                       help="execute instead of printing the plan")
+        p.set_defaults(func=globals()[f"cmd_{name}"])
+
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
