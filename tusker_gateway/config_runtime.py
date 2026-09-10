@@ -51,6 +51,7 @@ class ConfigRuntime:
         self._initial_refresh_tokens: frozenset[str] | None = None
         self._task: asyncio.Task[None] | None = None
         self._stop_event: asyncio.Event | None = None
+        self._last_media_providers: frozenset | None = None
     async def apply_reload(self) -> bool:
         """Reload the store now and apply any generation change. Admin hook."""
         if not self.reload_now():
@@ -105,6 +106,28 @@ class ConfigRuntime:
             if self._last_good_identity is not None:
                 return self._last_good_identity
             return fallback
+
+    def _rebuild_identity_store(self) -> None:
+        """Refresh ``app[\"identity_store\"]`` from the live DB-backed
+        ``IdentityConfig``.  The auth middleware resolves identity on every
+        request so the replacement takes effect immediately.
+        """
+        store = self._store()
+        if store is None:
+            return
+        fallback_cfg = (
+            self._app.get("identity_store").config
+            if self._app.get("identity_store") is not None
+            else load_identity_config_from_env()
+        )
+        new_cfg = store.identity_config(fallback_cfg)
+        new_store = IdentityStore(new_cfg)
+        self._app["identity_store"] = new_store
+        logger.debug(
+            "identity store refreshed: %d identities",
+            len(new_cfg.identities),
+        )
+
 
     def reload_now(self) -> bool:
         """Trigger an immediate store reload. Returns True on success."""
@@ -205,7 +228,7 @@ class ConfigRuntime:
         self._rebuild_rotators()
         self._rebuild_catalog()
         self._rebuild_capabilities(generation)
-        self._rebuild_identity()
+        self._rebuild_identity_store()
         try:
             from tusker_gateway.rtk import set_enabled as rtk_set_enabled
             rtk_set_enabled(bool(self._app.get("rtk_enabled", False)))
