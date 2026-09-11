@@ -57,6 +57,77 @@ def test_public_provider_quota_failure_has_safe_machine_signal():
     assert response.headers["X-Tusker-Provider-Failure"] == "provider_quota"
 
 
+def test_public_provider_non_capacity_failure_does_not_leak_upstream_body():
+    """Schema errors, quota messages, and stack traces must never reach the
+    connected client. The full detail is logged server-side; the public
+    response carries a stable error code and a generic message.
+    """
+    secret_upstream_body = (
+        '{"errors":[{"message":"AiError: you have used up your daily free '
+        "allocation of 10,000 neurons, please upgrade to Cloudflare's Workers "
+        "Paid plan (b0d9b4cc-2ae3-43df-aef7-3b6916c2d322)\",\"code\":4006}],"
+        "\"success\":false,\"result\":{},\"messages\":[]}"
+    )
+    exc = ProviderError(message="upstream chat failed")
+    exc.upstream_body = secret_upstream_body
+    response = _public_provider_failure_response(exc)
+    assert response.status == 502
+    body = response.body.decode("utf-8")
+    assert "neurons" not in body
+    assert "Cloudflare" not in body
+    assert "upgrade" not in body
+    assert secret_upstream_body[:20] not in body
+    payload = json.loads(body)
+    assert payload["error"]["code"] == "provider_error"
+    assert "request_id" in payload["error"]["message"]
+    assert "X-Tusker-Provider-Failure" not in response.headers
+
+
+def test_public_provider_schema_error_does_not_leak_validation_details():
+    """Schema mismatch details from the upstream (oneOf, required-property
+    errors) expose the provider's internal API surface and must be redacted.
+    """
+    secret_schema_error = (
+        'oneOf at "/" not met. 0 matches: required properties at "/" are "prompt"'
+    )
+    exc = ProviderError(message="upstream chat failed")
+    exc.upstream_body = secret_schema_error
+    response = _public_provider_failure_response(exc)
+    assert response.status == 502
+    body = response.body.decode("utf-8")
+    assert "oneOf" not in body
+    assert "required properties" not in body
+    assert '"prompt"' not in body
+    payload = json.loads(body)
+    assert payload["error"]["code"] == "provider_error"
+    assert secret_schema_error not in body
+
+
+def test_public_provider_quota_failure_does_not_leak_account_metric():
+    """Account-quota exhaustion bodies reveal the configured account's
+    private metric paths (free_tier_requests, etc.) and must be redacted.
+    The header ``X-Tusker-Provider-Failure: provider_quota`` is the safe
+    signal the caller can switch on.
+    """
+    secret_quota_body = (
+        "Quota exceeded for metric "
+        "generativelanguage.googleapis.com/generate_content_free_tier_requests, "
+        "limit: 0"
+    )
+    response = _public_provider_failure_response(
+        RateLimitError(body=secret_quota_body)
+    )
+    assert response.status == 502
+    assert response.headers["X-Tusker-Provider-Failure"] == "provider_quota"
+    body = response.body.decode("utf-8")
+    assert "generativelanguage" not in body
+    assert "free_tier_requests" not in body
+    assert secret_quota_body not in body
+    payload = json.loads(body)
+    assert payload["error"]["code"] == "provider_error"
+    assert "quota" in payload["error"]["message"].lower()
+
+
 @pytest.mark.asyncio
 async def test_disabled_passthrough_provider_fails_before_upstream_call():
     upstream = MagicMock()

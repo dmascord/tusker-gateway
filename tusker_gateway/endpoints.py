@@ -50,6 +50,7 @@ from tusker_gateway.passthrough import (
     _sanitize_opencode_session_id,
     _stable_opencode_session_id,
 )
+from tusker_gateway.max_tokens import apply_max_tokens_floor
 from tusker_gateway.pools import PoolManager
 from tusker_gateway.provider_usage import is_capacity_error
 from tusker_gateway.quality import QualityDB
@@ -2266,7 +2267,14 @@ def _is_capacity_failure(exc: BaseException | None) -> bool:
 
 
 def _public_provider_failure_response(exc: BaseException) -> web.Response:
-    """Hide provider capacity details without changing other error semantics."""
+    """Hide provider error details without changing other error semantics.
+
+    Raw upstream error bodies (schema mismatches, quota messages, internal
+    stack traces) must never reach the connected client. The full detail is
+    already persisted to the structured access log via ``logger.warning``
+    in the caller; here we only return a generic message plus a stable
+    error code the caller can switch on.
+    """
     if not _is_capacity_failure(exc):
         upstream_body = (
             getattr(exc, "body", None)
@@ -2279,8 +2287,22 @@ def _public_provider_failure_response(exc: BaseException) -> web.Response:
             # Keep the public error body generic while exposing a safe,
             # machine-readable signal to the maintenance qualification path.
             headers["X-Tusker-Provider-Failure"] = "provider_quota"
+            public_message = (
+                "Upstream provider quota exhausted; retry after the upstream "
+                "quota window resets."
+            )
+        else:
+            public_message = (
+                "Upstream provider request failed; the gateway could not find a "
+                "healthy candidate. Retry shortly or contact the gateway "
+                "operator with the request_id for triage."
+            )
         return web.json_response(
-            openai_error(str(exc), code="provider_error", error_type="provider_error"),
+            openai_error(
+                public_message,
+                code="provider_error",
+                error_type="provider_error",
+            ),
             status=502,
             headers=headers,
         )
@@ -2407,7 +2429,7 @@ async def _call_with_pool_fallback(
                     stream=bool(body.get("stream")),
                     tools=tools,
                     tool_choice=body.get("tool_choice"),
-                    extra_body=extra_body or None,
+                    extra_body=apply_max_tokens_floor(extra_body, provider, model),
                     conversation_id=conversation_id,
                     metrics_registry=metrics_registry,
                 )
@@ -2645,7 +2667,7 @@ async def _call_with_pool_fallback(
                     stream=bool(body.get("stream")),
                     tools=tools,
                     tool_choice=body.get("tool_choice"),
-                    extra_body=extra_body or None,
+                    extra_body=apply_max_tokens_floor(extra_body, provider, model),
                     conversation_id=conversation_id,
                     metrics_registry=metrics_registry,
                 )
@@ -4954,7 +4976,12 @@ async def images_handler(request: web.Request) -> web.Response:
     except Exception as exc:
         logger.exception("Unexpected image generation failure")
         return web.json_response(
-            openai_error(str(exc), code="image_generation_error", error_type="provider_error"),
+            openai_error(
+                "Upstream image generation failed; retry shortly or contact "
+                "the gateway operator with the request_id for triage.",
+                code="image_generation_error",
+                error_type="provider_error",
+            ),
             status=502,
         )
 
@@ -4969,7 +4996,6 @@ async def tts_handler(request: web.Request) -> web.Response:
         blocked = await _media_preflight(request, body, budget_units=budget_units)
         if blocked is not None:
             return blocked
-        model = body.get("model", "tts-1")
         tts = request.app.get("tts_handler")
         if tts is None:
             return web.json_response(
@@ -4977,6 +5003,7 @@ async def tts_handler(request: web.Request) -> web.Response:
                 status=503,
             )
         config = request.app["config"]
+        model = body.get("model", "tts-1")
         provider_keys = config.get("provider_api_keys", {})
         provider = tts.get_provider_for_tts_request(model)
         set_access_log_context(
@@ -5006,7 +5033,12 @@ async def tts_handler(request: web.Request) -> web.Response:
     except Exception as exc:
         logger.warning("TTS request failed: %s", exc)
         return web.json_response(
-            openai_error(str(exc), code="tts_error", error_type="provider_error"),
+            openai_error(
+                "Upstream text-to-speech failed; retry shortly or contact the "
+                "gateway operator with the request_id for triage.",
+                code="tts_error",
+                error_type="provider_error",
+            ),
             status=502,
         )
 
@@ -5066,7 +5098,12 @@ async def video_handler(request: web.Request) -> web.Response:
     except Exception as exc:
         logger.exception("Unexpected video request failure")
         return web.json_response(
-            openai_error(str(exc), code="video_error", error_type="provider_error"),
+            openai_error(
+                "Upstream video generation failed; retry shortly or contact "
+                "the gateway operator with the request_id for triage.",
+                code="video_error",
+                error_type="provider_error",
+            ),
             status=502,
         )
 
