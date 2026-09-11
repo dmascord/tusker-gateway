@@ -1975,8 +1975,10 @@ class PassthroughClient:
         url = f"{endpoint_raw['base_url']}{endpoint_raw['chat_path']}"
         # DEBUG: log the exact request
         logger.error(
-            "DBG_CODEX_REQ url=%s headers_keys=%s auth_token_prefix=%s body_keys=%s body=%s",
+            "DBG_CODEX_REQ url=%s auth_type=%s endpoint_raw_keys=%s headers_keys=%s auth_token_prefix=%s body_keys=%s body=%s",
             url,
+            auth_type,
+            list(endpoint_raw.keys()),
             list(headers.keys()),
             headers.get("Authorization", "")[:30],
             list(body.keys()),
