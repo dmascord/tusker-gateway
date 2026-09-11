@@ -129,3 +129,45 @@ def test_config_store_db_substitutes_models_path(monkeypatch):
         assert provider["models_path"] == "/2024-01/models"
     finally:
         os.unlink(dbfile)
+
+def test_config_store_db_infers_kind_for_oauth_providers(monkeypatch):
+    """DB-loaded OAuth/Codex providers must NOT be tagged as bearer.
+    
+    Regression: previously the config store hardcoded ``kind="bearer"`` for every
+    DB-loaded provider, which caused ``_split_unkeyed`` to drop OAuth/Codex
+    models from pools because their rotator-issued tokens aren't in
+    ``provider_api_keys``.
+    """
+    dbfile = tempfile.NamedTemporaryFile(suffix=".db", delete=False).name
+    os.unlink(dbfile)
+    try:
+        store = ConfigStore(
+            database=dbfile,
+            fallback_config={},
+            fallback_identity_config=IdentityConfig(),
+        )
+        store.upsert_provider({
+            "name": "openai-codex",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "chat_path": "/responses",
+            "pool_env": "opencode_codex_credentials",
+        })
+        store.upsert_provider({
+            "name": "github-copilot",
+            "base_url": "https://api.githubcopilot.com",
+            "chat_path": "/chat/completions",
+            "pool_env": "GITHUB_COPILOT_CREDENTIALS",
+        })
+        store.upsert_provider({
+            "name": "cerebras",
+            "base_url": "https://api.cerebras.ai",
+            "chat_path": "/v1/chat/completions",
+            "auth_env": "CEREBRAS_API_KEY",
+        })
+        runtime = store.runtime_config({})
+        assert runtime["providers"]["openai-codex"].kind == "codex"
+        assert runtime["providers"]["github-copilot"].kind == "oauth"
+        assert runtime["providers"]["cerebras"].kind == "bearer"
+    finally:
+        os.unlink(dbfile)
+ 

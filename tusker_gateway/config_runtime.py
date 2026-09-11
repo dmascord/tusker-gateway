@@ -437,12 +437,21 @@ class ConfigRuntime:
 
 
     def _wire_catalog_api_keys(self, registry: Any, config: dict[str, Any]) -> None:
-        """Mirror of app._wire_catalog_api_keys without duplicating its internals."""
-        for provider, key in (config.get("provider_api_keys") or {}).items():
-            if key:
-                client = registry._clients.get(provider)
-                if client is not None:
-                    client._api_key = key
+        """Wire API keys + OAuth token sources into catalog clients.
+
+        Mirrors ``app._wire_catalog_api_keys`` so config reloads don't drop the
+        OAuth token sources for Codex/Copilot (which would leave ``_api_key``
+        and ``_token_source`` both None and cause subsequent catalog refreshes
+        to return HTTP 401 with ``auth=none``).
+        """
+        from tusker_gateway.app import _wire_catalog_api_keys
+        _wire_catalog_api_keys(
+            registry,
+            config.get("provider_api_keys", {}),
+            codex_rotator=self._app.get("codex_rotator"),
+            credential_rotators=self._app.get("credential_rotators"),
+            provider_registry=config.get("providers"),
+        )
 
     # -- poll loop --------------------------------------------------------
 

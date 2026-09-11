@@ -202,9 +202,20 @@ class ConfigStore:
                         aliases = json.loads(model_aliases_raw)
                     except Exception:
                         pass
+                # Infer auth kind: providers with a ``pool_env`` use credential
+                # rotation (oauth/codex), so they must not be treated as bearer.
+                # Only providers that carry a static ``auth_env`` are bearer-kind.
+                # Unknown providers default to ``bearer`` for back-compat with the
+                # legacy DEFAULT_PROVIDER_REGISTRY shape.
+                if pool_env:
+                    kind = "codex" if str(pool_env).startswith("opencode_codex") else "oauth"
+                elif auth_env:
+                    kind = "bearer"
+                else:
+                    kind = "bearer"
                 providers[str(name).lower()] = ProviderConfig(
                     name=str(name).lower(),
-                    kind="bearer",
+                    kind=kind,
                     base_url=expand_env_placeholders(str(base_url or "")) or str(base_url or ""),
                     chat_path=expand_env_placeholders(str(chat_path or "/v1/chat/completions")) or str(chat_path or "/v1/chat/completions"),
                     auth_env=str(auth_env) if auth_env else None,
