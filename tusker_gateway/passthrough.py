@@ -1973,17 +1973,7 @@ class PassthroughClient:
                         reasoning["effort"]
                     )
         url = f"{endpoint_raw['base_url']}{endpoint_raw['chat_path']}"
-        # DEBUG: log the exact request
-        logger.error(
-            "DBG_CODEX_REQ url=%s auth_type=%s endpoint_raw_keys=%s headers_keys=%s auth_token_prefix=%s body_keys=%s body=%s",
-            url,
-            auth_type,
-            list(endpoint_raw.keys()),
-            list(headers.keys()),
-            headers.get("Authorization", "")[:30],
-            list(body.keys()),
-            str(body)[:500],
-        )
+        start = time.monotonic()
         resp = await self._http.request("POST", url, headers=headers, json=body, timeout=aiohttp.ClientTimeout(total=120))
         try:
             await self._check_response(resp, provider=provider, model=model)

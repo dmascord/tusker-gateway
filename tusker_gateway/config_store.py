@@ -216,6 +216,7 @@ class ConfigStore:
                 providers[str(name).lower()] = ProviderConfig(
                     name=str(name).lower(),
                     kind=kind,
+                    auth_type=kind,
                     base_url=expand_env_placeholders(str(base_url or "")) or str(base_url or ""),
                     chat_path=expand_env_placeholders(str(chat_path or "/v1/chat/completions")) or str(chat_path or "/v1/chat/completions"),
                     auth_env=str(auth_env) if auth_env else None,
