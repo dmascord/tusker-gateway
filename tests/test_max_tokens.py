@@ -1,4 +1,5 @@
 """Unit tests for tusker_gateway.max_tokens reasoning floor."""
+
 from __future__ import annotations
 
 from tusker_gateway.max_tokens import (
@@ -36,6 +37,15 @@ class TestIsReasoningModel:
     def test_google_gemini_25_is_reasoning(self):
         assert is_reasoning_model("gemini-2.5-pro")
         assert is_reasoning_model("gemini-2.5-flash")
+
+    def test_minimax_is_reasoning(self):
+        # All current MiniMax M-series models emit inline <think> blocks
+        # and need the floor.
+        assert is_reasoning_model("MiniMax-M3")
+        assert is_reasoning_model("MiniMax-M2.7")
+        assert is_reasoning_model("MiniMax-M2.7-highspeed")
+        assert is_reasoning_model("minimax-m3")
+        assert is_reasoning_model("MiniMax.M3")
 
     def test_non_reasoning_models(self):
         assert not is_reasoning_model("gpt-4o")

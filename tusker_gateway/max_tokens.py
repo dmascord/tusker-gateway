@@ -11,6 +11,7 @@ is below the floor, the gateway raises it to the floor before forwarding
 the request upstream.  The floor is only applied to models whose slug
 matches a known reasoning pattern.
 """
+
 from __future__ import annotations
 
 import os
@@ -25,19 +26,23 @@ from typing import Any
 # Slug substrings (case-insensitive) that identify reasoning / thinking models.
 _REASONING_SLUGS: tuple[str, ...] = (
     # Qwen family (MLX-native and upstream)
-    "qwen3",           # Qwen3-8B, Qwen3-Coder-30B, etc.
-    "qwopus",          # MLX-Qwopus3.5-* family (all reasoning)
+    "qwen3",  # Qwen3-8B, Qwen3-Coder-30B, etc.
+    "qwopus",  # MLX-Qwopus3.5-* family (all reasoning)
     # OpenAI reasoning line
-    "o1-",             # o1, o1-preview, o1-mini
-    "o3-",             # o3, o3-mini
-    "o4-",             # o4-mini
+    "o1-",  # o1, o1-preview, o1-mini
+    "o3-",  # o3, o3-mini
+    "o4-",  # o4-mini
     # DeepSeek
     "deepseek-r1",
-    "-r1",             # catch-all for R1 variants
+    "-r1",  # catch-all for R1 variants
     # Anthropic (extended thinking by default)
     "claude-opus",
     # Google (thinking models)
     "gemini-2.5",
+    # MiniMax — all current M-series models emit inline <think> blocks before
+    # the visible answer; without a floor the thinking budget eats the
+    # response budget.
+    "minimax",
 )
 
 _REASONING_RE = re.compile(
@@ -55,9 +60,7 @@ _REASONING_RE = re.compile(
 # accommodates short-to-medium reasoning chains without being wasteful.
 # Environment-variable override (TUSKER_REASONING_MAX_TOKENS_FLOOR) lets
 # operators tune this without a code change.
-REASONING_FLOOR: int = int(
-    os.environ.get("TUSKER_REASONING_MAX_TOKENS_FLOOR", "2000")
-)
+REASONING_FLOOR: int = int(os.environ.get("TUSKER_REASONING_MAX_TOKENS_FLOOR", "2000"))
 
 # Non-reasoning models use no floor (value 0 = no enforcement).
 # Upstream providers handle their own defaults when max_tokens is absent.
@@ -67,6 +70,7 @@ DEFAULT_FLOOR: int = 0
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 def is_reasoning_model(model: str) -> bool:
     """Return *True* when *model* matches a known reasoning model slug."""
@@ -118,6 +122,7 @@ def apply_max_tokens_floor(
     bumped = dict(extra_body)
     bumped["max_tokens"] = floor
     import logging
+
     logging.getLogger(__name__).info(
         "max_tokens floor: %s/%s %s → %d (reasoning model floor)",
         provider,

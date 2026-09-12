@@ -4,6 +4,7 @@ The gateway's public contract is OpenAI chat-completions tool calls. Provider
 adapters may use native Anthropic blocks or emit XML/DSML in assistant text;
 this module converts those representations without executing tools.
 """
+
 from __future__ import annotations
 
 import json
@@ -63,6 +64,41 @@ _ID_SUFFIXED_TOOL_RE = re.compile(
 )
 _AUXILIARY_TEXT_FIELDS = ("reasoning_content", "reasoning", "thinking", "analysis")
 
+# Inline `` markers used by some reasoning providers (DeepSeek R1, GLM
+# Air, MiniMax M-series) that emit their chain-of-thought inline with the
+# visible answer rather than in a separate `reasoning_content` field.
+# ``/`` blocks may appear multiple times; we strip every occurrence
+# and move the joined text into `reasoning_content` so OpenAI-compatible
+# clients that key off reasoning_content see a uniform shape.
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+
+def _split_think_blocks(content: str) -> tuple[str, str | None]:
+    """Return ``(visible, reasoning)`` from an assistant ``content`` string.
+
+    * If no `` marker is present the original content is returned
+      unchanged and ``reasoning`` is ``None``.
+    * Otherwise ``reasoning`` is the concatenation (double-newline separated)
+      of every `` inner payload, and ``visible`` is the surrounding
+      text with the blocks removed and trimmed.
+    """
+    if not content:
+        return content, None
+    matches = list(_THINK_BLOCK_RE.finditer(content))
+    if not matches:
+        return content, None
+    reasoning_parts = []
+    for match in matches:
+        inner = match.group(0)
+        # Strip the wrapper tags. We deliberately slice on the matched span
+        # rather than re-running the regex, so the inner text is preserved
+        # verbatim including internal whitespace and newlines.
+        body = inner[len("<think>") : -len("</think>")]
+        reasoning_parts.append(body)
+    visible = _THINK_BLOCK_RE.sub("", content).strip()
+    return visible, "\n\n".join(reasoning_parts)
+
+
 # Tool arguments are part of each tool's public schema. Do not silently rename
 # fields here: a heuristic rewrite can turn a valid call into an invalid one
 # before the client-side tool validator sees it.
@@ -71,7 +107,10 @@ _AUXILIARY_TEXT_FIELDS = ("reasoning_content", "reasoning", "thinking", "analysi
 def tool_diagnostics_enabled() -> bool:
     """Return whether safe tool-markup diagnostics are enabled."""
     return os.environ.get("TUSKER_TOOL_DIAGNOSTICS", "0").strip().lower() in {
-        "1", "true", "yes", "on",
+        "1",
+        "true",
+        "yes",
+        "on",
     }
 
 
@@ -134,14 +173,16 @@ def _openai_content_to_anthropic(content: Any) -> str | list[dict[str, Any]]:
             )
         data_match = _ANTHROPIC_IMAGE_DATA_URL_RE.fullmatch(url)
         if data_match:
-            blocks.append({
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": data_match.group(1),
-                    "data": data_match.group(2),
-                },
-            })
+            blocks.append(
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": data_match.group(1),
+                        "data": data_match.group(2),
+                    },
+                }
+            )
         elif url.startswith("https://"):
             blocks.append({"type": "image", "source": {"type": "url", "url": url}})
         else:
@@ -189,10 +230,12 @@ def normalize_tools(tools: Any) -> list[dict[str, Any]]:
         # three-field shape.
         if "strict" in fn:
             normalized_function["strict"] = fn["strict"]
-        result.append({
-            "type": "function",
-            "function": normalized_function,
-        })
+        result.append(
+            {
+                "type": "function",
+                "function": normalized_function,
+            }
+        )
     return result
 
 
@@ -232,11 +275,13 @@ def normalize_tool_calls(raw: Any) -> list[dict[str, Any]]:
         # function in separate streamed blocks, causing clients to concatenate
         # two independent argument objects into one malformed call.
         call_id = str(call_id or f"call_{secrets.token_hex(12)}")
-        calls.append({
-            "id": call_id,
-            "type": "function",
-            "function": {"name": name, "arguments": _json_args(args)},
-        })
+        calls.append(
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {"name": name, "arguments": _json_args(args)},
+            }
+        )
     return calls
 
 
@@ -270,11 +315,18 @@ def openai_messages_to_anthropic(messages: list[dict[str, Any]]) -> list[dict[st
                     tool_content = json.dumps(tool_content, ensure_ascii=False)
                 except (TypeError, ValueError):
                     tool_content = str(tool_content)
-            result.append({"role": "user", "content": [{
-                "type": "tool_result",
-                "tool_use_id": str(message.get("tool_call_id", "")),
-                "content": tool_content,
-            }]})
+            result.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": str(message.get("tool_call_id", "")),
+                            "content": tool_content,
+                        }
+                    ],
+                }
+            )
             continue
         raw_calls = message.get("tool_calls")
         if raw_calls is None and message.get("function_call") is not None:
@@ -294,7 +346,9 @@ def openai_messages_to_anthropic(messages: list[dict[str, Any]]) -> list[dict[st
                     args = json.loads(fn["arguments"])
                 except json.JSONDecodeError:
                     args = {"raw": fn["arguments"]}
-                blocks.append({"type": "tool_use", "id": call["id"], "name": fn["name"][:200], "input": args})
+                blocks.append(
+                    {"type": "tool_use", "id": call["id"], "name": fn["name"][:200], "input": args}
+                )
             result.append({"role": "assistant", "content": blocks})
             continue
         content = _openai_content_to_anthropic(message.get("content", ""))
@@ -341,24 +395,45 @@ def parse_text_tool_calls(text: Any) -> list[dict[str, Any]]:
             calls.append(call)
     # 3. Claude-style function_calls/invoke and DSML namespaced variants.
     # Handles: <invoke name="bash">, <dsml:invoke name="bash">, <ds:function name="bash">
-    for match in re.finditer(r"<(?:[\w:-]+:)?(?:invoke|function|tool)\s+name=[\"']([^\"']+)[\"'][^>]*>(.*?)</(?:[\w:-]+:)?(?:invoke|function|tool)>", text, re.I | re.S):
+    for match in re.finditer(
+        r"<(?:[\w:-]+:)?(?:invoke|function|tool)\s+name=[\"']([^\"']+)[\"'][^>]*>(.*?)</(?:[\w:-]+:)?(?:invoke|function|tool)>",
+        text,
+        re.I | re.S,
+    ):
         name, inner = match.groups()
         args: dict[str, Any] = {}
-        for param in re.finditer(r"<(?:[\w:-]+:)?parameter(?:\s+name=[\"']([^\"']+)[\"'])?[^>]*>(.*?)</(?:[\w:-]+:)?parameter>", inner, re.I | re.S):
+        for param in re.finditer(
+            r"<(?:[\w:-]+:)?parameter(?:\s+name=[\"']([^\"']+)[\"'])?[^>]*>(.*?)</(?:[\w:-]+:)?parameter>",
+            inner,
+            re.I | re.S,
+        ):
             key, value = param.groups()
             args[key or "value"] = value.strip()
         calls.append({"name": name.strip(), "arguments": args})
     # 4. Newer DSML: <tool_name> + <parameters> fields.
     for block in re.finditer(r"<tool_call[^>]*>(.*?)</tool_call>", text, re.I | re.S):
         inner = block.group(1)
-        name_match = re.search(r"<(?:tool_name|name)>(.*?)</(?:tool_name|name)>", inner, re.I | re.S)
+        name_match = re.search(
+            r"<(?:tool_name|name)>(.*?)</(?:tool_name|name)>", inner, re.I | re.S
+        )
         if name_match:
-            args_match = re.search(r"<(?:parameters|args)>(.*?)</(?:parameters|args)>", inner, re.I | re.S)
+            args_match = re.search(
+                r"<(?:parameters|args)>(.*?)</(?:parameters|args)>", inner, re.I | re.S
+            )
             args = _parse_json_call(args_match.group(1).strip()) if args_match else None
-            calls.append({"name": name_match.group(1).strip(), "arguments": (args or {}).get("arguments", {})})
+            calls.append(
+                {
+                    "name": name_match.group(1).strip(),
+                    "arguments": (args or {}).get("arguments", {}),
+                }
+            )
     # 5. Self-closing tool invocation with JSON arguments.
     # Handles: <tool_invocation name="bash" arguments={...} />
-    for match in re.finditer(r"<tool_invocation\s+name=[\"']([^\"']+)[\"']\s+arguments=(\{.*?\})[^>]*?/?>", text, re.I | re.S):
+    for match in re.finditer(
+        r"<tool_invocation\s+name=[\"']([^\"']+)[\"']\s+arguments=(\{.*?\})[^>]*?/?>",
+        text,
+        re.I | re.S,
+    ):
         try:
             args: Any = json.loads(match.group(2))
         except json.JSONDecodeError:
@@ -384,7 +459,8 @@ def parse_text_tool_calls(text: Any) -> list[dict[str, Any]]:
     #   </tool_call>
     for match in re.finditer(
         r"<\s*function\s*=\s*[\"']?([^\s\"'<>]+)[\"']?\s*>(.*?)<\s*/\s*function\s*>",
-        text, re.I | re.S,
+        text,
+        re.I | re.S,
     ):
         name = match.group(1).strip()
         inner = match.group(2)
@@ -392,7 +468,8 @@ def parse_text_tool_calls(text: Any) -> list[dict[str, Any]]:
         # Match each <parameter=name>value</parameter> sibling.
         for param in re.finditer(
             r"<\s*parameter\s*=\s*[\"']?([^\s\"'<>]*)[\"']?\s*>(.*?)<\s*/\s*parameter\s*>",
-            inner, re.I | re.S,
+            inner,
+            re.I | re.S,
         ):
             key = (param.group(1) or "value").strip()
             args[key] = param.group(2).strip()
@@ -400,7 +477,8 @@ def parse_text_tool_calls(text: Any) -> list[dict[str, Any]]:
         if not args:
             for param in re.finditer(
                 r"<\s*parameter\s*>(.*?)<\s*/\s*parameter\s*>",
-                inner, re.I | re.S,
+                inner,
+                re.I | re.S,
             ):
                 args[f"arg_{len(args)}"] = param.group(1).strip()
         # A bare function block without parameter tags is commonly prose
@@ -437,9 +515,16 @@ def strip_tool_text(text: Any) -> Any:
     # possibly containing sibling parameter tags).
     cleaned = _BARE_FUNCTION_BLOCK_RE.sub("", cleaned)
     # Strip malformed <function=name</parameter>...</function> blocks (legacy fallback).
-    cleaned = re.sub(r"<function=[^\s<>]+</parameter>.*?</function>", "", cleaned, flags=re.I | re.S)
+    cleaned = re.sub(
+        r"<function=[^\s<>]+</parameter>.*?</function>", "", cleaned, flags=re.I | re.S
+    )
     cleaned = re.sub(r"<tool_invocation[^>]*/>", "", cleaned, flags=re.I)
-    cleaned = re.sub(r"</?\s*(?:(?:MiMoML|DSML)[|｜]?|[|｜](?:MiMoML|DSML)[|｜]?)\s*[^>]*>", "", cleaned, flags=re.I)
+    cleaned = re.sub(
+        r"</?\s*(?:(?:MiMoML|DSML)[|｜]?|[|｜](?:MiMoML|DSML)[|｜]?)\s*[^>]*>",
+        "",
+        cleaned,
+        flags=re.I,
+    )
     # Models sometimes emit only closing tags after abandoning a call.
     cleaned = _TOOL_CLOSE_TAG_RE.sub("", cleaned)
     return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
@@ -491,6 +576,21 @@ def normalize_response_tool_calls(
                     message["tool_calls"] = found_calls
                 content = "\n\n".join(text_parts) if text_parts else None
 
+        # Reasoning-block pass. Some providers (DeepSeek R1, MiniMax M-series,
+        # GLM Air) emit ``...</think>`` blocks inline with the visible
+        # answer. Pull every such block into `reasoning_content` so
+        # OpenAI-compatible clients see a uniform shape.
+        if isinstance(content, str):
+            content, extracted_reasoning = _split_think_blocks(content)
+            if extracted_reasoning is not None:
+                # Preserve any provider-supplied reasoning_content by
+                # appending our extracted block underneath it.
+                existing = message.get("reasoning_content")
+                if isinstance(existing, str) and existing:
+                    message["reasoning_content"] = existing + "\n\n" + extracted_reasoning
+                else:
+                    message["reasoning_content"] = extracted_reasoning
+
         raw_native_calls = message.get("tool_calls")
         if raw_native_calls is None and message.get("function_call") is not None:
             raw_native_calls = [message["function_call"]]
@@ -501,11 +601,15 @@ def normalize_response_tool_calls(
             if isinstance(message.get(field), str) and message[field]
         ]
         details = message.get("reasoning_details")
-        details_text = "".join(
-            item["text"]
-            for item in details
-            if isinstance(item, dict) and isinstance(item.get("text"), str)
-        ) if isinstance(details, list) else ""
+        details_text = (
+            "".join(
+                item["text"]
+                for item in details
+                if isinstance(item, dict) and isinstance(item.get("text"), str)
+            )
+            if isinstance(details, list)
+            else ""
+        )
         if details_text and not auxiliary_texts:
             auxiliary_texts.append(("reasoning_details", details_text))
         elif details_text and details_text != "".join(value for _, value in auxiliary_texts):
