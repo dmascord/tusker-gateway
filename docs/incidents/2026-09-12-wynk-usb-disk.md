@@ -2,13 +2,13 @@
 
 ## Summary
 
-The Longhorn disk entry `usb-longhorn` on node `wynk` had previously entered
-retirement (`evictionRequested: true`, `allowScheduling: false`) after the USB
-storage flap. Its disk-health checks reported a missing
-`/mnt/kubelet/longhorn/longhorn-disk.cfg`. No Longhorn storage was scheduled on
-the disk, so the safe repair was to remove the retired disk entry from the
-Longhorn node specification. The filesystem was not reformatted and the node
-was not deleted.
+`/dev/sdb1`, the ASM246X-enclosed Samsung 990 EVO Plus 2 TB attached to `wynk`,
+had been flapping repeatedly. The Longhorn disk was retired after the 2026-08
+USB-SSD incident and removed from the node spec on 2026-09-12. The path was
+then verified clean and re-registered as `usb-longhorn` with
+`allowScheduling: false`. A soak period is required before any replica
+scheduling is enabled. The filesystem was not reformatted and the node was not
+deleted.
 
 ## Observed state before the change
 
@@ -21,14 +21,18 @@ was not deleted.
 - `status.diskStatus.usb-longhorn.scheduledReplica`: `{}`
 - The default disk `/srv/data` was healthy and schedulable.
 
-A fresh read immediately before the patch showed the USB disk status had
-already recovered to `Ready=True` and `Schedulable=True`, but the spec still
-retained the retired entry. Removing that stale entry prevents Longhorn and the
-health checker from treating the retired USB path as an active managed disk.
+A fresh read immediately before re-registration showed the USB disk status had
+recovered to `Ready=True` and `Schedulable=True`. The host checks showed
+`/dev/sdb1` mounted read-write at `/mnt/kubelet`, ext4 state `clean`, and
+`/mnt/kubelet/longhorn/longhorn-disk.cfg` present with `state: "ready"`.
 
-## Action
+The node's USB recovery agent was also found to be installed but crashing on a
+missing `ESCALATION_TIMEOUT` constant. That source defect was fixed, deployed,
+and the service returned to `MONITORING`.
 
-At approximately `2026-09-12T07:47Z`:
+## Initial retirement action
+
+At approximately `2026-09-12T07:47Z`, the stale retired entry was removed:
 
 ```sh
 kubectl -n longhorn-system patch nodes.longhorn.io wynk \
@@ -39,23 +43,34 @@ kubectl -n longhorn-system patch nodes.longhorn.io wynk \
 No filesystem operation, disk format, Longhorn node deletion, volume deletion,
 or replica deletion was performed.
 
-## Verification
+## Re-registration and monitoring
 
-The patched node reported:
+At approximately `2026-09-12T07:59Z`, the disk was re-registered with
+`allowScheduling=false` and `evictionRequested=false`. Longhorn reported the
+disk `Ready=True`, with a fresh heartbeat and `storageScheduled=0`.
 
-- `spec.disks`: only `default-disk-f7f601c02e9bb38`
-- `status.diskStatus`: only `default-disk-f7f601c02e9bb38`
+The recovery agent source was updated in
+`/Volumes/dev/dev/k8s/scripts/maintenance/usb-disk-recovery-agent.py`:
 
-The post-change `disk-health-verify` job started at `2026-09-12T07:47:20Z`
-and completed successfully at `2026-09-12T07:47:40Z` with `succeeded=1`.
-The scheduled `disk-health-check-29819985` job at `07:45Z` also completed
-successfully.
+- fixed missing `POLL_INTERVAL` and `ESCALATION_TIMEOUT` definitions;
+- made recovery preserve the scheduling gate, defaulting to unschedulable;
+- deployed the fix to `wynk` and verified the systemd service is `active`;
+- configured `/etc/usb-disk-recovery/config.json` with
+  `allow_scheduling_after_recovery: false`.
 
-## Result and follow-up
+The existing `disk-health-check` job passed after re-registration. Its output
+also showed unrelated Kubernetes API/node-readiness query errors (`DNS` and an
+uninitialized `nodes` variable) while still printing `All checks passed`; those
+checker defects should be fixed before treating it as a reliable alert.
 
-`wynk` continues to use its internal `/srv/data` Longhorn disk. The USB path is
-no longer registered as a Longhorn disk and must not be re-added unless the
-USB storage is intentionally restored, validated, and explicitly approved for
-Longhorn use. The earlier USB-flap monitor remains useful for detecting any
-future physical disturbance, but this retired disk no longer participates in
-Longhorn scheduling.
+## Current result and scheduling gate
+
+`wynk` continues to use its internal `/srv/data` Longhorn disk. The USB disk is
+registered for health observation only. No replica is scheduled on it. The
+recovery agent can remount and validate the path after a drop, but automatic
+recovery is not evidence that the USB device is safe for replicas.
+
+Do not set `allow_scheduling_after_recovery` to true until a defined soak
+period completes without USB disconnects or ext4/JBD2 I/O errors. The visor
+USB monitor does not cover this disk; the disk is on `wynk` and requires
+wynk-local monitoring.

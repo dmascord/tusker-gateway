@@ -89,33 +89,32 @@ The fake-injection hack should be deleted.
 
 ## Longhorn disk `usb-longhorn` on node `wynk` is not ready
 
-`kubectl -n longhorn-system get nodes.longhorn.io wynk -o
-jsonpath='{.status.diskStatus.usb-longhorn.conditions}'` reports:
-
-- `Ready: False` — `failed to generate disk config: open
-  /mnt/kubelet/longhorn/longhorn-disk.cfg: no such file or directory`
-- `Schedulable: False` — `Disk usb-longhorn (/mnt/kubelet/longhorn) on
-  the node wynk is not ready`
-
-`usb-flap-monitor` reports the disk has been recovered (`Validation OK:
-/mnt/kubelet`, last recovery 2026-09-11T19:46:48Z) but the Longhorn
-operator never rewrote `longhorn-disk.cfg`, so the disk stays
-non-schedulable and `disk-health-check` jobs keep failing by design.
+The retired disk was re-checked on 2026-09-12 and found healthy at the host
+filesystem layer. The Longhorn entry was re-registered as unschedulable for a
+soak test; no filesystem repair or formatting was performed.
 
 ### Open items
 
-- [ ] Capture current Longhorn state for usb-longhorn on wynk (state,
+- [x] Capture current Longhorn state for usb-longhorn on wynk (state,
       node instance-manager logs, PVCs currently bound to it).
-- [ ] Decide action: re-register the disk (`kubectl -n longhorn-system
-      edit nodes.longhorn.io wynk`), retire it, or re-format the path.
-- [ ] Apply chosen action and verify `Ready: True` / `Schedulable: True`.
-- [ ] Document outcome under `docs/incidents/2026-09-12-wynk-usb-disk.md`.
+- [x] Decide action: re-register the disk as unschedulable for observation;
+      do not retire, reformat, or allow replica scheduling during soak.
+- [ ] Monitor disk-health and USB recovery signals during the soak period.
+- [ ] Document final soak result under
+      `docs/incidents/2026-09-12-wynk-usb-disk.md`.
+
+### Current observation
+
+At re-check time:
+
+- `/dev/sdb1` was mounted read-write at `/mnt/kubelet`.
+- ext4 reported `Filesystem state: clean`.
+- `/mnt/kubelet/longhorn/longhorn-disk.cfg` existed with `state: "ready"`.
+- No storage was scheduled on the disk before re-registration.
 
 ### Destructive actions (require confirmation)
 
-- `kubectl -n longhorn-system edit nodes.longhorn.io wynk` to remove
-  the disk from `spec.disks`.
-- `kubectl -n longhorn-system delete nodes.longhorn.io wynk` (rebuilds
-  the Longhorn node registration).
 - Any filesystem-level change to `/mnt/kubelet/longhorn` on `wynk`.
+- Enabling scheduling on this USB disk before the soak period completes.
+- Removing the disk entry again or deleting the Longhorn node registration.
 
