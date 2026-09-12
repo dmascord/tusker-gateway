@@ -129,3 +129,37 @@ async def test_local_capacity_error_is_client_safe(monkeypatch, tmp_path):
 
     assert caught.value.capacity_rejected is True
     assert "ResourceExhausted" not in caught.value.message
+
+
+def test_local_backends_have_independent_single_request_limits(monkeypatch):
+    from tusker_gateway.provider_usage import (
+        LOCAL_LLM_CAPACITY_GROUP,
+        MLX_MAC_CAPACITY_GROUP,
+        capacity_limit,
+    )
+
+    monkeypatch.delenv("TUSKER_LOCAL_LLM_MAX_CONCURRENT", raising=False)
+    monkeypatch.delenv("TUSKER_MLX_MAC_MAX_CONCURRENT", raising=False)
+    assert capacity_group_for_route("local-llm", "llama3.2:3b") == LOCAL_LLM_CAPACITY_GROUP
+    assert capacity_group_for_route("mlx-mac", "mlx-community/Qwen3-8B") == MLX_MAC_CAPACITY_GROUP
+    assert capacity_limit(LOCAL_LLM_CAPACITY_GROUP) == 1
+    assert capacity_limit(MLX_MAC_CAPACITY_GROUP) == 1
+
+
+def test_local_backend_capacity_controller_rejects_second_request(monkeypatch):
+    monkeypatch.setenv("TUSKER_LOCAL_LLM_MAX_CONCURRENT", "1")
+    monkeypatch.setenv("TUSKER_MLX_MAC_MAX_CONCURRENT", "1")
+    controller = capacity_controller()
+    controller.reset()
+
+    local_first = controller.acquire("local-llm")
+    mlx_first = controller.acquire("mlx-mac")
+    assert local_first is not None
+    assert mlx_first is not None
+    assert controller.acquire("local-llm") is None
+    assert controller.acquire("mlx-mac") is None
+
+    local_first.release()
+    mlx_first.release()
+    assert controller.acquire("local-llm") is not None
+    controller.reset()

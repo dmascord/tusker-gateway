@@ -16,13 +16,14 @@ from pathlib import Path
 from typing import Any
 
 from tusker_gateway.storage import shared_database
-
-
 NVIDIA_CAPACITY_GROUP = "nvidia"
+LOCAL_LLM_CAPACITY_GROUP = "local-llm"
+MLX_MAC_CAPACITY_GROUP = "mlx-mac"
 DEFAULT_NVIDIA_MAX_CONCURRENT = 8
+DEFAULT_LOCAL_LLM_MAX_CONCURRENT = 1
+DEFAULT_MLX_MAC_MAX_CONCURRENT = 1
 DEFAULT_CAPACITY_COOLDOWN_SECS = 300.0
 DEFAULT_CAPACITY_BUSY_COOLDOWN_SECS = 2.0
-
 _CAPACITY_HINTS = (
     "resourceexhausted",
     "worker local total request limit",
@@ -50,12 +51,16 @@ def capacity_group_for_route(
     """Map a route or provider error to a shared capacity group.
 
     OpenRouter exposes Nvidia models under ``nvidia/<model>`` while direct
-    Nvidia requests use the ``nvidia`` provider.  They consume the same
-    logical upstream capacity from this gateway's point of view.
+    Nvidia requests use the ``nvidia`` provider. Local providers are isolated
+    separately because each backend has its own single-request worker budget.
     """
     provider_name = str(provider or "").strip().lower()
     model_name = str(model or "").strip().lower()
     detail_text = str(detail or "")
+    if provider_name == LOCAL_LLM_CAPACITY_GROUP:
+        return LOCAL_LLM_CAPACITY_GROUP
+    if provider_name == MLX_MAC_CAPACITY_GROUP:
+        return MLX_MAC_CAPACITY_GROUP
     if (
         provider_name == NVIDIA_CAPACITY_GROUP
         or model_name.startswith("nvidia/")
@@ -91,16 +96,26 @@ def capacity_busy_cooldown_seconds() -> float:
 
 def capacity_limit(group: str) -> int:
     """Return the local concurrency ceiling; zero means unlimited."""
-    if group == NVIDIA_CAPACITY_GROUP:
-        raw = os.environ.get(
-            "TUSKER_NVIDIA_MAX_CONCURRENT",
-            str(DEFAULT_NVIDIA_MAX_CONCURRENT),
-        )
-        try:
-            return max(0, int(raw))
-        except (TypeError, ValueError):
-            return DEFAULT_NVIDIA_MAX_CONCURRENT
-    return 0
+    settings = {
+        NVIDIA_CAPACITY_GROUP: (
+            "TUSKER_NVIDIA_MAX_CONCURRENT", DEFAULT_NVIDIA_MAX_CONCURRENT
+        ),
+        LOCAL_LLM_CAPACITY_GROUP: (
+            "TUSKER_LOCAL_LLM_MAX_CONCURRENT", DEFAULT_LOCAL_LLM_MAX_CONCURRENT
+        ),
+        MLX_MAC_CAPACITY_GROUP: (
+            "TUSKER_MLX_MAC_MAX_CONCURRENT", DEFAULT_MLX_MAC_MAX_CONCURRENT
+        ),
+    }
+    setting = settings.get(group)
+    if setting is None:
+        return 0
+    env_name, default = setting
+    raw = os.environ.get(env_name, str(default))
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return default
 
 
 @dataclass
@@ -315,7 +330,11 @@ __all__ = [
     "CapacityController",
     "CapacityLease",
     "DEFAULT_CAPACITY_COOLDOWN_SECS",
+    "DEFAULT_LOCAL_LLM_MAX_CONCURRENT",
+    "DEFAULT_MLX_MAC_MAX_CONCURRENT",
     "DEFAULT_NVIDIA_MAX_CONCURRENT",
+    "LOCAL_LLM_CAPACITY_GROUP",
+    "MLX_MAC_CAPACITY_GROUP",
     "NVIDIA_CAPACITY_GROUP",
     "ProviderUsageDB",
     "capacity_busy_cooldown_seconds",

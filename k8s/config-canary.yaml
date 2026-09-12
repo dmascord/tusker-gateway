@@ -165,10 +165,22 @@ items:
             value: '21600'
           - name: TUSKER_CATALOG_STARTUP_TIMEOUT_SECS
             value: '30'
-          - name: TUSKER_UPSTREAM_SOCK_READ_SECS
-            value: '90'
+          # Local Ollama/MLX Mac cold model loads need up to 240s before the
+          # first byte. The request deadline must cover the per-provider budget;
+          # remote candidates still return immediately and are not delayed.
+          - name: TUSKER_REQUEST_TIMEOUT_MS
+            value: '240000'
           - name: TUSKER_PROVIDER_ATTEMPT_TIMEOUT_OVERRIDES_JSON
-            value: '{"local-llm": 120, "mlx-mac": 120}'
+            value: '{"local-llm": 240, "mlx-mac": 240}'
+          # Single-request worker budgets on local backends. Cold-loading a
+          # 7B-class model on the Jetson or MLX Mac saturates RAM and CPU;
+          # queueing concurrent requests just stalls all of them. The gateway
+          # fails fast to the next pool candidate instead of holding the
+          # request open while the local backend thrashes.
+          - name: TUSKER_LOCAL_LLM_MAX_CONCURRENT
+            value: '1'
+          - name: TUSKER_MLX_MAC_MAX_CONCURRENT
+            value: '1'
           - name: TUSKER_BUDGETS_ENABLED
             value: 'false'
           - name: API_KEYS
