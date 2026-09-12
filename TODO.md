@@ -87,30 +87,37 @@ The fake-injection hack should be deleted.
   different encryption key than the existing rows were encrypted with —
   this permanently bricks the row.
 
-## Longhorn disk `usb-longhorn` on node `wynk` is not ready
+## Longhorn disk `usb-longhorn` on node `wynk` soak test
 
-The retired disk was re-checked on 2026-09-12 and found healthy at the host
-filesystem layer. The Longhorn entry was re-registered as unschedulable for a
-soak test; no filesystem repair or formatting was performed.
+The USB disk was re-registered on 2026-09-12 as an unschedulable Longhorn
+disk. The host auto-recovery agent is active and the disk-health CronJob is
+running every five minutes. No filesystem repair or formatting was performed;
+no replica is scheduled on this disk.
 
-### Open items
+### Soak items
 
 - [x] Capture current Longhorn state for usb-longhorn on wynk (state,
       node instance-manager logs, PVCs currently bound to it).
-- [x] Decide action: re-register the disk as unschedulable for observation;
-      do not retire, reformat, or allow replica scheduling during soak.
-- [ ] Monitor disk-health and USB recovery signals during the soak period.
-- [ ] Document final soak result under
+- [x] Re-register the disk with `allowScheduling: false` and
+      `evictionRequested: false`.
+- [x] Fix and deploy the wynk auto-recovery agent; verify it reaches
+      `MONITORING`.
+- [x] Fix and deploy the disk-health checker so Kubernetes API failures fail
+      the job instead of printing a false success.
+- [ ] Complete a sustained soak without USB disconnects or ext4/JBD2 I/O
+      errors before enabling Longhorn scheduling.
+- [x] Document the current soak status under
       `docs/incidents/2026-09-12-wynk-usb-disk.md`.
 
 ### Current observation
 
-At re-check time:
-
-- `/dev/sdb1` was mounted read-write at `/mnt/kubelet`.
-- ext4 reported `Filesystem state: clean`.
-- `/mnt/kubelet/longhorn/longhorn-disk.cfg` existed with `state: "ready"`.
-- No storage was scheduled on the disk before re-registration.
+- `/dev/sdb1` is mounted read-write at `/mnt/kubelet`; ext4 reported `clean`.
+- `/mnt/kubelet/longhorn/longhorn-disk.cfg` exists with `state: "ready"`.
+- Longhorn reports `Ready=True`; `storageScheduled=0`.
+- `allowScheduling=false` remains the explicit safety gate.
+- The local recovery agent is `active`, state `MONITORING`.
+- The corrected health job reports real failures; its latest run caught a
+  transient DNS/API failure instead of falsely passing.
 
 ### Destructive actions (require confirmation)
 
