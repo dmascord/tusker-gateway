@@ -5,12 +5,11 @@ The score combines success rate and latency with exponential decay.
 """
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-
-import logging
 
 from tusker_gateway.storage import shared_database
 
@@ -75,6 +74,53 @@ class QualityDB:
                     created_at REAL NOT NULL
                 )
                 """
+            )
+            conn.commit()
+
+    def prime_model(self, provider: str, model: str) -> None:
+        """Pre-seed a quality score for a known-good model.
+
+        Sets quality_score to 100.0 (maximum), so that known-good static models
+        always outrank unknown catalog entries (which use the adaptive floor of ~40).
+        A single real successful event immediately overwrites the pre-seed via
+        _recompute_score, so a broken or slow model drops to its true score right
+        away. The pre-seed therefore acts as a trusted-foundation signal that is
+        safe to override — it never permanently locks a model into the top tier.
+        """
+        with self._db.connection() as conn:
+            if self._db.is_postgres:
+                conn.execute(
+                    "INSERT INTO model_quality (provider, model, quality_score, "
+                    "total_calls, success_calls) VALUES (?, ?, 100.0, 1, 1) "
+                    "ON CONFLICT(provider, model) DO UPDATE SET quality_score = 100.0",
+                    (provider, model),
+                )
+            else:
+                # SQLite: INSERT OR IGNORE avoids clobbering real event data;
+                # UPDATE then applies the pre-seed score on top.
+                conn.execute(
+                    "INSERT OR IGNORE INTO model_quality "
+                    "(provider, model, quality_score, total_calls, success_calls) "
+                    "VALUES (?, ?, 100.0, 1, 1)",
+                    (provider, model),
+                )
+                conn.execute(
+                    "UPDATE model_quality SET quality_score = 100.0 "
+                    "WHERE provider = ? AND model = ?",
+                    (provider, model),
+                )
+            conn.commit()
+
+    def unprime_model(self, provider: str, model: str) -> None:
+        """Remove the pre-seed quality score for a model.
+
+        Called when a static pool entry is removed so the model reverts to the
+        adaptive floor and behaves as an unknown candidate.
+        """
+        with self._db.connection() as conn:
+            conn.execute(
+                "DELETE FROM model_quality WHERE provider = ? AND model = ?",
+                (provider, model),
             )
             conn.commit()
 

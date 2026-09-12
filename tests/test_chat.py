@@ -1731,3 +1731,56 @@ async def test_chat_completions_streaming_no_heartbeat_when_disabled(client, mon
     assert b": keepalive" not in content
     assert b'data: {"content": "x"}' in content
     assert b'data: [DONE]' in content
+
+
+@pytest.mark.asyncio
+async def test_provider_attempt_timeout_helper_uses_per_provider_override():
+    """Per-provider overrides extend the global idle budget for slow backends.
+
+    Local Ollama/MLX Mac backends can take 60-120s before the first byte
+    when cold-loading a model, so the global 30s default is too aggressive.
+    The override map must extend (never shorten) the configured budget for
+    matching providers.
+    """
+    import os
+
+    from tusker_gateway.endpoints import _provider_attempt_timeout_secs
+
+    os.environ["TUSKER_PROVIDER_ATTEMPT_TIMEOUT_SECS"] = "30"
+    os.environ["TUSKER_PROVIDER_ATTEMPT_TIMEOUT_OVERRIDES_JSON"] = (
+        '{"local-llm": 120, "mlx-mac": 120}'
+    )
+    try:
+        request = SimpleNamespace(
+            get=lambda key, default=None: None  # no deadline -> no clamp
+        )
+        # Default applies for unrelated providers.
+        assert _provider_attempt_timeout_secs(request, provider="openai-codex") == 30.0
+        # Override raises the budget for local backends.
+        assert _provider_attempt_timeout_secs(request, provider="local-llm") == 120.0
+        assert _provider_attempt_timeout_secs(request, provider="mlx-mac") == 120.0
+        # Case-insensitive.
+        assert _provider_attempt_timeout_secs(request, provider="Local-LLM") == 120.0
+        # No provider -> falls back to global.
+        assert _provider_attempt_timeout_secs(request) == 30.0
+    finally:
+        os.environ.pop("TUSKER_PROVIDER_ATTEMPT_TIMEOUT_SECS", None)
+        os.environ.pop("TUSKER_PROVIDER_ATTEMPT_TIMEOUT_OVERRIDES_JSON", None)
+
+
+@pytest.mark.asyncio
+async def test_provider_attempt_timeout_helper_ignores_invalid_override_json():
+    """Malformed override JSON must not crash startup — it logs and falls back."""
+    import os
+
+    from tusker_gateway.endpoints import _provider_attempt_timeout_secs
+
+    os.environ["TUSKER_PROVIDER_ATTEMPT_TIMEOUT_SECS"] = "30"
+    os.environ["TUSKER_PROVIDER_ATTEMPT_TIMEOUT_OVERRIDES_JSON"] = "{not-json"
+    try:
+        request = SimpleNamespace(get=lambda key, default=None: None)
+        # Silently falls back to global; no exception, no override.
+        assert _provider_attempt_timeout_secs(request, provider="local-llm") == 30.0
+    finally:
+        os.environ.pop("TUSKER_PROVIDER_ATTEMPT_TIMEOUT_SECS", None)
+        os.environ.pop("TUSKER_PROVIDER_ATTEMPT_TIMEOUT_OVERRIDES_JSON", None)

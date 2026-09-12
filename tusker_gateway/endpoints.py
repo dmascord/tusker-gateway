@@ -2100,8 +2100,49 @@ def _max_pool_provider_attempts() -> int:
     except ValueError:
         return 6
 
-def _provider_attempt_timeout_secs(request: web.Request | None) -> float:
-    """Return the bounded budget for one pool candidate."""
+def _provider_attempt_timeout_overrides() -> dict[str, float]:
+    """Per-provider override map from ``TUSKER_PROVIDER_ATTEMPT_TIMEOUT_OVERRIDES_JSON``.
+
+    Local backends (Jetson Ollama, MLX Mac) regularly exceed the 30s default
+    idle budget during cold model loads. Operators can extend those specific
+    providers without slowing every other candidate down.
+    """
+    raw = os.environ.get("TUSKER_PROVIDER_ATTEMPT_TIMEOUT_OVERRIDES_JSON", "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "ignoring TUSKER_PROVIDER_ATTEMPT_TIMEOUT_OVERRIDES_JSON: invalid JSON"
+        )
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    parsed: dict[str, float] = {}
+    for provider, value in data.items():
+        try:
+            seconds = float(value)
+        except (TypeError, ValueError):
+            continue
+        if seconds <= 0:
+            continue
+        parsed[str(provider).lower()] = seconds
+    return parsed
+
+
+def _provider_attempt_timeout_secs(
+    request: web.Request | None,
+    provider: str | None = None,
+) -> float:
+    """Return the bounded budget for one pool candidate.
+
+    ``provider`` may extend the global ``TUSKER_PROVIDER_ATTEMPT_TIMEOUT_SECS``
+    by overriding per upstream — used for cold-start local model backends
+    that need >30s before the first byte. The override map is read from
+    ``TUSKER_PROVIDER_ATTEMPT_TIMEOUT_OVERRIDES_JSON`` on each call so
+    config-runtime updates take effect without a restart.
+    """
     try:
         configured = max(
             0.1,
@@ -2109,6 +2150,10 @@ def _provider_attempt_timeout_secs(request: web.Request | None) -> float:
         )
     except (TypeError, ValueError):
         configured = 30.0
+    if provider:
+        override = _provider_attempt_timeout_overrides().get(provider.lower())
+        if override is not None:
+            configured = max(configured, override)
     if request is None or not hasattr(request, "get"):
         return configured
     deadline_at = request.get("_deadline_at")
@@ -2451,7 +2496,7 @@ async def _call_with_pool_fallback(
 
             result = await _await_attempt(
                 asyncio.create_task(call_direct()),
-                budget=_provider_attempt_timeout_secs(request),
+                budget=_provider_attempt_timeout_secs(request, provider=provider),
                 deadline_at=_request_deadline_at(request),
                 activity=activity,
             )
@@ -2689,7 +2734,7 @@ async def _call_with_pool_fallback(
 
             result = await _await_attempt(
                 asyncio.create_task(call_candidate()),
-                budget=_provider_attempt_timeout_secs(request),
+                budget=_provider_attempt_timeout_secs(request, provider=provider),
                 deadline_at=_request_deadline_at(request),
                 activity=activity,
             )
@@ -2726,7 +2771,7 @@ async def _call_with_pool_fallback(
                 model,
                 attempts,
                 max_attempts,
-                _provider_attempt_timeout_secs(request),
+                _provider_attempt_timeout_secs(request, provider=provider),
             )
         except RateLimitError as exc:
             if breaker is not None:

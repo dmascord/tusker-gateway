@@ -3,6 +3,7 @@
 Handles the actual HTTP call to upstream providers, with token rotation
 for Codex OAuth and cooldown tracking on failures.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -119,10 +120,12 @@ def _conversation_opening(messages: Any) -> list[dict[str, Any]]:
         if opening:
             break
     if not opening and messages and isinstance(messages[0], dict):
-        opening.append({
-            "role": messages[0].get("role"),
-            "content": messages[0].get("content"),
-        })
+        opening.append(
+            {
+                "role": messages[0].get("role"),
+                "content": messages[0].get("content"),
+            }
+        )
     return opening
 
 
@@ -133,9 +136,7 @@ def _stable_opencode_session_id(
 ) -> str:
     """Build a stable, non-secret fallback ID for one conversation."""
     caller_fingerprint = (
-        hashlib.sha256(caller_key.encode("utf-8")).hexdigest()[:16]
-        if caller_key
-        else "anonymous"
+        hashlib.sha256(caller_key.encode("utf-8")).hexdigest()[:16] if caller_key else "anonymous"
     )
     material = json.dumps(
         {
@@ -192,9 +193,7 @@ def _stream_error_from_frame(
     has already committed a 200 response to OMP and cannot select a fallback.
     """
     data_lines = [
-        line[5:].lstrip()
-        for line in frame.splitlines()
-        if line.lower().startswith(b"data:")
+        line[5:].lstrip() for line in frame.splitlines() if line.lower().startswith(b"data:")
     ]
     if not data_lines:
         return None
@@ -236,8 +235,10 @@ def _stream_error_from_frame(
             hint.encode() in raw_lower for hint in _STREAM_ERROR_HINTS
         ):
             return None
-        message = parsed.get("message") or parsed.get("detail") or payload.decode(
-            "utf-8", errors="replace"
+        message = (
+            parsed.get("message")
+            or parsed.get("detail")
+            or payload.decode("utf-8", errors="replace")
         )
         code = parsed.get("code")
         status = _stream_status(parsed.get("status")) or _stream_status(code)
@@ -273,9 +274,7 @@ def _stream_error_from_frame(
 def _stream_frame_is_ready(frame: bytes) -> bool:
     """Return whether a non-error frame proves useful output has begun."""
     data_lines = [
-        line[5:].lstrip()
-        for line in frame.splitlines()
-        if line.lower().startswith(b"data:")
+        line[5:].lstrip() for line in frame.splitlines() if line.lower().startswith(b"data:")
     ]
     if not data_lines:
         return False
@@ -331,9 +330,9 @@ def _stream_frame_is_terminal(frame: bytes) -> bool:
         return True
     choices = parsed.get("choices")
     return isinstance(choices, list) and any(
-        isinstance(choice, dict) and choice.get("finish_reason") is not None
-        for choice in choices
+        isinstance(choice, dict) and choice.get("finish_reason") is not None for choice in choices
     )
+
 
 def _stream_frame_is_failure(frame: bytes) -> str | None:
     """Return the terminal type when a provider streams ``response.failed``/``response.incomplete``.
@@ -368,9 +367,7 @@ def _upstream_failure_cooldown_seconds(exc: BaseException) -> float | None:
     # message may contain the word "capacity" while still being a transient
     # overload; those failures must keep the short retry cooldown.
     if status_code == 402 or (
-        status_code is not None
-        and status_code < 500
-        and any(hint in body for hint in _QUOTA_HINTS)
+        status_code is not None and status_code < 500 and any(hint in body for hint in _QUOTA_HINTS)
     ):
         try:
             return max(
@@ -425,9 +422,7 @@ def _persist_capacity_group_cooldown(
 
         from tusker_gateway.persistent_cooldown import PersistentCooldownStore
 
-        db_path = Path(
-            config.get("quality_db_path", "data/quality.db")
-        ).parent / "cooldowns.db"
+        db_path = Path(config.get("quality_db_path", "data/quality.db")).parent / "cooldowns.db"
         PersistentCooldownStore(db_path=db_path).record_group(group, seconds)
     except Exception:
         pass
@@ -444,10 +439,7 @@ def _capacity_failure_group(
     detail = getattr(exc, "upstream_body", None) or str(exc)
     if not is_capacity_error(detail) and not getattr(exc, "capacity_group", None):
         return None
-    return (
-        getattr(exc, "capacity_group", None)
-        or capacity_group_for_route(provider, model, detail)
-    )
+    return getattr(exc, "capacity_group", None) or capacity_group_for_route(provider, model, detail)
 
 
 def _quarantine_capacity_failure(
@@ -479,15 +471,15 @@ def _quarantine_capacity_failure(
 # stalled provider surfaces as a clean timeout instead of hanging silently
 # until `total` expires (which is what causes the "socket connection was
 # closed unexpectedly" symptom on the client).
-_UPSTREAM_STREAM_SOCK_READ_SECS = float(
-    os.environ.get("TUSKER_UPSTREAM_SOCK_READ_SECS", "90")
-)
+_UPSTREAM_STREAM_SOCK_READ_SECS = float(os.environ.get("TUSKER_UPSTREAM_SOCK_READ_SECS", "90"))
+
 
 # Build per-provider endpoints dict from the normalized registry in config.py
 # Falls back to legacy hard-coded mapping if the registry is unavailable.
 def _init_provider_endpoints() -> dict[str, dict[str, Any]]:
     try:
         from tusker_gateway.config import DEFAULT_PROVIDER_REGISTRY, expand_env_placeholders
+
         out: dict[str, dict[str, Any]] = {}
         for name, pc in DEFAULT_PROVIDER_REGISTRY.items():
             entry: dict[str, Any] = {
@@ -503,14 +495,49 @@ def _init_provider_endpoints() -> dict[str, dict[str, Any]]:
     except ImportError:
         pass
     return {
-        "github-copilot": {"base_url": "https://api.githubcopilot.com", "chat_path": "/chat/completions", "auth_type": "oauth", "model_header": "x-github-gpt-model"},
-        "github-copilot-enterprise": {"base_url": "https://copilot-api.sita.ghe.com", "chat_path": "/chat/completions", "auth_type": "oauth", "model_header": "x-github-gpt-model"},
-        "openai-codex": {"base_url": "https://api.github.com/copilot", "chat_path": "/chat/completions", "auth_type": "oauth", "model_header": "x-openai-gpt-model"},
-        "openai": {"base_url": "https://api.openai.com", "chat_path": "/v1/chat/completions", "auth_type": "bearer"},
-        "openrouter": {"base_url": "https://openrouter.ai/api/v1", "chat_path": "/chat/completions", "auth_type": "bearer"},
-        "groq": {"base_url": "https://api.groq.com/openai", "chat_path": "/v1/chat/completions", "auth_type": "bearer"},
-        "local-llm": {"base_url": "http://localhost:11434", "chat_path": "/v1/chat/completions", "auth_type": "bearer"},
-        "zai": {"base_url": "https://api.z.ai/api/paas", "chat_path": "/v4/chat/completions", "auth_type": "bearer"},
+        "github-copilot": {
+            "base_url": "https://api.githubcopilot.com",
+            "chat_path": "/chat/completions",
+            "auth_type": "oauth",
+            "model_header": "x-github-gpt-model",
+        },
+        "github-copilot-enterprise": {
+            "base_url": "https://copilot-api.sita.ghe.com",
+            "chat_path": "/chat/completions",
+            "auth_type": "oauth",
+            "model_header": "x-github-gpt-model",
+        },
+        "openai-codex": {
+            "base_url": "https://api.github.com/copilot",
+            "chat_path": "/chat/completions",
+            "auth_type": "oauth",
+            "model_header": "x-openai-gpt-model",
+        },
+        "openai": {
+            "base_url": "https://api.openai.com",
+            "chat_path": "/v1/chat/completions",
+            "auth_type": "bearer",
+        },
+        "openrouter": {
+            "base_url": "https://openrouter.ai/api/v1",
+            "chat_path": "/chat/completions",
+            "auth_type": "bearer",
+        },
+        "groq": {
+            "base_url": "https://api.groq.com/openai",
+            "chat_path": "/v1/chat/completions",
+            "auth_type": "bearer",
+        },
+        "local-llm": {
+            "base_url": "http://localhost:11434",
+            "chat_path": "/v1/chat/completions",
+            "auth_type": "bearer",
+        },
+        "zai": {
+            "base_url": "https://api.z.ai/api/paas",
+            "chat_path": "/v4/chat/completions",
+            "auth_type": "bearer",
+        },
     }
 
 
@@ -555,8 +582,7 @@ def _configured_endpoint(config: dict[str, Any], provider: str) -> dict[str, Any
 # Exposed for test assertions and downstream code that needs to know which
 # providers require credential pools.
 OAUTH_PROVIDERS: frozenset[str] = frozenset(
-    name for name, ep in PROVIDER_ENDPOINTS.items()
-    if ep.get("auth_type") in ("oauth", "codex")
+    name for name, ep in PROVIDER_ENDPOINTS.items() if ep.get("auth_type") in ("oauth", "codex")
 )
 
 
@@ -596,6 +622,17 @@ class CodexTokenRotator:
 
     _JWT_REFRESH_MARGIN_SECONDS = 120
     _DEFAULT_REFRESH_FAILURE_COOLDOWN_SECONDS = 60.0
+    # OAuth error codes that mean the refresh token is permanently rejected
+    # (already redeemed, revoked, or otherwise unusable). These never recover
+    # by retrying the same refresh token, so we treat them as long-cooldown
+    # rather than transient. Without this, the rotator keeps replaying the
+    # dead token every 60s, starving the other healthy entries in the pool
+    # and surfacing repeated 401s as transient OAuth noise.
+    _PERMANENT_REFRESH_ERROR_CODES: frozenset[str] = frozenset(
+        {"refresh_token_reused", "invalid_grant"}
+    )
+    # 24h default; the operator re-authenticates via the enrollment flow.
+    _DEFAULT_PERMANENT_REFRESH_FAILURE_COOLDOWN_SECONDS = 86400.0
 
     def __init__(
         self,
@@ -614,20 +651,22 @@ class CodexTokenRotator:
         self._http = http_client  # aiohttp.ClientSession for OAuth calls
         self._provider = str(provider or "openai-codex").lower()
         self._refresh_failed_until: dict[int, float] = {}
-        # Optional DB-backed persistence:
+        # Per-credential cooldowns keyed by token fingerprint. A single
+        # exhausted-quota 429 on one credential must not lock out the
+        # other healthy credentials in the same pool — ``get_token``
+        # skips fingerprints whose cooldown is still active.
+        self._credential_cooldowns: dict[str, float] = {}
+
         #   persist_credentials(provider, expected, replacement) -> bool CAS.
         # When set, refreshed credentials persist to the encrypted DB instead
         # of the legacy auth.json file (auth_file is ignored).
         self._persist_credentials = persist_credentials
         self._secrets_authoritative = bool(secrets_authoritative)
         self._canary_mode = bool(
-            os.environ.get("TUSKER_CONFIG_CANARY", "").strip().lower()
-            in {"1", "true", "yes", "on"}
+            os.environ.get("TUSKER_CONFIG_CANARY", "").strip().lower() in {"1", "true", "yes", "on"}
         )
         self._initial_refresh_tokens: frozenset[str] = frozenset(
-            str(c.get("refresh_token"))
-            for c in self._creds
-            if c.get("refresh_token")
+            str(c.get("refresh_token")) for c in self._creds if c.get("refresh_token")
         )
 
     @property
@@ -639,10 +678,9 @@ class CodexTokenRotator:
         self._creds = list(credentials)
         self._index = min(self._index, max(len(self._creds) - 1, 0))
         self._refresh_failed_until.clear()
+        self._credential_cooldowns.clear()
         self._initial_refresh_tokens = frozenset(
-            str(c.get("refresh_token"))
-            for c in self._creds
-            if c.get("refresh_token")
+            str(c.get("refresh_token")) for c in self._creds if c.get("refresh_token")
         )
 
     @staticmethod
@@ -653,6 +691,46 @@ class CodexTokenRotator:
             if value:
                 return " ".join(str(value).split())[:80]
         return f"cred#{index + 1}"
+
+    @staticmethod
+    def fingerprint(token: str | None) -> str | None:
+        """Return a stable 12-char fingerprint for a bearer token (or None)."""
+        if not token:
+            return None
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()[:12]
+
+    def cooldown_credential(
+        self, fingerprint: str | None, seconds: float, *, label: str = ""
+    ) -> None:
+        """Quarantine a single credential so ``get_token`` skips it.
+
+        Used for per-user quota exhaustion (e.g. a codex team user hitting
+        their own quota) so a single bad credential does not lock the model
+        out for the other credentials in the same pool.
+        """
+        if not fingerprint or seconds <= 0:
+            return
+        self._credential_cooldowns[fingerprint] = time.time() + float(seconds)
+        logger.info(
+            "credential cooldown set provider=%s fingerprint=%s label=%s seconds=%.0f",
+            self._provider,
+            fingerprint,
+            label or "?",
+            float(seconds),
+        )
+
+    def credential_available(self, fingerprint: str | None) -> bool:
+        """Return True when the fingerprint has no active cooldown."""
+        if not fingerprint:
+            return True
+        expiry = self._credential_cooldowns.get(fingerprint)
+        if expiry is None:
+            return True
+        if expiry <= time.time():
+            # Expired; drop it so the dict does not grow forever.
+            self._credential_cooldowns.pop(fingerprint, None)
+            return True
+        return False
 
     async def get_token(self) -> str | None:
         """Return the next usable token in round-robin order.
@@ -679,51 +757,67 @@ class CodexTokenRotator:
                 )
                 if not token:
                     continue
+                # Skip credentials on per-credential cooldown (quota 429).
+                # ``credential_available`` evicts expired entries so the
+                # dict does not grow unbounded over time.
+                fp = self.fingerprint(token)
+                if not self.credential_available(fp):
+                    logger.debug(
+                        "oauth rotator skip provider=%s credential_index=%d/%d "
+                        "label=%s fingerprint=%s reason=credential_cooldown",
+                        self._provider,
+                        idx + 1,
+                        count,
+                        label,
+                        fp,
+                    )
+                    continue
 
-                if self._http and self._is_near_expiry(cred):
-                    if self._canary_skip_rotation(cred):
-                        # Canary policy: never rotate a refresh token that
-                        # production also holds. A still-valid access token
-                        # remains usable; a dead one is skipped.
-                        if self._is_expired(cred):
-                            logger.warning(
-                                "oauth refresh skipped by canary policy provider=%s "
-                                "credential_index=%d/%d refresh_token_held_by_prod=true",
+                if self._canary_skip_rotation(cred):
+                    # Canary policy: never rotate a refresh token that
+                    # production also holds. A still-valid access token
+                    # remains usable; a dead one is skipped.
+                    if self._is_expired(cred):
+                        logger.warning(
+                            "oauth refresh skipped by canary policy provider=%s "
+                            "credential_index=%d/%d refresh_token_held_by_prod=true",
+                            self._provider,
+                            idx + 1,
+                            count,
+                        )
+                        continue
+                else:
+                    retry_at = self._refresh_failed_until.get(idx, 0.0)
+                    if retry_at <= now:
+                        pre_refresh = dict(cred)
+                        try:
+                            refreshed = await self._refresh_one(cred)
+                        except Exception as exc:
+                            self._refresh_failed_until[idx] = time.time() + (
+                                self._permanent_refresh_cooldown_seconds()
+                                if self._is_permanent_refresh_error(exc)
+                                else self._refresh_failure_cooldown_seconds()
+                            )
+                            self._log_refresh_failure(idx, exc)
+                            if self._is_expired(cred):
+                                continue
+                        else:
+                            self._creds[idx] = refreshed
+                            self._refresh_failed_until.pop(idx, None)
+                            self._persist(pre_refresh, refreshed)
+                            token = _creds_access_token(refreshed)
+                            logger.info(
+                                "oauth refresh succeeded provider=%s credential_index=%d/%d "
+                                "expires_in_s=%.0f",
                                 self._provider,
                                 idx + 1,
                                 count,
+                                max(0.0, _creds_expires_at(refreshed) - time.time()),
                             )
-                            continue
-                    else:
-                        retry_at = self._refresh_failed_until.get(idx, 0.0)
-                        if retry_at <= now:
-                            pre_refresh = dict(cred)
-                            try:
-                                refreshed = await self._refresh_one(cred)
-                            except Exception as exc:
-                                self._refresh_failed_until[idx] = (
-                                    time.time() + self._refresh_failure_cooldown_seconds()
-                                )
-                                self._log_refresh_failure(idx, exc)
-                                if self._is_expired(cred):
-                                    continue
-                            else:
-                                self._creds[idx] = refreshed
-                                self._refresh_failed_until.pop(idx, None)
-                                self._persist(pre_refresh, refreshed)
-                                token = _creds_access_token(refreshed)
-                                logger.info(
-                                    "oauth refresh succeeded provider=%s credential_index=%d/%d "
-                                    "expires_in_s=%.0f",
-                                    self._provider,
-                                    idx + 1,
-                                    count,
-                                    max(0.0, _creds_expires_at(refreshed) - time.time()),
-                                )
-                        elif self._is_expired(cred):
-                            # Do not retry a known-bad refresh on every request
-                            # and do not forward an access token that is dead.
-                            continue
+                    elif self._is_expired(cred):
+                        # Do not retry a known-bad refresh on every request
+                        # and do not forward an access token that is dead.
+                        continue
 
                 if token:
                     # Reserve the next slot before releasing the lock. This
@@ -822,11 +916,35 @@ class CodexTokenRotator:
         except (TypeError, ValueError):
             return cls._DEFAULT_REFRESH_FAILURE_COOLDOWN_SECONDS
 
+    @classmethod
+    def _is_permanent_refresh_error(cls, exc: BaseException) -> bool:
+        """Return whether ``exc`` is a permanently-rejected OAuth refresh."""
+        from tusker_gateway.codex_oauth import CodexOAuthError
+
+        if isinstance(exc, CodexOAuthError):
+            return (exc.code or "") in cls._PERMANENT_REFRESH_ERROR_CODES
+        return False
+
+    @classmethod
+    def _permanent_refresh_cooldown_seconds(cls) -> float:
+        """Cooldown applied to permanently-rejected credentials (default 24h)."""
+        try:
+            return max(
+                1.0,
+                float(
+                    os.environ.get(
+                        "TUSKER_OAUTH_PERMANENT_FAILURE_COOLDOWN_SECS",
+                        str(cls._DEFAULT_PERMANENT_REFRESH_FAILURE_COOLDOWN_SECONDS),
+                    )
+                ),
+            )
+        except (TypeError, ValueError):
+            return cls._DEFAULT_PERMANENT_REFRESH_FAILURE_COOLDOWN_SECONDS
+
     def _log_refresh_failure(self, index: int, exc: BaseException) -> None:
         """Log OAuth failure metadata without logging token-bearing details."""
         logger.warning(
-            "oauth refresh failed provider=%s credential_index=%s status=%s code=%s "
-            "retryable=%s",
+            "oauth refresh failed provider=%s credential_index=%s status=%s code=%s retryable=%s",
             self._provider,
             index + 1 if index >= 0 else index,
             getattr(exc, "status", None),
@@ -871,8 +989,7 @@ class CodexTokenRotator:
                     # overwrite the admin replacement.
                     if not persist(provider, expected_snap, replacement_snap):
                         logger.info(
-                            "oauth credential CAS skipped (row replaced "
-                            "concurrently) provider=%s",
+                            "oauth credential CAS skipped (row replaced concurrently) provider=%s",
                             provider,
                         )
                 except Exception:
@@ -890,6 +1007,7 @@ class CodexTokenRotator:
             return
         try:
             from tusker_gateway.copilot_enroll import save_provider_auth_pool
+
             save_provider_auth_pool(
                 self._provider,
                 self._creds,
@@ -944,7 +1062,9 @@ def _chat_content_to_responses(content: Any) -> str | list[dict[str, Any]]:
                 url = image_url
                 detail = block.get("detail")
             if not isinstance(url, str) or not url:
-                raise ProviderError(f"Message image block {index} must contain a non-empty image_url")
+                raise ProviderError(
+                    f"Message image block {index} must contain a non-empty image_url"
+                )
             image_block: dict[str, Any] = {"type": "input_image", "image_url": url}
             if detail is not None:
                 image_block["detail"] = detail
@@ -991,9 +1111,7 @@ def _chat_messages_to_responses(messages: list[dict[str, Any]]) -> list[dict[str
                 # tool result. Failing explicitly prevents a malformed
                 # transcript from looking like a valid request with missing
                 # history.
-                raise ProviderError(
-                    f"Message {index} is a tool result without tool_call_id"
-                )
+                raise ProviderError(f"Message {index} is a tool result without tool_call_id")
             output_item: dict[str, Any] = {
                 "type": "function_call_output",
                 "call_id": call_id,
@@ -1008,9 +1126,7 @@ def _chat_messages_to_responses(messages: list[dict[str, Any]]) -> list[dict[str
             continue
 
         if role not in {"system", "developer", "user", "assistant"}:
-            raise ProviderError(
-                f"Message {index} has unsupported role: {role!r}"
-            )
+            raise ProviderError(f"Message {index} has unsupported role: {role!r}")
 
         content = _chat_content_to_responses(msg.get("content"))
         input_role = "developer" if role == "developer" else role
@@ -1027,12 +1143,14 @@ def _chat_messages_to_responses(messages: list[dict[str, Any]]) -> list[dict[str
                 raw_calls = [msg["function_call"]]
             for call in normalize_tool_calls(raw_calls):
                 function = call["function"]
-                input_data.append({
-                    "type": "function_call",
-                    "call_id": call["id"],
-                    "name": function["name"],
-                    "arguments": function["arguments"],
-                })
+                input_data.append(
+                    {
+                        "type": "function_call",
+                        "call_id": call["id"],
+                        "name": function["name"],
+                        "arguments": function["arguments"],
+                    }
+                )
             continue
 
         if isinstance(content, str):
@@ -1045,11 +1163,7 @@ def _chat_messages_to_responses(messages: list[dict[str, Any]]) -> list[dict[str
 def _responses_text(content: str | list[dict[str, Any]]) -> str:
     if isinstance(content, str):
         return content
-    return "\n".join(
-        block["text"]
-        for block in content
-        if block.get("type") == "input_text"
-    )
+    return "\n".join(block["text"] for block in content if block.get("type") == "input_text")
 
 
 def _responses_tool_choice(tool_choice: Any) -> Any:
@@ -1102,7 +1216,6 @@ def _chat_response_format_to_codex_text(value: Any) -> dict[str, Any] | None:
     raise ProviderError(f"Unsupported response_format type for Codex: {kind!r}")
 
 
-
 async def _stream_with_model_alias(
     upstream_model: str,
     alias: str,
@@ -1151,17 +1264,17 @@ class PassthroughClient:
         self._http = http_client
         self._catalog_registry = catalog_registry
         self._usage = ProviderUsageDB(
-            default_provider_usage_db_path(
-                config.get("quality_db_path", "data/quality.db")
-            )
+            default_provider_usage_db_path(config.get("quality_db_path", "data/quality.db"))
         )
         secrets_authoritative = bool(config.get("config_db_credentials_authoritative"))
         auth_file = config.get("auth_file")
         if not auth_file:
             import os
+
             auth_file = os.getenv("TUSKER_AUTH_FILE")
         if not auth_file:
             from pathlib import Path
+
             auth_file = str(Path.home() / ".hermes" / "auth.json")
         codex_creds = config.get("codex_credentials", [])
         if not codex_creds and not secrets_authoritative:
@@ -1171,6 +1284,7 @@ class PassthroughClient:
             # disk file.
             try:
                 from tusker_gateway.copilot_enroll import load_auth_file
+
                 codex_creds = load_auth_file(auth_file)
             except Exception:
                 codex_creds = []
@@ -1238,7 +1352,7 @@ class PassthroughClient:
         model: str,
     ) -> str:
         """Resolve a client-facing model alias to its canonical upstream name.
-        
+
         If the model is not an alias for the given provider, return it unchanged.
         Only applies to providers that do not use the Responses API adapter
         (standard /v1/chat/completions passthrough).
@@ -1254,6 +1368,7 @@ class PassthroughClient:
             return model
         try:
             from tusker_gateway.config import _load_providers
+
             registry = _load_providers()
             pc = registry.get(provider)
             if pc and pc.model_aliases and model in pc.model_aliases:
@@ -1266,6 +1381,7 @@ class PassthroughClient:
         """Return the client-facing alias for a given upstream model, if one exists."""
         try:
             from tusker_gateway.config import _load_providers
+
             registry = _load_providers()
             pc = registry.get(provider)
             if pc and pc.model_aliases:
@@ -1385,9 +1501,7 @@ class PassthroughClient:
         await self._record_quality(provider, model, False, latency_ms)
 
         body = getattr(exc, "upstream_body", None) or str(exc)
-        capacity_group = _quarantine_capacity_failure(
-            self._config, provider, model, exc
-        )
+        capacity_group = _quarantine_capacity_failure(self._config, provider, model, exc)
         self._record_usage(
             provider,
             model,
@@ -1397,6 +1511,7 @@ class PassthroughClient:
 
         if getattr(exc, "upstream_status", None) in (404, 410):
             from tusker_gateway.cooldown import mark_permanently_failed
+
             mark_permanently_failed(provider, model)
 
         seconds = _upstream_failure_cooldown_seconds(exc)
@@ -1436,13 +1551,14 @@ class PassthroughClient:
         metrics_registry: Any | None = None,
     ) -> dict[str, Any] | AsyncIterator[bytes]:
         """Make a passthrough chat completions call to the provider."""
-        logger.info('passthrough %s/%s stream=%s', provider, model, stream)
+        logger.info("passthrough %s/%s stream=%s", provider, model, stream)
 
         # Optional RTK compression: trims verbose tool_result content (git
         # diffs, ls dumps, test runner output) before dispatch. Default ON
         # when the global RTK flag is set; pass rtk_compress=False to skip.
         if rtk_compress and messages:
             from tusker_gateway.rtk import compress_tool_results, is_enabled as rtk_enabled
+
             if rtk_enabled():
                 messages = compress_tool_results(messages, metrics=metrics_registry)
 
@@ -1450,7 +1566,11 @@ class PassthroughClient:
         # the standard chat-completions passthrough and the openai-codex
         # Responses API adapter.
         if upstream_gateway:
-            endpoint = {"base_url": upstream_gateway.rstrip("/"), "chat_path": "/v1/chat/completions", "auth_type": "bearer"}
+            endpoint = {
+                "base_url": upstream_gateway.rstrip("/"),
+                "chat_path": "/v1/chat/completions",
+                "auth_type": "bearer",
+            }
         else:
             # Runtime config overrides (from PROVIDER_REGISTRY_JSON) take
             # precedence over the built-in DEFAULT_PROVIDER_REGISTRY.
@@ -1494,10 +1614,15 @@ class PassthroughClient:
 
         if use_responses:
             return await self._chat_codex(
-                provider, model, messages,
-                stream=stream, api_key=api_key, tools=tools,
+                provider,
+                model,
+                messages,
+                stream=stream,
+                api_key=api_key,
+                tools=tools,
                 tool_choice=tool_choice,
-                extra_headers=extra_headers, extra_body=extra_body,
+                extra_headers=extra_headers,
+                extra_body=extra_body,
                 endpoint=endpoint,
             )
 
@@ -1505,13 +1630,22 @@ class PassthroughClient:
         path = endpoint["chat_path"]
         url = f"{base_url}{path}"
         provider_config = (self._config.get("providers") or {}).get(provider)
-        aliases = provider_config.get("model_aliases", {}) if isinstance(provider_config, dict) else getattr(provider_config, "model_aliases", {})
+        aliases = (
+            provider_config.get("model_aliases", {})
+            if isinstance(provider_config, dict)
+            else getattr(provider_config, "model_aliases", {})
+        )
         upstream_model = model if upstream_gateway else aliases.get(model, model)
         headers, body = await self._build_request(
-            provider, upstream_model, messages,
-            stream=stream, api_key=(self._config["api_keys"][0] if upstream_gateway else api_key),
-            tools=tools, tool_choice=tool_choice,
-            extra_headers=extra_headers, extra_body=extra_body,
+            provider,
+            upstream_model,
+            messages,
+            stream=stream,
+            api_key=(self._config["api_keys"][0] if upstream_gateway else api_key),
+            tools=tools,
+            tool_choice=tool_choice,
+            extra_headers=extra_headers,
+            extra_body=extra_body,
             conversation_id=conversation_id,
             endpoint=endpoint,
         )
@@ -1521,7 +1655,10 @@ class PassthroughClient:
         if stream:
             try:
                 resp = await self._http.request(
-                    "POST", url, headers=headers, json=body,
+                    "POST",
+                    url,
+                    headers=headers,
+                    json=body,
                     timeout=aiohttp.ClientTimeout(
                         total=120,
                         # Cap the *gap* between SSE bytes. If the provider goes
@@ -1544,10 +1681,13 @@ class PassthroughClient:
                 )
             except RateLimitError as exc:
                 from tusker_gateway.cooldown import _cooldown_seconds_for_429
+
                 tracker = global_tracker()
                 body_text = exc.body or "429 rate limit"
-                seconds = _cooldown_seconds_for_429({"body": body_text, "headers": dict(resp.headers)})
-                logger.warning('429 from %s/%s, cooldown=%.0fs', provider, model, seconds)
+                seconds = _cooldown_seconds_for_429(
+                    {"body": body_text, "headers": dict(resp.headers)}
+                )
+                logger.warning("429 from %s/%s, cooldown=%.0fs", provider, model, seconds)
                 tracker.cooldown(provider, model, seconds)
                 self._record_usage(
                     provider,
@@ -1560,7 +1700,11 @@ class PassthroughClient:
                 try:
                     from tusker_gateway.persistent_cooldown import PersistentCooldownStore
                     from pathlib import Path
-                    db_path = Path(self._config.get("quality_db_path", "data/quality.db")).parent / "cooldowns.db"
+
+                    db_path = (
+                        Path(self._config.get("quality_db_path", "data/quality.db")).parent
+                        / "cooldowns.db"
+                    )
                     store = PersistentCooldownStore(db_path=db_path)
                     store.record(provider, model, seconds)
                 except Exception:
@@ -1586,12 +1730,16 @@ class PassthroughClient:
             return stream_iter
         try:
             async with self._http.request(
-                "POST", url, headers=headers, json=body,
+                "POST",
+                url,
+                headers=headers,
+                json=body,
                 timeout=aiohttp.ClientTimeout(total=120),
             ) as resp:
                 await self._check_response(resp, provider=provider, model=model)
                 result = await resp.json()
                 from tusker_gateway.tool_formats import normalize_response_tool_calls
+
                 result = normalize_response_tool_calls(
                     result,
                     source=f"{provider}/{model}",
@@ -1605,17 +1753,18 @@ class PassthroughClient:
                 )
                 latency_ms = (time.monotonic() - start) * 1000
                 await self._record_quality(provider, model, True, latency_ms)
-                logger.debug('quality recorded %s/%s success=True', provider, model)
+                logger.debug("quality recorded %s/%s success=True", provider, model)
                 global_tracker().clear_failures(provider)
                 if model != upstream_model and result.get("model") == upstream_model:
                     result["model"] = model
                 return result
         except RateLimitError as exc:
             from tusker_gateway.cooldown import _cooldown_seconds_for_429
+
             tracker = global_tracker()
             body_text = exc.body or "429 rate limit"
             seconds = _cooldown_seconds_for_429({"body": body_text, "headers": exc.headers})
-            logger.warning('429 from %s/%s, cooldown=%.0fs', provider, model, seconds)
+            logger.warning("429 from %s/%s, cooldown=%.0fs", provider, model, seconds)
             tracker.cooldown(provider, model, seconds)
             self._record_usage(
                 provider,
@@ -1626,7 +1775,11 @@ class PassthroughClient:
             try:
                 from tusker_gateway.persistent_cooldown import PersistentCooldownStore
                 from pathlib import Path
-                db_path = Path(self._config.get("quality_db_path", "data/quality.db")).parent / "cooldowns.db"
+
+                db_path = (
+                    Path(self._config.get("quality_db_path", "data/quality.db")).parent
+                    / "cooldowns.db"
+                )
                 store = PersistentCooldownStore(db_path=db_path)
                 store.record(provider, model, seconds)
             except Exception:
@@ -1642,14 +1795,18 @@ class PassthroughClient:
                 success=False,
                 group=capacity_group,
             )
-            logger.debug('quality recorded %s/%s success=False', provider, model)
+            logger.debug("quality recorded %s/%s success=False", provider, model)
             tracker = global_tracker()
             if tracker.record_failure(provider):
-                tracker.cooldown(provider, "", 300.0) # Provider-level cooldown
+                tracker.cooldown(provider, "", 300.0)  # Provider-level cooldown
                 try:
                     from tusker_gateway.persistent_cooldown import PersistentCooldownStore
                     from pathlib import Path
-                    db_path = Path(self._config.get("quality_db_path", "data/quality.db")).parent / "cooldowns.db"
+
+                    db_path = (
+                        Path(self._config.get("quality_db_path", "data/quality.db")).parent
+                        / "cooldowns.db"
+                    )
                     store = PersistentCooldownStore(db_path=db_path)
                     store.record_provider(provider, 300.0)
                 except Exception:
@@ -1658,8 +1815,9 @@ class PassthroughClient:
             status_code = getattr(exc, "upstream_status", None)
             if status_code in (404, 410):
                 from tusker_gateway.cooldown import mark_permanently_failed
+
                 mark_permanently_failed(provider, model)
-            logger.warning('provider error %s/%s: %s', provider, model, exc)
+            logger.warning("provider error %s/%s: %s", provider, model, exc)
             if isinstance(exc, ProviderError):
                 raise
             raise ProviderError(str(exc)) from exc
@@ -1764,15 +1922,12 @@ class PassthroughClient:
             **(extra_headers or {}),
         }
         headers.update(
-            await strategy.headers(
-                self._config, provider, model, api_key, endpoint_model
-            )
+            await strategy.headers(self._config, provider, model, api_key, endpoint_model)
         )
-        if (
-            provider.lower()
-            in {"github-copilot", "github-copilot-enterprise"}
-            and _messages_contain_image_input(messages)
-        ):
+        if provider.lower() in {
+            "github-copilot",
+            "github-copilot-enterprise",
+        } and _messages_contain_image_input(messages):
             # The model slug is not a reliable vision signal (for example,
             # provider aliases and newly-added multimodal models often have
             # text-looking names). Tell Copilot from the actual request
@@ -1818,6 +1973,7 @@ class PassthroughClient:
             if isinstance(effort, str):
                 body["reasoning_effort"] = _normalize_reasoning_effort(effort)
         return headers, body
+
     async def _chat_codex(
         self,
         provider: str,
@@ -1835,6 +1991,7 @@ class PassthroughClient:
         from tusker_gateway.auth_strategies import get_auth_strategy
         from tusker_gateway.models import ProviderConfig
         from tusker_gateway.tool_formats import normalize_tools
+
         endpoint_raw = endpoint or PROVIDER_ENDPOINTS["openai-codex"]
         endpoint_model = ProviderConfig.from_raw(endpoint_raw)
         rotator = self._rotator_for(provider)
@@ -1847,17 +2004,9 @@ class PassthroughClient:
             strategy = get_auth_strategy("oauth", rotator)
         else:
             strategy = get_auth_strategy("bearer", getattr(self, "_codex_rotator", None))
-        headers = {
-            "Content-Type": "application/json",
-            **(extra_headers or {}),
-            **await strategy.headers(self._config, provider, model, api_key, endpoint_model),
-        }
-        if (
-            provider.lower()
-            in {"github-copilot", "github-copilot-enterprise"}
-            and _messages_contain_image_input(messages)
-        ):
-            headers["Copilot-Vision-Request"] = "true"
+        # headers are built inside the retry loop below so each attempt can
+        # pick a fresh credential from the rotator when the previous one
+        # gets quarantined by a per-user quota 429.
         input_data = _chat_messages_to_responses(messages)
         # Codex backend requires stream=true; force it here regardless of
         # what the caller asked for (the response parser handles SSE).
@@ -1897,9 +2046,7 @@ class PassthroughClient:
                 response_tools.append(response_tool)
             body["tools"] = response_tools
             body["tool_choice"] = (
-                _responses_tool_choice(tool_choice)
-                if tool_choice is not None
-                else "auto"
+                _responses_tool_choice(tool_choice) if tool_choice is not None else "auto"
             )
             body["parallel_tool_calls"] = True
         if extra_body:
@@ -1969,66 +2116,154 @@ class PassthroughClient:
             if isinstance(reasoning, dict):
                 reasoning.setdefault("summary", "auto")
                 if "effort" in reasoning:
-                    reasoning["effort"] = _normalize_reasoning_effort(
-                        reasoning["effort"]
-                    )
+                    reasoning["effort"] = _normalize_reasoning_effort(reasoning["effort"])
         url = f"{endpoint_raw['base_url']}{endpoint_raw['chat_path']}"
-        start = time.monotonic()
-        resp = await self._http.request("POST", url, headers=headers, json=body, timeout=aiohttp.ClientTimeout(total=120))
-        try:
-            await self._check_response(resp, provider=provider, model=model)
-        except RateLimitError as exc:
-            resp.release()
-            from tusker_gateway.cooldown import _cooldown_seconds_for_429
-            tracker = global_tracker()
-            seconds = _cooldown_seconds_for_429({"body": (exc.body or "429"), "headers": {}})
-            tracker.cooldown(provider, model, seconds)
+        # Retry loop: on a per-credential quota 429 (e.g. codex team user
+        # exhausted their own quota), quarantine the credential and retry
+        # with the next one from the rotator. Non-quota 429s (generic
+        # throttling) and other errors re-raise immediately. At most
+        # ``rotator.size`` attempts to prevent infinite loops.
+        max_attempts = max(rotator.size, 1) if rotator else 1
+        last_exc: RateLimitError | None = None
+        for attempt in range(max_attempts):
+            # Rebuild headers so the strategy picks the next credential
+            # from the rotator (the previous attempt's credential may be
+            # quarantined by the time we get here).
+            headers = {
+                "Content-Type": "application/json",
+                **(extra_headers or {}),
+                **await strategy.headers(self._config, provider, model, api_key, endpoint_model),
+            }
+            if provider.lower() in {
+                "github-copilot",
+                "github-copilot-enterprise",
+            } and _messages_contain_image_input(messages):
+                headers["Copilot-Vision-Request"] = "true"
+            start = time.monotonic()
+            resp = await self._http.request(
+                "POST", url, headers=headers, json=body, timeout=aiohttp.ClientTimeout(total=120)
+            )
             try:
-                from tusker_gateway.persistent_cooldown import PersistentCooldownStore
-                from pathlib import Path
-                db_path = Path(self._config.get("quality_db_path", "data/quality.db")).parent / "cooldowns.db"
-                PersistentCooldownStore(db_path=db_path).record(provider, model, seconds)
-            except Exception:
-                pass
-            # get_token() already reserved the next credential before this
-            # request was sent, so advancing here would skip a credential.
-            raise
-        except Exception as exc:
-            # Use the body/status attached by _check_response (raised above)
-            # instead of re-reading the response — aiohttp's resp.text() may
-            # have already been consumed. Auth failures (401/403) are ERROR
-            # level since a credential/model is broken and needs attention.
-            status = getattr(exc, "upstream_status", None)
-            body_text = _safe_upstream_body(getattr(exc, "upstream_body", None))
-            if status in (401, 403):
-                logger.error(
-                    "codex auth error model=%s stream=%s status=%d body=%s",
-                    model, stream, status or 0, body_text[:300],
-                )
-            elif status is not None:
-                logger.warning(
-                    "codex error model=%s stream=%s status=%d body=%s",
-                    model, stream, status, body_text[:300],
-                )
-            else:
-                logger.error(
-                    "codex error model=%s stream=%s body=%s",
-                    model, stream, body_text[:300],
-                )
-            resp.release()
-            # get_token() already reserved the next credential before this
-            # request was sent, so advancing here would skip a credential.
-            raise
-        result = await self._parse_codex_sse_async(resp)
-        from tusker_gateway.tool_formats import normalize_response_tool_calls
+                await self._check_response(resp, provider=provider, model=model)
+            except RateLimitError as exc:
+                resp.release()
+                from tusker_gateway.cooldown import _cooldown_seconds_for_429
 
-        result = normalize_response_tool_calls(
-            result,
-            source=f"{provider}/{model}",
-        )
-        latency_ms = (time.monotonic() - start) * 1000
-        await self._record_quality(provider, model, True, latency_ms)
-        return result
+                tracker = global_tracker()
+                body_text = exc.body or "429"
+                seconds = _cooldown_seconds_for_429({"body": body_text, "headers": {}})
+                # Per-credential quarantine: when a codex user hits their own
+                # quota (plan_type: team, usage_limit_reached, etc.), only the
+                # credential that returned 429 should be skipped. The other
+                # credentials in the same pool keep serving the same model so
+                # healthy accounts are not collateral damage. Generic 429s
+                # (provider-wide throttling) still trigger model-level cooldown.
+                auth_value = str(headers.get("Authorization") or "")
+                used_token = auth_value[7:] if auth_value.lower().startswith("bearer ") else ""
+                used_fp = CodexTokenRotator.fingerprint(used_token)
+                quota_429 = bool(used_fp) and any(
+                    hint in body_text.lower() for hint in _QUOTA_HINTS
+                )
+                if quota_429 and rotator is not None and used_fp:
+                    used_label = ""
+                    for c in rotator._creds:
+                        if CodexTokenRotator.fingerprint(_creds_access_token(c)) == used_fp:
+                            used_label = rotator._credential_label(c, 0)
+                            break
+                    rotator.cooldown_credential(used_fp, seconds, label=used_label)
+                    last_exc = exc
+                    # Only escalate to a model-level cooldown once EVERY
+                    # credential is individually quarantined; otherwise the
+                    # next pool selection still tries a healthy account.
+                    if len(rotator._credential_cooldowns) >= rotator.size:
+                        tracker.cooldown(provider, model, seconds)
+                        try:
+                            from tusker_gateway.persistent_cooldown import PersistentCooldownStore
+
+                            db_path = (
+                                Path(self._config.get("quality_db_path", "data/quality.db")).parent
+                                / "cooldowns.db"
+                            )
+                            PersistentCooldownStore(db_path=db_path).record(
+                                provider, model, seconds
+                            )
+                        except Exception:
+                            pass
+                    logger.warning(
+                        "codex quota 429 provider=%s model=%s credential=%s "
+                        "attempt=%d/%d cooldown=%.0fs",
+                        provider,
+                        model,
+                        used_label or used_fp or "?",
+                        attempt + 1,
+                        max_attempts,
+                        seconds,
+                    )
+                    if attempt + 1 < max_attempts:
+                        continue
+                    raise
+                # Generic 429 (not per-user quota): model-level cooldown.
+                tracker.cooldown(provider, model, seconds)
+                try:
+                    from tusker_gateway.persistent_cooldown import PersistentCooldownStore
+
+                    db_path = (
+                        Path(self._config.get("quality_db_path", "data/quality.db")).parent
+                        / "cooldowns.db"
+                    )
+                    PersistentCooldownStore(db_path=db_path).record(provider, model, seconds)
+                except Exception:
+                    pass
+                raise
+            except Exception as exc:
+                # Use the body/status attached by _check_response (raised above)
+                # instead of re-reading the response — aiohttp's resp.text() may
+                # have already been consumed. Auth failures (401/403) are ERROR
+                # level since a credential/model is broken and needs attention.
+                status = getattr(exc, "upstream_status", None)
+                body_text = _safe_upstream_body(getattr(exc, "upstream_body", None))
+                if status in (401, 403):
+                    logger.error(
+                        "codex auth error model=%s stream=%s status=%d body=%s",
+                        model,
+                        stream,
+                        status or 0,
+                        body_text[:300],
+                    )
+                elif status is not None:
+                    logger.warning(
+                        "codex error model=%s stream=%s status=%d body=%s",
+                        model,
+                        stream,
+                        status,
+                        body_text[:300],
+                    )
+                else:
+                    logger.error(
+                        "codex error model=%s stream=%s body=%s",
+                        model,
+                        stream,
+                        body_text[:300],
+                    )
+                resp.release()
+                # get_token() already reserved the next credential before this
+                # request was sent, so advancing here would skip a credential.
+                raise
+            result = await self._parse_codex_sse_async(resp)
+            from tusker_gateway.tool_formats import normalize_response_tool_calls
+
+            result = normalize_response_tool_calls(
+                result,
+                source=f"{provider}/{model}",
+            )
+            latency_ms = (time.monotonic() - start) * 1000
+            await self._record_quality(provider, model, True, latency_ms)
+            return result
+        # All attempts exhausted (every credential returned quota 429).
+        if last_exc is not None:
+            raise last_exc
+        raise ProviderError("All codex credentials exhausted")
+
     async def _parse_codex_sse_async(self, resp: aiohttp.ClientResponse) -> dict[str, Any]:
         """Iterate a Codex SSE response and assemble an OpenAI-compatible dict."""
         content_parts: list[str] = []
@@ -2084,7 +2319,7 @@ class PassthroughClient:
             if not line.startswith("data: "):
                 continue
             try:
-                evt = json.loads(line[len("data: "):])
+                evt = json.loads(line[len("data: ") :])
             except json.JSONDecodeError:
                 continue
             etype = evt.get("type", "")
@@ -2141,7 +2376,9 @@ class PassthroughClient:
                                     content_parts.append(text)
             elif etype == "response.failed":
                 err = evt.get("error") or {}
-                raise ProviderError(f"Codex response failed: {err.get('code','unknown')} {err.get('message','')[:200]}")
+                raise ProviderError(
+                    f"Codex response failed: {err.get('code', 'unknown')} {err.get('message', '')[:200]}"
+                )
         message: dict[str, Any] = {"role": "assistant", "content": "".join(content_parts)}
         if tool_order:
             message["tool_calls"] = [tool_calls[cid] for cid in tool_order]
@@ -2150,10 +2387,15 @@ class PassthroughClient:
             "object": "chat.completion",
             "created": int(time.time()),
             "model": "openai-codex",
-            "choices": [{"index": 0, "message": message, "finish_reason": "tool_calls" if tool_order else "stop"}],
+            "choices": [
+                {
+                    "index": 0,
+                    "message": message,
+                    "finish_reason": "tool_calls" if tool_order else "stop",
+                }
+            ],
             "usage": usage_obj or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         }
-
 
     @staticmethod
     async def _check_response(
@@ -2189,9 +2431,13 @@ class PassthroughClient:
         elif resp.status == 403:
             exc = ProviderError("Provider access forbidden", code="forbidden")
         elif resp.status >= 500:
-            exc = ProviderError(f"Provider returned {resp.status}: {body[:200]}", code="provider_error")
+            exc = ProviderError(
+                f"Provider returned {resp.status}: {body[:200]}", code="provider_error"
+            )
         else:
-            exc = ProviderError(f"Provider returned {resp.status}: {body[:200]}", code="provider_error")
+            exc = ProviderError(
+                f"Provider returned {resp.status}: {body[:200]}", code="provider_error"
+            )
         # Carry the upstream status/body so the circuit-breaker failure path
         # can derive a sensible cooldown for permanent (401/403/404) failures.
         exc.upstream_status = resp.status
@@ -2251,6 +2497,7 @@ class PassthroughClient:
                     raise failure
                 if _stream_frame_is_terminal(frame):
                     saw_terminal = True
+
         try:
             for chunk in initial_chunks or []:
                 observe(chunk)
@@ -2270,34 +2517,49 @@ class PassthroughClient:
             logger.info(
                 "upstream server disconnected mid-stream provider=%s model=%s "
                 "url=%s status=%s err=%s",
-                provider, model, upstream_str, status, exc,
+                provider,
+                model,
+                upstream_str,
+                status,
+                exc,
             )
             if provider and model:
                 await self._record_stream_failure(provider, model, exc, started or time.monotonic())
             raise
         except aiohttp.ClientConnectionError as exc:
             logger.info(
-                "upstream connection error mid-stream provider=%s model=%s "
-                "url=%s status=%s err=%s",
-                provider, model, upstream_str, status, exc,
+                "upstream connection error mid-stream provider=%s model=%s url=%s status=%s err=%s",
+                provider,
+                model,
+                upstream_str,
+                status,
+                exc,
             )
             if provider and model:
                 await self._record_stream_failure(provider, model, exc, started or time.monotonic())
             raise
         except asyncio.TimeoutError:
             logger.warning(
-                "upstream SSE read timeout (>%ss idle) provider=%s model=%s "
-                "url=%s status=%s",
-                _UPSTREAM_STREAM_SOCK_READ_SECS, provider, model, upstream_str, status,
+                "upstream SSE read timeout (>%ss idle) provider=%s model=%s url=%s status=%s",
+                _UPSTREAM_STREAM_SOCK_READ_SECS,
+                provider,
+                model,
+                upstream_str,
+                status,
             )
             if provider and model:
-                await self._record_stream_failure(provider, model, TimeoutError(), started or time.monotonic())
+                await self._record_stream_failure(
+                    provider, model, TimeoutError(), started or time.monotonic()
+                )
             raise
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "upstream SSE read failed provider=%s model=%s "
-                "url=%s status=%s err=%s",
-                provider, model, upstream_str, status, exc,
+                "upstream SSE read failed provider=%s model=%s url=%s status=%s err=%s",
+                provider,
+                model,
+                upstream_str,
+                status,
+                exc,
                 exc_info=True,
             )
             if provider and model:
@@ -2322,8 +2584,6 @@ class PassthroughClient:
                 if inspect.iscoroutinefunction(record):
                     await record(provider, model, success, latency_ms)
                 else:
-                    await asyncio.to_thread(
-                        record, provider, model, success, latency_ms
-                    )
+                    await asyncio.to_thread(record, provider, model, success, latency_ms)
         except Exception:
             pass  # Quality DB is best-effort

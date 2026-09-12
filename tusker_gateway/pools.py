@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from tusker_gateway.catalog import (
+    AUTO_DISCOVERED_HEAVYWEIGHT_WEIGHT,
     advertised_input_modalities,
     advertised_output_modalities,
     advertised_tool_support,
@@ -397,6 +398,13 @@ class PoolManager:
                     "pool '%s': dropping %s '%s' — %s (add the key to the provider secret to enable)",
                     name, s.provider, s.model, reason,
                 )
+            # Pre-seed quality scores for operator-curated models so that
+            # known-good static entries always outrank unknown auto-discovered
+            # catalog candidates (which start at the adaptive floor ~40).
+            # The pre-seed is overwritten by the first real event, so a broken
+            # model immediately drops to its true score.
+            for s in usable:
+                self._quality.prime_model(s.provider, s.model)
             self.unkeyed[name] = unkeyed
             self.models[name] = usable
             # Warn about unknown providers once at startup
@@ -640,6 +648,15 @@ class PoolManager:
                         "auto_discovered": True,
                     }
                     model_data["heavyweight"] = heavyweight
+                    # Deprioritise auto-discovered heavyweights so they are only
+                    # selected after all weight-1.0 candidates are exhausted.
+                    # This prevents expensive catalog entries (e.g. claude-sonnet-4.6
+                    # via copilot) from burning a limited budget alongside known-good
+                    # static models before the quality DB has evidence.
+                    if heavyweight:
+                        model_data["weight"] = AUTO_DISCOVERED_HEAVYWEIGHT_WEIGHT
+                    else:
+                        model_data["weight"] = 1.0
                     modalities = advertised_input_modalities(entry)
                     if modalities is not None:
                         model_data["input_modalities"] = sorted(modalities)

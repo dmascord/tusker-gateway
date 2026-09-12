@@ -1,4 +1,5 @@
 """Tests for pools, selection, and cooldown logic."""
+
 from __future__ import annotations
 
 import os
@@ -9,6 +10,7 @@ from tusker_gateway.config import PoolConfig, _load_pools, load_config
 from tusker_gateway.cooldown import CooldownTracker, _cooldown_seconds_for_429
 from tusker_gateway.model_capability import STRUCTURED_OUTPUT_PROBE_VERSION
 from tusker_gateway.pools import ModelSpec, PoolManager, is_general_chat_model
+from tusker_gateway.quality import QualityDB
 
 
 def test_default_code_pool_includes_current_provider_routes(monkeypatch):
@@ -18,10 +20,7 @@ def test_default_code_pool_includes_current_provider_routes(monkeypatch):
 
     pool = _load_pools()["code"]
     models = pool.models
-    routes = {
-        (model["provider"], model["model"])
-        for model in models
-    }
+    routes = {(model["provider"], model["model"]) for model in models}
 
     assert {
         ("groq", "openai/gpt-oss-120b"),
@@ -40,10 +39,7 @@ def test_synthetic_is_eligible_for_privacy_pool(monkeypatch):
     from tusker_gateway.config import DEFAULT_PROVIDER_REGISTRY
 
     assert DEFAULT_PROVIDER_REGISTRY["synthetic"].zdr_ok is True
-    routes = {
-        (model["provider"], model["model"])
-        for model in _load_pools()["privacy"].models
-    }
+    routes = {(model["provider"], model["model"]) for model in _load_pools()["privacy"].models}
     assert {
         ("synthetic", "syn:large:text"),
         ("synthetic", "syn:small:text"),
@@ -71,13 +67,27 @@ def test_new_privacy_eligible_providers_load(monkeypatch):
     privacy_models = [
         {"provider": "groq", "model": "qwen/qwen3.8-27b"},
         {"provider": "groq", "model": "openai/gpt-oss-20b"},
-        {"provider": "workers-ai", "model": "@cf/meta/llama-3.3-70b-instruct-fp8-fast", "input_modalities": ["text", "image"]},
-        {"provider": "workers-ai", "model": "@cf/meta/llama-4-scout-17b-16e-instruct", "input_modalities": ["text", "image"]},
-        {"provider": "workers-ai", "model": "@cf/nvidia/nemotron-3-120b-a12b", "input_modalities": ["text"]},
+        {
+            "provider": "workers-ai",
+            "model": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+            "input_modalities": ["text", "image"],
+        },
+        {
+            "provider": "workers-ai",
+            "model": "@cf/meta/llama-4-scout-17b-16e-instruct",
+            "input_modalities": ["text", "image"],
+        },
+        {
+            "provider": "workers-ai",
+            "model": "@cf/nvidia/nemotron-3-120b-a12b",
+            "input_modalities": ["text"],
+        },
     ]
     monkeypatch.setenv(
         "TUSKER_POOL_PRIVACY",
-        '{"models":' + json.dumps(privacy_models) + ',"zdr":true,"auto_free":true,"auto_catalog_providers":["groq","workers-ai"]}',
+        '{"models":'
+        + json.dumps(privacy_models)
+        + ',"zdr":true,"auto_free":true,"auto_catalog_providers":["groq","workers-ai"]}',
     )
 
     from tusker_gateway.config import _provider_registry_from_env
@@ -89,13 +99,61 @@ def test_new_privacy_eligible_providers_load(monkeypatch):
     assert registry["alibaba"].zdr_ok is False
 
     pool = _load_pools()["privacy"]
-    routes = {
-        (model["provider"], model["model"])
-        for model in pool.models
-    }
+    routes = {(model["provider"], model["model"]) for model in pool.models}
     assert {("groq", "qwen/qwen3.8-27b"), ("groq", "openai/gpt-oss-20b")} <= routes
     assert {("workers-ai", "@cf/meta/llama-3.3-70b-instruct-fp8-fast")} <= routes
     assert all(p != "alibaba" for p, _ in routes)
+
+
+def test_local_hardware_routes_in_privacy_pool(monkeypatch):
+    """local-llm (Jetson Ollama) and mlx-mac are privacy-eligible. Pool config
+    that lists their canonical models as static entries must include them as
+    candidate routes without triggering the heavyweight gate.
+    """
+    for key in tuple(os.environ):
+        if key.startswith("TUSKER_POOL_") or key == "TUSKER_AUTO_CATALOG_PROVIDERS":
+            monkeypatch.delenv(key, raising=False)
+
+    monkeypatch.setenv(
+        "PROVIDER_REGISTRY_JSON",
+        '{"local-llm":{"kind":"local","base_url":"http://10.0.0.212:11434","chat_path":"/v1/chat/completions","models_path":"/api/tags","zdr_ok":true},'
+        '"mlx-mac":{"kind":"local","base_url":"http://10.0.0.141:11435","chat_path":"/v1/chat/completions","models_path":"/v1/models","zdr_ok":true,"model_aliases":{"qwen3-coder-30b-a3b-instruct-4bit":"/Users/tusker/models/Qwen3-Coder-30B-A3B-Instruct-4bit"}}}',
+    )
+    privacy_models = [
+        {
+            "provider": "local-llm",
+            "model": "qwopus-9b-coder-mtp:latest",
+            "input_modalities": ["text"],
+        },
+        {
+            "provider": "mlx-mac",
+            "model": "qwen3-coder-30b-a3b-instruct-4bit",
+            "input_modalities": ["text"],
+        },
+    ]
+    monkeypatch.setenv(
+        "TUSKER_POOL_PRIVACY",
+        '{"models":' + json.dumps(privacy_models) + ',"zdr":true,"auto_free":true}',
+    )
+
+    from tusker_gateway.config import _provider_registry_from_env
+    from tusker_gateway.heavyweight import is_heavyweight_slug
+
+    registry = _provider_registry_from_env()
+    assert registry["local-llm"].zdr_ok is True
+    assert registry["mlx-mac"].zdr_ok is True
+
+    # Neither slug should trip the heavyweight gate (privacy drops heavies).
+    assert is_heavyweight_slug("qwopus-9b-coder-mtp:latest") is False
+    assert is_heavyweight_slug("qwen3-coder-30b-a3b-instruct-4bit") is False
+
+    pool = _load_pools()["privacy"]
+    routes = {(model["provider"], model["model"]) for model in pool.models}
+    assert {
+        ("local-llm", "qwopus-9b-coder-mtp:latest"),
+        ("mlx-mac", "qwen3-coder-30b-a3b-instruct-4bit"),
+    } <= routes
+
 
 def test_business_copilot_is_available_to_privacy_catalog(monkeypatch):
     for key in tuple(os.environ):
@@ -143,6 +201,7 @@ def test_pool_config_heavyweight_only_flag():
     assert PoolConfig(name="code", models=[]).heavyweight_only is False
     assert PoolConfig(name="premium", models=[], heavyweight_only=True).heavyweight_only is True
 
+
 def test_pool_selection_logic():
     # Use real providers from DEFAULT_PROVIDER_REGISTRY (pools require known providers).
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -171,19 +230,21 @@ def test_pool_selection_logic():
 
 def test_stickiness_expires_and_is_cardinality_bounded():
     with tempfile.TemporaryDirectory() as tmpdir:
-        manager = PoolManager({
-            "pools": {
-                "test": PoolConfig(
-                    name="test",
-                    models=[
-                        {"provider": "groq", "model": "m1"},
-                        {"provider": "openai", "model": "m2"},
-                    ],
-                )
-            },
-            "quality_db_path": os.path.join(tmpdir, "quality.db"),
-            "provider_api_keys": {"groq": "k", "openai": "k"},
-        })
+        manager = PoolManager(
+            {
+                "pools": {
+                    "test": PoolConfig(
+                        name="test",
+                        models=[
+                            {"provider": "groq", "model": "m1"},
+                            {"provider": "openai", "model": "m2"},
+                        ],
+                    )
+                },
+                "quality_db_path": os.path.join(tmpdir, "quality.db"),
+                "provider_api_keys": {"groq": "k", "openai": "k"},
+            }
+        )
         manager.STICKINESS_MAX_ENTRIES = 2
         first = manager.select("test", session_id="expired")
         manager._stickiness_expires[("expired", "test")] = 0
@@ -197,16 +258,18 @@ def test_stickiness_expires_and_is_cardinality_bounded():
 
 def test_readiness_reports_pool_with_only_unkeyed_routes_as_empty():
     with tempfile.TemporaryDirectory() as tmpdir:
-        manager = PoolManager({
-            "pools": {
-                "code": PoolConfig(
-                    name="code",
-                    models=[{"provider": "openai", "model": "gpt-4o"}],
-                )
-            },
-            "quality_db_path": os.path.join(tmpdir, "quality.db"),
-            "provider_api_keys": {},
-        })
+        manager = PoolManager(
+            {
+                "pools": {
+                    "code": PoolConfig(
+                        name="code",
+                        models=[{"provider": "openai", "model": "gpt-4o"}],
+                    )
+                },
+                "quality_db_path": os.path.join(tmpdir, "quality.db"),
+                "provider_api_keys": {},
+            }
+        )
         health, empty = manager.readiness_status()
         assert empty == ["code"]
         assert health["code"] == {"configured": 1, "selectable": 0, "unkeyed": 1}
@@ -214,20 +277,22 @@ def test_readiness_reports_pool_with_only_unkeyed_routes_as_empty():
 
 def test_equal_weight_candidates_round_robin():
     with tempfile.TemporaryDirectory() as tmpdir:
-        manager = PoolManager({
-            "pools": {
-                "test": PoolConfig(
-                    name="test",
-                    models=[
-                        {"provider": "groq", "model": "m1"},
-                        {"provider": "openai", "model": "m2"},
-                    ],
-                ),
-            },
-            "quality_db_path": os.path.join(tmpdir, "quality.db"),
-            "excluded_providers": [],
-            "provider_api_keys": {"groq": "k-groq", "openai": "k-openai"},
-        })
+        manager = PoolManager(
+            {
+                "pools": {
+                    "test": PoolConfig(
+                        name="test",
+                        models=[
+                            {"provider": "groq", "model": "m1"},
+                            {"provider": "openai", "model": "m2"},
+                        ],
+                    ),
+                },
+                "quality_db_path": os.path.join(tmpdir, "quality.db"),
+                "excluded_providers": [],
+                "provider_api_keys": {"groq": "k-groq", "openai": "k-openai"},
+            }
+        )
 
         selections = [manager.select("test") for _ in range(4)]
 
@@ -241,20 +306,22 @@ def test_equal_weight_candidates_round_robin():
 
 def test_caller_provider_policy_filters_pool_before_selection():
     with tempfile.TemporaryDirectory() as tmpdir:
-        manager = PoolManager({
-            "pools": {
-                "test": PoolConfig(
-                    name="test",
-                    models=[
-                        {"provider": "groq", "model": "m1"},
-                        {"provider": "openai", "model": "m2"},
-                    ],
-                ),
-            },
-            "quality_db_path": os.path.join(tmpdir, "quality.db"),
-            "excluded_providers": [],
-            "provider_api_keys": {"groq": "k-groq", "openai": "k-openai"},
-        })
+        manager = PoolManager(
+            {
+                "pools": {
+                    "test": PoolConfig(
+                        name="test",
+                        models=[
+                            {"provider": "groq", "model": "m1"},
+                            {"provider": "openai", "model": "m2"},
+                        ],
+                    ),
+                },
+                "quality_db_path": os.path.join(tmpdir, "quality.db"),
+                "excluded_providers": [],
+                "provider_api_keys": {"groq": "k-groq", "openai": "k-openai"},
+            }
+        )
 
         assert manager.select("test", allowed_providers=("open*",)) == (
             "openai",
@@ -265,27 +332,31 @@ def test_caller_provider_policy_filters_pool_before_selection():
 
 def test_caller_model_policy_filters_concrete_pool_candidates():
     with tempfile.TemporaryDirectory() as tmpdir:
-        manager = PoolManager({
-            "pools": {
-                "test": PoolConfig(
-                    name="test",
-                    models=[
-                        {"provider": "openrouter", "model": "approved"},
-                        {"provider": "openrouter", "model": "denied"},
-                    ],
-                ),
-            },
-            "quality_db_path": os.path.join(tmpdir, "quality.db"),
-            "excluded_providers": [],
-            "provider_api_keys": {"openrouter": "k-openrouter"},
-        })
+        manager = PoolManager(
+            {
+                "pools": {
+                    "test": PoolConfig(
+                        name="test",
+                        models=[
+                            {"provider": "openrouter", "model": "approved"},
+                            {"provider": "openrouter", "model": "denied"},
+                        ],
+                    ),
+                },
+                "quality_db_path": os.path.join(tmpdir, "quality.db"),
+                "excluded_providers": [],
+                "provider_api_keys": {"openrouter": "k-openrouter"},
+            }
+        )
 
-        assert manager.select(
-            "test", allowed_models=("openrouter/approved",)
-        ) == ("openrouter", "approved")
-        assert manager.select(
-            "test", allowed_models=("openrouter::approved",)
-        ) == ("openrouter", "approved")
+        assert manager.select("test", allowed_models=("openrouter/approved",)) == (
+            "openrouter",
+            "approved",
+        )
+        assert manager.select("test", allowed_models=("openrouter::approved",)) == (
+            "openrouter",
+            "approved",
+        )
         assert manager.select("test", allowed_models=()) is None
 
 
@@ -392,25 +463,117 @@ def test_privacy_structured_output_gate_fails_open_for_unknown_candidates(tmp_pa
 
 
 def test_unrated_model_does_not_outrank_measured_model():
-    """New catalog entries must not outrank a proven healthy candidate."""
+    """Pre-seeded static models outrank models with no pre-seed (unknown catalog entries).
+
+    A model that appears only in the catalog (no prime_model call) gets the adaptive
+    floor (~40). A curated static model is pre-seeded at 100.0, so it always wins
+    over catalog entries — even before any real events are recorded.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         config = {
             "pools": {
                 "test": PoolConfig(
                     name="test",
                     models=[
-                        {"provider": "openai", "model": "new-model"},
-                        {"provider": "groq", "model": "proven-model"},
+                        # Static curated model — pre-seeded at 100.0 by PoolManager.__post_init__
+                        {"provider": "openai", "model": "curated-model"},
                     ],
                 )
             },
             "quality_db_path": os.path.join(tmpdir, "quality.db"),
             "excluded_providers": [],
-            "provider_api_keys": {"groq": "k-groq", "openai": "k-openai"},
+            "provider_api_keys": {"openai": "k-openai"},
         }
         mgr = PoolManager(config)
-        mgr._quality.record("groq", "proven-model", True, 500.0)
-        assert mgr.select("test") == ("groq", "proven-model")
+        # curated-model is pre-seeded at 100.0; catalog model would be at floor ~40
+        # → curated-model wins even though neither has real events
+        assert mgr.select("test") == ("openai", "curated-model")
+
+
+def test_pre_seed_and_unprime():
+    """prime_model sets 100.0; unprime_model removes it; real events override pre-seed."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        qdb_path = os.path.join(tmpdir, "quality.db")
+
+        # prime_model: sets 100.0
+        qdb = QualityDB(qdb_path)
+        qdb.prime_model("openai", "curated-model")
+        assert qdb.get_quality("openai", "curated-model") == 100.0
+
+        # unprime_model: removes it
+        qdb.unprime_model("openai", "curated-model")
+        assert qdb.get_quality("openai", "curated-model") is None
+
+        # Real event: overrides pre-seed to actual score
+        qdb.prime_model("openai", "known-good")
+        qdb.record("openai", "known-good", True, 2000.0)
+        score = qdb.get_quality("openai", "known-good")
+        # One success at 2000ms → success_rate=1.0, bonus=exp(-2000/1500)=0.264
+        # score = 1.0*80 + 0.264*20 = 80 + 5.28 ≈ 85.28 < 100.0
+        assert score < 100.0
+        assert score > 80.0
+
+
+def test_prime_sets_and_unprime_clears():
+    """prime_model sets 100.0; unprime_model removes it."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        qdb_path = os.path.join(tmpdir, "q.db")
+        qdb = QualityDB(qdb_path)
+
+        # No score yet
+        assert qdb.get_quality("openai", "test-model") is None
+
+        # prime_model: sets 100.0
+        qdb.prime_model("openai", "test-model")
+        assert qdb.get_quality("openai", "test-model") == 100.0
+
+        # unprime_model: removes it
+        qdb.unprime_model("openai", "test-model")
+        assert qdb.get_quality("openai", "test-model") is None
+
+
+def test_real_event_overrides_preseed():
+    """A recorded event immediately overrides the pre-seed score."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        qdb_path = os.path.join(tmpdir, "q.db")
+        qdb = QualityDB(qdb_path)
+
+        # Pre-seed at 100.0
+        qdb.prime_model("groq", "my-model")
+        assert qdb.get_quality("groq", "my-model") == 100.0
+
+        # Record a slow success — score should drop below 100
+        qdb.record("groq", "my-model", True, 5000.0)
+        score = qdb.get_quality("groq", "my-model")
+        # latency_bonus = exp(-5000/1500) ≈ 0.035; score = 1.0*80 + 0.035*20 ≈ 80.7
+        assert score < 100.0
+        assert score > 80.0
+
+
+def test_preselected_model_wins_over_unknown():
+    """A pre-seeded model (100.0) ranks above an unknown model at floor (~40)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = os.path.join(tmpdir, "pool.db")
+        mgr = PoolManager(
+            {
+                "pools": {
+                    "test": PoolConfig(
+                        name="test",
+                        # Two models in the same pool: one pre-seeded, one unknown
+                        models=[
+                            {"provider": "groq", "model": "curated-model"},
+                            {"provider": "openai", "model": "unknown-model"},
+                        ],
+                    )
+                },
+                "quality_db_path": db_path,
+                "excluded_providers": [],
+                "provider_api_keys": {"groq": "k-groq", "openai": "k-openai"},
+            }
+        )
+        # curated-model is pre-seeded at 100.0; unknown-model has no score → floor ~40
+        # curated-model wins
+        assert mgr.select("test") == ("groq", "curated-model")
 
 
 def test_unkeyed_bearer_provider_soft_fails():
@@ -423,10 +586,10 @@ def test_unkeyed_bearer_provider_soft_fails():
                 "test": PoolConfig(
                     name="test",
                     models=[
-                        {"provider": "groq", "model": "m1"},          # bearer, no key → dropped
+                        {"provider": "groq", "model": "m1"},  # bearer, no key → dropped
                         {"provider": "openai-codex", "model": "m2"},  # codex kind → exempt
-                        {"provider": "local-llm", "model": "m3"},     # local kind → exempt
-                        {"provider": "openai", "model": "m4"},        # bearer, has key → kept
+                        {"provider": "local-llm", "model": "m3"},  # local kind → exempt
+                        {"provider": "openai", "model": "m4"},  # bearer, has key → kept
                     ],
                 )
             },
@@ -491,16 +654,18 @@ def test_cooldown_tracker():
 
 def test_cooldown_probe_ignores_model_cooldown_but_keeps_capacity_quarantine():
     with tempfile.TemporaryDirectory() as tmpdir:
-        manager = PoolManager({
-            "pools": {
-                "test": PoolConfig(
-                    name="test",
-                    models=[{"provider": "openai-codex", "model": "m1"}],
-                ),
-            },
-            "quality_db_path": os.path.join(tmpdir, "quality.db"),
-            "excluded_providers": [],
-        })
+        manager = PoolManager(
+            {
+                "pools": {
+                    "test": PoolConfig(
+                        name="test",
+                        models=[{"provider": "openai-codex", "model": "m1"}],
+                    ),
+                },
+                "quality_db_path": os.path.join(tmpdir, "quality.db"),
+                "excluded_providers": [],
+            }
+        )
         manager._cooldowns.cooldown("openai-codex", "m1", 30)
 
         assert manager.select("test") is None
@@ -513,16 +678,18 @@ def test_cooldown_probe_ignores_model_cooldown_but_keeps_capacity_quarantine():
 def test_empty_pool_selection_logs_filter_breakdown(caplog):
     """An exhausted pool must emit a usable diagnostic, not a logging error."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        manager = PoolManager({
-            "pools": {
-                "test": PoolConfig(
-                    name="test",
-                    models=[{"provider": "openai-codex", "model": "m1"}],
-                ),
-            },
-            "quality_db_path": os.path.join(tmpdir, "quality.db"),
-            "excluded_providers": [],
-        })
+        manager = PoolManager(
+            {
+                "pools": {
+                    "test": PoolConfig(
+                        name="test",
+                        models=[{"provider": "openai-codex", "model": "m1"}],
+                    ),
+                },
+                "quality_db_path": os.path.join(tmpdir, "quality.db"),
+                "excluded_providers": [],
+            }
+        )
         manager._cooldowns.cooldown("openai-codex", "m1", 30)
 
         with caplog.at_level("WARNING", logger="tusker_gateway.pools"):
@@ -537,17 +704,19 @@ def test_empty_pool_selection_logs_filter_breakdown(caplog):
 def test_empty_pool_logs_unkeyed_candidates(caplog):
     """Credential filtering must be visible when it empties a pool."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        manager = PoolManager({
-            "pools": {
-                "test": PoolConfig(
-                    name="test",
-                    models=[{"provider": "groq", "model": "m1"}],
-                ),
-            },
-            "quality_db_path": os.path.join(tmpdir, "quality.db"),
-            "excluded_providers": [],
-            "provider_api_keys": {},
-        })
+        manager = PoolManager(
+            {
+                "pools": {
+                    "test": PoolConfig(
+                        name="test",
+                        models=[{"provider": "groq", "model": "m1"}],
+                    ),
+                },
+                "quality_db_path": os.path.join(tmpdir, "quality.db"),
+                "excluded_providers": [],
+                "provider_api_keys": {},
+            }
+        )
 
         with caplog.at_level("WARNING", logger="tusker_gateway.pools"):
             assert manager.select("test") is None
@@ -560,21 +729,23 @@ def test_empty_pool_logs_unkeyed_candidates(caplog):
 
 def test_pool_fallbacks_are_explicit_and_ignore_unknown_or_self_references():
     with tempfile.TemporaryDirectory() as tmpdir:
-        manager = PoolManager({
-            "pools": {
-                "code": PoolConfig(
-                    name="code",
-                    models=[{"provider": "openai-codex", "model": "code-model"}],
-                    fallback_pools=["premium", "missing", "code"],
-                ),
-                "premium": PoolConfig(
-                    name="premium",
-                    models=[{"provider": "openai-codex", "model": "premium-model"}],
-                ),
-            },
-            "quality_db_path": os.path.join(tmpdir, "quality.db"),
-            "excluded_providers": [],
-        })
+        manager = PoolManager(
+            {
+                "pools": {
+                    "code": PoolConfig(
+                        name="code",
+                        models=[{"provider": "openai-codex", "model": "code-model"}],
+                        fallback_pools=["premium", "missing", "code"],
+                    ),
+                    "premium": PoolConfig(
+                        name="premium",
+                        models=[{"provider": "openai-codex", "model": "premium-model"}],
+                    ),
+                },
+                "quality_db_path": os.path.join(tmpdir, "quality.db"),
+                "excluded_providers": [],
+            }
+        )
 
         assert manager.fallback_pools("code") == ("premium",)
 
@@ -607,33 +778,42 @@ class _CatalogRegistry:
 
 
 def _xiaomi_pool_manager(tmpdir: str, pools: dict[str, PoolConfig]) -> PoolManager:
-    return PoolManager({
-        "pools": pools,
-        "quality_db_path": os.path.join(tmpdir, "quality.db"),
-        "excluded_providers": [],
-        "provider_api_keys": {"xiaomi": "k-xiaomi"},
-    })
+    return PoolManager(
+        {
+            "pools": pools,
+            "quality_db_path": os.path.join(tmpdir, "quality.db"),
+            "excluded_providers": [],
+            "provider_api_keys": {"xiaomi": "k-xiaomi"},
+        }
+    )
 
 
 def test_selection_filters_known_modalities_and_invalidates_stickiness():
     with tempfile.TemporaryDirectory() as tmpdir:
-        manager = _xiaomi_pool_manager(tmpdir, {
-            "code": PoolConfig(name="code", models=[
-                {
-                    "provider": "xiaomi",
-                    "model": "mimo-v2.5-pro",
-                    "input_modalities": ["text"],
-                },
-                {
-                    "provider": "xiaomi",
-                    "model": "mimo-v2.5",
-                    "input_modalities": ["text", "image"],
-                },
-            ]),
-        })
+        manager = _xiaomi_pool_manager(
+            tmpdir,
+            {
+                "code": PoolConfig(
+                    name="code",
+                    models=[
+                        {
+                            "provider": "xiaomi",
+                            "model": "mimo-v2.5-pro",
+                            "input_modalities": ["text"],
+                        },
+                        {
+                            "provider": "xiaomi",
+                            "model": "mimo-v2.5",
+                            "input_modalities": ["text", "image"],
+                        },
+                    ],
+                ),
+            },
+        )
 
         assert manager.select("code", session_id="sticky") == (
-            "xiaomi", "mimo-v2.5-pro",
+            "xiaomi",
+            "mimo-v2.5-pro",
         )
         assert manager.select(
             "code",
@@ -646,31 +826,37 @@ def test_selection_filters_known_modalities_and_invalidates_stickiness():
             required_input_modalities={"text", "image"},
         ) == ("xiaomi", "mimo-v2.5")
         assert manager._stickiness[("sticky", "code")] == (
-            "xiaomi", "mimo-v2.5",
+            "xiaomi",
+            "mimo-v2.5",
         )
 
 
 def test_minimax_m3_can_cover_image_tool_requests():
     with tempfile.TemporaryDirectory() as tmpdir:
-        manager = PoolManager({
-            "pools": {
-                "code": PoolConfig(name="code", models=[
-                    {
-                        "provider": "minimax",
-                        "model": "MiniMax-M3",
-                        "input_modalities": ["text", "image"],
-                    },
-                    {
-                        "provider": "minimax",
-                        "model": "MiniMax-M2.7",
-                        "input_modalities": ["text"],
-                    },
-                ]),
-            },
-            "quality_db_path": os.path.join(tmpdir, "quality.db"),
-            "excluded_providers": [],
-            "provider_api_keys": {"minimax": "k-minimax"},
-        })
+        manager = PoolManager(
+            {
+                "pools": {
+                    "code": PoolConfig(
+                        name="code",
+                        models=[
+                            {
+                                "provider": "minimax",
+                                "model": "MiniMax-M3",
+                                "input_modalities": ["text", "image"],
+                            },
+                            {
+                                "provider": "minimax",
+                                "model": "MiniMax-M2.7",
+                                "input_modalities": ["text"],
+                            },
+                        ],
+                    ),
+                },
+                "quality_db_path": os.path.join(tmpdir, "quality.db"),
+                "excluded_providers": [],
+                "provider_api_keys": {"minimax": "k-minimax"},
+            }
+        )
 
         assert manager.select(
             "code",
@@ -681,19 +867,28 @@ def test_minimax_m3_can_cover_image_tool_requests():
 
 def test_unknown_non_text_modalities_are_not_eligible_without_evidence():
     with tempfile.TemporaryDirectory() as tmpdir:
-        manager = PoolManager({
-            "pools": {
-                "test": PoolConfig(name="test", models=[
-                    {"provider": "local-llm", "model": "legacy"},
-                ]),
-            },
-            "quality_db_path": os.path.join(tmpdir, "quality.db"),
-            "excluded_providers": [],
-        })
+        manager = PoolManager(
+            {
+                "pools": {
+                    "test": PoolConfig(
+                        name="test",
+                        models=[
+                            {"provider": "local-llm", "model": "legacy"},
+                        ],
+                    ),
+                },
+                "quality_db_path": os.path.join(tmpdir, "quality.db"),
+                "excluded_providers": [],
+            }
+        )
 
-        assert manager.select(
-            "test", required_input_modalities={"image"},
-        ) is None
+        assert (
+            manager.select(
+                "test",
+                required_input_modalities={"image"},
+            )
+            is None
+        )
 
         manager._model_capability_db.record(
             provider="local-llm",
@@ -703,45 +898,54 @@ def test_unknown_non_text_modalities_are_not_eligible_without_evidence():
             source="modality_probe",
         )
         assert manager.select(
-            "test", required_input_modalities={"image"},
+            "test",
+            required_input_modalities={"image"},
         ) == ("local-llm", "legacy")
 
 
 def test_configured_modality_names_are_normalized():
-    spec = ModelSpec.from_dict({
-        "provider": "openai",
-        "model": "vision-model",
-        "input_modalities": ["TEXT", "image-input"],
-    })
+    spec = ModelSpec.from_dict(
+        {
+            "provider": "openai",
+            "model": "vision-model",
+            "input_modalities": ["TEXT", "image-input"],
+        }
+    )
 
     assert spec.input_modalities == frozenset({"text", "image_input"})
 
 
 def test_auto_discovered_unknown_non_text_modality_requires_evidence():
     with tempfile.TemporaryDirectory() as tmpdir:
-        manager = PoolManager({
-            "pools": {
-                "code": PoolConfig(name="code", models=[
-                    {
-                        "provider": "groq",
-                        "model": "catalog-model",
-                        "auto_discovered": True,
-                    },
-                    {
-                        "provider": "synthetic",
-                        "model": "syn:large:vision",
-                        "input_modalities": ["text", "image"],
-                    },
-                ]),
-            },
-            "quality_db_path": os.path.join(tmpdir, "quality.db"),
-            "model_capability_db_path": os.path.join(tmpdir, "model-capability.db"),
-            "excluded_providers": [],
-            "provider_api_keys": {"groq": "k-groq", "synthetic": "k-synthetic"},
-        })
+        manager = PoolManager(
+            {
+                "pools": {
+                    "code": PoolConfig(
+                        name="code",
+                        models=[
+                            {
+                                "provider": "groq",
+                                "model": "catalog-model",
+                                "auto_discovered": True,
+                            },
+                            {
+                                "provider": "synthetic",
+                                "model": "syn:large:vision",
+                                "input_modalities": ["text", "image"],
+                            },
+                        ],
+                    ),
+                },
+                "quality_db_path": os.path.join(tmpdir, "quality.db"),
+                "model_capability_db_path": os.path.join(tmpdir, "model-capability.db"),
+                "excluded_providers": [],
+                "provider_api_keys": {"groq": "k-groq", "synthetic": "k-synthetic"},
+            }
+        )
 
         assert manager.select(
-            "code", required_input_modalities={"image"},
+            "code",
+            required_input_modalities={"image"},
         ) == ("synthetic", "syn:large:vision")
 
         manager._model_capability_db.record(
@@ -752,54 +956,85 @@ def test_auto_discovered_unknown_non_text_modality_requires_evidence():
             source="modality_probe",
         )
         assert manager.select(
-            "code", required_input_modalities={"image"},
+            "code",
+            required_input_modalities={"image"},
         ) == ("groq", "catalog-model")
 
 
 def test_selection_excludes_special_purpose_and_provider_router_models():
     with tempfile.TemporaryDirectory() as tmpdir:
-        manager = PoolManager({
-            "pools": {
-                "code": PoolConfig(name="code", models=[
-                    {
-                        "provider": "openrouter",
-                        "model": "nvidia/nemotron-3.5-content-safety:free",
-                    },
-                    {"provider": "openrouter", "model": "openrouter/free"},
-                    {"provider": "openrouter", "model": "openrouter/auto"},
-                    {"provider": "openrouter", "model": "openai/gpt-oss-20b:free"},
-                ]),
-            },
-            "quality_db_path": os.path.join(tmpdir, "quality.db"),
-            "excluded_providers": [],
-            "provider_api_keys": {"openrouter": "k-openrouter"},
-        })
+        manager = PoolManager(
+            {
+                "pools": {
+                    "code": PoolConfig(
+                        name="code",
+                        models=[
+                            {
+                                "provider": "openrouter",
+                                "model": "nvidia/nemotron-3.5-content-safety:free",
+                            },
+                            {"provider": "openrouter", "model": "openrouter/free"},
+                            {"provider": "openrouter", "model": "openrouter/auto"},
+                            {"provider": "openrouter", "model": "openai/gpt-oss-20b:free"},
+                        ],
+                    ),
+                },
+                "quality_db_path": os.path.join(tmpdir, "quality.db"),
+                "excluded_providers": [],
+                "provider_api_keys": {"openrouter": "k-openrouter"},
+            }
+        )
 
         assert manager.select("code") == (
-            "openrouter", "openai/gpt-oss-20b:free",
+            "openrouter",
+            "openai/gpt-oss-20b:free",
         )
 
 
 def test_live_audio_models_are_not_general_chat_candidates():
     """Gemini Live/native-audio IDs require WebSocket, not HTTP chat."""
-    assert is_general_chat_model(
-        "google", "gemini-2.5-flash-native-audio-latest",
-    ) is False
-    assert is_general_chat_model(
-        "google", "gemini-3.1-flash-live-preview",
-    ) is False
-    assert is_general_chat_model(
-        "google", "gemini-2.5-flash-image",
-    ) is False
-    assert is_general_chat_model(
-        "google", "gemini-2.5-computer-use-preview-10-2025",
-    ) is False
-    assert is_general_chat_model(
-        "google", "deep-research-preview-04-2026",
-    ) is False
-    assert is_general_chat_model(
-        "google", "gemini-2.5-flash-preview-09-2025",
-    ) is True
+    assert (
+        is_general_chat_model(
+            "google",
+            "gemini-2.5-flash-native-audio-latest",
+        )
+        is False
+    )
+    assert (
+        is_general_chat_model(
+            "google",
+            "gemini-3.1-flash-live-preview",
+        )
+        is False
+    )
+    assert (
+        is_general_chat_model(
+            "google",
+            "gemini-2.5-flash-image",
+        )
+        is False
+    )
+    assert (
+        is_general_chat_model(
+            "google",
+            "gemini-2.5-computer-use-preview-10-2025",
+        )
+        is False
+    )
+    assert (
+        is_general_chat_model(
+            "google",
+            "deep-research-preview-04-2026",
+        )
+        is False
+    )
+    assert (
+        is_general_chat_model(
+            "google",
+            "gemini-2.5-flash-preview-09-2025",
+        )
+        is True
+    )
     # A model slug mentioning image is not automatically image generation.
     assert is_general_chat_model("openrouter", "tool-image") is True
 
@@ -816,43 +1051,53 @@ def test_language_restricted_chat_models_are_not_general_candidates():
 
 def test_selection_filters_catalog_models_without_tools_or_images():
     with tempfile.TemporaryDirectory() as tmpdir:
-        manager = PoolManager({
-            "pools": {
-                "code": PoolConfig(name="code", models=[
-                    {"provider": "openrouter", "model": "text-only"},
-                    {"provider": "openrouter", "model": "image-no-tools"},
-                    {"provider": "openrouter", "model": "tool-image"},
-                ]),
-            },
-            "quality_db_path": os.path.join(tmpdir, "quality.db"),
-            "excluded_providers": [],
-            "provider_api_keys": {"openrouter": "k-openrouter"},
-        })
-        manager.catalog_registry = _CatalogRegistry({
-            "openrouter": [
-                _CatalogEntry(
-                    "openrouter", "text-only",
-                    raw={
-                        "architecture": {"input_modalities": ["text"]},
-                        "supported_parameters": ["max_tokens"],
-                    },
-                ),
-                _CatalogEntry(
-                    "openrouter", "image-no-tools",
-                    raw={
-                        "architecture": {"input_modalities": ["text", "image"]},
-                        "supported_parameters": ["max_tokens"],
-                    },
-                ),
-                _CatalogEntry(
-                    "openrouter", "tool-image",
-                    raw={
-                        "architecture": {"input_modalities": ["text", "image"]},
-                        "supported_parameters": ["max_tokens", "tools"],
-                    },
-                ),
-            ],
-        })
+        manager = PoolManager(
+            {
+                "pools": {
+                    "code": PoolConfig(
+                        name="code",
+                        models=[
+                            {"provider": "openrouter", "model": "text-only"},
+                            {"provider": "openrouter", "model": "image-no-tools"},
+                            {"provider": "openrouter", "model": "tool-image"},
+                        ],
+                    ),
+                },
+                "quality_db_path": os.path.join(tmpdir, "quality.db"),
+                "excluded_providers": [],
+                "provider_api_keys": {"openrouter": "k-openrouter"},
+            }
+        )
+        manager.catalog_registry = _CatalogRegistry(
+            {
+                "openrouter": [
+                    _CatalogEntry(
+                        "openrouter",
+                        "text-only",
+                        raw={
+                            "architecture": {"input_modalities": ["text"]},
+                            "supported_parameters": ["max_tokens"],
+                        },
+                    ),
+                    _CatalogEntry(
+                        "openrouter",
+                        "image-no-tools",
+                        raw={
+                            "architecture": {"input_modalities": ["text", "image"]},
+                            "supported_parameters": ["max_tokens"],
+                        },
+                    ),
+                    _CatalogEntry(
+                        "openrouter",
+                        "tool-image",
+                        raw={
+                            "architecture": {"input_modalities": ["text", "image"]},
+                            "supported_parameters": ["max_tokens", "tools"],
+                        },
+                    ),
+                ],
+            }
+        )
 
         assert manager.select(
             "code",
@@ -863,31 +1108,38 @@ def test_selection_filters_catalog_models_without_tools_or_images():
 
 def test_status_reports_catalog_and_live_modality_evidence():
     with tempfile.TemporaryDirectory() as tmpdir:
-        manager = PoolManager({
-            "pools": {
-                "code": PoolConfig(name="code", models=[
-                    {"provider": "openrouter", "model": "vision-model"},
-                ]),
-            },
-            "quality_db_path": os.path.join(tmpdir, "quality.db"),
-            "model_capability_db_path": os.path.join(tmpdir, "model-capability.db"),
-            "excluded_providers": [],
-            "provider_api_keys": {"openrouter": "k-openrouter"},
-        })
-        manager.catalog_registry = _CatalogRegistry({
-            "openrouter": [
-                _CatalogEntry(
-                    "openrouter",
-                    "vision-model",
-                    raw={
-                        "architecture": {
-                            "input_modalities": ["text", "image"],
-                            "output_modalities": ["text"],
+        manager = PoolManager(
+            {
+                "pools": {
+                    "code": PoolConfig(
+                        name="code",
+                        models=[
+                            {"provider": "openrouter", "model": "vision-model"},
+                        ],
+                    ),
+                },
+                "quality_db_path": os.path.join(tmpdir, "quality.db"),
+                "model_capability_db_path": os.path.join(tmpdir, "model-capability.db"),
+                "excluded_providers": [],
+                "provider_api_keys": {"openrouter": "k-openrouter"},
+            }
+        )
+        manager.catalog_registry = _CatalogRegistry(
+            {
+                "openrouter": [
+                    _CatalogEntry(
+                        "openrouter",
+                        "vision-model",
+                        raw={
+                            "architecture": {
+                                "input_modalities": ["text", "image"],
+                                "output_modalities": ["text"],
+                            },
                         },
-                    },
-                ),
-            ],
-        })
+                    ),
+                ],
+            }
+        )
         manager._model_capability_db.record(
             provider="openrouter",
             model="vision-model",
@@ -904,38 +1156,46 @@ def test_status_reports_catalog_and_live_modality_evidence():
 
 def test_xiaomi_catalog_auto_adds_only_nonheavy_chat_models_to_code():
     with tempfile.TemporaryDirectory() as tmpdir:
-        manager = _xiaomi_pool_manager(tmpdir, {
-            "code": PoolConfig(name="code", models=[], auto_free=True),
-            "privacy": PoolConfig(
-                name="privacy", models=[], zdr=True, auto_free=True,
-            ),
-            "premium": PoolConfig(name="premium", models=[], auto_free=True),
-        })
-        manager.catalog_registry = _CatalogRegistry({
-            "xiaomi": [
-                _CatalogEntry(
-                    "xiaomi",
-                    "mimo-v2.5",
-                    cost_input=0.14,
-                    cost_output=0.28,
-                    input_modalities=frozenset({"text", "image"}),
+        manager = _xiaomi_pool_manager(
+            tmpdir,
+            {
+                "code": PoolConfig(name="code", models=[], auto_free=True),
+                "privacy": PoolConfig(
+                    name="privacy",
+                    models=[],
+                    zdr=True,
+                    auto_free=True,
                 ),
-                _CatalogEntry(
-                    "xiaomi",
-                    "mimo-v2.5-pro",
-                    cost_input=0.435,
-                    cost_output=0.87,
-                    input_modalities=frozenset({"text"}),
-                ),
-                _CatalogEntry(
-                    "xiaomi",
-                    "expensive-chat",
-                    cost_input=1.0,
-                    cost_output=0.5,
-                    input_modalities=frozenset({"text"}),
-                ),
-            ],
-        })
+                "premium": PoolConfig(name="premium", models=[], auto_free=True),
+            },
+        )
+        manager.catalog_registry = _CatalogRegistry(
+            {
+                "xiaomi": [
+                    _CatalogEntry(
+                        "xiaomi",
+                        "mimo-v2.5",
+                        cost_input=0.14,
+                        cost_output=0.28,
+                        input_modalities=frozenset({"text", "image"}),
+                    ),
+                    _CatalogEntry(
+                        "xiaomi",
+                        "mimo-v2.5-pro",
+                        cost_input=0.435,
+                        cost_output=0.87,
+                        input_modalities=frozenset({"text"}),
+                    ),
+                    _CatalogEntry(
+                        "xiaomi",
+                        "expensive-chat",
+                        cost_input=1.0,
+                        cost_output=0.5,
+                        input_modalities=frozenset({"text"}),
+                    ),
+                ],
+            }
+        )
 
         manager.extend_pools_with_free_catalog()
 
@@ -944,41 +1204,53 @@ def test_xiaomi_catalog_auto_adds_only_nonheavy_chat_models_to_code():
             ("xiaomi", "mimo-v2.5"),
             ("xiaomi", "mimo-v2.5-pro"),
         }
-        assert code[("xiaomi", "mimo-v2.5")].input_modalities == frozenset({
-            "text", "image",
-        })
-        assert code[("xiaomi", "mimo-v2.5-pro")].input_modalities == frozenset({
-            "text",
-        })
+        assert code[("xiaomi", "mimo-v2.5")].input_modalities == frozenset(
+            {
+                "text",
+                "image",
+            }
+        )
+        assert code[("xiaomi", "mimo-v2.5-pro")].input_modalities == frozenset(
+            {
+                "text",
+            }
+        )
         assert manager.models["privacy"] == []
         assert manager.models["premium"] == []
 
 
 def test_static_xiaomi_privacy_entry_remains_operator_curated():
     with tempfile.TemporaryDirectory() as tmpdir:
-        manager = _xiaomi_pool_manager(tmpdir, {
-            "privacy": PoolConfig(
-                name="privacy",
-                models=[{
-                    "provider": "xiaomi",
-                    "model": "mimo-v2.5-pro",
-                    "input_modalities": ["text"],
-                }],
-                zdr=True,
-                auto_free=True,
-            ),
-        })
-        manager.catalog_registry = _CatalogRegistry({
-            "xiaomi": [
-                _CatalogEntry(
-                    "xiaomi",
-                    "mimo-v2.5",
-                    cost_input=0.14,
-                    cost_output=0.28,
-                    input_modalities=frozenset({"text", "image"}),
+        manager = _xiaomi_pool_manager(
+            tmpdir,
+            {
+                "privacy": PoolConfig(
+                    name="privacy",
+                    models=[
+                        {
+                            "provider": "xiaomi",
+                            "model": "mimo-v2.5-pro",
+                            "input_modalities": ["text"],
+                        }
+                    ],
+                    zdr=True,
+                    auto_free=True,
                 ),
-            ],
-        })
+            },
+        )
+        manager.catalog_registry = _CatalogRegistry(
+            {
+                "xiaomi": [
+                    _CatalogEntry(
+                        "xiaomi",
+                        "mimo-v2.5",
+                        cost_input=0.14,
+                        cost_output=0.28,
+                        input_modalities=frozenset({"text", "image"}),
+                    ),
+                ],
+            }
+        )
 
         manager.extend_pools_with_free_catalog()
 
@@ -999,19 +1271,21 @@ def test_readiness_reports_oauth_pool_with_empty_rotator_as_empty():
     exist.
     """
     with tempfile.TemporaryDirectory() as tmpdir:
-        manager = PoolManager({
-            "pools": {
-                "code": PoolConfig(
-                    name="code",
-                    models=[{"provider": "openai-codex", "model": "gpt-5"}],
-                ),
-            },
-            "providers": {
-                "openai-codex": {"kind": "oauth", "zdr_ok": False},
-            },
-            "quality_db_path": os.path.join(tmpdir, "quality.db"),
-            "provider_api_keys": {},
-        })
+        manager = PoolManager(
+            {
+                "pools": {
+                    "code": PoolConfig(
+                        name="code",
+                        models=[{"provider": "openai-codex", "model": "gpt-5"}],
+                    ),
+                },
+                "providers": {
+                    "openai-codex": {"kind": "oauth", "zdr_ok": False},
+                },
+                "quality_db_path": os.path.join(tmpdir, "quality.db"),
+                "provider_api_keys": {},
+            }
+        )
         # Without credential_sizes, OAuth providers with no registry keys are
         # still considered eligible — useful for bare test executors. With an
         # empty credential_sizes map they are filtered out.
@@ -1026,19 +1300,21 @@ def test_readiness_counts_oauth_pool_with_credential_as_selectable():
     credential in the rotator map should be sufficient for preflight success.
     """
     with tempfile.TemporaryDirectory() as tmpdir:
-        manager = PoolManager({
-            "pools": {
-                "code": PoolConfig(
-                    name="code",
-                    models=[{"provider": "openai-codex", "model": "gpt-5"}],
-                ),
-            },
-            "providers": {
-                "openai-codex": {"kind": "oauth", "zdr_ok": False},
-            },
-            "quality_db_path": os.path.join(tmpdir, "quality.db"),
-            "provider_api_keys": {},
-        })
+        manager = PoolManager(
+            {
+                "pools": {
+                    "code": PoolConfig(
+                        name="code",
+                        models=[{"provider": "openai-codex", "model": "gpt-5"}],
+                    ),
+                },
+                "providers": {
+                    "openai-codex": {"kind": "oauth", "zdr_ok": False},
+                },
+                "quality_db_path": os.path.join(tmpdir, "quality.db"),
+                "provider_api_keys": {},
+            }
+        )
         health, empty = manager.readiness_status(
             credential_sizes={"openai-codex": 3},
         )
@@ -1059,20 +1335,22 @@ def test_concurrent_selects_distribute_without_dropping_increments():
     import threading
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        manager = PoolManager({
-            "pools": {
-                "test": PoolConfig(
-                    name="test",
-                    models=[
-                        {"provider": "groq", "model": "m1"},
-                        {"provider": "openai", "model": "m2"},
-                        {"provider": "openai", "model": "m3"},
-                    ],
-                ),
-            },
-            "quality_db_path": os.path.join(tmpdir, "quality.db"),
-            "provider_api_keys": {"groq": "k", "openai": "k"},
-        })
+        manager = PoolManager(
+            {
+                "pools": {
+                    "test": PoolConfig(
+                        name="test",
+                        models=[
+                            {"provider": "groq", "model": "m1"},
+                            {"provider": "openai", "model": "m2"},
+                            {"provider": "openai", "model": "m3"},
+                        ],
+                    ),
+                },
+                "quality_db_path": os.path.join(tmpdir, "quality.db"),
+                "provider_api_keys": {"groq": "k", "openai": "k"},
+            }
+        )
 
         results: list[tuple[str, str]] = []
         results_lock = threading.Lock()
@@ -1114,6 +1392,7 @@ def test_concurrent_selects_distribute_without_dropping_increments():
         # with 50 workers can vary by ±1. Heavy skew (one model picked by
         # > 50% of workers) would indicate lost offset increments.
         from collections import Counter
+
         counts = Counter(model for _, model in results)
         worst = max(counts.values())
         assert worst <= (n_workers // 2) + 1, (
@@ -1124,23 +1403,27 @@ def test_concurrent_selects_distribute_without_dropping_increments():
         # (m1, m2, m3) interleaved: any distribution where one candidate
         # was chosen more than ceil(N/3) * 2 times would indicate lost
         # increments.
+
+
 def test_catalog_unavailable_routes_drop_from_selection():
     """Models absent from an authoritative catalog are excluded from selection."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        manager = PoolManager({
-            "pools": {
-                "code": PoolConfig(
-                    name="code",
-                    models=[
-                        {"provider": "google", "model": "gemini-3-pro"},
-                        {"provider": "nvidia", "model": "nvidia/llama-3.1-nemotron-70b"},
-                    ],
-                )
-            },
-            "quality_db_path": os.path.join(tmpdir, "q.db"),
-            "provider_api_keys": {"google": "k-g", "nvidia": "k-n"},
-            "authoritative_catalog_providers": ["google"],
-        })
+        manager = PoolManager(
+            {
+                "pools": {
+                    "code": PoolConfig(
+                        name="code",
+                        models=[
+                            {"provider": "google", "model": "gemini-3-pro"},
+                            {"provider": "nvidia", "model": "nvidia/llama-3.1-nemotron-70b"},
+                        ],
+                    )
+                },
+                "quality_db_path": os.path.join(tmpdir, "q.db"),
+                "provider_api_keys": {"google": "k-g", "nvidia": "k-n"},
+                "authoritative_catalog_providers": ["google"],
+            }
+        )
 
         class _FakeClient:
             provider = "google"
@@ -1168,24 +1451,26 @@ def test_catalog_unavailable_routes_drop_from_selection():
 def test_catalog_unavailable_respects_alias_outbound_id():
     """The outbound model ID (alias resolution) is matched against catalog."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        manager = PoolManager({
-            "pools": {
-                "code": PoolConfig(
-                    name="code",
-                    models=[
-                        {"provider": "google", "model": "gemini-3-pro"},
-                    ],
-                )
-            },
-            "quality_db_path": os.path.join(tmpdir, "q.db"),
-            "provider_api_keys": {"google": "k-g"},
-            "authoritative_catalog_providers": ["google"],
-            "providers": {
-                "google": {
-                    "model_aliases": {"gemini-3-pro": "gemini-3.5-pro"},
-                }
-            },
-        })
+        manager = PoolManager(
+            {
+                "pools": {
+                    "code": PoolConfig(
+                        name="code",
+                        models=[
+                            {"provider": "google", "model": "gemini-3-pro"},
+                        ],
+                    )
+                },
+                "quality_db_path": os.path.join(tmpdir, "q.db"),
+                "provider_api_keys": {"google": "k-g"},
+                "authoritative_catalog_providers": ["google"],
+                "providers": {
+                    "google": {
+                        "model_aliases": {"gemini-3-pro": "gemini-3.5-pro"},
+                    }
+                },
+            }
+        )
 
         class _FakeClient:
             provider = "google"
@@ -1216,17 +1501,19 @@ def test_catalog_unavailable_empty_or_stale_preserves_routes():
             None,
         ]
         for case in cases:
-            manager = PoolManager({
-                "pools": {
-                    "code": PoolConfig(
-                        name="code",
-                        models=[{"provider": "google", "model": "gemini-3-pro"}],
-                    )
-                },
-                "quality_db_path": os.path.join(tmpdir, "q.db"),
-                "provider_api_keys": {"google": "k-g"},
-                "authoritative_catalog_providers": ["google"],
-            })
+            manager = PoolManager(
+                {
+                    "pools": {
+                        "code": PoolConfig(
+                            name="code",
+                            models=[{"provider": "google", "model": "gemini-3-pro"}],
+                        )
+                    },
+                    "quality_db_path": os.path.join(tmpdir, "q.db"),
+                    "provider_api_keys": {"google": "k-g"},
+                    "authoritative_catalog_providers": ["google"],
+                }
+            )
 
             class _FakeClient:
                 provider = "google"
@@ -1254,20 +1541,22 @@ def test_catalog_unavailable_empty_or_stale_preserves_routes():
 def test_catalog_unavailable_stickiness_drops_on_exclusion():
     """A sticky route that becomes catalog-unavailable is cleared and re-selected."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        manager = PoolManager({
-            "pools": {
-                "code": PoolConfig(
-                    name="code",
-                    models=[
-                        {"provider": "google", "model": "gemini-3-pro"},
-                        {"provider": "nvidia", "model": "nvidia/llama-3.1-nemotron-70b"},
-                    ],
-                )
-            },
-            "quality_db_path": os.path.join(tmpdir, "q.db"),
-            "provider_api_keys": {"google": "k-g", "nvidia": "k-n"},
-            "authoritative_catalog_providers": ["google"],
-        })
+        manager = PoolManager(
+            {
+                "pools": {
+                    "code": PoolConfig(
+                        name="code",
+                        models=[
+                            {"provider": "google", "model": "gemini-3-pro"},
+                            {"provider": "nvidia", "model": "nvidia/llama-3.1-nemotron-70b"},
+                        ],
+                    )
+                },
+                "quality_db_path": os.path.join(tmpdir, "q.db"),
+                "provider_api_keys": {"google": "k-g", "nvidia": "k-n"},
+                "authoritative_catalog_providers": ["google"],
+            }
+        )
 
         class _FakeClient:
             provider = "google"
@@ -1297,20 +1586,22 @@ def test_catalog_unavailable_stickiness_drops_on_exclusion():
 def test_catalog_unavailable_readiness_excludes_unavailable():
     """readiness_status reports catalog-unavailable routes as not selectable."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        manager = PoolManager({
-            "pools": {
-                "code": PoolConfig(
-                    name="code",
-                    models=[
-                        {"provider": "google", "model": "gemini-3-pro"},
-                        {"provider": "groq", "model": "llama-3.3-70b"},
-                    ],
-                )
-            },
-            "quality_db_path": os.path.join(tmpdir, "q.db"),
-            "provider_api_keys": {"google": "k-g", "groq": "k-groq"},
-            "authoritative_catalog_providers": ["google"],
-        })
+        manager = PoolManager(
+            {
+                "pools": {
+                    "code": PoolConfig(
+                        name="code",
+                        models=[
+                            {"provider": "google", "model": "gemini-3-pro"},
+                            {"provider": "groq", "model": "llama-3.3-70b"},
+                        ],
+                    )
+                },
+                "quality_db_path": os.path.join(tmpdir, "q.db"),
+                "provider_api_keys": {"google": "k-g", "groq": "k-groq"},
+                "authoritative_catalog_providers": ["google"],
+            }
+        )
 
         class _FakeClient:
             provider = "google"
@@ -1336,16 +1627,18 @@ def test_catalog_unavailable_readiness_excludes_unavailable():
 def test_authoritative_catalog_providers_default_empty():
     """Without TUSKER_AUTHORITATIVE_CATALOG_PROVIDERS, no catalog exclusion applies."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        manager = PoolManager({
-            "pools": {
-                "code": PoolConfig(
-                    name="code",
-                    models=[{"provider": "groq", "model": "llama-3.3-70b"}],
-                )
-            },
-            "quality_db_path": os.path.join(tmpdir, "q.db"),
-            "provider_api_keys": {"groq": "k-groq"},
-        })
+        manager = PoolManager(
+            {
+                "pools": {
+                    "code": PoolConfig(
+                        name="code",
+                        models=[{"provider": "groq", "model": "llama-3.3-70b"}],
+                    )
+                },
+                "quality_db_path": os.path.join(tmpdir, "q.db"),
+                "provider_api_keys": {"groq": "k-groq"},
+            }
+        )
         # No catalog registry at all
         assert manager.select("code") == ("groq", "llama-3.3-70b")
         health, _ = manager.readiness_status()
@@ -1356,21 +1649,23 @@ def test_extend_pools_with_catalog_resolves_outbound_alias():
     """extend_pools_with_catalog counts a static route when its outbound alias
     matches a catalog model."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        manager = PoolManager({
-            "pools": {
-                "code": PoolConfig(
-                    name="code",
-                    models=[{"provider": "google", "model": "gemini-3-pro"}],
-                )
-            },
-            "quality_db_path": os.path.join(tmpdir, "q.db"),
-            "provider_api_keys": {"google": "k-g"},
-            "providers": {
-                "google": {
-                    "model_aliases": {"gemini-3-pro": "gemini-3.5-pro"},
-                }
-            },
-        })
+        manager = PoolManager(
+            {
+                "pools": {
+                    "code": PoolConfig(
+                        name="code",
+                        models=[{"provider": "google", "model": "gemini-3-pro"}],
+                    )
+                },
+                "quality_db_path": os.path.join(tmpdir, "q.db"),
+                "provider_api_keys": {"google": "k-g"},
+                "providers": {
+                    "google": {
+                        "model_aliases": {"gemini-3-pro": "gemini-3.5-pro"},
+                    }
+                },
+            }
+        )
 
         class _FakeClient:
             provider = "google"
@@ -1396,17 +1691,19 @@ def test_extend_pools_with_catalog_resolves_outbound_alias():
 def test_catalog_unavailable_excludes_only_when_provider_is_authoritative():
     """Only providers in authoritative_catalog_providers are gated."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        manager = PoolManager({
-            "pools": {
-                "code": PoolConfig(
-                    name="code",
-                    models=[{"provider": "groq", "model": "llama-3.3-70b"}],
-                )
-            },
-            "quality_db_path": os.path.join(tmpdir, "q.db"),
-            "provider_api_keys": {"groq": "k-groq"},
-            "authoritative_catalog_providers": [],
-        })
+        manager = PoolManager(
+            {
+                "pools": {
+                    "code": PoolConfig(
+                        name="code",
+                        models=[{"provider": "groq", "model": "llama-3.3-70b"}],
+                    )
+                },
+                "quality_db_path": os.path.join(tmpdir, "q.db"),
+                "provider_api_keys": {"groq": "k-groq"},
+                "authoritative_catalog_providers": [],
+            }
+        )
 
         class _FakeClient:
             provider = "groq"
@@ -1434,13 +1731,20 @@ def test_catalog_refresh_cannot_restore_permanently_failed_model(tmp_path):
     from tusker_gateway.cooldown import mark_permanently_failed, clear_permanently_failed
 
     route = ("google", "gemini-2.5-flash")
-    manager = PoolManager({
-        "pools": {"code": PoolConfig(
-            name="code", models=[], auto_free=True, auto_catalog_providers=["google"],
-        )},
-        "quality_db_path": str(tmp_path / "quality.db"),
-        "provider_api_keys": {"google": "test-key"},
-    })
+    manager = PoolManager(
+        {
+            "pools": {
+                "code": PoolConfig(
+                    name="code",
+                    models=[],
+                    auto_free=True,
+                    auto_catalog_providers=["google"],
+                )
+            },
+            "quality_db_path": str(tmp_path / "quality.db"),
+            "provider_api_keys": {"google": "test-key"},
+        }
+    )
     registry = _CatalogRegistry({"google": [_CatalogEntry(*route)]})
     registry.providers = lambda: ("google",)
     manager.catalog_registry = registry

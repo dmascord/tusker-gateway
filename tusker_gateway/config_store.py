@@ -204,15 +204,15 @@ class ConfigStore:
                         pass
                 # Infer auth kind: providers with a ``pool_env`` use credential
                 # rotation (oauth/codex), so they must not be treated as bearer.
-                # Only providers that carry a static ``auth_env`` are bearer-kind.
-                # Unknown providers default to ``bearer`` for back-compat with the
-                # legacy DEFAULT_PROVIDER_REGISTRY shape.
+                # Providers with a static ``auth_env`` are bearer-kind.
+                # Providers with neither (e.g. local Ollama on the LAN) are
+                # local-kind and need no API key.
                 if pool_env:
                     kind = "codex" if str(pool_env).startswith("opencode_codex") else "oauth"
                 elif auth_env:
                     kind = "bearer"
                 else:
-                    kind = "bearer"
+                    kind = "local"
                 providers[str(name).lower()] = ProviderConfig(
                     name=str(name).lower(),
                     kind=kind,

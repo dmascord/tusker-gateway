@@ -1,0 +1,428 @@
+---
+apiVersion: v1
+kind: List
+items:
+- apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    name: tusker-gateway-config-canary
+    namespace: hermes
+    labels:
+      app: tusker-gateway-config-canary
+      tusker.gateway.io/canary: 'true'
+      tusker.gateway.io/source-deployment: tusker-gateway
+    annotations:
+      tusker.gateway.io/rendered-at: '2026-09-10T09:59:59Z'
+      tusker.gateway.io/image-digest: sha256:408aad0c47026e4b47ac24f39b732ef12afc9fb9797f79243104298b817ba9ce
+      tusker.gateway.io/source-image: registry.tusker.net.au:5000/tusker-gateway:swarm-alpine-23237dc14a74fe1614dfa123d16cba92df4596e0
+  spec:
+    replicas: 1
+    selector:
+      matchLabels:
+        app: tusker-gateway-config-canary
+    strategy:
+      type: Recreate
+    template:
+      metadata:
+        labels:
+          app: tusker-gateway-config-canary
+          tusker.gateway.io/canary: 'true'
+      spec:
+        securityContext:
+          fsGroup: 65534
+          fsGroupChangePolicy: OnRootMismatch
+        terminationGracePeriodSeconds: 90
+        containers:
+        - name: tusker-gateway-config-canary
+          image: registry.tusker.net.au:5000/tusker-gateway@sha256:408aad0c47026e4b47ac24f39b732ef12afc9fb9797f79243104298b817ba9ce
+          imagePullPolicy: Always
+          envFrom:
+          - secretRef:
+              name: tusker-env-vault
+          env:
+          - name: MODEL_NAME
+            value: tusker-gateway
+          - name: TUSKER_CIRCUIT_ENABLED
+            value: 'true'
+          - name: TUSKER_BUDGETS_JSON
+            value: '{}'
+          - name: TUSKER_NVIDIA_MAX_CONCURRENT
+            value: '8'
+          - name: TUSKER_PROVIDER_CAPACITY_COOLDOWN_SECS
+            value: '300'
+          - name: TUSKER_PROVIDER_CAPACITY_BUSY_COOLDOWN_SECS
+            value: '2'
+          - name: HOME
+            value: /home/tusker
+          - name: PYTHONUNBUFFERED
+            value: '1'
+          - name: PYTHONDONTWRITEBYTECODE
+            value: '1'
+          - name: TUSKER_STATE_DATABASE_POOL_MAX
+            value: '12'
+          - name: TUSKER_STATE_DATABASE_CONNECT_TIMEOUT
+            value: '2'
+          - name: TUSKER_STATE_DEGRADED_MODE
+            value: advisory
+          - name: TUSKER_CACHE_ENABLED
+            value: 'false'
+          - name: TUSKER_SEMANTIC_CACHE_ENABLED
+            value: 'false'
+          - name: TUSKER_SEMANTIC_CACHE_THRESHOLD
+            value: '0.92'
+          - name: TUSKER_SEMANTIC_CACHE_TTL
+            value: '300'
+          - name: TUSKER_SEMANTIC_CACHE_MAX_ENTRIES
+            value: '5000'
+          - name: TUSKER_SEMANTIC_CACHE_MAX_INPUT_CHARS
+            value: '12000'
+          - name: TUSKER_SEMANTIC_CACHE_MAX_RESPONSE_BYTES
+            value: '262144'
+          - name: TUSKER_SEMANTIC_CACHE_MODEL
+            value: sentence-transformers/all-MiniLM-L6-v2
+          - name: TUSKER_SEMANTIC_CACHE_MODEL_REVISION
+            value: 1110a243fdf4706b3f48f1d95db1a4f5529b4d41
+          - name: TUSKER_SEMANTIC_CACHE_DEVICE
+            value: cpu
+          - name: TUSKER_SEMANTIC_CACHE_LOCAL_FILES_ONLY
+            value: 'true'
+          - name: TUSKER_SEMANTIC_CACHE_INIT_TIMEOUT_SECS
+            value: '120'
+          - name: TUSKER_SEMANTIC_CACHE_OPERATION_TIMEOUT_SECS
+            value: '2'
+          - name: TUSKER_SEMANTIC_CACHE_MAX_CONCURRENT_OPERATIONS
+            value: '2'
+          # Reasoning-model max_tokens floor. See deployment.yaml for rationale.
+          - name: TUSKER_REASONING_MAX_TOKENS_FLOOR
+            value: '2000'
+          - name: TUSKER_SEMANTIC_CACHE_REQUIRE_DETERMINISTIC
+            value: 'true'
+          - name: TUSKER_SEMANTIC_CACHE_EXCLUDED_POOLS
+            value: privacy
+          - name: TUSKER_SEMANTIC_CACHE_PATH
+            value: /home/tusker/.hermes/semantic_cache
+          - name: TUSKER_COPILOT_BUSINESS
+            value: 'true'
+          - name: PROVIDER_REGISTRY_JSON
+            value: '{"local-llm":{"kind":"local","base_url":"http://10.0.0.212:11434","chat_path":"/v1/chat/completions","models_path":"/api/tags","zdr_ok":true},"mlx-mac":{"kind":"local","base_url":"http://10.0.0.141:11435","chat_path":"/v1/chat/completions","models_path":"/v1/models","zdr_ok":true,"model_aliases":{"qwen3-coder-30b-a3b-instruct-4bit":"/Users/tusker/models/Qwen3-Coder-30B-A3B-Instruct-4bit"}}}'
+          - name: TUSKER_AUTO_FREE_EXCLUDED_PROVIDERS
+            value: nvidia
+          - name: TUSKER_CATALOG_DISABLED_PROVIDERS
+            value: arcee,arliai,cohere,openai,cerebras
+          - name: TUSKER_DISABLED_PROVIDERS
+            value: arcee,cohere,cerebras
+          - name: TUSKER_PASSTHROUGH_DISABLED_PROVIDERS
+            value: cerebras
+          - name: TUSKER_POOL_CODE
+            value: '{"models":[{"provider":"minimax","model":"MiniMax-M3","input_modalities":["text","image"]},{"provider":"minimax","model":"MiniMax-M2.7","input_modalities":["text"]},{"provider":"minimax","model":"MiniMax-M2.7-highspeed","input_modalities":["text"]},{"provider":"minimax","model":"MiniMax-M2.5","input_modalities":["text"]},{"provider":"minimax","model":"MiniMax-M2.5-highspeed","input_modalities":["text"]},{"provider":"minimax","model":"MiniMax-M2.1","input_modalities":["text"]},{"provider":"minimax","model":"MiniMax-M2.1-highspeed","input_modalities":["text"]},{"provider":"minimax","model":"MiniMax-M2","input_modalities":["text"]},{"provider":"synthetic","model":"syn:large:text","input_modalities":["text"]},{"provider":"synthetic","model":"syn:small:text","input_modalities":["text"]},{"provider":"synthetic","model":"syn:large:vision","input_modalities":["text","image"]},{"provider":"synthetic","model":"syn:small:vision","input_modalities":["text","image"]},{"provider":"groq","model":"openai/gpt-oss-120b","input_modalities":["text"]},{"provider":"groq","model":"openai/gpt-oss-20b","input_modalities":["text"]},{"provider":"groq","model":"qwen/qwen3.6-27b","input_modalities":["text","image"]},{"provider":"zai","model":"glm-4.7"},{"provider":"openai-codex","model":"gpt-5.6-luna"},{"provider":"openai-codex","model":"gpt-5.4-mini"},{"provider":"github-copilot","model":"gpt-5.6-luna"},{"provider":"github-copilot-enterprise","model":"gpt-5.6-luna"}],"auto_catalog_providers":["alibaba","minimax","synthetic","zai","openai-codex","github-copilot","github-copilot-enterprise","opencode-go","ollama-cloud","groq","google","workers-ai"],"context_window":128000,"zdr":false,"auto_free":true,"fallback_pools":["premium","swarm"]}'
+          - name: TUSKER_POOL_PRIVACY
+            value: '{"models":[{"provider":"synthetic","model":"syn:large:text","input_modalities":["text"]},{"provider":"synthetic","model":"syn:small:text","input_modalities":["text"]},{"provider":"synthetic","model":"syn:large:vision","input_modalities":["text","image"]},{"provider":"synthetic","model":"syn:small:vision","input_modalities":["text","image"]},{"provider":"github-copilot-enterprise","model":"gpt-5-mini"},{"provider":"github-copilot-enterprise","model":"gpt-4o-mini"},{"provider":"github-copilot-enterprise","model":"gpt-4.1","auto_discovered":true},{"provider":"github-copilot-enterprise","model":"gpt-4.1-2025-04-14","auto_discovered":true},{"provider":"github-copilot-enterprise","model":"gpt-5.4-mini","auto_discovered":true},{"provider":"github-copilot-enterprise","model":"mai-code-1-flash-picker","auto_discovered":true},{"provider":"ollama-cloud","model":"ollama/deepseek-v4-flash"},{"provider":"opencode-go","model":"minimax-m3"},{"provider":"opencode-go","model":"minimax-m2.7"},{"provider":"opencode-go","model":"qwen3.6-plus"},{"provider":"opencode-go","model":"qwen3.5-plus"},{"provider":"opencode-go","model":"deepseek-v4-flash"},{"provider":"xiaomi","model":"mimo-v2.5-pro","input_modalities":["text"]},{"provider":"ollama-cloud","model":"glm-5.1"},{"provider":"ollama-cloud","model":"deepseek-v4-flash:preview"},{"provider":"ollama-cloud","model":"kimi-k2.6"},{"provider":"ollama-cloud","model":"gpt-oss:20b"},{"provider":"ollama-cloud","model":"minimax-m2.7"},{"provider":"openai-codex","model":"gpt-5.6-luna"},{"provider":"openai-codex","model":"gpt-5.4-mini"},{"provider":"github-copilot","model":"gpt-5.6-luna"},{"provider":"github-copilot-enterprise","model":"gpt-5.6-luna"}],"context_window":128000,"zdr":true,"auto_free":true,"auto_catalog_providers":["synthetic","github-copilot","opencode-go","ollama-cloud","xiaomi"]}'
+          - name: TUSKER_POOL_PREMIUM
+            value: '{"models":[{"provider":"github-copilot-enterprise","model":"claude-sonnet-4.6"},{"provider":"github-copilot-enterprise","model":"claude-opus-4.6"},{"provider":"openai-codex","model":"gpt-5.6-sol"},{"provider":"openai-codex","model":"gpt-5.6-terra"},{"provider":"openai-codex","model":"gpt-5.5"},{"provider":"openai-codex","model":"gpt-5.4"},{"provider":"github-copilot-enterprise","model":"gpt-5.5"},{"provider":"github-copilot-enterprise","model":"gpt-5.4"},{"provider":"opencode-go","model":"deepseek-v4-pro"},{"provider":"synthetic","model":"syn:large:text","input_modalities":["text"]},{"provider":"synthetic","model":"syn:large:vision","input_modalities":["text","image"]},{"provider":"synthetic","model":"syn:small:vision","input_modalities":["text","image"]},{"provider":"minimax","model":"MiniMax-M2.7-highspeed","input_modalities":["text"]},{"provider":"minimax","model":"MiniMax-M2.7","input_modalities":["text"]},{"provider":"google","model":"gemini-3-pro"}],"context_window":128000,"auto_free":true,"auto_catalog_providers":["ollama-cloud"],"heavyweight_only":true}'
+          - name: TUSKER_POOL_SWARM
+            value: '{"models":[{"provider":"opencode-go","model":"deepseek-v4-flash"},{"provider":"xiaomi","model":"mimo-v2.5","input_modalities":["text","image"]}],"context_window":128000}'
+          - name: TUSKER_RATELIMIT_ENABLED
+            value: 'true'
+          - name: TUSKER_RATELIMIT_DEFAULT_RATE
+            value: '10'
+          - name: TUSKER_RATELIMIT_DEFAULT_BURST
+            value: '20'
+          - name: TUSKER_RATELIMIT_JSON
+            value: '{"d8f3cf6f55568fe94621208d0570e5d7":{"rate_per_sec":20,"burst":64},"bed71eb19cd84ab9571c3837df8b2efb":{"rate_per_sec":30,"burst":64}}'
+          - name: TUSKER_RTK_ENABLED
+            value: 'true'
+          - name: TUSKER_LOG_LEVEL
+            value: INFO
+          - name: TUSKER_TOOL_CAPABILITY_GATE
+            value: auto
+          - name: TUSKER_TOOL_DIAGNOSTICS
+            value: 'true'
+          - name: TUSKER_MODEL_CAPABILITY_DB_PATH
+            value: /home/tusker/.hermes/model_capability-recovered.db
+          - name: TUSKER_CAPABILITY_PROBE_GENERATION
+            value: 'false'
+          - name: TUSKER_QUALIFICATION_MAINTENANCE_ENABLED
+            value: 'true'
+          - name: TUSKER_QUALIFICATION_MAINTENANCE_INITIAL_DELAY_SECS
+            value: '300'
+          - name: TUSKER_QUALIFICATION_MAINTENANCE_INTERVAL_SECS
+            value: '21600'
+          - name: TUSKER_QUALIFICATION_MAINTENANCE_LIMIT
+            value: '12'
+          - name: TUSKER_QUALIFICATION_MAINTENANCE_TIMEOUT_SECS
+            value: '30'
+          - name: TUSKER_QUALIFICATION_MAINTENANCE_MAX_AGE_SECS
+            value: '86400'
+          - name: TUSKER_STRUCTURED_QUALIFICATION_ENABLED
+            value: 'true'
+          - name: TUSKER_STRUCTURED_QUALIFICATION_POOL
+            value: privacy
+          - name: TUSKER_STRUCTURED_QUALIFICATION_LIMIT
+            value: '4'
+          - name: TUSKER_STRUCTURED_QUALIFICATION_TIMEOUT_SECS
+            value: '45'
+          - name: TUSKER_STRUCTURED_QUALIFICATION_MAX_AGE_SECS
+            value: '21600'
+          - name: TUSKER_CATALOG_STARTUP_TIMEOUT_SECS
+            value: '30'
+          - name: TUSKER_UPSTREAM_SOCK_READ_SECS
+            value: '90'
+          - name: TUSKER_PROVIDER_ATTEMPT_TIMEOUT_OVERRIDES_JSON
+            value: '{"local-llm": 120, "mlx-mac": 120}'
+          - name: TUSKER_BUDGETS_ENABLED
+            value: 'false'
+          - name: API_KEYS
+            valueFrom:
+              secretKeyRef:
+                key: API_KEYS
+                name: tusker-env-vault
+          - name: PROVIDER_GITHUB_COPILOT_API_KEY
+            valueFrom:
+              secretKeyRef:
+                key: COPILOT_GITHUB_TOKEN
+                name: tusker-env-vault
+                optional: true
+          - name: PROVIDER_GITHUB_COPILOT_ENTERPRISE_API_KEY
+            valueFrom:
+              secretKeyRef:
+                key: GITHUB_COPILOT_ENTERPRISE_TOKEN
+                name: tusker-env-vault
+                optional: true
+          - name: GITHUB_COPILOT_CREDENTIALS
+            valueFrom:
+              secretKeyRef:
+                key: GITHUB_COPILOT_CREDENTIALS
+                name: tusker-env-vault
+                optional: true
+          - name: GITHUB_COPILOT_ENTERPRISE_CREDENTIALS
+            valueFrom:
+              secretKeyRef:
+                key: GITHUB_COPILOT_ENTERPRISE_CREDENTIALS
+                name: tusker-env-vault
+                optional: true
+          - name: PROVIDER_OPENROUTER_API_KEY
+            valueFrom:
+              secretKeyRef:
+                key: OPENROUTER_API_KEY
+                name: tusker-env-vault
+                optional: true
+          - name: PROVIDER_GROQ_API_KEY
+            valueFrom:
+              secretKeyRef:
+                key: GROQ_API_KEY
+                name: tusker-env-vault
+                optional: true
+          - name: PROVIDER_ARCEE_API_KEY
+            valueFrom:
+              secretKeyRef:
+                key: ARCEEAI_API_KEY
+                name: tusker-env-vault
+                optional: true
+          - name: PROVIDER_ZAI_API_KEY
+            valueFrom:
+              secretKeyRef:
+                key: GLM_API_KEY
+                name: tusker-env-vault
+                optional: true
+          - name: PROVIDER_XIAOMI_API_KEY
+            valueFrom:
+              secretKeyRef:
+                key: XIAOMI_API_KEY
+                name: tusker-env-vault
+                optional: true
+          - name: PROVIDER_GEMINI_API_KEY
+            valueFrom:
+              secretKeyRef:
+                key: GEMINI_API_KEY
+                name: tusker-env-vault
+                optional: true
+          - name: PROVIDER_CEREBRAS_API_KEY
+            valueFrom:
+              secretKeyRef:
+                key: CEREBRAS_API_KEY
+                name: tusker-env-vault
+                optional: true
+          - name: PROVIDER_COHERE_API_KEY
+            valueFrom:
+              secretKeyRef:
+                key: COHERE_API_KEY
+                name: tusker-env-vault
+                optional: true
+          - name: PROVIDER_VOYAGE_API_KEY
+            valueFrom:
+              secretKeyRef:
+                key: VOYAGE_API_KEY
+                name: tusker-env-vault
+                optional: true
+          - name: PROVIDER_JINA_API_KEY
+            valueFrom:
+              secretKeyRef:
+                key: JINA_API_KEY
+                name: tusker-env-vault
+                optional: true
+          - name: PROVIDER_MINIMAX_API_KEY
+            valueFrom:
+              secretKeyRef:
+                key: MINIMAX_API_KEY
+                name: tusker-env-vault
+                optional: true
+          - name: PROVIDER_SYNTHETIC_API_KEY
+            valueFrom:
+              secretKeyRef:
+                key: SYNTHETIC_API_KEY
+                name: tusker-env-vault
+                optional: true
+          - name: PROVIDER_OLLAMA_API_KEY
+            valueFrom:
+              secretKeyRef:
+                key: OLLAMA_API_KEY
+                name: tusker-env-vault
+                optional: true
+          - name: PROVIDER_NVIDIA_API_KEY
+            valueFrom:
+              secretKeyRef:
+                key: NVIDIA_API_KEY
+                name: tusker-env-vault
+                optional: true
+          - name: PROVIDER_OPENCODE_GO_API_KEY
+            valueFrom:
+              secretKeyRef:
+                key: OPENCODE_GO_API_KEY
+                name: tusker-env-vault
+                optional: true
+          - name: PROVIDER_OPENCODE_ZEN_API_KEY
+            valueFrom:
+              secretKeyRef:
+                key: OPENCODE_ZEN_API_KEY
+                name: tusker-env-vault
+                optional: true
+          - name: CF_ACCOUNT_ID
+            valueFrom:
+              secretKeyRef:
+                key: CF_ACCOUNT_ID
+                name: tusker-env-vault
+                optional: true
+          - name: CF_API_TOKEN
+            valueFrom:
+              secretKeyRef:
+                key: CF_API_TOKEN
+                name: tusker-env-vault
+                optional: true
+          - name: HF_TOKEN
+            valueFrom:
+              secretKeyRef:
+                key: HF_TOKEN
+                name: tusker-env-vault
+                optional: true
+          - name: TUSKER_STATE_DATABASE_URL
+            valueFrom:
+              secretKeyRef:
+                name: tusker-gateway-postgres-auth-canary
+                key: DATABASE_URL
+          - name: TUSKER_KEY_ENCRYPTION_KEY
+            valueFrom:
+              secretKeyRef:
+                name: tusker-gateway-config-canary-encryption
+                key: TUSKER_KEY_ENCRYPTION_KEY
+          - name: TUSKER_CONFIG_DATABASE_ENABLED
+            value: '1'
+          - name: TUSKER_CONFIG_CANARY
+            value: 'true'
+          ports:
+          - containerPort: 8642
+            name: http
+            protocol: TCP
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8642
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8642
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8642
+            periodSeconds: 30
+            timeoutSeconds: 3
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                - sleep
+                - '10'
+          volumeMounts:
+          - mountPath: /home/tusker/.hermes
+            name: tusker-home
+          - mountPath: /home/tusker/.claude
+            name: tusker-home
+          resources:
+            limits:
+              ephemeral-storage: 4Gi
+              memory: 1Gi
+            requests:
+              cpu: 500m
+              ephemeral-storage: 1Gi
+              memory: 768Mi
+        volumes:
+        - name: tusker-home
+          emptyDir:
+            sizeLimit: 1Gi
+- apiVersion: v1
+  kind: Service
+  metadata:
+    name: tusker-gateway-config-canary
+    namespace: hermes
+    labels:
+      app: tusker-gateway-config-canary
+      tusker.gateway.io/canary: 'true'
+    annotations:
+      tusker.gateway.io/selector-isolation: selects app=tusker-gateway-config-canary
+        only
+  spec:
+    type: ClusterIP
+    ports:
+    - port: 8642
+      targetPort: 8642
+      protocol: TCP
+      name: http
+    selector:
+      app: tusker-gateway-config-canary
+- apiVersion: networking.k8s.io/v1
+  kind: NetworkPolicy
+  metadata:
+    name: allow-tusker-gateway-config-canary-to-postgres
+    namespace: hermes
+    labels:
+      app: tusker-gateway-config-canary
+      tusker.gateway.io/canary: 'true'
+    annotations:
+      tusker.gateway.io/role: allow canary pods to reach shared postgres
+  spec:
+    podSelector:
+      matchLabels:
+        app: tusker-gateway-postgres
+    policyTypes:
+    - Ingress
+    ingress:
+    - from:
+      - podSelector:
+          matchLabels:
+            app: tusker-gateway-config-canary
+      ports:
+      - protocol: TCP
+        port: 5432
+
+---
+# Secrets required before apply (create out-of-band):
+#   - tusker-gateway-postgres-auth-canary: DATABASE_URL
+#   - tusker-gateway-config-canary-encryption: TUSKER_KEY_ENCRYPTION_KEY
+# No secrets are present in the rendered manifest.

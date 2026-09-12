@@ -407,3 +407,136 @@ async def test_rotator_skips_expired_credential_after_refresh_failure(
     assert await rotator.get_token() is None
     refresh.assert_awaited_once()
     rotator._persist.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_rotator_applies_long_cooldown_for_permanent_refresh_error(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """refresh_token_reused / invalid_grant skip the 60s retry loop.
+
+    A dead refresh token must not be replayed every 60s forever; that pins a
+    single bad credential in front of healthy peers. The rotator must apply
+    the permanent-failure cooldown so the bad credential is skipped for the
+    long cooldown, letting other credentials (and other providers) carry
+    traffic until the operator re-authenticates.
+    """
+    import os
+
+    import tusker_gateway.codex_oauth as codex_oauth
+    from tusker_gateway.codex_oauth import CodexOAuthError
+    from tusker_gateway.passthrough import CodexTokenRotator
+
+    monkeypatch.delenv(
+        "TUSKER_OAUTH_PERMANENT_FAILURE_COOLDOWN_SECS", raising=False
+    )
+
+    refresh = AsyncMock(
+        side_effect=CodexOAuthError(
+            "Codex OAuth refresh rejected",
+            status=401,
+            code="refresh_token_reused",
+        )
+    )
+    monkeypatch.setattr(codex_oauth, "refresh_codex_token", refresh)
+
+    rotator = CodexTokenRotator(
+        [
+            {
+                "access_token": "expired-access",
+                "refresh_token": "stale-refresh",
+                # Already expired and refused a refresh -> get_token() must
+                # skip this credential so the upstream never sees a dead
+                # bearer token. The permanent cooldown we want to assert is
+                # recorded on the in-memory cooldown map.
+                "expires_at_ms": int((time.time() - 60) * 1000),
+            }
+        ],
+        http_client=object(),
+        provider="openai-codex",
+    )
+    rotator._persist = MagicMock()  # type: ignore[method-assign]
+
+    now = time.time()
+    assert await rotator.get_token() is None
+
+    # Permanent cooldown (24h) must be applied, not the 60s transient one.
+    failed_until = rotator._refresh_failed_until.get(0)
+    assert failed_until is not None
+    delta = failed_until - now
+    # 24h default is 86400s; allow generous slack for test runtime.
+    assert delta > 3600, f"expected long cooldown, got {delta}s"
+    assert delta >= CodexTokenRotator._DEFAULT_PERMANENT_REFRESH_FAILURE_COOLDOWN_SECONDS - 5
+    refresh.assert_awaited_once()
+    rotator._persist.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_rotator_keeps_short_cooldown_for_transient_refresh_error(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Network-class failures must stay on the short (default 60s) cooldown."""
+    import os
+
+    import tusker_gateway.codex_oauth as codex_oauth
+    from tusker_gateway.codex_oauth import CodexOAuthError
+    from tusker_gateway.passthrough import CodexTokenRotator
+
+    monkeypatch.delenv(
+        "TUSKER_OAUTH_PERMANENT_FAILURE_COOLDOWN_SECS", raising=False
+    )
+
+    refresh = AsyncMock(
+        side_effect=CodexOAuthError(
+            "Codex OAuth refresh rejected",
+            status=503,
+            code="server_error",
+        )
+    )
+    monkeypatch.setattr(codex_oauth, "refresh_codex_token", refresh)
+
+    rotator = CodexTokenRotator(
+        [
+            {
+                "access_token": "expired-access",
+                "refresh_token": "transient-refresh",
+                # Already expired so get_token() returns None; the transient
+                # cooldown is recorded on the in-memory cooldown map.
+                "expires_at_ms": int((time.time() - 60) * 1000),
+            }
+        ],
+        http_client=object(),
+        provider="openai-codex",
+    )
+    rotator._persist = MagicMock()  # type: ignore[method-assign]
+
+    now = time.time()
+    assert await rotator.get_token() is None
+
+    failed_until = rotator._refresh_failed_until.get(0)
+    assert failed_until is not None
+    # Transient cooldown (~60s), definitely not 24h.
+    delta = failed_until - now
+    assert 0 <= delta <= 120, f"expected transient cooldown, got {delta}s"
+    refresh.assert_awaited_once()
+    rotator._persist.assert_not_called()
+
+
+def test_rotator_classifies_invalid_grant_as_permanent():
+    """invalid_grant must be recognised alongside refresh_token_reused."""
+    from tusker_gateway.codex_oauth import CodexOAuthError
+    from tusker_gateway.passthrough import CodexTokenRotator
+
+    err = CodexOAuthError(
+        "Codex OAuth refresh rejected",
+        status=400,
+        code="invalid_grant",
+    )
+    assert CodexTokenRotator._is_permanent_refresh_error(err) is True
+
+    server_err = CodexOAuthError(
+        "Codex OAuth refresh rejected",
+        status=503,
+        code="server_error",
+    )
+    assert CodexTokenRotator._is_permanent_refresh_error(server_err) is False

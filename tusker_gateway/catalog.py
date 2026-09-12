@@ -78,6 +78,11 @@ DEFAULT_TTLS: dict[str, float] = {
     "xiaomi": 3600.0,             # Xiaomi Token Plan: 60 min
 }
 
+# Weight applied to auto-discovered heavyweight catalog entries in cheap-tier pools.
+# This deprioritises (but does not exclude) expensive auto-discovered models so
+# they are only selected after all weight-1.0 candidates are exhausted.
+AUTO_DISCOVERED_HEAVYWEIGHT_WEIGHT: float = 0.05
+
 
 # Ollama Cloud publishes per-1M-token prices on ollama.com/library pages but
 # neither its /v1/models payload nor models.dev carries cost data, so the
@@ -118,6 +123,11 @@ class CatalogEntry:
     input_modalities: frozenset[str] | None = None
     # Known output modalities. None means the catalog does not advertise them.
     output_modalities: frozenset[str] | None = None
+    # Relative weight for weighted selection. Auto-discovered heavyweights are
+    # set to AUTO_DISCOVERED_HEAVYWEIGHT_WEIGHT so they are deprioritised
+    # (not excluded) in cheap-tier pools, while non-heavyweight auto-discovered
+    # models retain the default weight of 1.0.
+    catalog_weight: float = 1.0
 
 
 def _capability_values(value: Any) -> frozenset[str] | None:
