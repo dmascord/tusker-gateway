@@ -264,7 +264,43 @@ outbound chat request. Successful JSON and SSE model fields retain the friendly
 name; generated content is untouched. `mlx-mac::qwen3-coder-30b-a3b-instruct-4bit`
 is equivalent. `/v1/models` advertises configured provider aliases alongside
 the gateway's virtual models. Unmapped model IDs still pass through unchanged.
-These providers do not opt local hardware into automatic pool rotation.
+The privacy pool includes both routes as eligible candidates so local hardware
+is reached automatically on cold-start before cloud privacy providers.
+
+#### Single-concurrency capacity gate
+
+Both `local-llm` and `mlx-mac` are isolated into their own capacity groups
+(`TUSKER_LOCAL_LLM_CAPACITY_GROUP`, `TUSKER_MLX_MAC_CAPACITY_GROUP`) and run
+at `TUSKER_LOCAL_LLM_MAX_CONCURRENT=1` / `TUSKER_MLX_MAC_MAX_CONCURRENT=1`.
+The Jetson Orin Nano and the MLX Mac both saturate RAM and CPU while
+cold-loading a 7B-class model; queueing concurrent requests just stalls all
+of them, so the gateway fails fast to the next pool candidate (or returns
+`503 service_unavailable` with `Retry-After: 5` for explicit routes) instead
+of holding the request open while the local backend thrashes.
+
+Per-attempt idle budget for these providers is `240s` (raised via
+`TUSKER_PROVIDER_ATTEMPT_TIMEOUT_OVERRIDES_JSON={"local-llm": 240,
+"mlx-mac": 240}`); `TUSKER_REQUEST_TIMEOUT_MS=240000` covers the local
+cold-load wall-clock on the gateway. Cloud candidates still return in
+well under the default deadline; the longer budget only affects the local
+route. After a capacity failure the route is in capacity cooldown
+(`TUSKER_PROVIDER_CAPACITY_COOLDOWN_SECS=300`) so a hot backend can finish
+its current request and the gateway stops hammering it.
+
+Operators should expect:
+
+- First request after a cold start of a large model may take ~25s on
+  `local-llm` and ~6s on `mlx-mac` once the model is warm.
+- Concurrent requests on the same provider receive `503 service_unavailable`
+  immediately with `Retry-After: 5`. Clients that ignore `Retry-After` will
+  see hard failures where they previously saw slow responses.
+- After a capacity failure the route is suppressed for ~5 minutes even
+  through explicit `local-llm/...` requests; this is intentional to let
+  the upstream worker drain.
+- Privacy-pool callers fall back to the next ZDR-eligible provider in the
+  privacy pool, never to a non-privacy candidate, so a saturated local
+  route degrades to cloud privacy (synthetic, github-copilot-enterprise)
+  rather than to a non-privacy provider.
 
 On 2026-09-08, x20-gateway (`10.0.0.1`) received a persistent DHCP reservation
 for `10.0.0.141`, name `mac-10-0-0-141`, en0 MAC `be:cf:90:06:f5:f6`.

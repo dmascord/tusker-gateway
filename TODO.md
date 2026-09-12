@@ -87,3 +87,35 @@ The fake-injection hack should be deleted.
   different encryption key than the existing rows were encrypted with —
   this permanently bricks the row.
 
+## Longhorn disk `usb-longhorn` on node `wynk` is not ready
+
+`kubectl -n longhorn-system get nodes.longhorn.io wynk -o
+jsonpath='{.status.diskStatus.usb-longhorn.conditions}'` reports:
+
+- `Ready: False` — `failed to generate disk config: open
+  /mnt/kubelet/longhorn/longhorn-disk.cfg: no such file or directory`
+- `Schedulable: False` — `Disk usb-longhorn (/mnt/kubelet/longhorn) on
+  the node wynk is not ready`
+
+`usb-flap-monitor` reports the disk has been recovered (`Validation OK:
+/mnt/kubelet`, last recovery 2026-09-11T19:46:48Z) but the Longhorn
+operator never rewrote `longhorn-disk.cfg`, so the disk stays
+non-schedulable and `disk-health-check` jobs keep failing by design.
+
+### Open items
+
+- [ ] Capture current Longhorn state for usb-longhorn on wynk (state,
+      node instance-manager logs, PVCs currently bound to it).
+- [ ] Decide action: re-register the disk (`kubectl -n longhorn-system
+      edit nodes.longhorn.io wynk`), retire it, or re-format the path.
+- [ ] Apply chosen action and verify `Ready: True` / `Schedulable: True`.
+- [ ] Document outcome under `docs/incidents/2026-09-12-wynk-usb-disk.md`.
+
+### Destructive actions (require confirmation)
+
+- `kubectl -n longhorn-system edit nodes.longhorn.io wynk` to remove
+  the disk from `spec.disks`.
+- `kubectl -n longhorn-system delete nodes.longhorn.io wynk` (rebuilds
+  the Longhorn node registration).
+- Any filesystem-level change to `/mnt/kubelet/longhorn` on `wynk`.
+
