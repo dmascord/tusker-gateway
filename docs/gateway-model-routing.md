@@ -264,14 +264,15 @@ outbound chat request. Successful JSON and SSE model fields retain the friendly
 name; generated content is untouched. `mlx-mac::qwen3-coder-30b-a3b-instruct-4bit`
 is equivalent. `/v1/models` advertises configured provider aliases alongside
 the gateway's virtual models. Unmapped model IDs still pass through unchanged.
-The privacy pool includes both routes as eligible candidates so local hardware
-is reached automatically on cold-start before cloud privacy providers.
+The privacy pool includes both routes as eligible candidates. Their actual
+selection order is still controlled by the pool's quality and rotation logic;
+they are not guaranteed to run before cloud privacy candidates.
 
 #### Single-concurrency capacity gate
 
 Both `local-llm` and `mlx-mac` are isolated into their own capacity groups
-(`TUSKER_LOCAL_LLM_CAPACITY_GROUP`, `TUSKER_MLX_MAC_CAPACITY_GROUP`) and run
-at `TUSKER_LOCAL_LLM_MAX_CONCURRENT=1` / `TUSKER_MLX_MAC_MAX_CONCURRENT=1`.
+(`local-llm` and `mlx-mac`) and run at
+`TUSKER_LOCAL_LLM_MAX_CONCURRENT=1` / `TUSKER_MLX_MAC_MAX_CONCURRENT=1`.
 The Jetson Orin Nano and the MLX Mac both saturate RAM and CPU while
 cold-loading a 7B-class model; queueing concurrent requests just stalls all
 of them, so the gateway fails fast to the next pool candidate (or returns
