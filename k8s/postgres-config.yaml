@@ -1,0 +1,45 @@
+# Stable PostgreSQL configuration overrides for tusker-gateway-postgres.
+# Mounted as /etc/postgresql/override.conf and included from postgresql.conf.
+# The defaults baked into postgres:16-alpine are correct; this file pins
+# durability-relevant settings that prevented an earlier unclean shutdown
+# from corrupting the auto-managed postgresql.conf.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tusker-gateway-postgres-config
+  namespace: hermes
+  labels:
+    app: tusker-gateway-postgres
+data:
+  override.conf: |
+    # Connection
+    listen_addresses = '*'
+    max_connections = 100
+
+    # Memory
+    shared_buffers = 128MB
+    work_mem = 4MB
+
+    # Write-ahead log
+    wal_level = replica
+    max_wal_size = 1GB
+    min_wal_size = 80MB
+    fsync = on
+    synchronous_commit = on
+    full_page_writes = on
+
+    # Checkpoint
+    checkpoint_completion_target = 0.9
+    wal_buffers = 16MB
+
+    # Query planner / autovacuum (kept at defaults)
+    random_page_cost = 1.1
+    effective_cache_size = 512MB
+
+    # Logging (preserve default log_destination)
+    log_min_duration_statement = 1000
+    log_checkpoints = on
+    log_connections = off
+    log_disconnections = off
+    log_lock_waits = on
+    log_temp_files = 0
