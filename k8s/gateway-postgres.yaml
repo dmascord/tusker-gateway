@@ -50,7 +50,22 @@ spec:
       labels:
         app: tusker-gateway-postgres
     spec:
-      terminationGracePeriodSeconds: 60
+      terminationGracePeriodSeconds: 90
+      initContainers:
+      - name: postgres-config-include
+        image: busybox:1.37
+        command:
+        - sh
+        - -ec
+        - |
+          F=/var/lib/postgresql/data/pgdata/postgresql.conf
+          [ -f "$F" ] || exit 0
+          if ! grep -q "include_if_exists = '/etc/postgresql/override/override.conf'" "$F"; then
+            printf "\n# Include ConfigMap-backed overrides\ninclude_if_exists = '/etc/postgresql/override/override.conf'\n" >> "$F"
+          fi
+        volumeMounts:
+        - name: postgres-data
+          mountPath: /var/lib/postgresql/data
       containers:
       - name: postgres
         image: postgres:16-alpine
@@ -73,6 +88,9 @@ spec:
         volumeMounts:
         - name: postgres-data
           mountPath: /var/lib/postgresql/data
+        - name: postgres-config
+          mountPath: /etc/postgresql/override
+          readOnly: true
         readinessProbe:
           exec:
             command:
@@ -91,6 +109,19 @@ spec:
           periodSeconds: 20
           timeoutSeconds: 3
           failureThreshold: 6
+        lifecycle:
+          preStop:
+            exec:
+              command:
+              - sh
+              - -ec
+              - |
+                # Trigger a clean shutdown before SIGKILL. K8s sends SIGTERM, then
+                # SIGKILL after terminationGracePeriodSeconds (90s). We give
+                # PostgreSQL up to 60s to flush WAL and close cleanly so the next
+                # pod start avoids an unclean-recovery replay. ``|| true`` so a
+                # failed shutdown doesn't block pod deletion.
+                su postgres -s /bin/sh -c 'pg_ctl -D /var/lib/postgresql/data/pgdata -m fast stop -t 60' || true
         resources:
           requests:
             cpu: 100m
@@ -102,6 +133,9 @@ spec:
       - name: postgres-data
         persistentVolumeClaim:
           claimName: tusker-gateway-postgres-data
+      - name: postgres-config
+        configMap:
+          name: tusker-gateway-postgres-config
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
