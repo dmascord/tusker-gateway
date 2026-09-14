@@ -113,8 +113,36 @@ class TestAccessLog:
         assert record["principal"] == "svc-build"
         assert record["tenant"] == "engineering"
         assert record["key_fingerprint"] == "a" * 64
-
 class TestClientIP:
+    """Real client IP extraction: CF-Connecting-IP > X-Forwarded-For > request.remote."""
+
+    def test_cf_connecting_ip(self):
+        """Cloudflare CF-Connecting-IP takes priority over XFF."""
+        request = make_mocked_request("GET", "/")
+        request = _patch_headers(
+            request,
+            {"CF-Connecting-IP": "198.51.100.42", "X-Forwarded-For": "10.0.0.1"},
+        )
+        assert client_ip(request) == "198.51.100.42"
+
+    def test_xff_chain(self):
+        """Rightmost XFF entry (last-hop proxy) is used when no CF header."""
+        request = make_mocked_request("GET", "/")
+        request = _patch_headers(
+            request, {"X-Forwarded-For": "203.0.113.1, 10.0.0.1, 192.168.1.1"}
+        )
+        assert client_ip(request) == "192.168.1.1"
+
+    def test_xff_with_spaces(self):
+        """Rightmost XFF entry with surrounding whitespace is stripped."""
+        request = make_mocked_request("GET", "/")
+        request = _patch_headers(request, {"X-Forwarded-For": "  203.0.113.55  ,  10.0.0.2  "})
+        assert client_ip(request) == "10.0.0.2"
+
+    def test_no_headers_fallback(self):
+        """No CF or XFF falls back to request.remote (or 'unknown' in mocked)."""
+        request = make_mocked_request("GET", "/")
+        assert client_ip(request) == "unknown"
     """X-Forwarded-For client IP extraction."""
 
     def test_xff_single(self):

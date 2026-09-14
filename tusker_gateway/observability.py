@@ -19,10 +19,13 @@ logger = logging.getLogger(__name__)
 def client_ip(request: web.Request) -> str:
     """Return the real client IP for a request.
 
-    Traefik appends the peer IP to the X-Forwarded-For chain, so the
-    rightmost entry is always the original caller.  For direct in-cluster
-    requests (no X-Forwarded-For header) we fall back to the TCP peer.
+    Cloudflare sends the real client IP in CF-Connecting-IP (set by Cloudflare,
+    cannot be spoofed by clients).  For non-Cloudflare sources (in-cluster,
+    direct access), fall back to X-Forwarded-For or request.remote.
     """
+    cf_ip = request.headers.get("CF-Connecting-IP", "")
+    if cf_ip:
+        return cf_ip.strip()
     xff = request.headers.get("X-Forwarded-For", "")
     if xff:
         return xff.split(",")[-1].strip()
