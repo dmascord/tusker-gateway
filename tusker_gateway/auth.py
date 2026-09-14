@@ -89,8 +89,9 @@ class AuthMiddleware:
                 logger.debug("auth OK")
                 self._attach_identity(request, token)
                 return
+        from tusker_gateway.observability import client_ip
 
-        logger.warning("auth failed: invalid API key")
+        logger.warning("auth failed: invalid API key from %s", client_ip(request))
         raise AuthenticationError("Invalid API key")
 
     def _attach_identity(self, request: web.Request, token: str) -> None:

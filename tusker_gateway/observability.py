@@ -15,6 +15,19 @@ from aiohttp import web
 
 logger = logging.getLogger(__name__)
 
+
+def client_ip(request: web.Request) -> str:
+    """Return the real client IP for a request.
+
+    Traefik appends the peer IP to the X-Forwarded-For chain, so the
+    rightmost entry is always the original caller.  For direct in-cluster
+    requests (no X-Forwarded-For header) we fall back to the TCP peer.
+    """
+    xff = request.headers.get("X-Forwarded-For", "")
+    if xff:
+        return xff.split(",")[-1].strip()
+    return request.remote or "unknown"
+
 _ACCESS_LOG_CONTEXT_KEY = "_access_log_context"
 _ACCESS_LOG_FIELDS = frozenset({
     "provider",
@@ -115,6 +128,7 @@ class AccessLog:
             "path": request.path,
             "status": response_status,
             "latency_ms": round(latency_ms, 1),
+            "client_ip": client_ip(request),
         }
 
         identity = request.get("identity")

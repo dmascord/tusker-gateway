@@ -13,6 +13,7 @@ from tusker_gateway.observability import (
     AccessLog,
     attach_request_id_middleware,
     set_access_log_context,
+    client_ip,
     _generate_request_id,
 )
 from tusker_gateway.pools import ModelSpec, PoolManager, PoolConfig
@@ -112,6 +113,43 @@ class TestAccessLog:
         assert record["principal"] == "svc-build"
         assert record["tenant"] == "engineering"
         assert record["key_fingerprint"] == "a" * 64
+
+class TestClientIP:
+    """X-Forwarded-For client IP extraction."""
+
+    def test_xff_single(self):
+        """XFF single value is returned directly."""
+        request = make_mocked_request("GET", "/")
+        request = _patch_headers(request, {"X-Forwarded-For": "203.0.113.1"})
+        assert client_ip(request) == "203.0.113.1"
+
+    def test_xff_chain(self):
+        """Rightmost XFF entry (last-hop proxy) is returned."""
+        request = make_mocked_request("GET", "/")
+        request = _patch_headers(
+            request, {"X-Forwarded-For": "203.0.113.1, 10.0.0.1, 192.168.1.1"}
+        )
+        assert client_ip(request) == "192.168.1.1"
+
+    def test_xff_with_spaces(self):
+        """Rightmost XFF entry with surrounding whitespace is stripped."""
+        request = make_mocked_request("GET", "/")
+        request = _patch_headers(request, {"X-Forwarded-For": "  203.0.113.55  ,  10.0.0.2  "})
+        assert client_ip(request) == "10.0.0.2"
+    def test_no_xff_fallback(self):
+        """No XFF header falls back to 'unknown'."""
+        request = make_mocked_request("GET", "/")
+        assert client_ip(request) == "unknown"
+
+
+def _patch_headers(request: web.Request, headers: dict) -> web.Request:
+    """Patch a mocked request's headers dict for XFF testing."""
+    # make_mocked_request creates a request with frozen headers.
+    # Replace the _headers object with a mutable MultiDictProxy.
+    from multidict import CIMultiDict
+    from yarl import URL
+    request._headers = CIMultiDict(headers)
+    return request
 
 
 class TestRequestIDMiddleware:
