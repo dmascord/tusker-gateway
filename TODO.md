@@ -125,3 +125,52 @@ no replica is scheduled on this disk.
 - Enabling scheduling on this USB disk before the soak period completes.
 - Removing the disk entry again or deleting the Longhorn node registration.
 
+## 2026-09-14 audit findings
+
+Audit done before further action. Items in priority order:
+
+### 1. USB T5 drive state (visor)
+- T5 still physically attached (`/dev/sdc`, 931 GB) at `/mnt/longhorn-ssd`.
+- Longhorn disk entry exists with `allowScheduling: false, evictionRequested: true`.
+- **No live replicas on the disk** (postgres volume has 3 replicas on wyrm, wytch, wyvern).
+- **Orphaned replica dirs** on disk from old PVCs: `pvc-2afe302d-*`, `pvc-84387ebb-*`. These PVCs/PVs no longer exist in K8s/LH; data is just leftover on the filesystem (~4KB metadata each, but actual data size unknown without read permission).
+- Memory said the drive was the critical path — that's stale. The drive is unused for critical state.
+
+### 2. usb-flap-monitor timer not installed on visor
+- Repo has `tusker_gateway/tools/usb-flap-monitor.{sh,service,timer}`.
+- `systemctl list-unit-files | grep usb-flap` returns nothing.
+- `/usr/local/bin/usb-flap-monitor.sh` does not exist.
+- Earlier today the script was deployed to `/usr/local/bin/` (md5 verified), but the systemd timer was not re-installed. The script was later removed during a visor cleanup.
+- AGENTS.md updated to note the deployment gap. Decision pending: re-install, or remove from docs since the drive is unused for critical state.
+
+### 3. Registry GC orchestrator fixed (this session)
+- Bug: hardcoded `REPOS = ["hermes-agent"]` excluded all other repos (esp. tusker-gateway with 259 tags → 138 GB of blobs).
+- Bug: full FQDN `registry.registry.svc.cluster.local` fails DNS in-cluster; switched to `registry.registry.svc`.
+- Bug: no `URLError` handling — silent crashes on DNS failure.
+- Fix verified: dynamic catalog fetch, all repos cleaned, GC ran, disk at 3% used (4.3 GB / 147.5 GB).
+- CronJob `registry-gc-orchestrator` in `registry` namespace runs weekly at `0 4 * * 0`. Next run: 2026-09-20 04:00 UTC.
+
+### 4. Cloudflare proxy mode enabled (2026-09-14)
+- DNS for `ai.tusker.net.au` now resolves to Cloudflare IPs (172.67.216.212, 104.21.24.21).
+- Direct route to public IP `103.68.121.242:443` from external hosts times out (expected — router firewall blocks non-Cloudflare IPs on port 443).
+- Logs now show real client IPs via `CF-Connecting-IP` (e.g. `182.54.232.211` from wildduck, `2405:800:2:1::6e` IPv6 from laptop).
+- `0c2facd` (leftmost XFF) is unnecessary now — `CF-Connecting-IP` provides the real IP and takes priority in the code.
+
+### 5. Unpushed local commits (6, ahead of origin/main)
+- `0c2facd` observability: use leftmost XFF for Cloudflare, not rightmost — **superseded by Cloudflare proxy mode; recommend revert**.
+- `44d2034` observability: prefer CF-Connecting-IP over X-Forwarded-For for client IP — deployed.
+- `27b2dc4` observability: log real client IP from X-Forwarded-For — deployed.
+- `ab51671` usb-flap-monitor: detect UAS aborts and USB resets, not just disconnects — script exists but timer not installed.
+- `d694084` fix(cooldown): strip URLs from 429 body before hint matching; honour x-ratelimit-* headers.
+- `7a03ad1` fix(stream): detect mid-stream 429 envelopes as RateLimitError.
+
+### 6. visor tree divergence
+- Visor's `/srv/opencode/tusker-ai-gateway` HEAD is at `ca119a3`, which is 65 commits behind `origin/main` (which is at `c79edcf`).
+- Visor has many uncommitted modifications and untracked files (uncommitted work in progress).
+- Local main has 6 commits ahead of origin/main (the observability/USB/429 fixes listed in #5).
+- The cluster runs an image built from a commit (`44d2034`) that's neither in visor's tree nor in origin/main — deployed via direct push to registry, not via visor's `deploy.sh`.
+
+### Destructive actions (require confirmation)
+- Removing orphaned replica directories from `/mnt/longhorn-ssd/replicas/` on visor.
+- Installing or removing the usb-flap-monitor systemd timer.
+- `git push` of unpushed commits to origin.

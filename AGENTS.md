@@ -58,19 +58,27 @@ always fine.
 `tests/test_passthrough_providers.py` for offline runs (hits live upstreams).
 ~894 passed + 3 skipped.
 
-## visor USB-flap monitor
+## visor USB-flap monitor — DEPLOYMENT STATUS UNCLEAR (2026-09-14 audit)
 
-A systemd timer on visor (`usb-flap-monitor.timer`) runs every minute and
-calls `tusker_gateway/tools/usb-flap-monitor.sh`. On a USB disconnect /
-new-device / rejected-I/O event in the last 60s of dmesg the script writes
-an `ALERT usb-flap-detected ...` line to the journal; forward that to your
-alerting channel. This is now a **smoke detector** — the Samsung T5 attached
-to visor's USB bus is currently unused for critical state, but it was the
-root cause of the 2026-08-26 outage when it was bumped and flapped. The
-monitor lets us catch the next disturbance early. When the drive is
-physically unplugged (follow-up in
-`docs/incidents/2026-08-26-usb-ssd-flap.md`), the timer + script can be
-removed (`systemctl disable --now usb-flap-monitor.timer`).
+`tusker_gateway/tools/usb-flap-monitor.{sh,service,timer}` exists in the
+repo. As of 2026-09-14, the systemd timer is **not installed on visor**
+(`systemctl list-unit-files | grep usb-flap` returns nothing, the script
+is missing from `/usr/local/bin/`). The previous deployment is no
+longer running.
+
+Whether to re-deploy depends on operational policy — the T5 is still
+physically attached to visor (`/dev/sdc`, 931 GB) and
+`/mnt/longhorn-ssd` is still a Longhorn disk with `allowScheduling: false,
+evictionRequested: true`. No live replicas currently sit on the T5, so
+the monitor would only catch disturbances that don't take down a
+service. If the goal is "smoke detector" only, re-deployment is
+appropriate; if the drive is being decommissioned, removal from docs
+is appropriate.
+
+The previous incident doc says: "When the drive is physically unplugged
+(follow-up in `docs/incidents/2026-08-26-usb-ssd-flap.md`), the timer +
+script can be removed (`systemctl disable --now usb-flap-monitor.timer`)."
+See `TODO.md` for the active decision.
 
 ## Memory
 
