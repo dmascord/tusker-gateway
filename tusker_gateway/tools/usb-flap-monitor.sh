@@ -64,7 +64,7 @@ WINDOW_SECONDS=60
 # "USB disconnect, device number N" — kernel saw the cable unplug
 # "new high-speed USB device" — kernel saw the cable reconnect
 # "rejected I/O to offline device" — too late, the damage is done
-EVENT_REGEX='(USB disconnect, device number|new high-speed USB device number|rejected I/O to offline device)'
+EVENT_REGEX='(USB disconnect|new high-speed USB device|rejected I/O|UAS|reset)'
 
 # dmesg output since the boot has form "[  123.456] message". The kernel
 # stores elapsed-since-boot timestamps, so we can read current uptime and
@@ -99,16 +99,15 @@ if [[ -z "$RECENT" ]]; then
     exit 0
 fi
 
-DISCONNECTS=$(echo "$RECENT" | grep -E 'USB disconnect, device number' | wc -l || true)
-RECONNECTS=$(echo "$RECENT" | grep -E 'new high-speed USB device number' | wc -l || true)
-IO_REJECTS=$(echo "$RECENT" | grep -E 'rejected I/O to offline device' | wc -l || true)
+DISCONNECTS=$(echo "$RECENT" | grep -Ei 'USB disconnect' | wc -l || true)
+RECONNECTS=$(echo "$RECENT" | grep -Ei 'new high-speed USB device' | wc -l || true)
+IO_REJECTS=$(echo "$RECENT" | grep -Ei 'rejected I/O' | wc -l || true)
+UAS_ERRORS=$(echo "$RECENT" | grep -Ei 'UAS.*(abort|error)' | wc -l || true)
+RESET_ERRORS=$(echo "$RECENT" | grep -Ei 'USB.*reset' | wc -l || true)
 
-# Alert if we saw at least one disconnect in the window OR any I/O rejection.
-# (A single disconnect + reconnect is a flap. A lone I/O reject means the
-# disk is already gone and we need an operator now.)
-if (( DISCONNECTS > 0 || IO_REJECTS > 0 )); then
-    printf 'ALERT usb-flap-detected disconnects=%d reconnects=%d io_rejects=%d window=%ds\n' \
-        "$DISCONNECTS" "$RECONNECTS" "$IO_REJECTS" "$WINDOW_SECONDS"
+if (( DISCONNECTS > 0 || IO_REJECTS > 0 || UAS_ERRORS > 0 || RESET_ERRORS > 0 )); then
+    printf 'ALERT usb-flap-detected disconnects=%d reconnects=%d io_rejects=%d uas=%d resets=%d window=%ds\n' \
+        "$DISCONNECTS" "$RECONNECTS" "$IO_REJECTS" "$UAS_ERRORS" "$RESET_ERRORS" "$WINDOW_SECONDS"
     echo "Recent dmesg entries:"
     echo "$RECENT" | grep -E "$EVENT_REGEX" | tail -10
     exit 0
