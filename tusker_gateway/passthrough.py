@@ -2495,6 +2495,28 @@ class PassthroughClient:
                     )
                     failure.upstream_status = 502
                     raise failure
+                # Detect mid-stream error envelopes (HTTP 200 with a synthetic
+                # error payload). Once the upstream has committed 200, we can
+                # only abandon this candidate if no useful chunks have been
+                # yielded yet. observe() runs before yield in this loop, so
+                # raising here means the caller never sees the bad frame.
+                envelope_error = _stream_error_from_frame(
+                    frame,
+                    provider=provider or "?",
+                    model=model or "?",
+                )
+                if envelope_error is not None:
+                    status = getattr(envelope_error, "upstream_status", None)
+                    if status == 429:
+                        rate_error = RateLimitError(
+                            envelope_error.message,
+                            code=envelope_error.code,
+                            body=getattr(envelope_error, "upstream_body", None)
+                            or "",
+                        )
+                        rate_error.upstream_status = 429
+                        raise rate_error
+                    raise envelope_error
                 if _stream_frame_is_terminal(frame):
                     saw_terminal = True
 

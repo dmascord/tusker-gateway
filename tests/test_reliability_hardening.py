@@ -4,8 +4,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import aiohttp
 import pytest
-
-from tusker_gateway.errors import ProviderError
+from tusker_gateway.errors import ProviderError, RateLimitError
 from tusker_gateway.passthrough import PassthroughClient
 
 
@@ -129,3 +128,93 @@ async def test_response_incomplete_terminal_is_recorded_as_failure():
     client._record_stream_failure.assert_awaited_once()
     for call in client._record_quality.await_args_list:
         assert call.args[2] is False, "response.incomplete must not record success"
+
+
+@pytest.mark.asyncio
+async def test_midstream_429_envelope_raises_rate_limit_error():
+    """An upstream that returns HTTP 200 with a synthetic 429 envelope mid-stream
+    must trigger the rate-limit cooldown path (not a generic 502). Without this,
+    the pool falls back but the breaker applies a 60s policy cooldown instead of
+    the quota cooldown parsed from the upstream body.
+    """
+    client = object.__new__(PassthroughClient)
+    client._record_stream_failure = AsyncMock()
+    client._record_quality = AsyncMock()
+    client._release_capacity = MagicMock()
+
+    async def rate_limited():
+        yield (
+            b'data: {"error":{"message":"You have exceeded your subscription '
+            b'rate limits. Upgrade, or try again later.","type":"rate_limit_error",'
+            b'"status":429}}\n\n'
+        )
+
+    stream = client._stream_events(
+        _Response(),
+        provider="test",
+        model="model",
+        stream_iterator=rate_limited(),
+    )
+    with pytest.raises(RateLimitError) as exc_info:
+        _ = [chunk async for chunk in stream]
+    assert exc_info.value.upstream_status == 429
+    assert "subscription" in (exc_info.value.body or "").lower()
+    client._record_stream_failure.assert_awaited_once()
+    for call in client._record_quality.await_args_list:
+        assert call.args[2] is False, "mid-stream 429 must not record success"
+
+
+@pytest.mark.asyncio
+async def test_midstream_5xx_envelope_raises_provider_error():
+    """An upstream that returns HTTP 200 with a 5xx envelope mid-stream should
+    still raise ProviderError with the propagated upstream_status so the breaker
+    can apply its policy cooldown.
+    """
+    client = object.__new__(PassthroughClient)
+    client._record_stream_failure = AsyncMock()
+    client._record_quality = AsyncMock()
+    client._release_capacity = MagicMock()
+
+    async def server_error():
+        yield (
+            b'data: {"error":{"message":"Internal upstream error",'
+            b'"type":"server_error","status":503}}\n\n'
+        )
+
+    stream = client._stream_events(
+        _Response(),
+        provider="test",
+        model="model",
+        stream_iterator=server_error(),
+    )
+    with pytest.raises(ProviderError) as exc_info:
+        _ = [chunk async for chunk in stream]
+    assert exc_info.value.upstream_status == 503
+    client._record_stream_failure.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_midstream_normal_assistant_content_passes_through():
+    """Regular assistant content frames must NOT be misinterpreted as errors.
+    This guards against false positives from the new envelope detector.
+    """
+    client = object.__new__(PassthroughClient)
+    client._record_stream_failure = AsyncMock()
+    client._record_quality = AsyncMock()
+    client._release_capacity = MagicMock()
+
+    async def normal():
+        yield b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
+        yield b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+        yield b'data: [DONE]\n\n'
+
+    stream = client._stream_events(
+        _Response(),
+        provider="test",
+        model="model",
+        stream_iterator=normal(),
+    )
+    chunks = []
+    async for chunk in stream:
+        chunks.append(chunk)
+    assert len(chunks) == 3
