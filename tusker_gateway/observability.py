@@ -19,18 +19,20 @@ logger = logging.getLogger(__name__)
 def client_ip(request: web.Request) -> str:
     """Return the real client IP for a request.
 
-    Cloudflare sends the real client IP in CF-Connecting-IP (set by Cloudflare,
-    cannot be spoofed by clients).  For non-Cloudflare sources (in-cluster,
-    direct access), fall back to X-Forwarded-For or request.remote.
+    Prioritises:
+    1. CF-Connecting-IP (Cloudflare) — real client IP if forwarded by Cloudflare.
+    2. X-Forwarded-For leftmost — works for Cloudflare (client, edge) and
+       direct reverse-proxies.  The leftmost entry is the original client.
+    3. request.remote — falls back for in-cluster and direct connections.
     """
     cf_ip = request.headers.get("CF-Connecting-IP", "")
     if cf_ip:
         return cf_ip.strip()
     xff = request.headers.get("X-Forwarded-For", "")
     if xff:
-        return xff.split(",")[-1].strip()
+        # Leftmost entry is the original client (Cloudflare appends edge IP).
+        return xff.split(",")[0].strip()
     return request.remote or "unknown"
-
 _ACCESS_LOG_CONTEXT_KEY = "_access_log_context"
 _ACCESS_LOG_FIELDS = frozenset({
     "provider",
