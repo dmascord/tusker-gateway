@@ -270,24 +270,90 @@ class CooldownTracker:
         # Don't clear provider-default; keep it for batch eviction
 
 
+def _strip_urls(body: str) -> str:
+    """Remove URLs from an error body so hint matching is not corrupted.
+
+    A URL like ``https://example.com/billing`` contains words such as
+    ``billing`` or ``usage`` that happen to match the quota hints but are not
+    part of the semantic error message. The user's eye sees a billing link;
+    the matcher would see a quota hint. Stripping URLs keeps the hint check
+    honest without dropping the URL from the response shown to the operator.
+    """
+    if not body:
+        return ""
+    return re.sub(r"https?://\S+", " ", body, flags=re.IGNORECASE)
+
+
+def _hint_in_body(hint: str, body_lower: str) -> bool:
+    """Match a quota hint as a whole word (or short phrase) in ``body_lower``.
+
+    Plain ``hint in body_lower`` matches substrings, which produces false
+    positives when the hint word appears inside a URL (e.g. ``/billing``),
+    inside a JSON key (``"billing":``), or inside a code identifier.
+    Requiring word boundaries avoids those cases while still matching natural
+    prose such as ``"your billing account has been suspended"``.
+    """
+    pattern = r"(?<![A-Za-z0-9_-])" + re.escape(hint) + r"(?![A-Za-z0-9_-])"
+    return re.search(pattern, body_lower) is not None
+
+
+def _header_to_seconds(value: str | None) -> float | None:
+    """Parse a Retry-After-style header value into a seconds-until-reset float.
+
+    Supports three forms:
+      - Numeric seconds (``"120"``) → 120.0
+      - HTTP-date (``"Wed, 21 Oct 2026 07:28:00 GMT"``) → seconds until that UTC time
+      - ``x-ratelimit-reset``-style unix timestamp (``"1761035280"``) when the
+        value is larger than 24h worth of seconds we treat it as epoch seconds.
+    Returns ``None`` if the value is missing or unparseable.
+    """
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    # Numeric seconds
+    try:
+        secs = float(raw)
+        # Disambiguate unix-epoch vs seconds. Retry-After RFC 7231 numeric form
+        # is seconds; x-ratelimit-reset is unix epoch. > 1e9 covers any current
+        # epoch second; > 1e12 would be milliseconds (rare in practice).
+        if secs >= 1_000_000_000:
+            return max(0.0, secs - time.time())
+        return max(0.0, secs)
+    except (TypeError, ValueError):
+        pass
+    # HTTP-date
+    from email.utils import parsedate_to_datetime
+    try:
+        dt = parsedate_to_datetime(raw)
+        if dt is None:
+            return None
+        delta = dt.timestamp() - time.time()
+        return max(0.0, delta)
+    except (TypeError, ValueError):
+        return None
+
+
 def _cooldown_seconds_for_429(exc: dict[str, Any]) -> float:
-    """Parse a 429 response body and return the cooldown seconds.
+    """Parse a 429 response and return the cooldown seconds.
 
-    Falls back to the Retry-After header value if present, otherwise
-    uses a heuristic from the error body.
+    Honours headers first, then falls back to body heuristics.
 
-    Rules:
-    - 401/403 on auth error → no retry
-    - 429 with Retry-After → honor that value (cap at 3600)
-    - 429 with "week" / "month" in body → 7 days
-    - 429 with "hour" in body → 3600
-    - 429 with "minute" in body → 3600 (default conservative)
-    - 429 with numeric "N/day" → N*86400
-    - Otherwise → 60 seconds
+    Headers consulted:
+      - ``Retry-After`` (numeric seconds or HTTP-date) — cap at MAX_RETRY_AFTER_SECS
+      - ``x-ratelimit-reset`` — unix epoch seconds; honour when present
+      - ``x-ratelimit-reset-after`` — numeric seconds (Synthetic/Some providers)
+
+    Body heuristics:
+      - JSON-style ``retry-after`` field
+      - Explicit "try again in N seconds/minutes/hours/days" prose
+      - Quota-hint word-boundary match (with URLs stripped) → quota cooldown
+      - Generic ``week`` / ``month`` / ``hour`` / ``N/day`` keywords
+      - Otherwise → 60s default
     """
     import aiohttp
 
-    # If already an aiohttp.ClientResponseError
     if isinstance(exc, aiohttp.ClientResponseError):
         body = exc.message or ""
         headers = exc.headers or {}
@@ -297,26 +363,34 @@ def _cooldown_seconds_for_429(exc: dict[str, Any]) -> float:
     else:
         body = str(exc)
         headers = {}
-    # Explicit Retry-After header
-    ra = headers.get("Retry-After", "")
-    if ra:
-        try:
-            return max(0.0, min(float(ra), MAX_RETRY_AFTER_SECS))
-        except ValueError:
-            pass
 
-    # Parse body for limit windows
-    body_lower = body.lower()
+    # Header-based cooldown. Retry-After wins (it's the authoritative hint
+    # from the upstream); the x-ratelimit-* family is consulted when
+    # Retry-After is absent because some providers (Synthetic and others)
+    # document those instead.
+    ra_seconds = _header_to_seconds(headers.get("Retry-After"))
+    if ra_seconds is None:
+        for hdr in ("x-ratelimit-reset", "x-ratelimit-reset-after"):
+            ra_seconds = _header_to_seconds(headers.get(hdr))
+            if ra_seconds is not None:
+                break
+    if ra_seconds is not None:
+        return min(ra_seconds, MAX_RETRY_AFTER_SECS)
 
-    if "retry-after" in body_lower:
-        m = re.search(r"retry[- ]after[:\s]+(\d+)", body_lower)
+    # Strip URLs so words like "billing" / "usage" inside a link don't trip
+    # the quota-hint matcher. Keep the original body for the "try again in"
+    # regex (URLs don't carry useful timing info there anyway).
+    body_for_hints = _strip_urls(body).lower()
+
+    if "retry-after" in body_for_hints:
+        m = re.search(r"retry[- ]after[:\s]+(\d+)", body_for_hints)
         if m:
             return float(m.group(1))
 
     # Explicit "try again in N seconds/minutes/hours/days"
     m = re.search(
         r"(?:try again in|wait|after|cooldown|retry)[^.]*?(\d+)\s*(seconds?|minutes?|hours?|days?|weeks?)",
-        body_lower,
+        body_for_hints,
     )
     if m:
         n, unit = float(m.group(1)), m.group(2)
@@ -328,28 +402,29 @@ def _cooldown_seconds_for_429(exc: dict[str, Any]) -> float:
 
     # Quota / usage-limit exhaustion is a long-lived state (the window won't
     # reset for hours or days), not a transient rate-limit blip. Backing off
-    # for only 60s would hammer the upstream with pointless probes. Treat
-    # these as a long cooldown so the gateway stops retrying until the quota
-    # window plausibly resets.
-    if any(hint in body_lower for hint in _QUOTA_HINTS):
+    # for only 60s would hammer the upstream with pointless probes until the
+    # window resets. Word-boundary matching avoids false positives when the
+    # trigger word sits inside a URL path (``/billing``) or JSON key.
+    if any(_hint_in_body(hint, body_for_hints) for hint in _QUOTA_HINTS):
         quota_cooldown = float(os.environ.get("TUSKER_RETRY_QUOTA_COOLDOWN", "3600"))
         logger.info(
             "429 cooldown: %.0fs for quota-exhausted provider", quota_cooldown
         )
         return quota_cooldown
 
-    # Generic heuristic fallbacks
-    if "week" in body_lower: return 7 * 86400.0
-    if "month" in body_lower: return 30 * 86400.0
-    if "hour" in body_lower: return 3600.0
-    m = re.search(r"(\d+)\s*/\s*day", body_lower)
+    # Generic heuristic fallbacks (URLs already stripped)
+    if "week" in body_for_hints: return 7 * 86400.0
+    if "month" in body_for_hints: return 30 * 86400.0
+    if "hour" in body_for_hints: return 3600.0
+    m = re.search(r"(\d+)\s*/\s*day", body_for_hints)
     if m: return 86400.0 / float(m.group(1))
-    if "429" in body_lower or "rate limit" in body_lower:
+    if "429" in body_for_hints or "rate limit" in body_for_hints:
         logger.info('429 cooldown: 60.0s for %s', 'unknown')
         return 60.0
 
     logger.info('429 cooldown: 60.0s for %s', 'unknown')
     return 60.0
+
 
 def _cooldown_seconds_for_provider_error(exc: Any) -> float | None:
     """Derive a circuit-breaker cooldown for a non-429 provider error.
