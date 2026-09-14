@@ -79,6 +79,15 @@ When retrying this, the right path is to first do a Longhorn version-aligned sna
 
 The USB T5 is still attached to visor but no longer used for tusker-gateway data. When the other-app PVCs on it (`pvc-2afe302d`, `pvc-84387ebb`) are migrated off, the drive can be physically unplugged and the USB-flap monitor can be removed.
 
+## Status update (2026-09-14 audit)
+
+Verified state on 2026-09-14:
+
+- **The two non-tusker PVCs (`pvc-2afe302d`, `pvc-84387ebb`) referenced above are no longer in the cluster** — the PVCs and their backing PVs were removed at some point between the incident and this audit. Only the stale replica directories remain on the T5 filesystem (`/mnt/longhorn-ssd/replicas/pvc-2afe302d-*`, `pvc-84387ebb-*`). These directories are owned by root and not tracked by Longhorn.
+- **No live Longhorn replicas are on the T5.** The postgres volume (`tusker-gateway-postgres-data`) has 3 replicas on wyrm, wytch, and wyvern. The T5 Longhorn disk entry has `allowScheduling: false, evictionRequested: true` — the eviction has effectively completed.
+- **The USB-flap monitor is no longer installed on visor.** `systemctl list-unit-files | grep usb-flap` returns nothing; `/usr/local/bin/usb-flap-monitor.sh` does not exist. The script source remains in the repo (`tusker_gateway/tools/usb-flap-monitor.{sh,service,timer}`). Re-installation is a separate decision — see `AGENTS.md` and `TODO.md`.
+- **Physical unplug of the T5 is now unblocked** by the missing non-tusker PVCs, but the drive still has the two orphaned replica directories on disk that would need to be cleaned up first. This is a destructive operation (requires confirmation).
+
 ## Longhorn v1.12.1 upgrade (2026-08-27)
 
 Upgraded Longhorn from chart `1.12.0` to `1.12.1` (app version `v1.12.0` → `v1.12.1`) via `helm upgrade longhorn longhorn/longhorn --version 1.12.1`. The cluster went through Helm chart revision 2 → 4 (revision 3 was a no-op because `--reuse-values` carried the previously computed image tag `v1.12.0` forward; the explicit `--set image.*.tag=v1.12.1` overrides were required).
