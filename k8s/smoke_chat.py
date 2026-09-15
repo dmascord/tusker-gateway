@@ -81,7 +81,14 @@ def fetch_chat(url, api_key, model, timeout=120):
     request = urllib.request.Request(url, data=json.dumps({
         "model": model, "stream": True, "max_tokens": 128,
         "messages": [{"role": "user", "content": "Reply with the word DONE."}],
-    }).encode(), headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"})
+    }).encode(), headers={
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+        # Cloudflare edge rejects the default Python-urllib user agent
+        # with error code 1010. Use a curl-like UA so the smoke helper
+        # works in any environment that gates on UA.
+        "User-Agent": "tusker-smoke/1.0 (curl-compatible)",
+    })
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             result = check_stream(iter(lambda: response.read1(4096), b""))
