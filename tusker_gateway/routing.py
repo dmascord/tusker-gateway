@@ -26,6 +26,7 @@ POOL_ALIASES = {
     "hermes-privacy": "privacy",
     "hermes-premium": "premium",
     "hermes-swarm": "swarm",
+    "hermes-embed": "embed",
 }
 
 # Model ids advertised by the legacy Hermes endpoint. Provider-prefixed ids

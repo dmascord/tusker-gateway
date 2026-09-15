@@ -53,6 +53,10 @@ HEAVYWEIGHT_SLUG_OVERRIDES: frozenset[str] = frozenset({
     # overlay, but static pool lists carry no cost data — this slug entry
     # keeps kimi-k3 out of cheap pools on that path too.
     "kimi-k3",
+    # Moonshot AI Kimi-K3 via synthetic.new (moonshotai/Kimi-K3).
+    # Slug is case-sensitive; synthetic.new returns "Kimi-K3" while
+    # ollama.com returns "kimi-k3". Both are covered.
+    "Kimi-K3",
 })
 
 

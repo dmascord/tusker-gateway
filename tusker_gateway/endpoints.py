@@ -3861,7 +3861,7 @@ async def models_handler(request: web.Request) -> web.Response:
                 {"id": f"{provider_name}/{alias}", "object": "model", "owned_by": "tusker-gateway"}
                 for alias in aliases
             )
-    data.extend({"id": alias, "object": "model", "owned_by": "tusker-gateway"} for alias in ("hermes-code", "hermes-privacy", "hermes-premium", "hermes-swarm", "hermes-reranker"))
+    data.extend({"id": alias, "object": "model", "owned_by": "tusker-gateway"} for alias in ("hermes-code", "hermes-privacy", "hermes-premium", "hermes-swarm", "hermes-reranker", "hermes-embed"))
     existing = {item["id"] for item in data}
     data.extend(
         {"id": model_id, "object": "model", "owned_by": "tusker-gateway"}
@@ -5256,6 +5256,108 @@ async def rerank_handler(request: web.Request) -> web.Response:
             status=502,
         )
 
+
+async def embeddings_handler(request: web.Request) -> web.Response:
+    """POST /v1/embeddings with provider-aware fallback.
+
+    The public response follows OpenAI's embeddings contract even when the
+    selected backend returns Voyage or Jina's native shape. Embedding is
+    kept separate from the chat pools: a provider disabled for chat can
+    still be used here when its native embed key and endpoint are
+    configured.
+    """
+    from tusker_gateway.providers.embed import EmbedHandler
+
+    started = time.monotonic()
+    metrics: MetricsRegistry | None = request.app.get("metrics")
+    provider = "unknown"
+    model = "unknown"
+    set_access_log_context(request, pool="embed")
+
+    def _emit(status_label: str) -> None:
+        if metrics is None:
+            return
+        labels = {"pool": "embed", "provider": provider, "model": model}
+        metrics.requests_total.inc({**labels, "status": status_label})
+        metrics.request_duration.observe(time.monotonic() - started, labels)
+
+    try:
+        try:
+            body = await request.json()
+        except (ContentTypeError, json.JSONDecodeError, UnicodeDecodeError, TypeError, ValueError) as exc:
+            raise BadRequestError(
+                "Request body must be valid JSON",
+                code="invalid_request",
+            ) from exc
+        if not isinstance(body, dict):
+            raise BadRequestError(
+                "Request body must be a JSON object",
+                code="invalid_request",
+            )
+
+        requested_model = body.get("model")
+        if isinstance(requested_model, str) and requested_model.strip():
+            model = requested_model.strip()
+            set_access_log_context(request, model=model)
+
+        embedder = request.app.get("embed_handler")
+        if embedder is None:
+            embedder = EmbedHandler(request.app["config"])
+
+        parsed = EmbedHandler.validate_request(body)
+        blocked = await _media_preflight(
+            request,
+            body,
+            budget_units=parsed.budget_units,
+            budget_pool="embed",
+        )
+        if blocked is not None:
+            _emit("blocked")
+            return blocked
+        parsed = EmbedHandler.validate_request(body)
+
+        provider, model, result = await embedder.embed(
+            body,
+            session=request.app.get("http_session"),
+            breaker=request.app.get("breaker"),
+        )
+        set_access_log_context(
+            request,
+            pool="embed",
+            provider=provider,
+            model=model,
+        )
+        await _record_media_budget(
+            request,
+            budget_units=parsed.budget_units,
+            budget_pool="embed",
+        )
+        _emit("ok")
+        return web.json_response(result)
+    except GatewayError as exc:
+        _emit(exc.code or "error")
+        headers: dict[str, str] = {}
+        retry_after = getattr(exc, "headers", {}).get("Retry-After")
+        if retry_after is not None:
+            headers["Retry-After"] = str(retry_after)
+        response_kwargs: dict[str, Any] = {"status": _media_error_status(exc)}
+        if headers:
+            response_kwargs["headers"] = headers
+        return web.json_response(
+            openai_error(exc.message, code=exc.code, error_type=exc.error_type),
+            **response_kwargs,
+        )
+    except Exception:
+        _emit("internal_error")
+        logger.exception("Unexpected embed request failure")
+        return web.json_response(
+            openai_error(
+                "Embed provider request failed",
+                code="provider_error",
+                error_type="provider_error",
+            ),
+            status=502,
+        )
 
 def _media_error_status(exc: GatewayError) -> int:
     if exc.code in {

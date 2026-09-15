@@ -52,6 +52,10 @@ def test_ollama_cloud_usage_heavy_slugs():
     not by slug."""
     assert is_heavyweight_slug("kimi-k3") is True
     assert is_heavyweight("kimi-k3") is True  # no pricing data needed
+    # synthetic.new exposes moonshotai/Kimi-K3 (capital K). The slug set
+    # must cover this variant too since matching is case-sensitive.
+    assert is_heavyweight_slug("Kimi-K3") is True
+    assert is_heavyweight("Kimi-K3") is True
     assert is_heavyweight_slug("glm-5.3") is False
     assert is_heavyweight("glm-5.3", cost_input=1.40, cost_output=4.40) is True
     assert is_heavyweight(

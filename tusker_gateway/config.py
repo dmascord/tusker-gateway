@@ -33,6 +33,9 @@ class ProviderConfig:
     # Optional provider-native rerank endpoint. Absolute URLs are allowed for
     # providers whose rerank API is not rooted at ``base_url``.
     rerank_path: str | None = None
+    # Optional provider-native embed endpoint. Absolute URLs are allowed for
+    # providers whose embed API is not rooted at ``base_url``.
+    embed_path: str | None = None
     # Mapping of friendly client-facing aliases → canonical upstream model names.
     # Keys are what clients pass in requests; values are what is sent upstream.
     # Used by mlx-mac (and similar local runs) where a short friendly name
@@ -326,7 +329,7 @@ def expand_env_placeholders(value: str | None) -> str | None:
 
 DEFAULT_PROVIDER_REGISTRY: dict[str, ProviderConfig] = {
     "openai": ProviderConfig("openai", "bearer", "https://api.openai.com", "/v1/chat/completions", auth_env="OPENAI_API_KEY", models_path="/v1/models"),
-    "openrouter": ProviderConfig("openrouter", "bearer", "https://openrouter.ai/api/v1", "/chat/completions", auth_env="OPENROUTER_API_KEY", models_path="/models"),
+    "openrouter": ProviderConfig("openrouter", "bearer", "https://openrouter.ai/api/v1", "/chat/completions", auth_env="OPENROUTER_API_KEY", models_path="/models", embed_path="/embeddings"),
     "groq": ProviderConfig("groq", "bearer", "https://api.groq.com/openai", "/v1/chat/completions", auth_env="GROQ_API_KEY", models_path="/v1/models"),
     "arcee": ProviderConfig("arcee", "bearer", "https://api.arcee.ai/api/v1", "/chat/completions", auth_env="ARCEEAI_API_KEY", models_path="/models"),
     "zai": ProviderConfig("zai", "bearer", "https://api.z.ai/api/coding/paas", "/v4/chat/completions", auth_env="GLM_API_KEY", models_path="/v4/models"),
@@ -337,17 +340,17 @@ DEFAULT_PROVIDER_REGISTRY: dict[str, ProviderConfig] = {
     "cohere": ProviderConfig("cohere", "bearer", "https://api.cohere.com/compatibility", "/v1/chat/completions", auth_env="COHERE_API_KEY", models_path="https://api.cohere.com/v1/models?page_size=1000", rerank_path="https://api.cohere.com/v2/rerank"),
     # Rerank-only providers intentionally have no model catalog or chat pool
     # route. Their native endpoint is exposed through POST /v1/rerank.
-    "voyage": ProviderConfig("voyage", "bearer", "https://api.voyageai.com", "/v1/chat/completions", auth_env="VOYAGE_API_KEY", rerank_path="/v1/rerank"),
-    "jina": ProviderConfig("jina", "bearer", "https://api.jina.ai", "/v1/chat/completions", auth_env="JINA_API_KEY", rerank_path="/v1/rerank"),
+    "voyage": ProviderConfig("voyage", "bearer", "https://api.voyageai.com", "/v1/chat/completions", auth_env="VOYAGE_API_KEY", rerank_path="/v1/rerank", embed_path="/v1/embeddings"),
+    "jina": ProviderConfig("jina", "bearer", "https://api.jina.ai", "/v1/chat/completions", auth_env="JINA_API_KEY", rerank_path="/v1/rerank", embed_path="/v1/embeddings"),
     "minimax": ProviderConfig("minimax", "bearer", "https://api.minimax.io", "/v1/chat/completions", auth_env="MINIMAX_API_KEY", models_path="/v1/models"),
     # Synthetic's API policy states that prompts/completions are not retained
     # or used for training, and requires the same posture from inference
     # partners. Treat it as eligible for the privacy pool.
-    "synthetic": ProviderConfig("synthetic", "bearer", "https://api.synthetic.new", "/v1/chat/completions", auth_env="SYNTHETIC_API_KEY", models_path="/v1/models", zdr_ok=True),
+    "synthetic": ProviderConfig("synthetic", "bearer", "https://api.synthetic.new", "/v1/chat/completions", auth_env="SYNTHETIC_API_KEY", models_path="/v1/models", embed_path="/v1/embeddings", zdr_ok=True),
     # Ollama states that cloud prompts/completions are transient, not logged,
     # and not used for training. Local-llm is private by locality; both are
     # therefore eligible for the privacy pool when explicitly configured.
-    "ollama-cloud": ProviderConfig("ollama-cloud", "bearer", "https://ollama.com", "/v1/chat/completions", auth_env="OLLAMA_API_KEY", models_path="/v1/models", zdr_ok=True),
+    "ollama-cloud": ProviderConfig("ollama-cloud", "bearer", "https://ollama.com", "/v1/chat/completions", auth_env="OLLAMA_API_KEY", models_path="/v1/models", embed_path="/v1/embeddings", zdr_ok=True),
     "opencode-go": ProviderConfig("opencode-go", "bearer", "https://opencode.ai/zen/go/v1", "/chat/completions", auth_env="OPENCODE_GO_API_KEY", zdr_ok=True),
     "opencode-zen": ProviderConfig("opencode-zen", "bearer", "https://opencode.ai/zen", "/v1/chat/completions", auth_env="OPENCODE_ZEN_API_KEY"),
     "openai-codex": ProviderConfig("openai-codex", "codex", "https://chatgpt.com/backend-api/codex", "/responses", pool_env="opencode_codex_credentials", auth_type="codex", model_header="x-openai-gpt-model", zdr_ok=True),
@@ -356,7 +359,7 @@ DEFAULT_PROVIDER_REGISTRY: dict[str, ProviderConfig] = {
     # Copilot has provider no-training/ZDR commitments; public individual
     # plans do not provide the same privacy boundary.
     "github-copilot-enterprise": ProviderConfig("github-copilot-enterprise", "oauth", "https://copilot-api.sita.ghe.com", "/chat/completions", pool_env="GITHUB_COPILOT_ENTERPRISE_CREDENTIALS", auth_type="oauth", model_header="x-github-gpt-model", zdr_ok=True),
-    "local-llm": ProviderConfig("local-llm", "local", "http://localhost:11434", "/v1/chat/completions", models_path="/api/tags", zdr_ok=True),
+    "local-llm": ProviderConfig("local-llm", "local", "http://localhost:11434", "/v1/chat/completions", models_path="/api/tags", embed_path="/v1/embeddings", zdr_ok=True),
     "nvidia": ProviderConfig("nvidia", "bearer", "https://integrate.api.nvidia.com", "/v1/chat/completions", auth_env="NVIDIA_API_KEY", models_path="/v1/models"),
     # Cloudflare Workers AI OpenAI-compatible API. The base URL embeds the
     # account ID; ``{CF_ACCOUNT_ID}`` (and any other ``{ENV_VAR}`` tokens) are
@@ -384,6 +387,7 @@ def _provider_registry_from_env() -> dict[str, ProviderConfig]:
             chat_path=expand_env_placeholders(provider_config.chat_path) or provider_config.chat_path,
             models_path=expand_env_placeholders(provider_config.models_path) or provider_config.models_path,
             rerank_path=expand_env_placeholders(provider_config.rerank_path) or provider_config.rerank_path,
+            embed_path=expand_env_placeholders(provider_config.embed_path) or provider_config.embed_path,
         )
         for name, provider_config in DEFAULT_PROVIDER_REGISTRY.items()
     }
@@ -410,6 +414,7 @@ def _provider_registry_from_env() -> dict[str, ProviderConfig]:
                     "heavyweight": bool(value.get("heavyweight", False)),
                     "models_path": expand_env_placeholders(value.get("models_path", value.get("catalog_path"))) or value.get("models_path", value.get("catalog_path")),
                     "rerank_path": expand_env_placeholders(value.get("rerank_path")) or value.get("rerank_path"),
+                    "embed_path": expand_env_placeholders(value.get("embed_path")) or value.get("embed_path"),
                 }
                 # Parse model aliases: {"qwen3-coder": "/Users/tusker/models/..."}
                 raw_aliases = value.get("model_aliases")

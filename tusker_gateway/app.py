@@ -31,6 +31,7 @@ from tusker_gateway.endpoints import (
     metrics_handler,
     models_handler,
     rerank_handler,
+    embeddings_handler,
     responses_handler,
     tts_handler,
     video_handler,
@@ -77,7 +78,9 @@ from tusker_gateway.providers.capabilities import (
 )
 from tusker_gateway.model_capability import ModelCapabilityDB
 from tusker_gateway.providers.rerank import RerankHandler
+from tusker_gateway.providers.embed import EmbedHandler
 from tusker_gateway.quality import QualityDB
+
 
 if TYPE_CHECKING:
     from tusker_gateway.passthrough import CodexTokenRotator
@@ -255,10 +258,8 @@ def create_app() -> web.Application:
     app["video_handler"] = VideoHandler(
         app["config"], capability_registry=capability_registry
     )
-    # Reranking is a dedicated provider pathway rather than a chat-pool
-    # candidate. Its provider keys/endpoints are resolved per request.
     app["rerank_handler"] = RerankHandler(app["config"])
-
+    app["embed_handler"] = EmbedHandler(app["config"])
 
     async def on_startup(app):
         startup_log = logging.getLogger("tusker_gateway.startup")
@@ -571,17 +572,19 @@ def create_app() -> web.Application:
     app.router.add_post("/v1/images/generations", images_handler)
     app.router.add_post("/v1/images/edits", images_handler)
     app.router.add_post("/v1/images/variations", images_handler)
-    app.router.add_post("/v1/audio/speech", tts_handler)
-    app.router.add_post("/v1/videos", video_handler)
     app.router.add_post("/v1/rerank", rerank_handler)
+    app.router.add_post("/v1/embeddings", embeddings_handler)
+    app.router.add_post("/v1/videos", video_handler)
     app.router.add_get("/v1/models", models_handler)
     app.router.add_post("/v1/chat/completions", chat_completions_handler)
     app.router.add_post("/v1/responses", responses_handler)
     app.router.add_post("/v1/messages", anthropic_messages_handler)
 
     app.on_cleanup.append(on_cleanup)
+
     app.on_startup.append(on_startup)
     return app
+
 
 
 def _wire_catalog_api_keys(
