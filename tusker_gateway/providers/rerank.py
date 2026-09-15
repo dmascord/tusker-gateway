@@ -29,7 +29,11 @@ from tusker_gateway.errors import (
     RateLimitError,
 )
 from tusker_gateway.passthrough import _persist_cooldown
-
+from tusker_gateway.providers._base_url import (
+    _provider_value,
+    is_local_provider,
+    resolve_base_url,
+)
 logger = logging.getLogger(__name__)
 
 _DEFAULT_PROVIDER_ORDER = ("cohere", "voyage", "jina")
@@ -152,28 +156,36 @@ class RerankHandler:
         return self._registry(self.config).get(provider)
 
     def _backend_for(self, provider: str) -> RerankBackend | None:
-        provider = provider.lower().replace("_", "-")
-        provider_config = self._backend_config(provider)
+        normalized = provider.lower().replace("_", "-")
+        provider_config = self._backend_config(normalized)
         if provider_config is None:
             return None
         path = str(_provider_value(provider_config, "rerank_path", "") or "").strip()
-        base_url = str(_provider_value(provider_config, "base_url", "") or "").strip()
+        base_url = resolve_base_url(
+            normalized,
+            provider_config,
+            env_prefix="TUSKER_RERANKER",
+        ).strip()
         if not path:
             return None
-        url = path if path.startswith(("http://", "https://")) else (
-            f"{base_url.rstrip('/')}/{path.lstrip('/')}"
+        if not base_url:
+            return None
+        url = (
+            path
+            if path.startswith(("http://", "https://"))
+            else f"{base_url.rstrip('/')}/{path.lstrip('/')}"
         )
         api_key = str(
-            self.config.get("provider_api_keys", {}).get(provider, "") or ""
+            self.config.get("provider_api_keys", {}).get(normalized, "") or ""
         ).strip()
-        if not api_key:
+        if not api_key and not is_local_provider(provider_config):
             return None
         return RerankBackend(
-            provider=provider,
+            provider=normalized,
             url=url,
-            model=self._default_model(provider),
+            model=self._default_model(normalized),
             api_key=api_key,
-            style=provider,
+            style=normalized,
         )
 
     def _known_rerank_providers(self) -> set[str]:

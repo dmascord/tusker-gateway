@@ -29,6 +29,11 @@ from tusker_gateway.errors import (
     RateLimitError,
 )
 from tusker_gateway.passthrough import _persist_cooldown
+from tusker_gateway.providers._base_url import (
+    _provider_value,
+    is_local_provider,
+    resolve_base_url,
+)
 
 logger = logging.getLogger(__name__)
 # Provider priority order — synthetic (free, ZDR) first, then paid, then
@@ -62,11 +67,6 @@ _DEFAULT_DIMENSIONS: dict[str, int] = {
 
 # Default base_url overrides applied when the registry entry has none (e.g.
 # local Ollama reachable at host.docker.internal rather than localhost).
-_LOCAL_BASE_URL_DEFAULTS: dict[str, str] = {
-    "local-llm": os.environ.get("TUSKER_EMBED_LOCAL_LLM_BASE_URL", "")
-    or "http://host.docker.internal:11434",
-}
-
 _EMBED_TIMEOUT_SECS = 30.0
 
 _VIRTUAL_MODELS = frozenset({"hermes-embed", "tusker-gateway/hermes-embed"})
@@ -96,10 +96,6 @@ class EmbedRequest:
     budget_units: int
 
 
-def _provider_value(provider_config: Any, field: str, default: Any = None) -> Any:
-    if isinstance(provider_config, dict):
-        return provider_config.get(field, default)
-    return getattr(provider_config, field, default)
 
 
 def _env_float(name: str, default: float, *, minimum: float = 0.1) -> float:
@@ -161,46 +157,22 @@ class EmbedHandler:
         except (TypeError, ValueError):
             return 768
 
-    def _is_local_provider(self, provider_config: Any) -> bool:
-        """True when the provider needs no API key (local Ollama etc.).
-
-        Both ``kind=local`` and ``auth_type=local`` signal unauthenticated
-        backends; either registry shape is supported.
-        """
-        return _provider_value(provider_config, "kind", "") == "local" or _provider_value(
-            provider_config, "auth_type", ""
-        ) == "local"
-
-    def _resolve_base_url(self, provider: str, provider_config: Any) -> str:
-        """Resolve base_url in priority order:
-        1. ``TUSKER_EMBED_<PROVIDER>_BASE_URL`` env override.
-        2. ``base_url`` from the provider registry entry.
-        3. ``_LOCAL_BASE_URL_DEFAULTS`` (e.g. host.docker.internal).
-        """
-        suffix = provider.upper().replace("-", "_")
-        env_value = (
-            os.environ.get(f"TUSKER_EMBED_{suffix}_BASE_URL", "").strip()
-            or os.environ.get(f"HERMES_EMBED_{suffix}_BASE_URL", "").strip()
-        )
-        if env_value:
-            return env_value
-        configured = str(_provider_value(provider_config, "base_url", "") or "").strip()
-        if configured:
-            return configured
-        return _LOCAL_BASE_URL_DEFAULTS.get(provider, "")
-
     def _backend_config(self, provider: str) -> Any | None:
         return self._registry(self.config).get(provider)
 
     def _backend_for(self, provider: str) -> EmbedBackend | None:
-        provider_config = self._backend_config(provider)
+        provider_config = self._backend_config(provider.lower().replace("_", "-"))
         if provider_config is None:
             return None
 
         embed_path = str(
             _provider_value(provider_config, "embed_path", "") or ""
         ).strip()
-        base_url = self._resolve_base_url(provider, provider_config).strip()
+        base_url = resolve_base_url(
+            provider.lower().replace("_", "-"),
+            provider_config,
+            env_prefix="TUSKER_EMBED",
+        ).strip()
         if not embed_path:
             return None
         if not base_url:
@@ -214,9 +186,8 @@ class EmbedHandler:
         api_key = str(
             self.config.get("provider_api_keys", {}).get(provider, "") or ""
         ).strip()
-        if not api_key and not self._is_local_provider(provider_config):
+        if not api_key and not is_local_provider(provider_config):
             return None
-
         return EmbedBackend(
             provider=provider,
             url=url,
