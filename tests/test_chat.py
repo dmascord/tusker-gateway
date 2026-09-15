@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from tusker_gateway.budget import BudgetDecision
+import tusker_gateway.sse
 from tusker_gateway.errors import (
     ProviderError,
     ProviderRouteDisabledError,
@@ -1732,6 +1733,46 @@ async def test_chat_completions_streaming_no_heartbeat_when_disabled(client, mon
     assert b'data: {"content": "x"}' in content
     assert b'data: [DONE]' in content
 
+
+@pytest.mark.asyncio
+async def test_chat_completions_streaming_heartbeat_runs_during_slow_upstream(
+    client, monkeypatch,
+):
+    """Heartbeats must reach the client even when upstream fetch blocks for seconds.
+
+    Regression for Cloudflare 522s: if the event loop never yields between heartbeat
+    task creation and upstream consumption, the heartbeat task is never scheduled
+    and Cloudflare sees silence on the response body for the entire upstream
+    duration (well past its 100s idle timeout).
+    """
+    monkeypatch.setenv("TUSKER_SSE_HEARTBEAT_SECS", "0.05")
+
+    async def slow_upstream(*args, **kwargs):
+        # Hold the upstream for longer than several heartbeat intervals.
+        await asyncio.sleep(0.3)
+        yield b'data: {"content": "done"}\n\n'
+
+    with patch(
+        "tusker_gateway.endpoints.PassthroughClient.chat", new_callable=AsyncMock
+    ) as mock_chat:
+        mock_chat.return_value = slow_upstream()
+        payload = {
+            "model": "hermes-code",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+        }
+        resp = await client.post(
+            "/v1/chat/completions", json=payload, headers=HEADERS_AUTH
+        )
+        content = await resp.read()
+
+    # We must see multiple heartbeats during the 0.3s upstream pause.
+    heartbeat_count = content.count(b": keepalive\n")
+    assert heartbeat_count >= 3, (
+        f"expected heartbeats during upstream pause, got {heartbeat_count}"
+    )
+    assert b'data: {"content": "done"}' in content
+    assert b"data: [DONE]" in content
 
 @pytest.mark.asyncio
 async def test_provider_attempt_timeout_helper_uses_per_provider_override():

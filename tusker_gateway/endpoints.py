@@ -4352,6 +4352,11 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                     ),
                     name="sse-heartbeat",
                 )
+                # Yield to event loop so heartbeat task can start before we await the
+                # upstream. Without this, the event loop blocks on the first await in
+                # the stream-consumption loop and the heartbeat task never gets scheduled
+                # → Cloudflare times out waiting for response body bytes.
+                await asyncio.sleep(0)
                 stream_ok = True
                 try:
                     if isinstance(result, dict):
