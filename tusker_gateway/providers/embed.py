@@ -31,15 +31,15 @@ from tusker_gateway.errors import (
 from tusker_gateway.passthrough import _persist_cooldown
 
 logger = logging.getLogger(__name__)
-
 # Provider priority order — synthetic (free, ZDR) first, then paid, then
-# cloud fallbacks, then local.
+# openrouter fallback. ollama-cloud intentionally excluded: ollama.com does
+# not expose an OpenAI-compatible /v1/embeddings endpoint, and /api/embed
+# rejects the static OLLAMA_API_KEY with 401.
 _DEFAULT_PROVIDER_ORDER: tuple[str, ...] = (
     "synthetic",
     "voyage",
     "jina",
     "openrouter",
-    "ollama-cloud",
     "local-llm",
 )
 
@@ -48,7 +48,6 @@ _DEFAULT_MODELS: dict[str, str] = {
     "voyage": "voyage-3",
     "jina": "jina-embeddings-v3",
     "openrouter": "sentence-transformers/all-MiniLM-L6-v2",
-    "ollama-cloud": "nomic-embed-text",
     "local-llm": "nomic-embed-text",
 }
 
@@ -58,8 +57,14 @@ _DEFAULT_DIMENSIONS: dict[str, int] = {
     "voyage": 1024,
     "jina": 1024,
     "openrouter": 384,
-    "ollama-cloud": 768,
     "local-llm": 768,
+}
+
+# Default base_url overrides applied when the registry entry has none (e.g.
+# local Ollama reachable at host.docker.internal rather than localhost).
+_LOCAL_BASE_URL_DEFAULTS: dict[str, str] = {
+    "local-llm": os.environ.get("TUSKER_EMBED_LOCAL_LLM_BASE_URL", "")
+    or "http://host.docker.internal:11434",
 }
 
 _EMBED_TIMEOUT_SECS = 30.0
@@ -156,11 +161,38 @@ class EmbedHandler:
         except (TypeError, ValueError):
             return 768
 
+    def _is_local_provider(self, provider_config: Any) -> bool:
+        """True when the provider needs no API key (local Ollama etc.).
+
+        Both ``kind=local`` and ``auth_type=local`` signal unauthenticated
+        backends; either registry shape is supported.
+        """
+        return _provider_value(provider_config, "kind", "") == "local" or _provider_value(
+            provider_config, "auth_type", ""
+        ) == "local"
+
+    def _resolve_base_url(self, provider: str, provider_config: Any) -> str:
+        """Resolve base_url in priority order:
+        1. ``TUSKER_EMBED_<PROVIDER>_BASE_URL`` env override.
+        2. ``base_url`` from the provider registry entry.
+        3. ``_LOCAL_BASE_URL_DEFAULTS`` (e.g. host.docker.internal).
+        """
+        suffix = provider.upper().replace("-", "_")
+        env_value = (
+            os.environ.get(f"TUSKER_EMBED_{suffix}_BASE_URL", "").strip()
+            or os.environ.get(f"HERMES_EMBED_{suffix}_BASE_URL", "").strip()
+        )
+        if env_value:
+            return env_value
+        configured = str(_provider_value(provider_config, "base_url", "") or "").strip()
+        if configured:
+            return configured
+        return _LOCAL_BASE_URL_DEFAULTS.get(provider, "")
+
     def _backend_config(self, provider: str) -> Any | None:
         return self._registry(self.config).get(provider)
 
     def _backend_for(self, provider: str) -> EmbedBackend | None:
-        provider = provider.lower().replace("_", "-")
         provider_config = self._backend_config(provider)
         if provider_config is None:
             return None
@@ -168,13 +200,11 @@ class EmbedHandler:
         embed_path = str(
             _provider_value(provider_config, "embed_path", "") or ""
         ).strip()
-        base_url = str(
-            _provider_value(provider_config, "base_url", "") or ""
-        ).strip()
-
+        base_url = self._resolve_base_url(provider, provider_config).strip()
         if not embed_path:
             return None
-
+        if not base_url:
+            return None
         url = (
             embed_path
             if embed_path.startswith(("http://", "https://"))
@@ -184,7 +214,7 @@ class EmbedHandler:
         api_key = str(
             self.config.get("provider_api_keys", {}).get(provider, "") or ""
         ).strip()
-        if not api_key:
+        if not api_key and not self._is_local_provider(provider_config):
             return None
 
         return EmbedBackend(
