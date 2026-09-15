@@ -473,6 +473,16 @@ class EmbedHandler:
                         code="provider_error",
                     ) from exc
                 return parsed
+        except GatewayError:
+            raise
+        except (aiohttp.ClientError, TimeoutError) as exc:
+            error = ProviderError(
+                "Embedding provider request failed",
+                code="timeout" if isinstance(exc, TimeoutError) else "upstream_error",
+            )
+            error.upstream_status = 504 if isinstance(exc, TimeoutError) else None
+            error.upstream_body = type(exc).__name__
+            raise error from exc
         finally:
             if owns_session:
                 await session.close()
