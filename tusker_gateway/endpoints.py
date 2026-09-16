@@ -1935,6 +1935,13 @@ def _request_conversation_id(
     return _stable_opencode_session_id(body.get("messages"), caller_key=caller_key)
 
 
+def _conversation_log_id(value: str | None) -> str:
+    """Return a stable, non-sensitive identifier for stream diagnostics."""
+    if not value:
+        return "none"
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+
+
 def _estimated_tokens(messages: list[dict[str, Any]]) -> int:
     """Rough prompt-token estimate for budget pre-flight.
 
@@ -4372,7 +4379,8 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                 # (b) forces the first bytes through any proxy buffer so
                 # subsequent heartbeats aren't held back. OpenAI's reference
                 # streaming behavior starts with `delta: {role: "assistant"}`.
-                await resp.write(sse_frame(format_openai_chunk(role="assistant")))
+                role_frame = sse_frame(format_openai_chunk(role="assistant"))
+                await resp.write(role_frame)
 
                 stop = asyncio.Event()
                 hb_interval = _sse_heartbeat_secs()
@@ -4393,6 +4401,8 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                 stream_write_start = time.monotonic()
                 _first_token_recorded = False
                 stream_ok = True
+                stream_frame_count = 1
+                stream_bytes = len(role_frame)
                 try:
                     if isinstance(result, dict):
                         # Codex parses the full response from its SSE stream;
@@ -4406,6 +4416,8 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                             if chunk == sse_done():
                                 continue
                             await resp.write(chunk)
+                            stream_frame_count += 1
+                            stream_bytes += len(chunk)
                             if not _first_token_recorded:
                                 _first_token_recorded = True
                                 if metrics is not None:
@@ -4428,6 +4440,8 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                         )
                         async for chunk in stream_result:
                             await resp.write(chunk)
+                            stream_frame_count += 1
+                            stream_bytes += len(chunk)
                             if not _first_token_recorded:
                                 _first_token_recorded = True
                                 if metrics is not None:
@@ -4459,11 +4473,57 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                     raise
                 except Exception as exc:  # noqa: BLE001
                     stream_ok = False
-                    status = "upstream_stream_error"
+                    tool_response_failure = isinstance(
+                        exc,
+                        (
+                            InvalidToolCallArgumentsError,
+                            MalformedToolCallError,
+                            RequiredToolCallError,
+                            ToolCallContractError,
+                            UnusableToolResponseError,
+                        ),
+                    )
+                    status = "tool_response_error" if tool_response_failure else "upstream_stream_error"
                     request["_stream_error"] = status
+                    # Stream validation failures happen after the HTTP 200 has
+                    # been committed, so _call_with_pool_fallback() cannot
+                    # quarantine the candidate. Apply the same quarantine and
+                    # breaker accounting here; otherwise an OMP retry with a
+                    # sticky session can immediately select the same bad route.
+                    if tool_response_failure:
+                        _quarantine_tool_response_failure(
+                            config, provider, target_model, exc
+                        )
+                    if breaker is not None:
+                        await asyncio.to_thread(
+                            breaker.record_failure,
+                            provider,
+                            target_model,
+                            cooldown_secs=(
+                                _cooldown_for_exc(exc)
+                                if isinstance(exc, GatewayError)
+                                else None
+                            ),
+                        )
                     logger.warning(
-                        "stream pump failed rid=%s provider=%s model=%s err=%s",
-                        request_id, provider, target_model, exc,
+                        "stream pump failed rid=%s session=%s provider=%s model=%s "
+                        "pool=%s status=%s error_type=%s error_code=%s "
+                        "frames=%d bytes=%d elapsed_ms=%.0f has_tools=%s "
+                        "tool_choice=%s err=%s",
+                        request_id,
+                        _conversation_log_id(conversation_id),
+                        provider,
+                        target_model,
+                        pool_name,
+                        status,
+                        type(exc).__name__,
+                        getattr(exc, "code", None),
+                        stream_frame_count,
+                        stream_bytes,
+                        (time.monotonic() - stream_write_start) * 1000,
+                        bool(tools),
+                        body.get("tool_choice") if body else None,
+                        _pool_failure_summary(exc),
                         exc_info=True,
                     )
                     if budget_recorded and budget is not None and api_key and body is not None:

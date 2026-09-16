@@ -937,7 +937,9 @@ async def test_terminal_provider_capacity_error_is_not_returned_to_client(app, c
     assert "Nvidia" not in json.dumps(data)
 
 
-async def test_chat_stream_malformed_tool_markup_falls_back_before_client_response(app, client):
+async def test_chat_stream_malformed_tool_markup_falls_back_before_client_response(
+    app, client, caplog,
+):
     """Malformed tool text must not become a successful OMP stop.
 
     With early streaming the provider's content reaches the client as it arrives;
@@ -1003,6 +1005,13 @@ async def test_chat_stream_malformed_tool_markup_falls_back_before_client_respon
     assert b"tool_call" not in body
     # No fallback fires: the error occurs at drain, after the 200 was committed.
     assert pool_manager.select.call_count == 1
+    from tusker_gateway.cooldown import global_tracker
+
+    assert global_tracker().is_cooldown("openrouter", "nvidia/malformed-tool-model")
+    assert "stream pump failed" in caplog.text
+    assert "status=tool_response_error" in caplog.text
+    assert "error_type=MalformedToolCallError" in caplog.text
+    assert "frames=" in caplog.text
 
 
 @pytest.mark.asyncio
