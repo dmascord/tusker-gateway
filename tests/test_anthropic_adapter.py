@@ -546,8 +546,12 @@ async def test_messages_streaming_converts_complete_provider_response(client):
 
 
 @pytest.mark.asyncio
-async def test_messages_required_tool_stream_falls_back_before_response(app, client):
-    """Anthropic tool streams use the same preflight and fallback as Chat."""
+async def test_messages_required_tool_stream_streams_early_content(app, client):
+    """With early streaming the first provider's content is delivered to the client
+    immediately. A required-tool contract violation is detected during drain (not
+    preflight), so the pool cannot fallback once the 200 response has been sent.
+    The client sees the first provider's content and must recover itself if needed.
+    """
     pool_manager = MagicMock()
     pool_manager.fallback_pools.return_value = ()
     pool_manager.select.side_effect = [
@@ -588,6 +592,7 @@ async def test_messages_required_tool_stream_falls_back_before_response(app, cli
         "tusker_gateway.anthropic_adapter.PassthroughClient.chat",
         new_callable=AsyncMock,
     ) as mock_chat:
+        # First provider ignores required tool; second provides valid tool call.
         mock_chat.side_effect = [ignored_tool_stream(), valid_tool_stream()]
         resp = await client.post(
             "/v1/messages",
@@ -611,11 +616,11 @@ async def test_messages_required_tool_stream_falls_back_before_response(app, cli
         content = await resp.read()
 
     assert resp.status == 200
-    assert b"plain text" not in content
-    assert b'"type": "tool_use"' in content
-    assert b'"name": "read"' in content
-    assert b"README.md" in content
-    assert mock_chat.call_count == 2
+    # The first provider's prose is delivered to the client (early streaming).
+    assert b"plain text" in content
+    # Only the first provider was called: the contract error is raised during
+    # drain after the response was committed, so pool fallback cannot fire.
+    assert mock_chat.call_count == 1
 
 
 @pytest.mark.asyncio

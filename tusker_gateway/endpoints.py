@@ -1758,15 +1758,17 @@ async def _prepare_stream_result(
     require_tool_call: bool = False,
     tool_choice: Any = None,
 ) -> Any:
-    """Preflight a tool stream before committing a client response.
+    """Validate a tool-bearing stream and return a stream ready for client consumption.
 
-    A provider may emit ordinary reasoning/text before a malformed tool
-    envelope, including after an upstream terminal frame. Probing only a
-    prefix lets that failure arrive after aiohttp has sent a 200, which makes
-    pool fallback impossible. Consume the normalized stream completely before
-    returning so every validation failure occurs before the client response is
-    committed, then replay the buffered stream so successful streams retain
-    their output.
+    Non-streaming responses with tools are fully validated upfront.
+
+    Streaming responses with tools are streamed to the client immediately: frames
+    are yielded as they arrive so the client sees content within the upstream TTFB
+    rather than after full consumption.  When a terminal frame or EOF is reached,
+    tool-call contract and argument validation run on the buffered frames.  If
+    validation fails the iterator raises and the caller aborts the stream — the
+    client can recover via its own retry (pool-level fallback is no longer
+    possible once a 200 response has been sent).
     """
     if isinstance(result, dict) and (tools is not None or tool_choice is not None):
         from tusker_gateway.tool_formats import normalize_response_tool_calls
@@ -1797,59 +1799,90 @@ async def _prepare_stream_result(
         tools_requested=True,
         require_tool_call=require_tool_call,
     )
-    buffered: list[bytes] = []
-    buffered_bytes = 0
-    saw_tool_call = False
-    saw_terminal = False
-    try:
-        async for frame in normalized:
-            buffered.append(frame)
-            buffered_bytes += len(frame)
-            if buffered_bytes > _tool_stream_preflight_max_bytes():
-                raise ToolCallContractError(reason="preflight_limit_exceeded")
-            has_tool_call, has_terminal = _stream_frame_signal(frame)
-            if has_tool_call:
-                saw_tool_call = True
-            if has_terminal:
-                saw_terminal = True
-    except Exception:
-        await _close_async_iterator(normalized)
-        await _close_async_iterator(result)
-        raise
-    assembled_calls = _assemble_stream_tool_calls(buffered)
-    _validate_tool_call_contract(
-        assembled_calls,
-        tools,
-        tool_choice=tool_choice,
-        require_tool_call=require_tool_call,
+    async def _first_frame(iterator: AsyncIterator[bytes]) -> tuple[bytes | None, AsyncIterator[bytes]]:
+        """Await the first frame eagerly so the per-attempt idle budget applies.
+
+        The bounded idle budget (``_provider_attempt_timeout_secs``) must still
+        fire when an upstream connects but never produces a first byte.  Awaiting
+        the first frame inside the attempt window preserves that guarantee while
+        keeping the rest of the stream delivered to the client as it arrives.
+        """
+        try:
+            first = await anext(iterator)
+        except StopAsyncIteration:
+            return None, iterator
+        return first, iterator
+
+    first_frame, rest = await _first_frame(normalized)
+
+    async def _early_stream(
+        first_frame: bytes | None,
+        iterator: AsyncIterator[bytes],
+        raw_result: Any,
+    ) -> AsyncIterator[bytes]:
+        buffered: list[bytes] = []
+        buffered_bytes = 0
+        saw_tool_call = False
+        saw_terminal = False
+        try:
+            async def frames() -> AsyncIterator[bytes]:
+                if first_frame is not None:
+                    yield first_frame
+                async for chunk in iterator:
+                    yield chunk
+
+            async for frame in frames():
+                buffered.append(frame)
+                buffered_bytes += len(frame)
+                if buffered_bytes > _tool_stream_preflight_max_bytes():
+                    raise ToolCallContractError(reason="preflight_limit_exceeded")
+                has_tool_call, has_terminal = _stream_frame_signal(frame)
+                if has_tool_call:
+                    saw_tool_call = True
+                if has_terminal:
+                    saw_terminal = True
+                yield frame
+            assembled_calls = _assemble_stream_tool_calls(buffered)
+            _validate_tool_call_contract(
+                assembled_calls,
+                tools,
+                tool_choice=tool_choice,
+                require_tool_call=require_tool_call,
+            )
+            if assembled_calls:
+                _validate_tool_call_arguments(
+                    assembled_calls,
+                    tools,
+                    provider=provider,
+                    model=model,
+                    request_id=request_id,
+                )
+            preflight_decision = (
+                "tool_call"
+                if saw_tool_call
+                else "terminal"
+                if saw_terminal
+                else "eof"
+            )
+            logger.info(
+                "tool stream preflight provider=%s model=%s request_id=%s decision=%s "
+                "frames=%d bytes=%d calls=%s",
+                provider,
+                model,
+                request_id or "unknown",
+                preflight_decision,
+                len(buffered),
+                buffered_bytes,
+                _tool_call_signature(assembled_calls),
+            )
+        except Exception:
+            await _close_async_iterator(iterator)
+            await _close_async_iterator(raw_result)
+            raise
+
+    return _PreparedStream(
+        _early_stream(first_frame, rest, result)
     )
-    if assembled_calls:
-        _validate_tool_call_arguments(
-            assembled_calls,
-            tools,
-            provider=provider,
-            model=model,
-            request_id=request_id,
-        )
-    preflight_decision = (
-        "tool_call"
-        if saw_tool_call
-        else "terminal"
-        if saw_terminal
-        else "eof"
-    )
-    logger.info(
-        "tool stream preflight provider=%s model=%s request_id=%s decision=%s "
-        "frames=%d bytes=%d calls=%s",
-        provider,
-        model,
-        request_id or "unknown",
-        preflight_decision,
-        len(buffered),
-        buffered_bytes,
-        _tool_call_signature(assembled_calls),
-    )
-    return _PreparedStream(_prepend_stream(buffered, normalized))
 
 
 def _pool_name(body: dict[str, Any]) -> str | None:
@@ -4357,6 +4390,8 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                 # the stream-consumption loop and the heartbeat task never gets scheduled
                 # → Cloudflare times out waiting for response body bytes.
                 await asyncio.sleep(0)
+                stream_write_start = time.monotonic()
+                _first_token_recorded = False
                 stream_ok = True
                 try:
                     if isinstance(result, dict):
@@ -4371,6 +4406,13 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                             if chunk == sse_done():
                                 continue
                             await resp.write(chunk)
+                            if not _first_token_recorded:
+                                _first_token_recorded = True
+                                if metrics is not None:
+                                    metrics.first_token_latency.observe(
+                                        time.monotonic() - stream_write_start,
+                                        {"pool": pool_name, "provider": provider, "model": target_model},
+                                    )
                     else:
                         stream_result = (
                             result.iterator
@@ -4386,6 +4428,13 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                         )
                         async for chunk in stream_result:
                             await resp.write(chunk)
+                            if not _first_token_recorded:
+                                _first_token_recorded = True
+                                if metrics is not None:
+                                    metrics.first_token_latency.observe(
+                                        time.monotonic() - stream_write_start,
+                                        {"pool": pool_name, "provider": provider, "model": target_model},
+                                    )
                 except (ConnectionResetError, ConnectionError, BrokenPipeError) as exc:
                     stream_ok = False
                     status = "client_disconnected"

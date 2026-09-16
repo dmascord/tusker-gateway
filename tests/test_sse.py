@@ -54,20 +54,25 @@ def test_sse_parser_waits_for_fragmented_boundary():
 
 @pytest.mark.asyncio
 async def test_tool_stream_preflight_rejects_oversized_buffer(monkeypatch):
+    """Oversized buffer is raised during drain (not preflight) with early streaming."""
     monkeypatch.setenv("TUSKER_TOOL_STREAM_PREFLIGHT_MAX_BYTES", "16")
 
     async def source():
         yield b'data: {"choices":[{"delta":{"content":"too large"}}]}\n\n'
 
+    result = await _prepare_stream_result(
+        source(),
+        provider="test",
+        model="test",
+        request_id="rid",
+        tools_requested=True,
+        tools=[{"type": "function", "function": {"name": "run"}}],
+    )
+    # Early streaming returns a prepared stream; the error surfaces on drain.
+    assert hasattr(result, "iterator")
     with pytest.raises(ToolCallContractError) as exc_info:
-        await _prepare_stream_result(
-            source(),
-            provider="test",
-            model="test",
-            request_id="rid",
-            tools_requested=True,
-            tools=[{"type": "function", "function": {"name": "run"}}],
-        )
+        async for _ in result.iterator:
+            pass
     assert exc_info.value.reason == "preflight_limit_exceeded"
 
 

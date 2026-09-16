@@ -241,6 +241,11 @@ class MetricsRegistry:
             "End-to-end chat completion latency in seconds",
             ("pool", "provider", "model"),
         )
+        self.first_token_latency = Histogram(
+            "tusker_first_token_latency_seconds",
+            "Time from upstream response headers to first SSE frame written to client",
+            ("pool", "provider", "model"),
+        )
         self.cache_hits = Counter("tusker_cache_hits_total", "Cache hits")
         self.cache_misses = Counter("tusker_cache_misses_total", "Cache misses")
         self.cache_writes = Counter("tusker_cache_writes_total", "Cache writes")
