@@ -376,7 +376,7 @@ async def run_structured_qualification(
             registry = _catalog_registry(config, http_client=session)
             await registry.refresh_all(session)
         manager.catalog_registry = registry
-        manager.extend_pools_with_free_catalog()
+        manager.extend_pools_with_auto_catalog()
         pairs = sorted(
             pair
             for pair in (

@@ -418,3 +418,62 @@ async def test_rebuild_identity_store_picks_up_new_keys() -> None:
 
     rt._rebuild_identity_store()
     assert app["identity_store"].resolve(new_key).principal == "post-reload"
+
+
+def test_schema_migration_renames_auto_free_to_auto_catalog(tmp_path) -> None:
+    """Pre-existing ``auto_free`` columns get renamed to ``auto_catalog`` on
+    first connection, and the migration is idempotent on subsequent startups.
+    """
+    import sqlite3
+
+    # Step 1: create a DB with the legacy ``auto_free`` column (no
+    # ``auto_catalog``). This simulates a database provisioned by an older
+    # deployment.
+    db_path = tmp_path / "migration.db"
+    raw = sqlite3.connect(str(db_path))
+    raw.execute(
+        "CREATE TABLE tusker_config_pools ("
+        "name TEXT PRIMARY KEY, models TEXT NOT NULL DEFAULT '[]')"
+    )
+    raw.execute(
+        "ALTER TABLE tusker_config_pools ADD COLUMN auto_free INTEGER NOT NULL DEFAULT 0"
+    )
+    raw.commit()
+    raw.close()
+
+    # Step 2: open via ConfigStore. _ensure_db renames auto_free -> auto_catalog.
+    store = ConfigStore(database=str(db_path))
+    store._ensure_db()
+    cols_after = {
+        row[1]
+        for row in sqlite3.connect(str(db_path)).execute(
+            "PRAGMA table_info(tusker_config_pools)"
+        )
+    }
+    assert "auto_catalog" in cols_after, cols_after
+    assert "auto_free" not in cols_after, cols_after
+
+    # Step 3: idempotent — second open is a no-op.
+    store2 = ConfigStore(database=str(db_path))
+    store2._ensure_db()
+    cols_final = {
+        row[1]
+        for row in sqlite3.connect(str(db_path)).execute(
+            "PRAGMA table_info(tusker_config_pools)"
+        )
+    }
+    assert "auto_catalog" in cols_final
+    assert "auto_free" not in cols_final
+
+    # Step 4: fresh DB (no legacy column) — nothing breaks, no rename needed.
+    fresh_path = tmp_path / "fresh.db"
+    fresh_store = ConfigStore(database=str(fresh_path))
+    fresh_store._ensure_db()
+    fresh_cols = {
+        row[1]
+        for row in sqlite3.connect(str(fresh_path)).execute(
+            "PRAGMA table_info(tusker_config_pools)"
+        )
+    }
+    assert "auto_catalog" in fresh_cols
+    assert "auto_free" not in fresh_cols

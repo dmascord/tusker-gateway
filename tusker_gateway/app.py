@@ -357,18 +357,11 @@ def create_app() -> web.Application:
                 )
                 if pool_manager is not None:
                     catalog_counts = pool_manager.extend_pools_with_catalog()
-                    auto_free = pool_manager.extend_pools_with_free_catalog()
+                    auto_catalog = pool_manager.extend_pools_with_auto_catalog()
                     startup_log.info(
-                        "catalog confirmed %d pool entries; auto_free pools: %s",
+                        "catalog confirmed %d pool entries; auto_catalog pools: %s",
                         sum(catalog_counts.values()),
-                        {k: len(v) for k, v in auto_free.items()},
-                    )
-                    startup_log.info(
-                        "catalog inventory providers=%s",
-                        {
-                            client.provider: len(client._entries)
-                            for client in registry._clients.values()
-                        },
+                        {k: len(v) for k, v in auto_catalog.items()},
                     )
                 app["catalog_task"] = asyncio.create_task(
                     catalog_refresh_loop(
@@ -377,7 +370,7 @@ def create_app() -> web.Application:
                         interval_secs,
                         stop_event,
                         on_refresh=(
-                            pool_manager.extend_pools_with_free_catalog
+                            pool_manager.extend_pools_with_auto_catalog
                             if pool_manager is not None
                             else None
                         ),

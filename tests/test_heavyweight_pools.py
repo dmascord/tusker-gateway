@@ -128,7 +128,7 @@ def test_ollama_cloud_pricing_overlay_filters_heavyweight_from_code_pool():
 
     cfg = {
         "pools": {
-            "code": PoolConfig(name="code", models=[], auto_free=True,
+            "code": PoolConfig(name="code", models=[], auto_catalog=True,
                                auto_catalog_providers=["ollama-cloud"]),
         },
         "excluded_providers": [],
@@ -161,7 +161,7 @@ def test_ollama_cloud_pricing_overlay_filters_heavyweight_from_code_pool():
     ]
     registry.register("ollama-cloud", ollama)
     pm.catalog_registry = registry
-    pm.extend_pools_with_free_catalog()
+    pm.extend_pools_with_auto_catalog()
 
     pool_by_pair = {
         (m["provider"], m["model"]): m
@@ -198,7 +198,7 @@ def test_premium_heavyweight_only_adopts_heavy_catalog_entries():
                     {"provider": "openai-codex", "model": "gpt-5.6-sol"},
                     {"provider": "synthetic", "model": "syn:large:text"},
                 ],
-                auto_free=True,
+                auto_catalog=True,
                 auto_catalog_providers=["ollama-cloud"],
                 heavyweight_only=True,
             ),
@@ -224,7 +224,7 @@ def test_premium_heavyweight_only_adopts_heavy_catalog_entries():
     ]
     registry.register("ollama-cloud", ollama)
     pm.catalog_registry = registry
-    pm.extend_pools_with_free_catalog()
+    pm.extend_pools_with_auto_catalog()
 
     premium = {(s.provider, s.model): s for s in pm.models["premium"]}
     assert ("openai-codex", "gpt-5.6-sol") in premium  # static kept
@@ -237,9 +237,9 @@ def test_premium_heavyweight_only_adopts_heavy_catalog_entries():
 
 
 
-def test_premium_heavyweight_only_requires_auto_free():
-    """Regression from the live rollout: without auto_free=True the pool is
-    skipped entirely by extend_pools_with_free_catalog — heavyweight_only
+def test_premium_heavyweight_only_requires_auto_catalog():
+    """Regression from the live rollout: without auto_catalog=True the pool is
+    skipped entirely by extend_pools_with_auto_catalog — heavyweight_only
     alone adopts nothing."""
     from tusker_gateway.catalog import (
         CatalogEntry,
@@ -252,7 +252,7 @@ def test_premium_heavyweight_only_requires_auto_free():
             "premium": PoolConfig(
                 name="premium",
                 models=[{"provider": "openai-codex", "model": "gpt-5.6-sol"}],
-                auto_free=False,
+                auto_catalog=False,
                 auto_catalog_providers=["ollama-cloud"],
                 heavyweight_only=True,
             ),
@@ -272,7 +272,7 @@ def test_premium_heavyweight_only_requires_auto_free():
     ]
     registry.register("ollama-cloud", ollama)
     pm.catalog_registry = registry
-    pm.extend_pools_with_free_catalog()
+    pm.extend_pools_with_auto_catalog()
 
     premium = {(s.provider, s.model) for s in pm.models["premium"]}
     assert ("ollama-cloud", "kimi-k3") not in premium

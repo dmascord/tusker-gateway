@@ -42,7 +42,7 @@ def _manager(tmp_path):
                 "code": PoolConfig(
                     name="code",
                     models=[],
-                    auto_free=True,
+                    auto_catalog=True,
                 ),
             },
             "quality_db_path": os.path.join(tmp_path, "quality.db"),
@@ -129,7 +129,7 @@ def test_tool_selection_reads_capability_table_once(tmp_path, monkeypatch):
 def test_auto_discovered_model_requires_qualified_stream_probe(tmp_path):
     manager = _manager(str(tmp_path))
     manager.catalog_registry = _Registry()
-    manager.extend_pools_with_free_catalog()
+    manager.extend_pools_with_auto_catalog()
 
     assert manager.auto_added["code"] == {("openrouter", "new-model:free")}
     assert manager.select("code", requires_tools=True) is None
@@ -155,7 +155,7 @@ def test_auto_discovered_model_requires_qualified_stream_probe(tmp_path):
 def test_failed_probe_keeps_auto_discovered_model_out_of_tool_pool(tmp_path):
     manager = _manager(str(tmp_path))
     manager.catalog_registry = _Registry()
-    manager.extend_pools_with_free_catalog()
+    manager.extend_pools_with_auto_catalog()
     manager._tool_capabilities.record(
         provider="openrouter",
         model="new-model:free",
@@ -204,7 +204,7 @@ def test_recovery_probe_allows_auto_discovered_structured_model(tmp_path):
     """A tested catalog model can be used when strict routes are exhausted."""
     manager = _manager(str(tmp_path))
     manager.catalog_registry = _Registry()
-    manager.extend_pools_with_free_catalog()
+    manager.extend_pools_with_auto_catalog()
     manager._tool_capabilities.record(
         provider="openrouter",
         model="new-model:free",
@@ -292,7 +292,7 @@ def test_unavailable_probe_keeps_auto_discovered_model_held_back(tmp_path):
     """An auto-discovered model still needs a successful qualification."""
     manager = _manager(str(tmp_path))
     manager.catalog_registry = _Registry()
-    manager.extend_pools_with_free_catalog()
+    manager.extend_pools_with_auto_catalog()
     manager._tool_capabilities.record(
         provider="openrouter",
         model="new-model:free",

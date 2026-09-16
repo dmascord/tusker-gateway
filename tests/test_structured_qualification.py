@@ -283,7 +283,7 @@ def test_qualified_count_ignores_stale_and_old_probe_passes(tmp_path):
 @pytest.mark.asyncio
 async def test_maintenance_probes_and_counts_catalog_added_models(monkeypatch, tmp_path):
     config = {
-        "pools": {"code": PoolConfig(name="code", models=[], auto_free=True)},
+        "pools": {"code": PoolConfig(name="code", models=[], auto_catalog=True)},
         "quality_db_path": str(tmp_path / "quality.db"),
         "provider_api_keys": {"openrouter": "key"},
         "providers": {"openrouter": {"kind": "bearer"}},
@@ -326,7 +326,7 @@ async def test_structured_probes_skip_non_text_output_catalog_models(monkeypatch
     """A catalog model advertising a non-text output modality (e.g. TTS) is
     never probed: the chat-shaped probe could only fail and poison stats."""
     config = {
-        "pools": {"code": PoolConfig(name="code", models=[], auto_free=True)},
+        "pools": {"code": PoolConfig(name="code", models=[], auto_catalog=True)},
         "quality_db_path": str(tmp_path / "quality.db"),
         "provider_api_keys": {"openrouter": "key"},
         "providers": {"openrouter": {"kind": "bearer"}},

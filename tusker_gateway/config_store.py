@@ -113,6 +113,18 @@ class ConfigStore:
             for table, _ in _TABLE_SCHEMAS.items():
                 conn.execute(f"CREATE TABLE IF NOT EXISTS {table} ({_TABLE_SCHEMAS[table][0]})")
 
+            # ── Schema migrations ─────────────────────────────────────────────
+            # Idempotent, runs once per startup. Each block must be safe to
+            # re-run on a fully migrated database (no-op when target shape is
+            # already in place).
+            self._migrate_rename_column(
+                conn,
+                table="tusker_config_pools",
+                old_column="auto_free",
+                new_column="auto_catalog",
+                is_pg=is_pg,
+            )
+
             if is_pg:
                 conn.execute(
                     "INSERT INTO tusker_config_meta (id, generation) VALUES (1, 0) "
@@ -124,8 +136,71 @@ class ConfigStore:
                 )
             conn.commit()
 
-    # ─── Encryption helpers ────────────────────────────────────────────────────
+    def _migrate_rename_column(
+        self,
+        conn: Any,
+        *,
+        table: str,
+        old_column: str,
+        new_column: str,
+        is_pg: bool,
+    ) -> None:
+        """Idempotently rename a column on ``table`` from ``old_column`` to
+        ``new_column`` if the old name exists and the new name does not.
 
+        Both PostgreSQL (>= 9.6) and SQLite (>= 3.25) support
+        ``ALTER TABLE ... RENAME COLUMN``. The check skips work on a database
+        that already has the new column name (post-migration state) and
+        raises on any unexpected error so the startup log surfaces it.
+        """
+        try:
+            if is_pg:
+                cur = conn.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name = %s AND column_name IN (%s, %s)",
+                    (table, old_column, new_column),
+                )
+                params_pg = True
+            else:
+                cur = conn.execute(f"PRAGMA table_info({table})")
+                params_pg = False
+        except Exception as exc:
+            logger.warning(
+                "schema migration: column introspection failed for %s (%s)",
+                table,
+                exc,
+            )
+            return
+
+        if is_pg:
+            present = {row[0] for row in cur.fetchall()}
+        else:
+            # PRAGMA table_info returns rows: (cid, name, type, notnull, dflt, pk)
+            present = {row[1] for row in cur.fetchall()}
+
+        if old_column not in present:
+            return  # Nothing to do — fresh DB or already migrated.
+        if new_column in present:
+            return  # Already in target shape.
+
+        # Quote identifiers safely for both engines.
+        if is_pg:
+            conn.execute(
+                f'ALTER TABLE "{table}" RENAME COLUMN "{old_column}" TO "{new_column}"'
+            )
+        else:
+            conn.execute(
+                f'ALTER TABLE "{table}" RENAME COLUMN "{old_column}" TO "{new_column}"'
+            )
+        logger.info(
+            "schema migration: renamed %s.%s -> %s.%s",
+            table,
+            old_column,
+            table,
+            new_column,
+        )
+
+    # ─── Encryption helpers ────────────────────────────────────────────────────
     def _encryption_key(self) -> str:
         for var in _ENCRYPTION_KEY_VARS:
             key = self._env.get(var, "").strip()
@@ -249,10 +324,10 @@ class ConfigStore:
             pools: dict[str, PoolConfig] = {}
             cursor = conn.execute(
                 "SELECT name, models, context_window, zdr, provider_warmup_secs, "
-                "auto_free, heavyweight_only, auto_catalog_providers, fallback_pools "
+                "auto_catalog, heavyweight_only, auto_catalog_providers, fallback_pools "
                 "FROM tusker_config_pools"
             )
-            for (name, models_raw, context_window, zdr, warmup, auto_free,
+            for (name, models_raw, context_window, zdr, warmup, auto_catalog,
                  heavyweight_only, ac_providers_raw, fallback_pools_raw) in cursor:
                 ac_providers: tuple[str, ...] = ()
                 if ac_providers_raw:
@@ -278,7 +353,7 @@ class ConfigStore:
                     context_window=int(context_window or 128000),
                     zdr=bool(zdr),
                     provider_warmup_secs=int(warmup or 300),
-                    auto_free=bool(auto_free),
+                    auto_catalog=bool(auto_catalog),
                     heavyweight_only=bool(heavyweight_only),
                     auto_catalog_providers=ac_providers,
                     fallback_pools=fallback_pools,
@@ -452,7 +527,7 @@ class ConfigStore:
             # pools
             cursor = conn.execute(
                 "SELECT name, models, context_window, zdr, provider_warmup_secs, "
-                "auto_free, heavyweight_only, auto_catalog_providers, fallback_pools, "
+                "auto_catalog, heavyweight_only, auto_catalog_providers, fallback_pools, "
                 "created_at, updated_at FROM tusker_config_pools"
             )
             for row in cursor:
@@ -463,7 +538,7 @@ class ConfigStore:
                     "context_window": int(row[2] or 128000),
                     "zdr": bool(row[3]),
                     "provider_warmup_secs": int(row[4] or 300),
-                    "auto_free": bool(row[5]),
+                    "auto_catalog": bool(row[5]),
                     "heavyweight_only": bool(row[6]),
                     "auto_catalog_providers": _try_json(row[7]),
                     "fallback_pools": _try_json(row[8]),
@@ -711,12 +786,12 @@ class ConfigStore:
                 conn.execute(
                     "INSERT INTO tusker_config_pools "
                     "(name, models, context_window, zdr, provider_warmup_secs, "
-                    "auto_free, heavyweight_only, auto_catalog_providers, fallback_pools) "
+                    "auto_catalog, heavyweight_only, auto_catalog_providers, fallback_pools) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT (name) DO UPDATE SET "
                     "models=excluded.models, context_window=excluded.context_window, "
                     "zdr=excluded.zdr, provider_warmup_secs=excluded.provider_warmup_secs, "
-                    "auto_free=excluded.auto_free, heavyweight_only=excluded.heavyweight_only, "
+                    "auto_catalog=excluded.auto_catalog, heavyweight_only=excluded.heavyweight_only, "
                     "auto_catalog_providers=excluded.auto_catalog_providers, "
                     "fallback_pools=excluded.fallback_pools, "
                     "updated_at=CURRENT_TIMESTAMP",
@@ -726,7 +801,7 @@ class ConfigStore:
                         int(body.get("context_window") or 128000),
                         int(bool(body.get("zdr"))),
                         int(body.get("provider_warmup_secs") or 300),
-                        int(bool(body.get("auto_free"))),
+                        int(bool(body.get("auto_catalog"))),
                         int(bool(body.get("heavyweight_only"))),
                         ac_raw,
                         fb_raw,
@@ -1161,7 +1236,7 @@ _TABLE_SCHEMAS: dict[str, tuple[str, str]] = {
         "context_window INTEGER NOT NULL DEFAULT 128000, "
         "zdr INTEGER NOT NULL DEFAULT 0, "
         "provider_warmup_secs INTEGER NOT NULL DEFAULT 300, "
-        "auto_free INTEGER NOT NULL DEFAULT 0, "
+        "auto_catalog INTEGER NOT NULL DEFAULT 0, "
         "heavyweight_only INTEGER NOT NULL DEFAULT 0, "
         "auto_catalog_providers TEXT, fallback_pools TEXT, "
         "created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP, "

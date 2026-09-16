@@ -1074,7 +1074,7 @@ _PROVIDER_SETTINGS_FIELDS = frozenset({
 })
 _POOL_FIELDS = frozenset({
     "name", "models", "context_window", "zdr",
-    "provider_warmup_secs", "auto_free", "heavyweight_only",
+    "provider_warmup_secs", "auto_catalog", "heavyweight_only",
     "auto_catalog_providers", "fallback_pools",
 })
 _IDENTITY_PROFILE_FIELDS = frozenset({

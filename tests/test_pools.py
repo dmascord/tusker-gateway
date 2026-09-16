@@ -87,7 +87,7 @@ def test_new_privacy_eligible_providers_load(monkeypatch):
         "TUSKER_POOL_PRIVACY",
         '{"models":'
         + json.dumps(privacy_models)
-        + ',"zdr":true,"auto_free":true,"auto_catalog_providers":["groq","workers-ai"]}',
+        + ',"zdr":true,"auto_catalog":true,"auto_catalog_providers":["groq","workers-ai"]}',
     )
 
     from tusker_gateway.config import _provider_registry_from_env
@@ -133,7 +133,7 @@ def test_local_hardware_routes_in_privacy_pool(monkeypatch):
     ]
     monkeypatch.setenv(
         "TUSKER_POOL_PRIVACY",
-        '{"models":' + json.dumps(privacy_models) + ',"zdr":true,"auto_free":true}',
+        '{"models":' + json.dumps(privacy_models) + ',"zdr":true,"auto_catalog":true}',
     )
 
     from tusker_gateway.config import _provider_registry_from_env
@@ -166,11 +166,11 @@ def test_business_copilot_is_available_to_privacy_catalog(monkeypatch):
     assert "github-copilot" in pool.auto_catalog_providers
 
 
-def test_load_config_normalizes_auto_free_provider_exclusions(monkeypatch):
-    monkeypatch.setenv("TUSKER_AUTO_FREE_EXCLUDED_PROVIDERS", "NVIDIA, open_router")
+def test_load_config_normalizes_auto_catalog_provider_exclusions(monkeypatch):
+    monkeypatch.setenv("TUSKER_AUTO_CATALOG_EXCLUDED_PROVIDERS", "NVIDIA, open_router")
     config = load_config()
 
-    assert config["auto_free_excluded_providers"] == ["nvidia", "open-router"]
+    assert config["auto_catalog_excluded_providers"] == ["nvidia", "open-router"]
 
 
 def test_load_config_parses_passthrough_disabled_providers(monkeypatch):
@@ -188,7 +188,7 @@ def test_pool_config_normalizes_auto_catalog_providers():
     pool = PoolConfig(
         name="code",
         models=[],
-        auto_free=True,
+        auto_catalog=True,
         auto_catalog_providers="GitHub_Copilot, ZAI",
     )
 
@@ -1159,14 +1159,14 @@ def test_xiaomi_catalog_auto_adds_only_nonheavy_chat_models_to_code():
         manager = _xiaomi_pool_manager(
             tmpdir,
             {
-                "code": PoolConfig(name="code", models=[], auto_free=True),
+                "code": PoolConfig(name="code", models=[], auto_catalog=True),
                 "privacy": PoolConfig(
                     name="privacy",
                     models=[],
                     zdr=True,
-                    auto_free=True,
+                    auto_catalog=True,
                 ),
-                "premium": PoolConfig(name="premium", models=[], auto_free=True),
+                "premium": PoolConfig(name="premium", models=[], auto_catalog=True),
             },
         )
         manager.catalog_registry = _CatalogRegistry(
@@ -1197,7 +1197,7 @@ def test_xiaomi_catalog_auto_adds_only_nonheavy_chat_models_to_code():
             }
         )
 
-        manager.extend_pools_with_free_catalog()
+        manager.extend_pools_with_auto_catalog()
 
         code = {(spec.provider, spec.model): spec for spec in manager.models["code"]}
         assert set(code) == {
@@ -1234,7 +1234,7 @@ def test_static_xiaomi_privacy_entry_remains_operator_curated():
                         }
                     ],
                     zdr=True,
-                    auto_free=True,
+                    auto_catalog=True,
                 ),
             },
         )
@@ -1252,7 +1252,7 @@ def test_static_xiaomi_privacy_entry_remains_operator_curated():
             }
         )
 
-        manager.extend_pools_with_free_catalog()
+        manager.extend_pools_with_auto_catalog()
 
         assert [(spec.provider, spec.model) for spec in manager.models["privacy"]] == [
             ("xiaomi", "mimo-v2.5-pro"),
@@ -1737,7 +1737,7 @@ def test_catalog_refresh_cannot_restore_permanently_failed_model(tmp_path):
                 "code": PoolConfig(
                     name="code",
                     models=[],
-                    auto_free=True,
+                    auto_catalog=True,
                     auto_catalog_providers=["google"],
                 )
             },
@@ -1748,16 +1748,16 @@ def test_catalog_refresh_cannot_restore_permanently_failed_model(tmp_path):
     registry = _CatalogRegistry({"google": [_CatalogEntry(*route)]})
     registry.providers = lambda: ("google",)
     manager.catalog_registry = registry
-    manager.extend_pools_with_free_catalog()
+    manager.extend_pools_with_auto_catalog()
     assert manager.select("code") == route
 
     mark_permanently_failed(*route)
     assert manager.select("code", allow_cooldown_probe=True) is None
-    manager.extend_pools_with_free_catalog()
+    manager.extend_pools_with_auto_catalog()
     assert manager.models["code"] == []
-    manager.extend_pools_with_free_catalog()
+    manager.extend_pools_with_auto_catalog()
     assert manager.select("code") is None
 
     clear_permanently_failed(*route)
-    manager.extend_pools_with_free_catalog()
+    manager.extend_pools_with_auto_catalog()
     assert manager.select("code") == route

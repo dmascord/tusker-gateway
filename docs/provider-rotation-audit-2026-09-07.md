@@ -1,7 +1,7 @@
 # Provider rotation audit — 2026-09-07
 
 Full inspection of the pool rotation pipeline (`config.py` → `PoolManager`
-(`pools.py`) → `catalog.py` / `extend_pools_with_free_catalog()` →
+(`pools.py`) → `catalog.py` / `extend_pools_with_auto_catalog()` →
 `k8s/deployment.yaml`). Goal: find rotation-logic gaps, models we could be
 using but aren't, and how to get the `google` (Gemini) provider working again.
 
@@ -31,7 +31,7 @@ A8 resolved by fixing the doc (no script existed).
   `max(20.0, median - 20.0)`) → weighted/round-robin within top tier.
 - Catalog refresh: `CatalogRegistry.default()` registers per-provider
   clients; `catalog_refresh_loop()` calls
-  `PoolManager.extend_pools_with_free_catalog()` after every refresh.
+  `PoolManager.extend_pools_with_auto_catalog()` after every refresh.
   Auto-free modes per provider: `pricing` (both prices exactly 0),
   `all` (opencode-zen/go, key-filtered), `xiaomi` (chat-only, cheap
   non-ZDR pools only), `catalog` (explicit `auto_catalog_providers`
@@ -46,7 +46,7 @@ A8 resolved by fixing the doc (no script existed).
 `TUSKER_POOL_CODE` (deployment.yaml) hardcodes ~55 entries; most are
 upstream-catalog freebies (`openrouter/*:free`, `opencode-zen/*-free`,
 `opencode-go/*`, `ollama-cloud/*`). Because the pool already sets
-`auto_free: true`, `extend_pools_with_free_catalog()` re-adds these every
+`auto_catalog: true`, `extend_pools_with_auto_catalog()` re-adds these every
 refresh — but they are frozen into `_original_static`, so the pruning
 guarantee ("auto-added entries are pruned when they stop being free")
 never applies to them. Static rows also never leave the list when an
@@ -97,7 +97,7 @@ privacy's `auto_catalog_providers` for ongoing discovery.
 
 ### A5. Heavyweight gate missing for `auto_catalog_providers` entries (BUG)
 
-`extend_pools_with_free_catalog()` (`pools.py` ~line 461): the
+`extend_pools_with_auto_catalog()` (`pools.py` ~line 461): the
 `is_heavyweight()` check and `model_data["heavyweight"] = ...` assignment
 run **only** in the `mode == "xiaomi"` branch. Catalog-mode entries
 (`auto_catalog_providers`) get `auto_discovered: True` with no heavyweight
@@ -193,7 +193,7 @@ confirmation per destructive-action policy for `kubectl apply`):
 ## D. Recommended fix order for next session
 
 1. **Code fix (A5)** — heavyweight marker for catalog-mode auto-added
-   entries in `extend_pools_with_free_catalog()` + regression test.
+   entries in `extend_pools_with_auto_catalog()` + regression test.
 2. **Code fix (A6)** — add `openrouter/free` (+ `auto`) to
    `_PROVIDER_ROUTER_MODELS` in `pools.py`.
 3. **Manifest cleanup (A1/A2/A3)** — remove dead static rows (`google`,

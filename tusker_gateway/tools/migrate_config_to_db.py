@@ -95,7 +95,7 @@ def _section_counts(store: ConfigStore, config: dict, *, dry_run: bool) -> list[
                     "context_window": pool.context_window,
                     "zdr": pool.zdr,
                     "provider_warmup_secs": pool.provider_warmup_secs,
-                    "auto_free": pool.auto_free,
+                    "auto_catalog": pool.auto_catalog,
                     "heavyweight_only": pool.heavyweight_only,
                     "auto_catalog_providers": list(pool.auto_catalog_providers),
                     "fallback_pools": list(pool.fallback_pools),

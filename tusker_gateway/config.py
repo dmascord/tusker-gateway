@@ -54,17 +54,20 @@ class PoolConfig:
         context_window: int = 128_000,
         zdr: bool = False,
         provider_warmup_secs: int = 300,
-        auto_free: bool = False,
+        auto_catalog: bool = False,
+        # Deprecated alias kept for backward compatibility with existing
+        # TUSKER_POOL_* JSON that uses the old ``auto_free`` key.
+        auto_free: bool | None = None,
         auto_catalog_providers: list[str] | tuple[str, ...] | str = (),
         heavyweight_only: bool = False,
-        fallback_pools: list[str] | tuple[str, ...] = (),
+        fallback_pools: list[str] | tuple[str, ...] | str = (),
     ):
         self.name = name
         self.models = models
         self.context_window = context_window
         self.zdr = zdr
         self.provider_warmup_secs = provider_warmup_secs
-        self.auto_free = auto_free
+        self.auto_catalog = auto_catalog if not auto_free else auto_free
         # When True, auto-catalog discovery only adds entries the
         # heavyweight classifier marks heavy. Static entries are unaffected.
         self.heavyweight_only = heavyweight_only
@@ -128,10 +131,12 @@ def load_config() -> dict[str, Any]:
     # Virtual model name advertised to clients
     config["model_name"] = os.environ.get("MODEL_NAME", "tusker-gateway")
     config["pools"] = _load_pools()
-    config["excluded_providers"] = [p.strip() for p in _parse_env_list("EXCLUDED_PROVIDERS") if p.strip()]
-    config["auto_free_excluded_providers"] = [
+    config["auto_catalog_excluded_providers"] = [
         p.strip().lower().replace("_", "-")
-        for p in _parse_env_list("TUSKER_AUTO_FREE_EXCLUDED_PROVIDERS")
+        for p in (
+            _parse_env_list("TUSKER_AUTO_CATALOG_EXCLUDED_PROVIDERS")
+            or _parse_env_list("TUSKER_AUTO_CATALOG_EXCLUDED_PROVIDERS")
+        )
         if p.strip()
     ]
     # Provider routes can be disabled without removing their registry entry.
@@ -464,14 +469,14 @@ def _load_pools() -> dict[str, PoolConfig]:
             if not isinstance(data, dict):
                 continue
             models = data.get("models", [])
-            if not models and not data.get("auto_free", False):
+            if not models and not data.get("auto_catalog", data.get("auto_catalog", False)):
                 continue
             pools[pool_name] = PoolConfig(
                 name=pool_name,
                 models=models,
                 context_window=data.get("context_window", 128_000),
                 zdr=data.get("zdr", False),
-                auto_free=bool(data.get("auto_free", False)),
+                auto_catalog=bool(data.get("auto_catalog", data.get("auto_catalog", False))),
                 heavyweight_only=bool(data.get("heavyweight_only", False)),
                 auto_catalog_providers=data.get(
                     "auto_catalog_providers",

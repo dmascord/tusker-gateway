@@ -436,18 +436,18 @@ def test_business_copilot_can_be_enabled_for_privacy_pool(monkeypatch):
     assert cfg["providers"]["github-copilot"].zdr_ok is True
 
 
-def test_config_keeps_empty_auto_free_pool_for_catalog_discovery(monkeypatch):
+def test_config_keeps_empty_auto_catalog_pool_for_catalog_discovery(monkeypatch):
     """An auto-configured pool may start empty and wait for its catalog."""
     monkeypatch.setenv(
         "TUSKER_POOL_CATALOG_TEST",
-        json.dumps({"models": [], "auto_free": True}),
+        json.dumps({"models": [], "auto_catalog": True}),
     )
     monkeypatch.setenv("API_KEYS", "k1")
 
     cfg = load_config()
 
     assert cfg["pools"]["catalog-test"].models == []
-    assert cfg["pools"]["catalog-test"].auto_free is True
+    assert cfg["pools"]["catalog-test"].auto_catalog is True
 
 
 # ---------------------------------------------------------------------------

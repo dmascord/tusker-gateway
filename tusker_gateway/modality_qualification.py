@@ -356,7 +356,7 @@ async def run_qualification(
         await registry.refresh_all(session)
         manager = PoolManager(config)
         manager.catalog_registry = registry
-        manager.extend_pools_with_free_catalog()
+        manager.extend_pools_with_auto_catalog()
         pairs = _candidate_pairs(
             manager,
             registry,

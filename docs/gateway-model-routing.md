@@ -145,7 +145,7 @@ surface eligible models without requiring a config edit:
 | Xiaomi MiMo | `https://token-plan-sgp.xiaomimimo.com/v1/models` | 60 min |
 
 Static `TUSKER_POOL_*` entries remain operator-curated baselines. Pools with
-`auto_free: true` also receive eligible catalog entries at startup and on each
+`auto_catalog: true` also receive eligible catalog entries at startup and on each
 refresh. Catalog-only entries are pruned when they disappear or become
 ineligible; static entries are never pruned.
 
@@ -171,10 +171,10 @@ fields are merged.
 ## Auto-free catalog merge
 
 Pools can opt in to **automatic free-tier discovery** by setting
-`auto_free: true` in their `TUSKER_POOL_<name>` JSON env var:
+`auto_catalog: true` in their `TUSKER_POOL_<name>` JSON env var:
 
 ```json
-TUSKER_POOL_CODE='{"models": [], "auto_free": true}'
+TUSKER_POOL_CODE='{"models": [], "auto_catalog": true}'
 ```
 
 Account-backed catalogs can be opted in explicitly with
@@ -182,7 +182,7 @@ Account-backed catalogs can be opted in explicitly with
 providers whose catalog does not expose a meaningful zero-price signal:
 
 ```json
-TUSKER_POOL_CODE='{"models": [], "auto_free": true, "auto_catalog_providers": ["openai-codex", "github-copilot", "github-copilot-enterprise", "opencode-go", "zai", "synthetic"]}'
+TUSKER_POOL_CODE='{"models": [], "auto_catalog": true, "auto_catalog_providers": ["openai-codex", "github-copilot", "github-copilot-enterprise", "opencode-go", "zai", "synthetic"]}'
 ```
 
 These entries are still filtered by heavyweight and privacy policy. A
@@ -209,7 +209,7 @@ explicit path for Codex, Copilot, OpenCode Go, Z.AI, Synthetic, MiniMax,
 Ollama Cloud, Groq, Google, or Cerebras when their credentials provide model
 access.
 
-`TUSKER_AUTO_FREE_EXCLUDED_PROVIDERS` can block a provider from dynamic
+`TUSKER_AUTO_CATALOG_EXCLUDED_PROVIDERS` can block a provider from dynamic
 catalog discovery while leaving explicitly configured models untouched. The
 deployment sets it to `nvidia` while that provider's worker capacity is under
 investigation; this prevents a direct NVIDIA `/models` refresh from adding new
@@ -337,7 +337,7 @@ separately in `PoolManager.auto_added`. When an entry stops being free on
 a subsequent refresh (e.g. `stealth/ox-alpha` flips from pricing 0/0 to
 3e-6/1.5e-5) it's pruned without disturbing operator-curated entries.
 
-**Pruning proof** (`tests/test_catalog.py::test_poolmanager_auto_free_drops_models_that_stop_being_free`):
+**Pruning proof** (`tests/test_catalog.py::test_poolmanager_auto_catalog_drops_models_that_stop_being_free`):
 
 ```text
 pass 1: stealth/ox-alpha is free

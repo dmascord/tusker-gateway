@@ -1054,8 +1054,8 @@ def test_poolmanager_extend_pools_without_registry():
 
 
 
-def test_poolmanager_auto_free_adds_openrouter_zero_pricing():
-    """auto_free pulls OpenRouter entries with prompt=0, completion=0
+def test_poolmanager_auto_catalog_adds_openrouter_zero_pricing():
+    """auto_catalog pulls OpenRouter entries with prompt=0, completion=0
     into the pool's runtime model list."""
     from tusker_gateway.config import PoolConfig
     from tusker_gateway.pools import PoolManager
@@ -1064,7 +1064,7 @@ def test_poolmanager_auto_free_adds_openrouter_zero_pricing():
             "code": PoolConfig(
                 name="code",
                 models=[{"provider": "openai-codex", "model": "gpt-5.6-luna"}],
-                auto_free=True,
+                auto_catalog=True,
             ),
         },
         "excluded_providers": [],
@@ -1105,7 +1105,7 @@ def test_poolmanager_auto_free_adds_openrouter_zero_pricing():
     reg.register("openrouter", orr)
     pm.catalog_registry = reg
 
-    pm.extend_pools_with_free_catalog()
+    pm.extend_pools_with_auto_catalog()
 
     pool_models = {(m["provider"], m["model"]) for m in pm.pools["code"].models}
     assert ("openai-codex", "gpt-5.6-luna") in pool_models  # static kept
@@ -1122,14 +1122,14 @@ def test_poolmanager_auto_free_adds_openrouter_zero_pricing():
     assert ("openrouter", "stealth/ox-alpha") in runtime
 
 
-def test_poolmanager_auto_free_adds_explicitly_free_generic_provider_models():
+def test_poolmanager_auto_catalog_adds_explicitly_free_generic_provider_models():
     """Generic provider catalogs participate only with an explicit 0/0 price."""
     from tusker_gateway.config import PoolConfig
     from tusker_gateway.pools import PoolManager
 
     cfg = {
         "pools": {
-            "code": PoolConfig(name="code", models=[], auto_free=True),
+            "code": PoolConfig(name="code", models=[], auto_catalog=True),
         },
         "excluded_providers": [],
         "provider_api_keys": {"cerebras": "k-cerebras"},
@@ -1164,7 +1164,7 @@ def test_poolmanager_auto_free_adds_explicitly_free_generic_provider_models():
     registry.register("cerebras", client)
     pm.catalog_registry = registry
 
-    pm.extend_pools_with_free_catalog()
+    pm.extend_pools_with_auto_catalog()
 
     assert {(m["provider"], m["model"]) for m in pm.pools["code"].models} == {
         ("cerebras", "free-chat"),
@@ -1181,7 +1181,7 @@ def test_poolmanager_auto_catalog_adds_opted_in_authenticated_models():
             "code": PoolConfig(
                 name="code",
                 models=[],
-                auto_free=True,
+                auto_catalog=True,
                 auto_catalog_providers=["zai"],
             ),
         },
@@ -1208,7 +1208,7 @@ def test_poolmanager_auto_catalog_adds_opted_in_authenticated_models():
     registry.register("zai", zai)
     manager.catalog_registry = registry
 
-    manager.extend_pools_with_free_catalog()
+    manager.extend_pools_with_auto_catalog()
 
     pool_models = {
         (model["provider"], model["model"])
@@ -1235,7 +1235,7 @@ def test_poolmanager_auto_catalog_marks_heavyweight_entries():
             "code": PoolConfig(
                 name="code",
                 models=[],
-                auto_free=True,
+                auto_catalog=True,
                 auto_catalog_providers=["zai"],
             ),
         },
@@ -1261,7 +1261,7 @@ def test_poolmanager_auto_catalog_marks_heavyweight_entries():
     registry.register("zai", zai)
     manager.catalog_registry = registry
 
-    manager.extend_pools_with_free_catalog()
+    manager.extend_pools_with_auto_catalog()
 
     by_pair = {
         (m["provider"], m["model"]): m
@@ -1276,17 +1276,17 @@ def test_poolmanager_auto_catalog_marks_heavyweight_entries():
     assert manager.select("code") == ("zai", "glm-lite")
 
 
-def test_poolmanager_auto_free_excludes_configured_provider():
+def test_poolmanager_auto_catalog_excludes_configured_provider():
     """An exhausted provider must not re-enter through dynamic discovery."""
     from tusker_gateway.config import PoolConfig
     from tusker_gateway.pools import PoolManager
 
     cfg = {
         "pools": {
-            "code": PoolConfig(name="code", models=[], auto_free=True),
+            "code": PoolConfig(name="code", models=[], auto_catalog=True),
         },
         "excluded_providers": [],
-        "auto_free_excluded_providers": ["NVIDIA"],
+        "auto_catalog_excluded_providers": ["NVIDIA"],
         "provider_api_keys": {"nvidia": "k-nvidia"},
         "quality_db_path": "/tmp/_unused.db",
     }
@@ -1307,13 +1307,13 @@ def test_poolmanager_auto_free_excludes_configured_provider():
     registry.register("nvidia", client)
     pm.catalog_registry = registry
 
-    pm.extend_pools_with_free_catalog()
+    pm.extend_pools_with_auto_catalog()
 
     assert pm.pools["code"].models == []
     assert pm.models["code"] == []
 
 
-def test_poolmanager_auto_free_does_not_add_non_zdr_catalog_to_privacy():
+def test_poolmanager_auto_catalog_does_not_add_non_zdr_catalog_to_privacy():
     """Free pricing is not sufficient to cross the privacy boundary."""
     from tusker_gateway.config import PoolConfig
     from tusker_gateway.pools import PoolManager
@@ -1321,7 +1321,7 @@ def test_poolmanager_auto_free_does_not_add_non_zdr_catalog_to_privacy():
     cfg = {
         "pools": {
             "privacy": PoolConfig(
-                name="privacy", models=[], zdr=True, auto_free=True,
+                name="privacy", models=[], zdr=True, auto_catalog=True,
             ),
         },
         "excluded_providers": [],
@@ -1342,20 +1342,20 @@ def test_poolmanager_auto_free_does_not_add_non_zdr_catalog_to_privacy():
     registry.register("openrouter", client)
     pm.catalog_registry = registry
 
-    pm.extend_pools_with_free_catalog()
+    pm.extend_pools_with_auto_catalog()
 
     assert pm.pools["privacy"].models == []
     assert pm.models["privacy"] == []
 
 
-def test_poolmanager_auto_free_includes_opencode_zen_and_go():
-    """auto_free treats the entire OpenCode Zen/Go catalog as free-for-key,
+def test_poolmanager_auto_catalog_includes_opencode_zen_and_go():
+    """auto_catalog treats the entire OpenCode Zen/Go catalog as free-for-key,
     since /v1/models is key-filtered (no per-model pricing field)."""
     from tusker_gateway.config import PoolConfig
     from tusker_gateway.pools import PoolManager
     cfg = {
         "pools": {
-            "code": PoolConfig(name="code", models=[], auto_free=True),
+            "code": PoolConfig(name="code", models=[], auto_catalog=True),
         },
         "excluded_providers": [],
         # Bearer-kind providers are dropped from pools without keys.
@@ -1383,7 +1383,7 @@ def test_poolmanager_auto_free_includes_opencode_zen_and_go():
     reg.register("opencode-go", go)
     pm.catalog_registry = reg
 
-    pm.extend_pools_with_free_catalog()
+    pm.extend_pools_with_auto_catalog()
 
     pool_models = {(m["provider"], m["model"]) for m in pm.pools["code"].models}
     assert ("opencode-zen", "muse-spark-1.2") in pool_models
@@ -1392,14 +1392,14 @@ def test_poolmanager_auto_free_includes_opencode_zen_and_go():
     assert ("opencode-go", "kimi-k2.6") in pool_models
 
 
-def test_poolmanager_auto_free_drops_models_that_stop_being_free():
+def test_poolmanager_auto_catalog_drops_models_that_stop_being_free():
     """Idempotency: when a model goes paid, it must be removed from
-    the pool on the next auto_free pass."""
+    the pool on the next auto_catalog pass."""
     from tusker_gateway.config import PoolConfig
     from tusker_gateway.pools import PoolManager
     cfg = {
         "pools": {
-            "code": PoolConfig(name="code", models=[], auto_free=True),
+            "code": PoolConfig(name="code", models=[], auto_catalog=True),
         },
         "excluded_providers": [],
         # Bearer-kind providers are dropped from pools without keys.
@@ -1419,7 +1419,7 @@ def test_poolmanager_auto_free_drops_models_that_stop_being_free():
                                   cost_input=0.0, cost_output=0.0)]
     reg1.register("openrouter", orr1)
     pm.catalog_registry = reg1
-    pm.extend_pools_with_free_catalog()
+    pm.extend_pools_with_auto_catalog()
     assert ("openrouter", "stealth/ox-alpha") in {(m["provider"], m["model"]) for m in pm.pools["code"].models}
 
     # Second pass: stealth/ox-alpha is now paid (cost > 0).
@@ -1429,17 +1429,17 @@ def test_poolmanager_auto_free_drops_models_that_stop_being_free():
                                   cost_input=3e-6, cost_output=1.5e-5)]
     reg2.register("openrouter", orr2)
     pm.catalog_registry = reg2
-    pm.extend_pools_with_free_catalog()
+    pm.extend_pools_with_auto_catalog()
     assert ("openrouter", "stealth/ox-alpha") not in {(m["provider"], m["model"]) for m in pm.pools["code"].models}
 
 
-def test_poolmanager_auto_free_disabled_is_noop():
-    """auto_free=False (default) means the catalog is ignored entirely."""
+def test_poolmanager_auto_catalog_disabled_is_noop():
+    """auto_catalog=False (default) means the catalog is ignored entirely."""
     from tusker_gateway.config import PoolConfig
     from tusker_gateway.pools import PoolManager
     cfg = {
         "pools": {
-            "code": PoolConfig(name="code", models=[], auto_free=False),
+            "code": PoolConfig(name="code", models=[], auto_catalog=False),
         },
         "excluded_providers": [],
         # Bearer-kind providers are dropped from pools without keys.
@@ -1459,16 +1459,16 @@ def test_poolmanager_auto_free_disabled_is_noop():
     reg.register("openrouter", orr)
     pm.catalog_registry = reg
 
-    pm.extend_pools_with_free_catalog()
+    pm.extend_pools_with_auto_catalog()
     assert pm.pools["code"].models == []
-def test_auto_free_excludes_non_text_output_catalog_models():
+def test_auto_catalog_excludes_non_text_output_catalog_models():
     """Catalog entries that advertise a non-text output modality (e.g. TTS,
-    transcription) are excluded from the auto_free merge regardless of price."""
+    transcription) are excluded from the auto_catalog merge regardless of price."""
     from tusker_gateway.config import PoolConfig
     from tusker_gateway.pools import PoolManager
     cfg = {
         "pools": {
-            "code": PoolConfig(name="code", models=[], auto_free=True),
+            "code": PoolConfig(name="code", models=[], auto_catalog=True),
         },
         "excluded_providers": [],
         "provider_api_keys": {"groq": "k-groq"},
@@ -1500,7 +1500,7 @@ def test_auto_free_excludes_non_text_output_catalog_models():
     ]
     reg.register("groq", client)
     pm.catalog_registry = reg
-    pm.extend_pools_with_free_catalog()
+    pm.extend_pools_with_auto_catalog()
     pool = pm.pools["code"]
     models = {(m["provider"], m["model"]) for m in pool.models}
     # text-only entries enter the pool
@@ -1514,13 +1514,13 @@ def test_auto_free_excludes_non_text_output_catalog_models():
     assert ("groq", "text-to-image") not in models
 
 
-def test_auto_free_excludes_non_text_output_logged():
+def test_auto_catalog_excludes_non_text_output_logged():
     """Non-text-output exclusions are surfaced in the log output."""
     from tusker_gateway.config import PoolConfig
     from tusker_gateway.pools import PoolManager
     cfg = {
         "pools": {
-            "code": PoolConfig(name="code", models=[], auto_free=True),
+            "code": PoolConfig(name="code", models=[], auto_catalog=True),
         },
         "excluded_providers": [],
         "provider_api_keys": {"groq": "k-groq"},
@@ -1539,7 +1539,7 @@ def test_auto_free_excludes_non_text_output_logged():
     ]
     reg.register("groq", client)
     pm.catalog_registry = reg
-    result = pm.extend_pools_with_free_catalog()
+    result = pm.extend_pools_with_auto_catalog()
     # The exclusion is reported in the log line; nothing enters the pool
     assert ("groq", "tts-model") not in {
         (m["provider"], m["model"]) for m in pm.pools["code"].models

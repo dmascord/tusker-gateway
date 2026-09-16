@@ -257,14 +257,14 @@ class PoolManager:
     # merges catalog-known models into the allowlist. See catalog.py.
     catalog_registry: object | None = None
     # pool_name -> set of (provider, model) pairs auto-added by
-    # extend_pools_with_free_catalog(). Tracked separately from
+    # extend_pools_with_auto_catalog(). Tracked separately from
     # static allowlist so we can prune auto-added entries when
     # they stop being free (e.g. stealth/ox-alpha goes paid),
     # while keeping operator-curated entries untouched.
     auto_added: dict[str, set[tuple[str, str]]] = field(default_factory=dict)
     # pool_name -> set of (provider, model) pairs from the original
     # TUSKER_POOL_* config, snapshotted at startup. Used by
-    # extend_pools_with_free_catalog() to distinguish operator-curated
+    # extend_pools_with_auto_catalog() to distinguish operator-curated
     # entries (never pruned) from auto-added ones (pruned when they
     # stop being free).
     _original_static: dict[str, frozenset[tuple[str, str]]] = field(default_factory=dict)
@@ -372,7 +372,7 @@ class PoolManager:
         # Build model lists from pool configs
         for name, pool in self.pools.items():
             # Snapshot the operator-curated entries BEFORE any catalog
-            # merge so auto_free can distinguish static from auto-added.
+            # merge so auto_catalog can distinguish static from auto-added.
             self._original_static[name] = frozenset(
                 (m.get("provider", ""), m.get("model", ""))
                 for m in pool.models
@@ -511,9 +511,8 @@ class PoolManager:
             confirmed[pool_name] = count
         logger.info("catalog confirmed %s pool entries", confirmed)
         return confirmed
-    def extend_pools_with_free_catalog(self) -> dict[str, list[str]]:
-        """Auto-promote eligible catalog models into ``auto_free`` pools.
-
+    def extend_pools_with_auto_catalog(self) -> dict[str, list[str]]:
+        """Auto-promote eligible catalog models into ``auto_catalog`` pools.
         OpenRouter and provider-native catalogs contribute models whose input
         and output pricing is explicitly zero. OpenCode Zen/Go catalogs are
         key-filtered, so all advertised models are eligible. Xiaomi's
@@ -522,22 +521,20 @@ class PoolManager:
         excluded. Operators can opt additional authenticated catalogs into a
         pool with ``auto_catalog_providers``; those providers are still
         subject to the pool's heavyweight, privacy, and tool-capability gates.
-
         Auto-added entries are tracked separately from operator-curated static
         entries so refreshes can add and prune models without disturbing the
         configured allowlist.
         """
         if self.catalog_registry is None:
             return {}
-
         changed = False
-        excluded_auto_free_providers = {
+        excluded_auto_catalog_providers = {
             str(provider).strip().lower().replace("_", "-")
-            for provider in self.config.get("auto_free_excluded_providers", ())
+            for provider in self.config.get("auto_catalog_excluded_providers", ())
             if str(provider).strip()
         }
         for pool_name, pool in self.pools.items():
-            if not pool.auto_free:
+            if not pool.auto_catalog:
                 continue
 
             auto_catalog_providers = {
@@ -561,16 +558,16 @@ class PoolManager:
                 if provider == "models.dev":
                     # models.dev is a pricing source, not an inference route.
                     continue
-                if provider in excluded_auto_free_providers:
+                if provider in excluded_auto_catalog_providers:
                     logger.info(
-                        "auto_free pool '%s': excluded provider '%s'",
+                        "auto_catalog pool '%s': excluded provider '%s'",
                         pool_name,
                         provider,
                     )
                     continue
                 if self._provider_is_disabled(provider):
                     logger.info(
-                        "auto_free pool '%s': disabled provider '%s'",
+                        "auto_catalog pool '%s': disabled provider '%s'",
                         pool_name,
                         provider,
                     )
@@ -678,13 +675,13 @@ class PoolManager:
                 pool.models = new_models
                 changed = True
                 logger.info(
-                    "auto_free pool '%s': %d eligible catalog entries",
+                    "auto_catalog pool '%s': %d eligible catalog entries",
                     pool_name,
                     len(desired_auto),
                 )
             if excluded_special_models:
                 logger.info(
-                    "auto_free pool '%s': excluded %d special-purpose models=%s",
+                    "auto_catalog pool '%s': excluded %d special-purpose models=%s",
                     pool_name,
                     len(excluded_special_models),
                     ",".join(sorted(excluded_special_models)[:12]),
