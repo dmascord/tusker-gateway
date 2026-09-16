@@ -224,6 +224,8 @@ class ConfigRuntime:
         candidate_pm.catalog_registry = (
             old_pm.catalog_registry if old_pm is not None else None
         )
+        if candidate_pm.catalog_registry is not None:
+            candidate_pm.extend_pools_with_auto_catalog()
         self._app["pool_manager"] = candidate_pm
         self._rebuild_rotators()
         self._rebuild_catalog()
@@ -314,7 +316,13 @@ class ConfigRuntime:
             if old_task is not None:
                 old_task.cancel()
             self._app["catalog_task"] = asyncio.create_task(
-                catalog_refresh_loop(new_registry, session, float(os.environ.get("TUSKER_CATALOG_REFRESH_SECS", "300")), stop_event),
+                catalog_refresh_loop(new_registry, session, float(os.environ.get("TUSKER_CATALOG_REFRESH_SECS", "300")), stop_event,
+                    on_refresh=(
+                        pm.extend_pools_with_auto_catalog
+                        if pm is not None
+                        else None
+                    ),
+                ),
                 name="catalog-refresh",
             )
         if pm is not None:
