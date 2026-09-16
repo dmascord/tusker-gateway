@@ -37,6 +37,7 @@ from tusker_gateway.provider_usage import (
 )
 from tusker_gateway.quality import QualityDB
 from tusker_gateway.sse import split_sse_frame, sse_data_payload
+from tusker_gateway.gemini_thought import default_cache as _gemini_cache
 
 logger = logging.getLogger(__name__)
 
@@ -178,6 +179,34 @@ def _stream_status(value: Any) -> int | None:
     except (TypeError, ValueError):
         return None
     return status if 100 <= status <= 599 else None
+
+
+def _try_extract_thought_signatures(frame: bytes) -> None:
+    """Best-effort extraction of Gemini thought_signatures from an SSE frame.
+
+    Runs for every frame of every Google-provider stream but is gated on a
+    ``b\"thought_signature\"`` substring check so the common path (no
+    signature in frame) is a single memcmp + short-circuit.
+    """
+    if b"thought_signature" not in frame:
+        return
+    import json as _json
+    from tusker_gateway.gemini_thought import GeminiThoughtCache
+
+    data_lines = [
+        line[5:].lstrip()
+        for line in frame.splitlines()
+        if line.lower().startswith(b"data:")
+    ]
+    for line in data_lines:
+        try:
+            obj = _json.loads(line)
+        except Exception:
+            continue
+        found = GeminiThoughtCache.extract_from_response(obj)
+        if found:
+            from tusker_gateway.gemini_thought import default_cache as _gc
+            _gc().store_many(found)
 
 
 def _stream_error_from_frame(
@@ -1794,6 +1823,11 @@ class PassthroughClient:
                     result,
                     source=f"{provider}/{model}",
                 )
+                if provider.lower() == "google":
+                    # Capture Gemini thought_signatures so the next turn's
+                    # tool_calls can be re-injected if the client stripped
+                    # ``extra_content`` from the echoed assistant message.
+                    _gemini_cache().extract_and_store(result)
                 self._record_usage(
                     provider,
                     model,
@@ -2018,6 +2052,9 @@ class PassthroughClient:
             # Gemini's OpenAI compatibility endpoint rejects the `store` field
             # even when explicitly disabled; drop it so valid requests succeed.
             body.pop("store", None)
+            # Re-inject thought_signatures clients stripped from assistant
+            # tool_calls. Gemini requires them on follow-up turns.
+            _gemini_cache().inject_into_messages(body.get("messages") or [])
         if provider.lower() == _OPENCODE_GO_PROVIDER:
             effort = body.get("reasoning_effort")
             if isinstance(effort, str):
@@ -2570,7 +2607,8 @@ class PassthroughClient:
                     raise envelope_error
                 if _stream_frame_is_terminal(frame):
                     saw_terminal = True
-
+                if provider and provider.lower() == "google":
+                    _try_extract_thought_signatures(frame)
         try:
             for chunk in initial_chunks or []:
                 observe(chunk)
