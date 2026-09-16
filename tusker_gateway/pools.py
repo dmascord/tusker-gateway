@@ -659,13 +659,13 @@ class PoolManager:
                         model_data["input_modalities"] = sorted(modalities)
                     eligible[(entry.provider, entry.model)] = model_data
 
+            desired_auto = set(eligible) - static_pairs
             logger.info(
                 "auto_catalog debug pool='%s' catalog_providers=%d eligible=%d desired_auto=%d excluded_special=%d static_pairs=%d",
                 pool_name, len(catalog_providers), len(eligible),
                 len(desired_auto), len(excluded_special_models),
                 len(static_pairs),
             )
-            desired_auto = set(eligible) - static_pairs
             static_models = [
                 model for model in pool.models
                 if (
