@@ -355,6 +355,7 @@ class MetricsRegistry:
         # Render every metric
         for m in (
             self.requests_total, self.tokens_total, self.request_duration,
+            self.first_token_latency,
             self.cache_hits, self.cache_misses, self.cache_writes, self.cache_evictions,
             self.semantic_cache_hits, self.semantic_cache_misses,
             self.semantic_cache_writes, self.semantic_cache_evictions,
