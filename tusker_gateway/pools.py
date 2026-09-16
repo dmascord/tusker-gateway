@@ -648,7 +648,7 @@ class PoolManager:
                     # Deprioritise auto-discovered heavyweights so they are only
                     # selected after all weight-1.0 candidates are exhausted.
                     # This prevents expensive catalog entries (e.g. claude-sonnet-4.6
-                    # via copilot) from burning a limited budget alongside known-good
+                    # via copilot) from burning a limited budget alongside the
                     # static models before the quality DB has evidence.
                     if heavyweight:
                         model_data["weight"] = AUTO_DISCOVERED_HEAVYWEIGHT_WEIGHT
@@ -659,6 +659,12 @@ class PoolManager:
                         model_data["input_modalities"] = sorted(modalities)
                     eligible[(entry.provider, entry.model)] = model_data
 
+            logger.info(
+                "auto_catalog debug pool='%s' catalog_providers=%d eligible=%d desired_auto=%d excluded_special=%d static_pairs=%d",
+                pool_name, len(catalog_providers), len(eligible),
+                len(desired_auto), len(excluded_special_models),
+                len(static_pairs),
+            )
             desired_auto = set(eligible) - static_pairs
             static_models = [
                 model for model in pool.models
