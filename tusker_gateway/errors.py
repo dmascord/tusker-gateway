@@ -38,6 +38,22 @@ class BadRequestError(GatewayError):
     error_type = "invalid_request_error"
 
 
+class HighImpactApprovalRequiredError(GatewayError):
+    """A proposed consequential tool action needs explicit user approval."""
+
+    status = 428
+    error_type = "invalid_request_error"
+
+    def __init__(self, *, provider: str, model: str, action: str) -> None:
+        super().__init__(
+            f"Explicit user approval is required before high-impact tool action: {action}",
+            code="approval_required",
+        )
+        self.provider = provider
+        self.model = model
+        self.action = action
+
+
 class NoHealthyModelsError(BadRequestError):
     """A pool has no currently eligible upstream candidate.
 

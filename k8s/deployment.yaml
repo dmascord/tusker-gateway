@@ -140,6 +140,19 @@ spec:
         # provider_route_disabled instead of returning an upstream 502.
         - name: TUSKER_PASSTHROUGH_DISABLED_PROVIDERS
           value: cerebras
+        # Safety deny-list for upstream models that emit unsafe/high-impact
+        # tool plans. The gateway also has a built-in deny-list entry for
+        # xiaomi/mimo-v2.5; this env var is for operator extensions.
+        - name: TUSKER_BLACKLISTED_MODELS
+          value: ''
+        - name: TUSKER_GREYLISTED_MODELS
+          value: ''
+        # Comma-separated provider/model globs allowed to emit direct
+        # high-impact action tools (for example place_trade).
+        - name: TUSKER_TRUSTED_ACTION_MODELS
+          value: ''
+        - name: TUSKER_SUSPICIOUS_MODEL_THRESHOLD
+          value: '3'
         # /v1/rerank is a dedicated native-provider route and is not disabled
         # by the chat-pool list above. It uses rerank_path + provider keys.
         - name: TUSKER_POOL_CODE

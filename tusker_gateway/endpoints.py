@@ -18,10 +18,18 @@ from tusker_gateway.cache import ResponseCache, make_cache_key, make_caller_scop
 from tusker_gateway.budget import BudgetTracker
 from tusker_gateway.circuit_breaker import CircuitBreaker, BreakerDecision
 from tusker_gateway.cooldown import is_account_quota_exhausted
-from tusker_gateway.config import provider_route_is_disabled
+from tusker_gateway.config import (
+    model_is_blacklisted,
+    model_is_greylisted,
+    model_is_trusted_for_high_impact,
+    provider_route_is_disabled,
+    tools_include_high_impact,
+    tools_may_produce_high_impact,
+)
 from tusker_gateway.errors import (
     BadRequestError,
     GatewayError,
+    HighImpactApprovalRequiredError,
     InvalidToolCallArgumentsError,
     MalformedToolCallError,
     NoHealthyModelsError,
@@ -1538,6 +1546,99 @@ def _tool_argument_text(value: Any) -> str:
         return str(value)
 
 
+_HIGH_IMPACT_ARGUMENT_RE = re.compile(
+    r"\b(?:buy|sell|purchase|place[_ -]?trade|trade[_ -]?order|"
+    r"submit[_ -]?order|wire|transfer|withdraw|delete|destroy|"
+    r"send[_ -]?message|change[_ -]?(?:password|email|permissions))\b",
+    re.IGNORECASE,
+)
+
+
+def _high_impact_call_kind(call: dict[str, Any]) -> str | None:
+    """Classify a tool call without treating ordinary login clicks as risky."""
+    function = call.get("function") or {}
+    name = str(function.get("name") or "").strip().lower()
+    argument_text = _tool_argument_text(function.get("arguments"))
+    if name in {"place_trade", "submit_order", "send_message"}:
+        return name
+    if name in {"task", "browser", "computer", "playwright"} and _HIGH_IMPACT_ARGUMENT_RE.search(argument_text):
+        return name
+    if _HIGH_IMPACT_ARGUMENT_RE.search(argument_text):
+        return name or "tool"
+    return None
+
+
+def _enforce_high_impact_approval(
+    calls: list[dict[str, Any]],
+    *,
+    provider: str,
+    model: str,
+    request_id: str | None,
+    explicitly_authorized: bool,
+    greylisted: bool = False,
+) -> None:
+    risky = next(
+        (kind for call in calls if (kind := _high_impact_call_kind(call))),
+        None,
+    )
+    if risky is None:
+        return
+    suspicion_count = 0
+    newly_blacklisted = False
+    if not explicitly_authorized:
+        from tusker_gateway.safety import record_suspicious_behavior
+
+        suspicion_count, newly_blacklisted = record_suspicious_behavior(provider, model)
+    logger.warning(
+        "high-impact tool call intercepted provider=%s model=%s request_id=%s "
+        "action=%s greylisted=%s authorized=%s suspicion_count=%d newly_blacklisted=%s",
+        provider,
+        model,
+        request_id or "unknown",
+        risky,
+        greylisted,
+        explicitly_authorized,
+        suspicion_count,
+        newly_blacklisted,
+    )
+    if not explicitly_authorized:
+        raise HighImpactApprovalRequiredError(
+            provider=provider,
+            model=model,
+            action=risky,
+        )
+
+
+def _explicit_high_impact_authorization(messages: Any) -> bool:
+    """Require affirmative authorization in the latest user turn."""
+    if not isinstance(messages, list):
+        return False
+    latest_user = next(
+        (message for message in reversed(messages)
+         if isinstance(message, dict) and message.get("role") == "user"),
+        None,
+    )
+    if not isinstance(latest_user, dict):
+        return False
+    content = latest_user.get("content")
+    if isinstance(content, list):
+        content = " ".join(
+            str(item.get("text", "")) for item in content
+            if isinstance(item, dict) and item.get("type") == "text"
+        )
+    if not isinstance(content, str):
+        return False
+    if re.search(r"\b(?:do not|don't|dont|never|not authorized|unauthorized)\b", content, re.I):
+        return False
+    return bool(re.search(
+        r"\b(?:i\s+(?:explicitly\s+)?(?:approve|authorize)|"
+        r"go\s+ahead\s+and|proceed\s+with|place\s+the\s+order|"
+        r"make\s+the\s+purchase)\b",
+        content,
+        re.I,
+    ))
+
+
 def _tool_call_signature(calls: list[dict[str, Any]]) -> str:
     """Return bounded tool name/argument-length diagnostics."""
     signature: list[str] = []
@@ -1712,6 +1813,8 @@ def _validate_complete_tool_response(
     require_tool_call: bool,
     reject_empty: bool,
     tool_choice: Any = None,
+    explicitly_authorized: bool = False,
+    greylisted: bool = False,
 ) -> dict[str, Any]:
     """Validate a complete provider response before it can reach the client."""
     calls = _response_tool_calls(response)
@@ -1728,6 +1831,14 @@ def _validate_complete_tool_response(
             provider=provider,
             model=model,
             request_id=request_id,
+        )
+        _enforce_high_impact_approval(
+            calls,
+            provider=provider,
+            model=model,
+            request_id=request_id,
+            explicitly_authorized=explicitly_authorized,
+            greylisted=greylisted,
         )
     if reject_empty and not calls and not _response_has_visible_content(response):
         raise UnusableToolResponseError(
@@ -1757,6 +1868,8 @@ async def _prepare_stream_result(
     tools: list[dict[str, Any]] | None = None,
     require_tool_call: bool = False,
     tool_choice: Any = None,
+    explicitly_authorized: bool = False,
+    greylisted: bool = False,
 ) -> Any:
     """Validate a tool-bearing stream and return a stream ready for client consumption.
 
@@ -1786,6 +1899,8 @@ async def _prepare_stream_result(
             require_tool_call=require_tool_call,
             reject_empty=tools_requested,
             tool_choice=tool_choice,
+            explicitly_authorized=explicitly_authorized,
+            greylisted=greylisted,
         )
 
     if not tools_requested or not hasattr(result, "__aiter__"):
@@ -1815,6 +1930,8 @@ async def _prepare_stream_result(
 
     first_frame, rest = await _first_frame(normalized)
 
+    buffer_before_client = tools_may_produce_high_impact(tools)
+
     async def _early_stream(
         first_frame: bytes | None,
         iterator: AsyncIterator[bytes],
@@ -1841,7 +1958,8 @@ async def _prepare_stream_result(
                     saw_tool_call = True
                 if has_terminal:
                     saw_terminal = True
-                yield frame
+                if not buffer_before_client:
+                    yield frame
             assembled_calls = _assemble_stream_tool_calls(buffered)
             _validate_tool_call_contract(
                 assembled_calls,
@@ -1857,6 +1975,17 @@ async def _prepare_stream_result(
                     model=model,
                     request_id=request_id,
                 )
+                _enforce_high_impact_approval(
+                    assembled_calls,
+                    provider=provider,
+                    model=model,
+                    request_id=request_id,
+                    explicitly_authorized=explicitly_authorized,
+                    greylisted=greylisted,
+                )
+            if buffer_before_client:
+                for buffered_frame in buffered:
+                    yield buffered_frame
             preflight_decision = (
                 "tool_call"
                 if saw_tool_call
@@ -2080,6 +2209,18 @@ def _select_cache_route_target(
     if route.kind == "passthrough" and route.provider and route.model:
         if provider_route_is_disabled(config, route.provider):
             raise ProviderRouteDisabledError(route.provider)
+        if model_is_blacklisted(config, route.provider, route.model):
+            raise BadRequestError(
+                f"model route is blacklisted: {route.provider}/{route.model}",
+                code="model_blacklisted",
+            )
+        if tools_include_high_impact(body.get("tools")) and not model_is_trusted_for_high_impact(
+            config, route.provider, route.model
+        ):
+            raise BadRequestError(
+                f"model is not trusted for high-impact tools: {route.provider}/{route.model}",
+                code="high_impact_model_not_trusted",
+            )
         if breaker is not None and not breaker.check(route.provider, route.model).allowed:
             return None
         return route.provider, route.model
@@ -2095,6 +2236,7 @@ def _select_cache_route_target(
         select_kwargs: dict[str, Any] = {
             "excluded": set(excluded),
             "required_input_modalities": required_modalities,
+            "high_impact_tools": tools_include_high_impact(body.get("tools")),
         }
         if requires_structured_output:
             select_kwargs["requires_structured_output"] = True
@@ -2489,6 +2631,7 @@ async def _call_with_pool_fallback(
     extra_body = _build_extra_body(body)
     required_input_modalities = _required_input_modalities(body.get("messages"))
     requires_tools = bool(tools)
+    high_impact_tools = tools_include_high_impact(tools)
     pool_name = _pool_name(body)
     requires_structured_output = _requires_structured_output(body, pool_name)
     if pool_name is None:
@@ -2532,6 +2675,8 @@ async def _call_with_pool_fallback(
                     tools=tools,
                     require_tool_call=_tool_choice_requires_call(body.get("tool_choice")),
                     tool_choice=body.get("tool_choice"),
+                    explicitly_authorized=_explicit_high_impact_authorization(body.get("messages")),
+                    greylisted=model_is_greylisted(config, provider, model),
                 )
 
             result = await _await_attempt(
@@ -2569,6 +2714,9 @@ async def _call_with_pool_fallback(
                     model,
                     cooldown_secs=_cooldown_for_exc(exc),
                 )
+            raise
+        except HighImpactApprovalRequiredError:
+            # Never retry a consequential action with another model.
             raise
         except Exception as exc:
             _quarantine_tool_response_failure(config, provider, model, exc)
@@ -2640,6 +2788,8 @@ async def _call_with_pool_fallback(
                 select_kwargs["allowed_models"] = allowed_models
             if requires_tools:
                 select_kwargs["requires_tools"] = True
+            if high_impact_tools:
+                select_kwargs["high_impact_tools"] = True
             if requires_structured_output:
                 select_kwargs["requires_structured_output"] = True
             if recovery_probe:
@@ -2770,6 +2920,8 @@ async def _call_with_pool_fallback(
                     tools=tools,
                     require_tool_call=_tool_choice_requires_call(body.get("tool_choice")),
                     tool_choice=body.get("tool_choice"),
+                    explicitly_authorized=_explicit_high_impact_authorization(body.get("messages")),
+                    greylisted=model_is_greylisted(config, provider, model),
                 )
 
             result = await _await_attempt(
@@ -2836,6 +2988,9 @@ async def _call_with_pool_fallback(
                 getattr(exc, "upstream_status", None),
                 _pool_failure_summary(exc),
             )
+        except HighImpactApprovalRequiredError:
+            # Never retry a consequential action with another model.
+            raise
         except Exception as exc:
             _quarantine_tool_response_failure(config, provider, model, exc)
             if breaker is not None:
@@ -3876,6 +4031,7 @@ def _route_target(config: dict[str, Any], body: dict[str, Any]) -> tuple[str, st
             pool_name,
             required_input_modalities=_required_input_modalities(body.get("messages")),
             requires_structured_output=_requires_structured_output(body, pool_name),
+            high_impact_tools=tools_include_high_impact(body.get("tools")),
         )
         if not selected:
             raise NoHealthyModelsError(pool=pool_name)
@@ -3883,6 +4039,18 @@ def _route_target(config: dict[str, Any], body: dict[str, Any]) -> tuple[str, st
     if route.kind == "passthrough" and route.provider and route.model:
         if provider_route_is_disabled(config, route.provider):
             raise ProviderRouteDisabledError(route.provider)
+        if model_is_blacklisted(config, route.provider, route.model):
+            raise BadRequestError(
+                f"model route is blacklisted: {route.provider}/{route.model}",
+                code="model_blacklisted",
+            )
+        if tools_include_high_impact(body.get("tools")) and not model_is_trusted_for_high_impact(
+            config, route.provider, route.model
+        ):
+            raise BadRequestError(
+                f"model is not trusted for high-impact tools: {route.provider}/{route.model}",
+                code="high_impact_model_not_trusted",
+            )
         return route.provider, route.model
     raise BadRequestError("Unsupported model route", code="unsupported_route")
 

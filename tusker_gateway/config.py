@@ -5,6 +5,7 @@ import json
 import os
 import re
 import secrets
+import fnmatch
 from typing import Any
 from dataclasses import dataclass, field, replace
 from typing import Literal
@@ -12,6 +13,29 @@ from typing import Literal
 import logging
 
 logger = logging.getLogger(__name__)
+
+# Models that have produced unsafe/high-impact tool plans are denied before
+# pool selection. Keep this small and explicit; operators can extend it with
+# TUSKER_BLACKLISTED_MODELS using provider/model glob patterns.
+BUILTIN_BLACKLISTED_MODELS: tuple[str, ...] = ()
+BUILTIN_GREYLISTED_MODELS = (
+    "xiaomi/mimo-v2.5",
+)
+DEFAULT_TRUSTED_ACTION_MODELS = (
+    "openai-codex/*",
+    "github-copilot/*",
+    "github-copilot-enterprise/*",
+    "opencode-go/*",
+    "local-llm/*",
+    "mlx-mac/*",
+)
+HIGH_IMPACT_TOOL_NAMES = frozenset({
+    "place_trade", "submit_order", "send_message",
+})
+ACTION_CAPABLE_TOOL_NAMES = frozenset({
+    *HIGH_IMPACT_TOOL_NAMES,
+    "task", "browser", "computer", "playwright",
+})
 
 
 @dataclass
@@ -156,6 +180,30 @@ def load_config() -> dict[str, Any]:
         for p in _parse_env_list("TUSKER_PASSTHROUGH_DISABLED_PROVIDERS")
         if p.strip()
     ]
+    configured_blacklist = _parse_env_list("TUSKER_BLACKLISTED_MODELS")
+    config["blacklisted_models"] = tuple(
+        dict.fromkeys(
+            [*BUILTIN_BLACKLISTED_MODELS, *(
+                item.strip().lower().replace("_", "-")
+                for item in configured_blacklist
+                if item.strip()
+            )]
+        )
+    )
+    configured_greylist = _parse_env_list("TUSKER_GREYLISTED_MODELS")
+    config["greylisted_models"] = tuple(
+        dict.fromkeys(
+            [*BUILTIN_GREYLISTED_MODELS, *(
+                item.strip().lower().replace("_", "-")
+                for item in configured_greylist
+                if item.strip()
+            )]
+        )
+    )
+    configured_action_models = _parse_env_list("TUSKER_TRUSTED_ACTION_MODELS")
+    config["trusted_action_models"] = tuple(
+        configured_action_models or DEFAULT_TRUSTED_ACTION_MODELS
+    )
     # Providers whose catalog is considered a complete authoritative list for
     # negative discovery (route exclusion when absent from catalog). Default
     # empty: catalog presence/absence is never a selection gate without this.
@@ -309,6 +357,68 @@ def provider_route_is_disabled(config: dict[str, Any], provider: str) -> bool:
     """Return whether explicit chat passthrough is disabled for a provider."""
     normalized = str(provider or "").strip().lower().replace("_", "-")
     return normalized in config.get("passthrough_disabled_providers", ())
+
+
+def model_is_blacklisted(config: dict[str, Any], provider: str, model: str) -> bool:
+    """Return whether an upstream provider/model is denied by safety policy."""
+    candidate = (
+        f"{str(provider or '').strip().lower().replace('_', '-')}/"
+        f"{str(model or '').strip().lower()}"
+    )
+    from tusker_gateway.safety import is_runtime_blacklisted
+
+    return is_runtime_blacklisted(provider, model) or any(
+        fnmatch.fnmatchcase(candidate, str(pattern).strip().lower())
+        for pattern in config.get("blacklisted_models", ())
+    )
+
+
+def model_is_greylisted(config: dict[str, Any], provider: str, model: str) -> bool:
+    candidate = (
+        f"{str(provider or '').strip().lower().replace('_', '-')}/"
+        f"{str(model or '').strip().lower()}"
+    )
+    return any(fnmatch.fnmatchcase(candidate, str(pattern).strip().lower())
+               for pattern in config.get("greylisted_models", ()))
+
+
+def tools_include_high_impact(tools: Any) -> bool:
+    """Return whether a request exposes a high-impact action tool."""
+    if not isinstance(tools, (list, tuple)):
+        return False
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+        name = str(function.get("name") or "").strip().lower()
+        if name in HIGH_IMPACT_TOOL_NAMES:
+            return True
+    return False
+
+
+def tools_may_produce_high_impact(tools: Any) -> bool:
+    """Return whether a tool can plausibly produce a consequential action."""
+    if not isinstance(tools, (list, tuple)):
+        return False
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+        name = str(function.get("name") or "").strip().lower()
+        if name in ACTION_CAPABLE_TOOL_NAMES:
+            return True
+    return False
+
+
+def model_is_trusted_for_high_impact(
+    config: dict[str, Any], provider: str, model: str,
+) -> bool:
+    candidate = (
+        f"{str(provider or '').strip().lower().replace('_', '-')}/"
+        f"{str(model or '').strip().lower()}"
+    )
+    return any(fnmatch.fnmatchcase(candidate, str(pattern).strip().lower())
+               for pattern in config.get("trusted_action_models", ()))
 
 
 def _load_providers() -> dict[str, ProviderConfig]:

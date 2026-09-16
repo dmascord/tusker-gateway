@@ -22,7 +22,11 @@ from tusker_gateway.catalog import (
     advertised_output_modalities,
     advertised_tool_support,
 )
-from tusker_gateway.config import DEFAULT_PROVIDER_REGISTRY, PoolConfig
+from tusker_gateway.config import (
+    DEFAULT_PROVIDER_REGISTRY,
+    PoolConfig,
+    model_is_blacklisted,
+)
 from tusker_gateway.cooldown import CooldownTracker, global_tracker, is_permanently_failed
 from tusker_gateway.heavyweight import is_heavyweight
 from tusker_gateway.model_capability import (
@@ -326,6 +330,9 @@ class PoolManager:
     def _provider_is_disabled(self, provider: str) -> bool:
         """Return whether operator policy disables this provider for pools."""
         return str(provider).strip().lower().replace("_", "-") in self._disabled_providers
+
+    def _model_is_blacklisted(self, provider: str, model: str) -> bool:
+        return model_is_blacklisted(self.config, provider, model)
 
     def __post_init__(self):
         self.pools = dict(self.config.get("pools", {}))
@@ -994,6 +1001,7 @@ class PoolManager:
         excluded: set[tuple[str, str]] | None = None,
         required_input_modalities: set[str] | frozenset[str] | None = None,
         requires_tools: bool = False,
+        high_impact_tools: bool = False,
         requires_structured_output: bool = False,
         allow_cooldown_probe: bool = False,
         allow_unqualified_static_tools: bool = False,
@@ -1081,6 +1089,30 @@ class PoolManager:
                     for pattern in allowed_models
                 )
             ]
+        if high_impact_tools:
+            trusted_patterns = self.config.get("trusted_action_models", ())
+            before_action_policy = specs
+            specs = [
+                spec
+                for spec in specs
+                if any(
+                    fnmatch.fnmatchcase(
+                        f"{spec.provider}/{spec.model}", pattern
+                    )
+                    for pattern in trusted_patterns
+                )
+            ]
+            filtered_action_models = [
+                f"{spec.provider}/{spec.model}"
+                for spec in before_action_policy
+                if spec not in specs
+            ]
+            if filtered_action_models:
+                logger.warning(
+                    "high-impact tool model policy filtered=%d models=%s",
+                    len(filtered_action_models),
+                    ",".join(filtered_action_models[:12]),
+                )
         if not specs:
             unkeyed_count = len(self.unkeyed.get(pool_name, ()))
             logger.warning(
@@ -1128,6 +1160,9 @@ class PoolManager:
                 prev = self._stickiness[key]
                 for s in specs:
                     if (s.provider, s.model) == prev:
+                        if self._model_is_blacklisted(s.provider, s.model):
+                            self._drop_stickiness(key)
+                            break
                         if (s.provider, s.model) in catalog_unavailable:
                             self._drop_stickiness(key)
                             break
@@ -1200,6 +1235,8 @@ class PoolManager:
         filter_counts = {
             "request_excluded": 0,
             "unregistered_provider": 0,
+            "blacklisted_model": 0,
+            "high_impact_model_policy": 0,
             "catalog_unavailable": 0,
             "special_purpose": 0,
             "context_window": 0,
@@ -1213,6 +1250,9 @@ class PoolManager:
         }
         filtered_zdr_models: list[str] = []
         for s in specs:
+            if self._model_is_blacklisted(s.provider, s.model):
+                filter_counts["blacklisted_model"] += 1
+                continue
             if (s.provider, s.model) in excluded:
                 filter_counts["request_excluded"] += 1
                 continue
