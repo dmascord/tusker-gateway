@@ -772,26 +772,30 @@ class PoolManager:
         entry = self._catalog_entry_for(spec)
         modalities = spec.input_modalities
         if modalities is None:
+            # Catalog rows are refreshed independently from the persistent
+            # capability evidence. A provider may return a sparse or
+            # text-only row on a later refresh even though an earlier catalog
+            # snapshot (or a live probe) established image/audio/video
+            # support. Merge positive evidence instead of letting the newest,
+            # incomplete row erase known capabilities. Explicit pool metadata
+            # remains authoritative and is intentionally not merged here.
             modalities = advertised_input_modalities(entry)
-        if modalities is None and self._model_capability_db is not None:
-            # A catalog refresh records modality claims in the persistent DB
-            # as well as retaining the in-memory catalog row. Use those
-            # records when a provider's catalog is temporarily unavailable
-            # or its row does not carry the modality fields. Explicit pool
-            # metadata remains authoritative over this fallback.
-            records = (
-                model_capability_records.get(key, ())
-                if model_capability_records is not None
-                else self._model_capability_db.for_model(spec.provider, spec.model)
-            )
-            discovered_modalities = {
-                record.capability.removeprefix("input_")
-                for record in records
-                if record.capability.startswith("input_")
-                and record.status in {"advertised", "passed"}
-            }
-            if discovered_modalities:
-                modalities = frozenset(discovered_modalities)
+            if self._model_capability_db is not None:
+                records = (
+                    model_capability_records.get(key, ())
+                    if model_capability_records is not None
+                    else self._model_capability_db.for_model(spec.provider, spec.model)
+                )
+                evidenced_modalities = {
+                    record.capability.removeprefix("input_")
+                    for record in records
+                    if record.capability.startswith("input_")
+                    and record.status in {"advertised", "discovered", "passed"}
+                }
+                if evidenced_modalities:
+                    modalities = frozenset(
+                        set(modalities or ()) | evidenced_modalities
+                    )
         tool_support = advertised_tool_support(entry)
         capability_cache[key] = (modalities, tool_support)
         return modalities, tool_support

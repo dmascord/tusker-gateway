@@ -1106,6 +1106,52 @@ def test_selection_filters_catalog_models_without_tools_or_images():
         ) == ("openrouter", "tool-image")
 
 
+def test_persistent_positive_modality_evidence_survives_sparse_catalog():
+    """A later text-only catalog refresh must not erase known image support."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = PoolManager(
+            {
+                "pools": {
+                    "code": PoolConfig(
+                        name="code",
+                        models=[{"provider": "openrouter", "model": "vision-model"}],
+                    ),
+                },
+                "quality_db_path": os.path.join(tmpdir, "quality.db"),
+                "model_capability_db_path": os.path.join(tmpdir, "model-capability.db"),
+                "excluded_providers": [],
+                "provider_api_keys": {"openrouter": "k-openrouter"},
+            }
+        )
+        manager.catalog_registry = _CatalogRegistry(
+            {
+                "openrouter": [
+                    _CatalogEntry(
+                        "openrouter",
+                        "vision-model",
+                        raw={
+                            "architecture": {"input_modalities": ["text"]},
+                            "supported_parameters": ["max_tokens", "tools"],
+                        },
+                    ),
+                ],
+            }
+        )
+        manager._model_capability_db.record(
+            provider="openrouter",
+            model="vision-model",
+            capability="input_image",
+            status="advertised",
+            source="catalog",
+        )
+
+        assert manager.select(
+            "code",
+            required_input_modalities={"image"},
+            requires_tools=True,
+        ) == ("openrouter", "vision-model")
+
+
 def test_status_reports_catalog_and_live_modality_evidence():
     with tempfile.TemporaryDirectory() as tmpdir:
         manager = PoolManager(
