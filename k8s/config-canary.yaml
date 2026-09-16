@@ -172,6 +172,9 @@ items:
             value: '240000'
           - name: TUSKER_PROVIDER_ATTEMPT_TIMEOUT_OVERRIDES_JSON
             value: '{"local-llm": 240, "mlx-mac": 240}'
+          # Per-provider streaming per-chunk idle budget overrides (seconds).
+          - name: TUSKER_PROVIDER_STREAM_TIMEOUT_OVERRIDES_JSON
+            value: '{"xiaomi": 600}'
           # Single-request worker budgets on local backends. Cold-loading a
           # 7B-class model on the Jetson or MLX Mac saturates RAM and CPU;
           # queueing concurrent requests just stalls all of them. The gateway

@@ -466,12 +466,55 @@ def _quarantine_capacity_failure(
     return group
 
 
-# Per-read timeout for upstream SSE streams. The `total` budget below is the
-# hard cap on the whole request; `sock_read` caps the *gap* between bytes so a
-# stalled provider surfaces as a clean timeout instead of hanging silently
-# until `total` expires (which is what causes the "socket connection was
-# closed unexpectedly" symptom on the client).
-_UPSTREAM_STREAM_SOCK_READ_SECS = float(os.environ.get("TUSKER_UPSTREAM_SOCK_READ_SECS", "90"))
+
+# Per-read timeout for upstream SSE streams. The `total` budget below is a
+# per-chunk idle window, NOT a hard wall-clock cap. It resets on each chunk
+# received, so a provider streaming content never hits it unless it goes
+# silent. A per-provider override map can extend it for slow models (e.g.
+# xiaomi/mimo large contexts).
+_UPSTREAM_STREAM_SOCK_READ_SECS = float(
+    os.environ.get("TUSKER_UPSTREAM_SOCK_READ_SECS", "90")
+)
+
+
+def _stream_total_budget_overrides() -> dict[str, float]:
+    raw = os.environ.get("TUSKER_PROVIDER_STREAM_TIMEOUT_OVERRIDES_JSON", "").strip()
+    if not raw:
+        return {}
+    try:
+        import json as _json
+        data = _json.loads(raw)
+        if isinstance(data, dict):
+            return {str(k).lower(): float(v) for k, v in data.items()}
+    except Exception:
+        pass
+    return {}
+
+
+def _stream_total_budget(
+    request: "web.Request | None" = None,
+    provider: str | None = None,
+) -> float:
+    """Per-chunk idle window for SSE streams. Resets on each chunk received.
+
+    Per-provider override map from
+    ``TUSKER_PROVIDER_STREAM_TIMEOUT_OVERRIDES_JSON`` allows outliers
+    (e.g. xiaomi/mimo large contexts) to extend beyond the default.
+    """
+    try:
+        configured = max(
+            5.0,
+            float(os.environ.get("TUSKER_STREAM_TIMEOUT_SECS", "120")),
+        )
+    except (TypeError, ValueError):
+        configured = 120.0
+    if provider:
+        override = _stream_total_budget_overrides().get(provider.lower())
+        if override is not None:
+            configured = max(configured, override)
+    if request is None or not hasattr(request, "get"):
+        return configured
+    return configured
 
 
 # Build per-provider endpoints dict from the normalized registry in config.py
@@ -1660,11 +1703,17 @@ class PassthroughClient:
                     headers=headers,
                     json=body,
                     timeout=aiohttp.ClientTimeout(
-                        total=120,
+                        # No hard wall-clock cap. The per-chunk idle window
+                        # (sock_read) below is the only upstream timeout for
+                        # streams — a provider streaming content never hits
+                        # it unless it goes silent. Per-provider overrides
+                        # via TUSKER_PROVIDER_STREAM_TIMEOUT_OVERRIDES_JSON.
+                        total=None,
                         # Cap the *gap* between SSE bytes. If the provider goes
                         # silent for this long, aiohttp raises a clean
                         # asyncio.TimeoutError instead of letting the socket
-                        # hang until the 120s `total` fires.
+                        # hang. Per-chunk reset applies naturally since
+                        # sock_read is an idle timeout.
                         sock_read=_UPSTREAM_STREAM_SOCK_READ_SECS,
                     ),
                 )
@@ -1724,6 +1773,7 @@ class PassthroughClient:
                 capacity_lease=capacity_lease,
                 capacity_group=capacity_group,
                 started=start,
+                chunk_budget_secs=_stream_total_budget(provider=provider),
             )
             if upstream_model != model:
                 return _stream_with_model_alias(upstream_model, model, stream_iter)
@@ -2455,6 +2505,7 @@ class PassthroughClient:
         capacity_lease: CapacityLease | None = None,
         capacity_group: str | None = None,
         started: float | None = None,
+        chunk_budget_secs: float | None = None,
     ) -> AsyncIterator[bytes]:
         """Pump an upstream SSE response byte-for-byte to the gateway caller.
 
@@ -2525,9 +2576,26 @@ class PassthroughClient:
                 observe(chunk)
                 yield chunk
             iterator = stream_iterator or resp.content.iter_any()
-            async for chunk in iterator:
-                observe(chunk)
-                yield chunk
+            if chunk_budget_secs and chunk_budget_secs > 0:
+                # Enforce a per-chunk idle budget that resets on every chunk
+                # received. Providers streaming content never hit it; silent
+                # upstreams get a clean asyncio.TimeoutError instead of a
+                # hard wall-clock kill mid-generation.
+                async def _next_chunk() -> bytes:
+                    return await iterator.__anext__()
+                while True:
+                    try:
+                        chunk = await asyncio.wait_for(
+                            _next_chunk(), timeout=chunk_budget_secs
+                        )
+                    except StopAsyncIteration:
+                        break
+                    observe(chunk)
+                    yield chunk
+            else:
+                async for chunk in iterator:
+                    observe(chunk)
+                    yield chunk
             if not saw_terminal:
                 incomplete = ProviderError(
                     "Provider stream ended without a terminal event",
@@ -2561,9 +2629,14 @@ class PassthroughClient:
                 await self._record_stream_failure(provider, model, exc, started or time.monotonic())
             raise
         except asyncio.TimeoutError:
+            timeout_source = (
+                f"chunk_budget>{chunk_budget_secs}s"
+                if chunk_budget_secs
+                else f"sock_read>{_UPSTREAM_STREAM_SOCK_READ_SECS}s"
+            )
             logger.warning(
-                "upstream SSE read timeout (>%ss idle) provider=%s model=%s url=%s status=%s",
-                _UPSTREAM_STREAM_SOCK_READ_SECS,
+                "upstream SSE read timeout (%s idle) provider=%s model=%s url=%s status=%s",
+                timeout_source,
                 provider,
                 model,
                 upstream_str,
