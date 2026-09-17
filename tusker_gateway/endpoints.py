@@ -2555,14 +2555,22 @@ def _mark_permanently_failed(
     provider: str,
     model: str,
 ) -> None:
-    """Record a (provider, model) that returned a permanent 401/403.
+    """Record a (provider, model) that returned a permanent failure.
 
     The auto-free pool extension consults this to skip/prune genuinely-dead
-    models (agentic-harness-only, WAF-blocked, wrong-tier) so they don't
-    re-enter rotation and keep failing. Transient 5xx / 429 are NOT marked.
+    models (agentic-harness-only, WAF-blocked, wrong-tier, upstream-deprecated)
+    so they don't re-enter rotation and keep failing. Transient 5xx / 429 are
+    NOT marked.
+
+    404 / 410 are permanent for this key/account: a model advertised in the
+    upstream catalog can still 404 at the inference endpoint (e.g. Google
+    deprecated gemini-2.5-pro and gemini-2.0-flash but still lists them in
+    /v1beta/openai/models). Marking them permanently failed prunes them from
+    auto_catalog on the next refresh instead of letting them trip the breaker
+    every minute forever.
     """
     status = getattr(exc, "upstream_status", None)
-    if status in (401, 403):
+    if status in (401, 403, 404, 410):
         from tusker_gateway.cooldown import mark_permanently_failed
 
         mark_permanently_failed(provider, model)

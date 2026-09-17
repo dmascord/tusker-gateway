@@ -35,3 +35,24 @@ def test_unlisted_provider_keeps_provider_wide_behavior():
 
     assert tracker.is_cooldown("cohere", "command-r-plus")
     assert tracker.is_cooldown("cohere", "another-model")
+
+def test_permanent_failure_marker_covers_404_and_410():
+    """404/410 are permanent for this key/account even when the upstream
+    catalog still advertises the model (e.g. Google deprecated gemini-2.5-pro
+    and gemini-2.0-flash but continues to list them in /v1beta/openai/models).
+    """
+    from tusker_gateway.cooldown import (
+        clear_permanently_failed,
+        is_permanently_failed,
+        mark_permanently_failed,
+    )
+
+    route = ("google", "gemini-2.5-pro")
+    try:
+        mark_permanently_failed(*route)
+        assert is_permanently_failed(*route)
+        # Sibling models are unaffected.
+        assert not is_permanently_failed("google", "gemini-2.5-flash")
+    finally:
+        clear_permanently_failed(*route)
+        assert not is_permanently_failed(*route)

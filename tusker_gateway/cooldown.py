@@ -60,17 +60,22 @@ def is_account_quota_exhausted(body: str | None) -> bool:
     )
 
 # Non-429 permanent provider failures (401 auth / 403 forbidden / 404
-# not-found). These are not transient blips; a 60s cooldown makes the
-# breaker re-probe a dead model every minute forever. Back off for a long
+# not-found / 410 gone). These are not transient blips; a 60s cooldown makes
+# the breaker re-probe a dead model every minute forever. Back off for a long
 # window instead so the gateway leaves permanently-unavailable models alone.
+#
+# 404 / 410 are permanent for this key/account even when the upstream catalog
+# still advertises the model (e.g. Google deprecated gemini-2.5-pro and
+# gemini-2.0-flash but continues to list them in /v1beta/openai/models).
 PERMANENT_ERROR_COOLDOWN_SECS = float(
     os.environ.get("TUSKER_RETRY_PERMANENT_COOLDOWN", "3600")
 )
 
 # (provider, model) pairs observed returning a permanent 401/403/404/410.
 # The auto-free pool skips these so genuinely-dead models
-# (agentic-harness-only, WAF-blocked, wrong-tier) don't re-enter rotation.
-# Values are expiry timestamps (monotonic) or None for indefinite.
+# (agentic-harness-only, WAF-blocked, wrong-tier, upstream-deprecated) don't
+# re-enter rotation. Values are expiry timestamps (monotonic) or None for
+# indefinite.
 PERMANENTLY_FAILED_MODELS: dict[tuple[str, str], float | None] = {}
 
 
