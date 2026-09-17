@@ -635,6 +635,7 @@ def _load_pools() -> dict[str, PoolConfig]:
                     "groq",
                     "google",
                     "cerebras",
+                    "openrouter",
                 )
             ),
         )
