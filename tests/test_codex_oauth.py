@@ -267,6 +267,37 @@ async def test_codex_rotator_uses_codex_authority_and_persists_rotation(
 
 
 @pytest.mark.asyncio
+async def test_rotator_refreshes_access_token_rejected_before_local_expiry(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A provider 401 must force refresh even when the JWT is not expired."""
+    import tusker_gateway.codex_oauth as codex_oauth
+    from tusker_gateway.passthrough import CodexTokenRotator
+
+    refresh = AsyncMock(
+        return_value=(
+            {"access_token": "fresh-access", "refresh_token": "fresh-refresh"},
+            time.time() + 3600,
+        )
+    )
+    monkeypatch.setattr(codex_oauth, "refresh_codex_token", refresh)
+    rotator = CodexTokenRotator(
+        [{
+            "access_token": "revoked-access",
+            "refresh_token": "refresh-token",
+            "expires_at_ms": 9_999_999_999_999,
+        }],
+        http_client=object(),
+        provider="openai-codex",
+    )
+
+    assert await rotator.get_token() == "revoked-access"
+    assert await rotator.invalidate_access_token("revoked-access") is True
+    assert await rotator.get_token() == "fresh-access"
+    refresh.assert_awaited_once_with("refresh-token", http=rotator._http)
+
+
+@pytest.mark.asyncio
 async def test_codex_rotation_preserves_other_auth_pools(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,

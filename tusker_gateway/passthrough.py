@@ -860,7 +860,7 @@ class CodexTokenRotator:
                         continue
                 else:
                     retry_at = self._refresh_failed_until.get(idx, 0.0)
-                    if retry_at <= now:
+                    if retry_at <= now and self._is_near_expiry(cred):
                         pre_refresh = dict(cred)
                         try:
                             refreshed = await self._refresh_one(cred)
@@ -912,6 +912,33 @@ class CodexTokenRotator:
         if len(self._creds) > 1:
             async with self._lock:
                 self._index = (self._index + 1) % len(self._creds)
+
+    async def invalidate_access_token(self, token: str | None) -> bool:
+        """Force-refresh an access token rejected by the upstream.
+
+        Access-token expiry claims are not sufficient to detect revocation:
+        Codex can return 401 for an access token whose local expiry is still
+        hours away. Mark only the rejected credential as expired so the next
+        rotation slot refreshes it, without disturbing the other accounts.
+        """
+        fingerprint = self.fingerprint(token)
+        if not fingerprint:
+            return False
+        async with self._lock:
+            for index, cred in enumerate(self._creds):
+                if self.fingerprint(_creds_access_token(cred)) != fingerprint:
+                    continue
+                cred["expires_at_ms"] = 1
+                self._refresh_failed_until.pop(index, None)
+                logger.info(
+                    "oauth access token invalidated provider=%s credential_index=%d/%d fingerprint=%s reason=upstream_401",
+                    self._provider,
+                    index + 1,
+                    len(self._creds),
+                    fingerprint,
+                )
+                return True
+        return False
 
     async def refresh_if_needed(self, cred: dict[str, Any]) -> dict[str, Any]:
         """Check token expiry and refresh if needed."""
@@ -2333,6 +2360,20 @@ class PassthroughClient:
                         body_text[:300],
                     )
                 resp.release()
+                # A revoked Codex access token can still carry a future local
+                # expiry. Force-refresh the credential that produced this
+                # 401 before trying the next account; otherwise rotation
+                # keeps sending stale bearer tokens until their JWT expiry.
+                if status == 401 and rotator is not None:
+                    auth_value = str(headers.get("Authorization") or "")
+                    used_token = (
+                        auth_value[7:]
+                        if auth_value.lower().startswith("bearer ")
+                        else None
+                    )
+                    await rotator.invalidate_access_token(used_token)
+                    if attempt + 1 < max_attempts:
+                        continue
                 # get_token() already reserved the next credential before this
                 # request was sent, so advancing here would skip a credential.
                 raise
