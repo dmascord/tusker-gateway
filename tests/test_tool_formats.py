@@ -45,6 +45,16 @@ def test_normalize_tool_calls_generates_unique_ids_per_invocation():
     assert second[0]["id"].startswith("call_")
     assert first[0]["id"] != second[0]["id"]
 
+def test_normalize_tool_calls_preserves_gemini_thought_signature():
+    call = normalize_tool_calls([{
+        "id": "call_gemini",
+        "type": "function",
+        "function": {"name": "bash", "arguments": "{}"},
+        "extra_content": {"google": {"thought_signature": "opaque-signature"}},
+    }])[0]
+
+    assert call["extra_content"]["google"]["thought_signature"] == "opaque-signature"
+
 def test_openai_to_anthropic_tools():
     tools = [{"type": "function", "function": {"name": "b", "parameters": {"type": "object", "properties": {}}}}]
     res = openai_to_anthropic_tools(tools)

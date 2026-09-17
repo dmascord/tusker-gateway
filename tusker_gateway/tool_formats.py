@@ -275,13 +275,14 @@ def normalize_tool_calls(raw: Any) -> list[dict[str, Any]]:
         # function in separate streamed blocks, causing clients to concatenate
         # two independent argument objects into one malformed call.
         call_id = str(call_id or f"call_{secrets.token_hex(12)}")
-        calls.append(
-            {
-                "id": call_id,
-                "type": "function",
-                "function": {"name": name, "arguments": _json_args(args)},
-            }
-        )
+        normalized = {
+            "id": call_id,
+            "type": "function",
+            "function": {"name": name, "arguments": _json_args(args)},
+        }
+        if isinstance(item.get("extra_content"), dict):
+            normalized["extra_content"] = item["extra_content"]
+        calls.append(normalized)
     return calls
 
 

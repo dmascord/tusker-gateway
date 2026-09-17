@@ -1844,6 +1844,11 @@ class PassthroughClient:
             ) as resp:
                 await self._check_response(resp, provider=provider, model=model)
                 result = await resp.json()
+                if provider.lower() == "google":
+                    # Store the native tool_call shape before generic response
+                    # normalization, which otherwise may discard provider
+                    # extensions such as ``extra_content.google``.
+                    _gemini_cache().extract_and_store(result)
                 from tusker_gateway.tool_formats import normalize_response_tool_calls
 
                 result = normalize_response_tool_calls(
@@ -1851,9 +1856,8 @@ class PassthroughClient:
                     source=f"{provider}/{model}",
                 )
                 if provider.lower() == "google":
-                    # Capture Gemini thought_signatures so the next turn's
-                    # tool_calls can be re-injected if the client stripped
-                    # ``extra_content`` from the echoed assistant message.
+                    # The normalized object still carries provider extensions;
+                    # retain this second scan for adapters that add calls.
                     _gemini_cache().extract_and_store(result)
                 self._record_usage(
                     provider,
