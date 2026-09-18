@@ -180,7 +180,8 @@ async def test_modality_cycle_forwards_transient_and_delay_kwargs(monkeypatch):
     assert summary["passed"] == 1
 
 
-def test_needs_probe_differentiates_passed_from_unavailable():
+@pytest.mark.asyncio
+async def test_needs_probe_differentiates_passed_from_unavailable(monkeypatch):
     """Cache ``passed``/``unsupported`` for ``max_age_secs`` and
     ``unavailable`` (transient failures) for the shorter
     ``transient_max_age_secs``.

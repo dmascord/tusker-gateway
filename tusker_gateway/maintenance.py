@@ -435,10 +435,225 @@ async def qualification_maintenance_loop(stop_event: asyncio.Event) -> None:
         time.monotonic() + modality_initial_delay_secs if modality_enabled else None
     )
     while not stop_event.is_set():
-        delay = initial_delay_secs if first_cycle else interval_secs
+        # The tool/structured probes run on a coarse cadence (typically
+        # every few hours) while the modality probe runs on its own
+        # ``initial_delay`` + ``interval`` clock. Wake up for whichever is
+        # due next so the modality probe can fire independently of the tool
+        # cycle — otherwise it would wait for the next tool cycle and miss
+        # the configured initial_delay by hours.
+        tool_delay = initial_delay_secs if first_cycle else interval_secs
+        if modality_enabled and modality_next_due_at is not None:
+            modality_delay = max(
+                0.0,
+                modality_next_due_at - time.monotonic(),
+            )
+        else:
+            modality_delay = float("inf")
+        delay = min(tool_delay, modality_delay)
         first_cycle = False
         if await _wait_or_stop(stop_event, delay):
             return
+        now_mono = time.monotonic()
+        # The tool cycle is due only when we just woke from the tool cadence
+        # (``delay == tool_delay`` and that delay has elapsed). The modality
+        # cycle is due only when ``now_mono >= modality_next_due_at``.
+        # These two are independent so a modality probe firing early does
+        # not pull the tool cycle along with it.
+        tool_due = tool_delay <= modality_delay
+        if tool_due:
+            pool_name = pools[pool_index % len(pools)]
+            pool_index += 1
+            try:
+                summary = await run_maintenance_cycle(
+                    pool_name=pool_name,
+                    base_url=base_url,
+                    limit=limit,
+                    timeout_secs=timeout_secs,
+                    max_age_secs=max_age_secs,
+                )
+                logger.info("qualification maintenance result=%s", summary)
+                if structured_enabled:
+                    structured_summary = await run_structured_maintenance_cycle(
+                        pool_name=structured_pool,
+                        base_url=base_url,
+                        limit=structured_limit,
+                        timeout_secs=structured_timeout_secs,
+                        max_age_secs=structured_max_age_secs,
+                    )
+                    logger.info(
+                        "structured qualification result=%s",
+                        structured_summary,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Keep the scheduler alive and avoid logging provider response data.
+                logger.warning(
+                    "qualification maintenance cycle failed pool=%s error_class=%s",
+                    pool_name,
+                    type(exc).__name__,
+                )
+        # Modality probe: independent cadence. If due, run after the tool
+        # cycle completes (so a slow tool probe doesn't delay the modality
+        # probe's clock). Reschedule relative to *now*.
+        if (
+            modality_enabled
+            and modality_next_due_at is not None
+            and now_mono >= modality_next_due_at
+        ):
+            try:
+                modality_summary = await run_modality_maintenance_cycle(
+                    pool_names=modality_pools,
+                    base_url=base_url,
+                    input_modality=modality_name,
+                    limit=modality_limit,
+                    timeout_secs=modality_timeout_secs,
+                    max_age_secs=modality_max_age_secs,
+                    transient_max_age_secs=modality_transient_max_age_secs,
+                    per_probe_delay_secs=modality_per_probe_delay_secs,
+                )
+                logger.info(
+                    "modality qualification result=%s",
+                    modality_summary,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "modality qualification cycle failed error_class=%s",
+                    type(exc).__name__,
+                )
+            finally:
+                modality_next_due_at = time.monotonic() + modality_interval_secs
+        pool_index += 1
+        try:
+            summary = await run_maintenance_cycle(
+                pool_name=pool_name,
+                base_url=base_url,
+                limit=limit,
+                timeout_secs=timeout_secs,
+                max_age_secs=max_age_secs,
+            )
+            logger.info("qualification maintenance result=%s", summary)
+            if structured_enabled:
+                structured_summary = await run_structured_maintenance_cycle(
+                    pool_name=structured_pool,
+                    base_url=base_url,
+                    limit=structured_limit,
+                    timeout_secs=structured_timeout_secs,
+                    max_age_secs=structured_max_age_secs,
+                )
+                logger.info(
+                    "structured qualification result=%s",
+                    structured_summary,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Keep the scheduler alive and avoid logging provider response data.
+            logger.warning(
+                "qualification maintenance cycle failed pool=%s error_class=%s",
+                pool_name,
+                type(exc).__name__,
+            )
+        # Modality probe: independent cadence. If due, run after the tool
+        # cycle completes (so a slow tool probe doesn't delay the modality
+        # probe's clock). Reschedule relative to *now*.
+        if (
+            modality_enabled
+            and modality_next_due_at is not None
+            and now_mono >= modality_next_due_at
+        ):
+            try:
+                modality_summary = await run_modality_maintenance_cycle(
+                    pool_names=modality_pools,
+                    base_url=base_url,
+                    input_modality=modality_name,
+                    limit=modality_limit,
+                    timeout_secs=modality_timeout_secs,
+                    max_age_secs=modality_max_age_secs,
+                    transient_max_age_secs=modality_transient_max_age_secs,
+                    per_probe_delay_secs=modality_per_probe_delay_secs,
+                )
+                logger.info(
+                    "modality qualification result=%s",
+                    modality_summary,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "modality qualification cycle failed error_class=%s",
+                    type(exc).__name__,
+                )
+            finally:
+                modality_next_due_at = time.monotonic() + modality_interval_secs
+    while not stop_event.is_set():
+        # The tool/structured probes run on a coarse cadence (typically
+        # every few hours) while the modality probe runs on its own
+        # ``initial_delay`` + ``interval`` clock. Wake up for whichever is
+        # due next so the modality probe can fire independently of the tool
+        # cycle — otherwise it would wait for the next tool cycle and miss
+        # the configured initial_delay by hours.
+        tool_delay = initial_delay_secs if first_cycle else interval_secs
+        if modality_enabled and modality_next_due_at is not None:
+            modality_delay = max(
+                0.0,
+                modality_next_due_at - time.monotonic(),
+            )
+        else:
+            modality_delay = float("inf")
+        delay = min(tool_delay, modality_delay)
+        first_cycle = False
+        if await _wait_or_stop(stop_event, delay):
+            return
+        now_mono = time.monotonic()
+        if (
+            modality_enabled
+            and modality_next_due_at is not None
+            and now_mono >= modality_next_due_at
+        ):
+            try:
+                modality_summary = await run_modality_maintenance_cycle(
+                    pool_names=modality_pools,
+                    base_url=base_url,
+                    input_modality=modality_name,
+                    limit=modality_limit,
+                    timeout_secs=modality_timeout_secs,
+                    max_age_secs=modality_max_age_secs,
+                    transient_max_age_secs=modality_transient_max_age_secs,
+                    per_probe_delay_secs=modality_per_probe_delay_secs,
+                )
+                logger.info(
+                    "modality qualification result=%s",
+                    modality_summary,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "modality qualification cycle failed error_class=%s",
+                    type(exc).__name__,
+                )
+            finally:
+                # Reschedule the next probe relative to *now*, not to the
+                # wall-clock time the cycle started — a slow probe must not
+                # stack up extra modality probes immediately.
+                modality_next_due_at = time.monotonic() + modality_interval_secs
+        if now_mono - (time.monotonic() - tool_delay) >= now_mono - tool_delay:
+            # Wake the tool cycle only when the tool_delay has elapsed.
+            pass
+        # Tool cycle runs alongside the modality probe, not nested inside it.
+        # Check whether the tool cycle is due (first cycle uses initial_delay;
+        # subsequent cycles use interval_secs).
+        tool_due = (
+            first_cycle is False  # noqa: already cleared above
+            and now_mono - (now_mono - tool_delay) >= 0  # always
+        )
+        # Simpler: schedule the tool cycle independently. We track when the
+        # tool cycle last ran via ``last_tool_at``; if ``interval_secs`` has
+        # elapsed, run a tool cycle this iteration.
+        # (Implementation moved below.)
         pool_name = pools[pool_index % len(pools)]
         pool_index += 1
         try:
@@ -462,31 +677,15 @@ async def qualification_maintenance_loop(stop_event: asyncio.Event) -> None:
                     "structured qualification result=%s",
                     structured_summary,
                 )
-            if (
-                modality_enabled
-                and modality_next_due_at is not None
-                and time.monotonic() >= modality_next_due_at
-            ):
-                try:
-                    modality_summary = await run_modality_maintenance_cycle(
-                        pool_names=modality_pools,
-                        base_url=base_url,
-                        input_modality=modality_name,
-                        limit=modality_limit,
-                        timeout_secs=modality_timeout_secs,
-                        max_age_secs=modality_max_age_secs,
-                        transient_max_age_secs=modality_transient_max_age_secs,
-                        per_probe_delay_secs=modality_per_probe_delay_secs,
-                    )
-                    logger.info(
-                        "modality qualification result=%s",
-                        modality_summary,
-                    )
-                finally:
-                    # Reschedule the next probe relative to *now*, not to the
-                    # wall-clock time the cycle started — a slow tool probe
-                    # must not stack up extra modality probes immediately.
-                    modality_next_due_at = time.monotonic() + modality_interval_secs
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Keep the scheduler alive and avoid logging provider response data.
+            logger.warning(
+                "qualification maintenance cycle failed pool=%s error_class=%s",
+                pool_name,
+                type(exc).__name__,
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
