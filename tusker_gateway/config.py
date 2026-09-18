@@ -1,4 +1,5 @@
 """Configuration loaded from environment variables."""
+
 from __future__ import annotations
 
 import json
@@ -18,9 +19,7 @@ logger = logging.getLogger(__name__)
 # pool selection. Keep this small and explicit; operators can extend it with
 # TUSKER_BLACKLISTED_MODELS using provider/model glob patterns.
 BUILTIN_BLACKLISTED_MODELS: tuple[str, ...] = ()
-BUILTIN_GREYLISTED_MODELS = (
-    "xiaomi/mimo-v2.5",
-)
+BUILTIN_GREYLISTED_MODELS = ("xiaomi/mimo-v2.5",)
 DEFAULT_TRUSTED_ACTION_MODELS = (
     "openai-codex/*",
     "github-copilot/*",
@@ -29,18 +28,56 @@ DEFAULT_TRUSTED_ACTION_MODELS = (
     "local-llm/*",
     "mlx-mac/*",
 )
-HIGH_IMPACT_TOOL_NAMES = frozenset({
-    "place_trade", "submit_order", "send_message",
-})
-ACTION_CAPABLE_TOOL_NAMES = frozenset({
-    *HIGH_IMPACT_TOOL_NAMES,
-    "task", "browser", "computer", "playwright",
-})
+HIGH_IMPACT_TOOL_NAMES = frozenset(
+    {
+        "place_trade",
+        "submit_order",
+        "send_message",
+    }
+)
+ACTION_CAPABLE_TOOL_NAMES = frozenset(
+    {
+        *HIGH_IMPACT_TOOL_NAMES,
+        "task",
+        "browser",
+        "computer",
+        "playwright",
+    }
+)
+# Default instrument/broker identifiers that should trip the high-impact gate
+# even when the tool name is innocuous. Operators extend via
+# ``TUSKER_HIGH_IMPACT_INSTRUMENT_TOKENS`` (comma-separated, case-insensitive).
+DEFAULT_HIGH_IMPACT_INSTRUMENT_TOKENS = (
+    "nkce",
+    "amtd",
+    "fxmp-069",
+    "fxmpa",
+    "0364",
+)
+# Default content-injection phrases. Anything in this list, anywhere in the
+# chat-completion message stream, is treated as a high-impact signal even when
+# it isn't paired with a tool call. Operators extend via
+# ``TUSKER_HIGH_IMPACT_CONTENT_PATTERNS`` (comma-separated substrings).
+DEFAULT_HIGH_IMPACT_CONTENT_PATTERNS = (
+    "place.*fx units",
+    "buy now via",
+    "must pass.*validation",
+    "submit.*order",
+    "wire.*funds",
+    "execute the order",
+)
+# Dynamic greylist thresholds. A greylisted provider/model still routes, but
+# the high-impact gate fires *before* the request reaches the upstream — even
+# when the user turn contains an affirmative. Operators tune these via
+# ``TUSKER_HIGH_IMPACT_GREYLIST_FORCE_DENY`` (default "true": greylist forces
+# the gate to require explicit approval regardless of authorization text).
+HIGH_IMPACT_GREYLIST_FORCE_DENY = True
 
 
 @dataclass
 class ProviderConfig:
     """Normalized provider configuration."""
+
     name: str
     kind: Literal["bearer", "oauth", "local", "upstream"]
     base_url: str
@@ -126,6 +163,13 @@ def _parse_env_list(env_var: str) -> list[str]:
     return [x.strip() for x in raw.split(",") if x.strip()]
 
 
+def _bool_env(value: str | None, *, default: bool) -> bool:
+    """Parse a boolean env var, returning *default* on empty/missing input."""
+    if not value:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _parse_env_json_list(env_var: str) -> list[dict[str, Any]]:
     """Parse an env var as a JSON array of objects."""
     raw = os.environ.get(env_var, "").strip()
@@ -183,35 +227,69 @@ def load_config() -> dict[str, Any]:
     configured_blacklist = _parse_env_list("TUSKER_BLACKLISTED_MODELS")
     config["blacklisted_models"] = tuple(
         dict.fromkeys(
-            [*BUILTIN_BLACKLISTED_MODELS, *(
-                item.strip().lower().replace("_", "-")
-                for item in configured_blacklist
-                if item.strip()
-            )]
+            [
+                *BUILTIN_BLACKLISTED_MODELS,
+                *(
+                    item.strip().lower().replace("_", "-")
+                    for item in configured_blacklist
+                    if item.strip()
+                ),
+            ]
         )
     )
     configured_greylist = _parse_env_list("TUSKER_GREYLISTED_MODELS")
     config["greylisted_models"] = tuple(
         dict.fromkeys(
-            [*BUILTIN_GREYLISTED_MODELS, *(
-                item.strip().lower().replace("_", "-")
-                for item in configured_greylist
-                if item.strip()
-            )]
+            [
+                *BUILTIN_GREYLISTED_MODELS,
+                *(
+                    item.strip().lower().replace("_", "-")
+                    for item in configured_greylist
+                    if item.strip()
+                ),
+            ]
         )
     )
     configured_action_models = _parse_env_list("TUSKER_TRUSTED_ACTION_MODELS")
     config["trusted_action_models"] = tuple(
         configured_action_models or DEFAULT_TRUSTED_ACTION_MODELS
     )
+    # Dynamic instrument-token patterns. Anything in this list that appears in
+    # a tool-call argument string (or chat message) trips the high-impact
+    # gate. Defaulted to the canonical "Buy NKCE via AMTD" set so the gate
+    # fires even when the harness renames place_trade to something innocuous.
+    configured_instruments = [
+        token.strip().lower()
+        for token in _parse_env_list("TUSKER_HIGH_IMPACT_INSTRUMENT_TOKENS")
+        if token.strip()
+    ]
+    config["high_impact_instrument_tokens"] = tuple(
+        dict.fromkeys([*DEFAULT_HIGH_IMPACT_INSTRUMENT_TOKENS, *configured_instruments])
+    )
+    # Dynamic content-injection phrases for the gate. Substring match,
+    # case-insensitive. Operators extend with comma-separated values.
+    configured_content_patterns = [
+        pattern.strip()
+        for pattern in _parse_env_list("TUSKER_HIGH_IMPACT_CONTENT_PATTERNS")
+        if pattern.strip()
+    ]
+    config["high_impact_content_patterns"] = tuple(
+        dict.fromkeys([*DEFAULT_HIGH_IMPACT_CONTENT_PATTERNS, *configured_content_patterns])
+    )
+    # Greylist enforcement mode. When true, a greylisted provider/model still
+    # routes, but the high-impact gate denies unapproved calls regardless of
+    # the user-turn authorization text. This is the safe default — operators
+    # must explicitly opt out to weaken the gate.
+    config["high_impact_greylist_force_deny"] = _bool_env(
+        os.environ.get("TUSKER_HIGH_IMPACT_GREYLIST_FORCE_DENY", ""),
+        default=HIGH_IMPACT_GREYLIST_FORCE_DENY,
+    )
     # Providers whose catalog is considered a complete authoritative list for
     # negative discovery (route exclusion when absent from catalog). Default
     # empty: catalog presence/absence is never a selection gate without this.
     # Opt in only after confirming that the provider catalog is complete.
     config["authoritative_catalog_providers"] = [
-        p.strip()
-        for p in _parse_env_list("TUSKER_AUTHORITATIVE_CATALOG_PROVIDERS")
-        if p.strip()
+        p.strip() for p in _parse_env_list("TUSKER_AUTHORITATIVE_CATALOG_PROVIDERS") if p.strip()
     ]
 
     # Normalized provider registry and API-key map.
@@ -259,7 +337,6 @@ def load_config() -> dict[str, Any]:
         "workers-ai": ["CF_API_TOKEN"],
         "github-copilot": ["GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN"],
         "github-copilot-enterprise": ["GITHUB_COPILOT_ENTERPRISE_TOKEN"],
-
     }
     for provider, alias_keys in _ENV_KEY_ALIASES.items():
         if provider in raw_providers:
@@ -279,15 +356,16 @@ def load_config() -> dict[str, Any]:
     auth_file = os.environ.get("TUSKER_AUTH_FILE", "").strip()
     if not auth_file:
         from pathlib import Path as _Path
+
         auth_file = str(_Path.home() / ".hermes" / "auth.json")
     config["auth_file"] = auth_file
     config["codex_credentials"] = _parse_env_json_list("CODEX_CREDENTIALS")
     auth_file_credentials: list[dict[str, Any]] = []
     try:
         from tusker_gateway.copilot_enroll import load_auth_file as _load_auth
+
         auth_file_credentials = [
-            credential for credential in _load_auth(auth_file)
-            if isinstance(credential, dict)
+            credential for credential in _load_auth(auth_file) if isinstance(credential, dict)
         ]
     except (OSError, TypeError, ValueError):
         pass
@@ -296,13 +374,10 @@ def load_config() -> dict[str, Any]:
             creds = auth_file_credentials
             # Filter to openai-codex credentials for the codex pool
             config["codex_credentials"] = [
-                c for c in creds
-                if str(c.get("provider", "openai-codex")).lower() == "openai-codex"
+                c for c in creds if str(c.get("provider", "openai-codex")).lower() == "openai-codex"
             ]
             # If no provider tag is present, keep all creds (legacy list-format file).
-            if not config["codex_credentials"] and any(
-                "provider" not in c for c in creds
-            ):
+            if not config["codex_credentials"] and any("provider" not in c for c in creds):
                 config["codex_credentials"] = creds
         except (OSError, TypeError, ValueError):
             pass
@@ -322,7 +397,8 @@ def load_config() -> dict[str, Any]:
             pool = config["codex_credentials"]
         if not pool:
             pool = [
-                credential for credential in auth_file_credentials
+                credential
+                for credential in auth_file_credentials
                 if str(credential.get("provider", "openai-codex")).lower() == provider
             ]
         credential_pools[provider] = pool
@@ -331,7 +407,12 @@ def load_config() -> dict[str, Any]:
     config["credential_pools"] = credential_pools
 
     from pathlib import Path as _Path
-    default_db = "/home/tusker/.hermes/model_quality.db" if _Path("/home/tusker").exists() else "/tmp/tusker-quality.db"
+
+    default_db = (
+        "/home/tusker/.hermes/model_quality.db"
+        if _Path("/home/tusker").exists()
+        else "/tmp/tusker-quality.db"
+    )
     config["quality_db_path"] = os.environ.get("QUALITY_DB_PATH", default_db)
     default_capability_db = (
         str(_Path(config["quality_db_path"]).with_name("model_capability.db"))
@@ -343,7 +424,7 @@ def load_config() -> dict[str, Any]:
         default_capability_db,
     )
     logger.info(
-        'config loaded: %d providers, %d pools, credential_pools=%s, quality_db=%s, capability_db=%s',
+        "config loaded: %d providers, %d pools, credential_pools=%s, quality_db=%s, capability_db=%s",
         len(config.get("providers", {})),
         len(config.get("pools", {})),
         {provider: len(credentials) for provider, credentials in credential_pools.items()},
@@ -378,8 +459,10 @@ def model_is_greylisted(config: dict[str, Any], provider: str, model: str) -> bo
         f"{str(provider or '').strip().lower().replace('_', '-')}/"
         f"{str(model or '').strip().lower()}"
     )
-    return any(fnmatch.fnmatchcase(candidate, str(pattern).strip().lower())
-               for pattern in config.get("greylisted_models", ()))
+    return any(
+        fnmatch.fnmatchcase(candidate, str(pattern).strip().lower())
+        for pattern in config.get("greylisted_models", ())
+    )
 
 
 def tools_include_high_impact(tools: Any) -> bool:
@@ -411,14 +494,71 @@ def tools_may_produce_high_impact(tools: Any) -> bool:
 
 
 def model_is_trusted_for_high_impact(
-    config: dict[str, Any], provider: str, model: str,
+    config: dict[str, Any],
+    provider: str,
+    model: str,
 ) -> bool:
     candidate = (
         f"{str(provider or '').strip().lower().replace('_', '-')}/"
         f"{str(model or '').strip().lower()}"
     )
-    return any(fnmatch.fnmatchcase(candidate, str(pattern).strip().lower())
-               for pattern in config.get("trusted_action_models", ()))
+    return any(
+        fnmatch.fnmatchcase(candidate, str(pattern).strip().lower())
+        for pattern in config.get("trusted_action_models", ())
+    )
+
+
+def build_high_impact_argument_regex(config: dict[str, Any]) -> re.Pattern[str]:
+    """Compile a regex that fires on any verb OR known-instrument token.
+
+    The verb set is the original ``buy|sell|...`` list. The instrument set is
+    configurable via ``high_impact_instrument_tokens`` so operators can add
+    broker or ticker symbols without code changes. The compiled regex is
+    cached on the config dict under ``high_impact_argument_regex``.
+    """
+    cached = config.get("high_impact_argument_regex")
+    if cached is not None:
+        return cached
+    verbs = (
+        r"(?:buy|sell|purchase|place[_ -]?trade|trade[_ -]?order|"
+        r"submit[_ -]?order|wire|transfer|withdraw|delete|destroy|"
+        r"send[_ -]?message|change[_ -]?(?:password|email|permissions))"
+    )
+    instruments = "|".join(
+        re.escape(token) for token in config.get("high_impact_instrument_tokens", ())
+    )
+    if instruments:
+        pattern = rf"\b(?:{verbs}|{instruments})\b"
+    else:
+        pattern = rf"\b(?:{verbs})\b"
+    compiled = re.compile(pattern, re.IGNORECASE)
+    config["high_impact_argument_regex"] = compiled
+    return compiled
+
+
+def build_high_impact_content_regex(config: dict[str, Any]) -> re.Pattern[str]:
+    """Compile a regex for high-impact content phrases found in message text.
+
+    Cached on the config dict under ``high_impact_content_regex``. Operators
+    extend the pattern set via ``high_impact_content_patterns``.
+    """
+    cached = config.get("high_impact_content_regex")
+    if cached is not None:
+        return cached
+    patterns = list(config.get("high_impact_content_patterns", ()))
+    body = "|".join(pattern.strip() for pattern in patterns if pattern.strip())
+    compiled = re.compile(rf"(?i)\b(?:{body})\b") if body else re.compile(r"(?!)")
+    config["high_impact_content_regex"] = compiled
+    return compiled
+
+
+def high_impact_greylist_force_deny(config: dict[str, Any]) -> bool:
+    """Whether the high-impact gate denies unapproved calls from greylisted models.
+
+    Defaults to ``True`` (safe). Operators opt out with
+    ``TUSKER_HIGH_IMPACT_GREYLIST_FORCE_DENY=false``.
+    """
+    return bool(config.get("high_impact_greylist_force_deny", True))
 
 
 def _load_providers() -> dict[str, ProviderConfig]:
@@ -443,43 +583,216 @@ def expand_env_placeholders(value: str | None) -> str | None:
 
 
 DEFAULT_PROVIDER_REGISTRY: dict[str, ProviderConfig] = {
-    "openai": ProviderConfig("openai", "bearer", "https://api.openai.com", "/v1/chat/completions", auth_env="OPENAI_API_KEY", models_path="/v1/models"),
-    "openrouter": ProviderConfig("openrouter", "bearer", "https://openrouter.ai/api/v1", "/chat/completions", auth_env="OPENROUTER_API_KEY", models_path="/models", embed_path="/embeddings"),
-    "groq": ProviderConfig("groq", "bearer", "https://api.groq.com/openai", "/v1/chat/completions", auth_env="GROQ_API_KEY", models_path="/v1/models"),
-    "arcee": ProviderConfig("arcee", "bearer", "https://api.arcee.ai/api/v1", "/chat/completions", auth_env="ARCEEAI_API_KEY", models_path="/models"),
-    "zai": ProviderConfig("zai", "bearer", "https://api.z.ai/api/coding/paas", "/v4/chat/completions", auth_env="GLM_API_KEY", models_path="/v4/models"),
-    "xiaomi": ProviderConfig("xiaomi", "bearer", "https://token-plan-sgp.xiaomimimo.com", "/v1/chat/completions", auth_env="XIAOMI_MIMO_API_KEY", zdr_ok=True),
-    "arliai": ProviderConfig("arliai", "bearer", "https://api.arliai.com", "/v1/chat/completions", auth_env="ARLIAI_API_KEY", models_path="/v1/models"),
-    "google": ProviderConfig("google", "bearer", "https://generativelanguage.googleapis.com", "/v1beta/openai/chat/completions", auth_env="GEMINI_API_KEY", models_path="/v1beta/openai/models"),
-    "cerebras": ProviderConfig("cerebras", "bearer", "https://api.cerebras.ai", "/v1/chat/completions", auth_env="CEREBRAS_API_KEY", models_path="/v1/models"),
-    "cohere": ProviderConfig("cohere", "bearer", "https://api.cohere.com/compatibility", "/v1/chat/completions", auth_env="COHERE_API_KEY", models_path="https://api.cohere.com/v1/models?page_size=1000", rerank_path="https://api.cohere.com/v2/rerank"),
+    "openai": ProviderConfig(
+        "openai",
+        "bearer",
+        "https://api.openai.com",
+        "/v1/chat/completions",
+        auth_env="OPENAI_API_KEY",
+        models_path="/v1/models",
+    ),
+    "openrouter": ProviderConfig(
+        "openrouter",
+        "bearer",
+        "https://openrouter.ai/api/v1",
+        "/chat/completions",
+        auth_env="OPENROUTER_API_KEY",
+        models_path="/models",
+        embed_path="/embeddings",
+    ),
+    "groq": ProviderConfig(
+        "groq",
+        "bearer",
+        "https://api.groq.com/openai",
+        "/v1/chat/completions",
+        auth_env="GROQ_API_KEY",
+        models_path="/v1/models",
+    ),
+    "arcee": ProviderConfig(
+        "arcee",
+        "bearer",
+        "https://api.arcee.ai/api/v1",
+        "/chat/completions",
+        auth_env="ARCEEAI_API_KEY",
+        models_path="/models",
+    ),
+    "zai": ProviderConfig(
+        "zai",
+        "bearer",
+        "https://api.z.ai/api/coding/paas",
+        "/v4/chat/completions",
+        auth_env="GLM_API_KEY",
+        models_path="/v4/models",
+    ),
+    "xiaomi": ProviderConfig(
+        "xiaomi",
+        "bearer",
+        "https://token-plan-sgp.xiaomimimo.com",
+        "/v1/chat/completions",
+        auth_env="XIAOMI_MIMO_API_KEY",
+        zdr_ok=True,
+    ),
+    "arliai": ProviderConfig(
+        "arliai",
+        "bearer",
+        "https://api.arliai.com",
+        "/v1/chat/completions",
+        auth_env="ARLIAI_API_KEY",
+        models_path="/v1/models",
+    ),
+    "google": ProviderConfig(
+        "google",
+        "bearer",
+        "https://generativelanguage.googleapis.com",
+        "/v1beta/openai/chat/completions",
+        auth_env="GEMINI_API_KEY",
+        models_path="/v1beta/openai/models",
+    ),
+    "cerebras": ProviderConfig(
+        "cerebras",
+        "bearer",
+        "https://api.cerebras.ai",
+        "/v1/chat/completions",
+        auth_env="CEREBRAS_API_KEY",
+        models_path="/v1/models",
+    ),
+    "cohere": ProviderConfig(
+        "cohere",
+        "bearer",
+        "https://api.cohere.com/compatibility",
+        "/v1/chat/completions",
+        auth_env="COHERE_API_KEY",
+        models_path="https://api.cohere.com/v1/models?page_size=1000",
+        rerank_path="https://api.cohere.com/v2/rerank",
+    ),
     # Rerank-only providers intentionally have no model catalog or chat pool
     # route. Their native endpoint is exposed through POST /v1/rerank.
-    "voyage": ProviderConfig("voyage", "bearer", "https://api.voyageai.com", "/v1/chat/completions", auth_env="VOYAGE_API_KEY", rerank_path="/v1/rerank", embed_path="/v1/embeddings"),
-    "jina": ProviderConfig("jina", "bearer", "https://api.jina.ai", "/v1/chat/completions", auth_env="JINA_API_KEY", rerank_path="/v1/rerank", embed_path="/v1/embeddings"),
-    "minimax": ProviderConfig("minimax", "bearer", "https://api.minimax.io", "/v1/chat/completions", auth_env="MINIMAX_API_KEY", models_path="/v1/models"),
+    "voyage": ProviderConfig(
+        "voyage",
+        "bearer",
+        "https://api.voyageai.com",
+        "/v1/chat/completions",
+        auth_env="VOYAGE_API_KEY",
+        rerank_path="/v1/rerank",
+        embed_path="/v1/embeddings",
+    ),
+    "jina": ProviderConfig(
+        "jina",
+        "bearer",
+        "https://api.jina.ai",
+        "/v1/chat/completions",
+        auth_env="JINA_API_KEY",
+        rerank_path="/v1/rerank",
+        embed_path="/v1/embeddings",
+    ),
+    "minimax": ProviderConfig(
+        "minimax",
+        "bearer",
+        "https://api.minimax.io",
+        "/v1/chat/completions",
+        auth_env="MINIMAX_API_KEY",
+        models_path="/v1/models",
+    ),
     # Synthetic's API policy states that prompts/completions are not retained
     # or used for training, and requires the same posture from inference
     # partners. Treat it as eligible for the privacy pool.
-    "synthetic": ProviderConfig("synthetic", "bearer", "https://api.synthetic.new", "/v1/chat/completions", auth_env="SYNTHETIC_API_KEY", models_path="/v1/models", embed_path="/v1/embeddings", zdr_ok=True),
+    "synthetic": ProviderConfig(
+        "synthetic",
+        "bearer",
+        "https://api.synthetic.new",
+        "/v1/chat/completions",
+        auth_env="SYNTHETIC_API_KEY",
+        models_path="/v1/models",
+        embed_path="/v1/embeddings",
+        zdr_ok=True,
+    ),
     # Ollama states that cloud prompts/completions are transient, not logged,
     # and not used for training. Local-llm is private by locality; both are
     # therefore eligible for the privacy pool when explicitly configured.
-    "ollama-cloud": ProviderConfig("ollama-cloud", "bearer", "https://ollama.com", "/v1/chat/completions", auth_env="OLLAMA_API_KEY", models_path="/v1/models", embed_path="/v1/embeddings", zdr_ok=True),
-    "opencode-go": ProviderConfig("opencode-go", "bearer", "https://opencode.ai/zen/go/v1", "/chat/completions", auth_env="OPENCODE_GO_API_KEY", zdr_ok=True),
-    "opencode-zen": ProviderConfig("opencode-zen", "bearer", "https://opencode.ai/zen", "/v1/chat/completions", auth_env="OPENCODE_ZEN_API_KEY"),
-    "openai-codex": ProviderConfig("openai-codex", "codex", "https://chatgpt.com/backend-api/codex", "/responses", pool_env="opencode_codex_credentials", auth_type="codex", model_header="x-openai-gpt-model", zdr_ok=True),
-    "github-copilot": ProviderConfig("github-copilot", "oauth", "https://api.githubcopilot.com", "/chat/completions", pool_env="GITHUB_COPILOT_CREDENTIALS", auth_type="oauth", model_header="x-github-gpt-model"),
+    "ollama-cloud": ProviderConfig(
+        "ollama-cloud",
+        "bearer",
+        "https://ollama.com",
+        "/v1/chat/completions",
+        auth_env="OLLAMA_API_KEY",
+        models_path="/v1/models",
+        embed_path="/v1/embeddings",
+        zdr_ok=True,
+    ),
+    "opencode-go": ProviderConfig(
+        "opencode-go",
+        "bearer",
+        "https://opencode.ai/zen/go/v1",
+        "/chat/completions",
+        auth_env="OPENCODE_GO_API_KEY",
+        zdr_ok=True,
+    ),
+    "opencode-zen": ProviderConfig(
+        "opencode-zen",
+        "bearer",
+        "https://opencode.ai/zen",
+        "/v1/chat/completions",
+        auth_env="OPENCODE_ZEN_API_KEY",
+    ),
+    "openai-codex": ProviderConfig(
+        "openai-codex",
+        "codex",
+        "https://chatgpt.com/backend-api/codex",
+        "/responses",
+        pool_env="opencode_codex_credentials",
+        auth_type="codex",
+        model_header="x-openai-gpt-model",
+        zdr_ok=True,
+    ),
+    "github-copilot": ProviderConfig(
+        "github-copilot",
+        "oauth",
+        "https://api.githubcopilot.com",
+        "/chat/completions",
+        pool_env="GITHUB_COPILOT_CREDENTIALS",
+        auth_type="oauth",
+        model_header="x-github-gpt-model",
+    ),
     # This is deliberately separate from public Copilot. Enterprise/business
     # Copilot has provider no-training/ZDR commitments; public individual
     # plans do not provide the same privacy boundary.
-    "github-copilot-enterprise": ProviderConfig("github-copilot-enterprise", "oauth", "https://copilot-api.sita.ghe.com", "/chat/completions", pool_env="GITHUB_COPILOT_ENTERPRISE_CREDENTIALS", auth_type="oauth", model_header="x-github-gpt-model", zdr_ok=True),
-    "local-llm": ProviderConfig("local-llm", "local", "http://localhost:11434", "/v1/chat/completions", models_path="/api/tags", embed_path="/v1/embeddings", zdr_ok=True),
-    "nvidia": ProviderConfig("nvidia", "bearer", "https://integrate.api.nvidia.com", "/v1/chat/completions", auth_env="NVIDIA_API_KEY", models_path="/v1/models"),
+    "github-copilot-enterprise": ProviderConfig(
+        "github-copilot-enterprise",
+        "oauth",
+        "https://copilot-api.sita.ghe.com",
+        "/chat/completions",
+        pool_env="GITHUB_COPILOT_ENTERPRISE_CREDENTIALS",
+        auth_type="oauth",
+        model_header="x-github-gpt-model",
+        zdr_ok=True,
+    ),
+    "local-llm": ProviderConfig(
+        "local-llm",
+        "local",
+        "http://localhost:11434",
+        "/v1/chat/completions",
+        models_path="/api/tags",
+        embed_path="/v1/embeddings",
+        zdr_ok=True,
+    ),
+    "nvidia": ProviderConfig(
+        "nvidia",
+        "bearer",
+        "https://integrate.api.nvidia.com",
+        "/v1/chat/completions",
+        auth_env="NVIDIA_API_KEY",
+        models_path="/v1/models",
+    ),
     # Cloudflare Workers AI OpenAI-compatible API. The base URL embeds the
     # account ID; ``{CF_ACCOUNT_ID}`` (and any other ``{ENV_VAR}`` tokens) are
     # substituted from the process environment in _provider_registry_from_env.
-    "workers-ai": ProviderConfig("workers-ai", "bearer", "https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai", "/v1/chat/completions", auth_env="CF_API_TOKEN"),
+    "workers-ai": ProviderConfig(
+        "workers-ai",
+        "bearer",
+        "https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai",
+        "/v1/chat/completions",
+        auth_env="CF_API_TOKEN",
+    ),
     # Alibaba Cloud Model Studio "Token Plan" keys (``sk-sp-…`` prefix) are
     # only valid against the region-scoped token-plan endpoint, not the
     # standard DashScope compatible-mode API. Key is wired via
@@ -491,18 +804,30 @@ DEFAULT_PROVIDER_REGISTRY: dict[str, ProviderConfig] = {
     # Must NOT be added to the privacy pool; must NOT carry zdr_ok=True.
     # Enterprise/business tiers may have separate terms — review before
     # changing this annotation.
-    "alibaba": ProviderConfig("alibaba", "bearer", "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode", "/v1/chat/completions", auth_env="ALIBABA_API_KEY", models_path="/v1/models"),
+    "alibaba": ProviderConfig(
+        "alibaba",
+        "bearer",
+        "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode",
+        "/v1/chat/completions",
+        auth_env="ALIBABA_API_KEY",
+        models_path="/v1/models",
+    ),
 }
+
 
 def _provider_registry_from_env() -> dict[str, ProviderConfig]:
     registry = {
         name: replace(
             provider_config,
             base_url=expand_env_placeholders(provider_config.base_url) or provider_config.base_url,
-            chat_path=expand_env_placeholders(provider_config.chat_path) or provider_config.chat_path,
-            models_path=expand_env_placeholders(provider_config.models_path) or provider_config.models_path,
-            rerank_path=expand_env_placeholders(provider_config.rerank_path) or provider_config.rerank_path,
-            embed_path=expand_env_placeholders(provider_config.embed_path) or provider_config.embed_path,
+            chat_path=expand_env_placeholders(provider_config.chat_path)
+            or provider_config.chat_path,
+            models_path=expand_env_placeholders(provider_config.models_path)
+            or provider_config.models_path,
+            rerank_path=expand_env_placeholders(provider_config.rerank_path)
+            or provider_config.rerank_path,
+            embed_path=expand_env_placeholders(provider_config.embed_path)
+            or provider_config.embed_path,
         )
         for name, provider_config in DEFAULT_PROVIDER_REGISTRY.items()
     }
@@ -520,16 +845,22 @@ def _provider_registry_from_env() -> dict[str, ProviderConfig]:
                     "name": str(name).lower(),
                     "kind": value.get("kind", value.get("auth_type", "bearer")),
                     "base_url": expand_env_placeholders(value.get("base_url")) or value["base_url"],
-                    "chat_path": expand_env_placeholders(value.get("chat_path")) or value.get("chat_path", "/v1/chat/completions"),
+                    "chat_path": expand_env_placeholders(value.get("chat_path"))
+                    or value.get("chat_path", "/v1/chat/completions"),
                     "auth_env": value.get("auth_env"),
                     "pool_env": value.get("pool_env"),
                     "model_header": value.get("model_header"),
                     "auth_type": value.get("auth_type", value.get("kind", "bearer")),
                     "zdr_ok": bool(value.get("zdr_ok", False)),
                     "heavyweight": bool(value.get("heavyweight", False)),
-                    "models_path": expand_env_placeholders(value.get("models_path", value.get("catalog_path"))) or value.get("models_path", value.get("catalog_path")),
-                    "rerank_path": expand_env_placeholders(value.get("rerank_path")) or value.get("rerank_path"),
-                    "embed_path": expand_env_placeholders(value.get("embed_path")) or value.get("embed_path"),
+                    "models_path": expand_env_placeholders(
+                        value.get("models_path", value.get("catalog_path"))
+                    )
+                    or value.get("models_path", value.get("catalog_path")),
+                    "rerank_path": expand_env_placeholders(value.get("rerank_path"))
+                    or value.get("rerank_path"),
+                    "embed_path": expand_env_placeholders(value.get("embed_path"))
+                    or value.get("embed_path"),
                 }
                 # Parse model aliases: {"qwen3-coder": "/Users/tusker/models/..."}
                 raw_aliases = value.get("model_aliases")
@@ -539,7 +870,10 @@ def _provider_registry_from_env() -> dict[str, ProviderConfig]:
                     }
                 registry[str(name).lower()] = ProviderConfig(**merged)
     business_copilot = os.environ.get("TUSKER_COPILOT_BUSINESS", "").strip().lower() in {
-        "1", "true", "yes", "on",
+        "1",
+        "true",
+        "yes",
+        "on",
     }
     if business_copilot and "github-copilot" in registry:
         registry["github-copilot"] = replace(
@@ -548,6 +882,7 @@ def _provider_registry_from_env() -> dict[str, ProviderConfig]:
         )
 
     return registry
+
 
 def _load_pools() -> dict[str, PoolConfig]:
     """Load pool definitions from environment variables.
@@ -564,9 +899,7 @@ def _load_pools() -> dict[str, PoolConfig]:
     }
     """
     pools: dict[str, PoolConfig] = {}
-    default_auto_catalog_providers = _parse_env_list(
-        "TUSKER_AUTO_CATALOG_PROVIDERS"
-    )
+    default_auto_catalog_providers = _parse_env_list("TUSKER_AUTO_CATALOG_PROVIDERS")
 
     for key, value in os.environ.items():
         if not key.startswith("TUSKER_POOL_"):
@@ -606,7 +939,11 @@ def _load_pools() -> dict[str, PoolConfig]:
                 # relies on. Everything else is contributed by the auto_catalog merge.
                 {"provider": "groq", "model": "openai/gpt-oss-120b", "input_modalities": ["text"]},
                 {"provider": "groq", "model": "openai/gpt-oss-20b", "input_modalities": ["text"]},
-                {"provider": "groq", "model": "qwen/qwen3.6-27b", "input_modalities": ["text", "image"]},
+                {
+                    "provider": "groq",
+                    "model": "qwen/qwen3.6-27b",
+                    "input_modalities": ["text", "image"],
+                },
                 {"provider": "arcee", "model": "trinity-mini", "input_modalities": ["text"]},
             ],
             fallback_pools=("premium", "swarm"),
@@ -636,8 +973,16 @@ def _load_pools() -> dict[str, PoolConfig]:
             models=[
                 {"provider": "synthetic", "model": "syn:large:text", "input_modalities": ["text"]},
                 {"provider": "synthetic", "model": "syn:small:text", "input_modalities": ["text"]},
-                {"provider": "synthetic", "model": "syn:large:vision", "input_modalities": ["text", "image"]},
-                {"provider": "synthetic", "model": "syn:small:vision", "input_modalities": ["text", "image"]},
+                {
+                    "provider": "synthetic",
+                    "model": "syn:large:vision",
+                    "input_modalities": ["text", "image"],
+                },
+                {
+                    "provider": "synthetic",
+                    "model": "syn:small:vision",
+                    "input_modalities": ["text", "image"],
+                },
             ],
             zdr=True,
             auto_catalog=True,

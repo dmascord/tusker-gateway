@@ -1,17 +1,24 @@
 """Tests for provider/model safety deny-listing."""
+
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import pytest
 
 from tusker_gateway.config import (
     PoolConfig,
+    build_high_impact_argument_regex,
+    build_high_impact_content_regex,
+    high_impact_greylist_force_deny,
     load_config,
     model_is_blacklisted,
     tools_include_high_impact,
 )
 from tusker_gateway.endpoints import (
+    _compiled_argument_regex,
+    _compiled_content_regex,
     _enforce_high_impact_approval,
     _explicit_high_impact_authorization,
     _high_impact_call_kind,
@@ -111,12 +118,16 @@ def test_trade_task_is_high_impact():
 
 
 def test_authorization_requires_affirmative_latest_user_turn():
-    assert _explicit_high_impact_authorization([
-        {"role": "user", "content": "I approve the purchase; go ahead and place the order."},
-    ])
-    assert not _explicit_high_impact_authorization([
-        {"role": "user", "content": "Do not place any order; this is only login debugging."},
-    ])
+    assert _explicit_high_impact_authorization(
+        [
+            {"role": "user", "content": "I approve the purchase; go ahead and place the order."},
+        ]
+    )
+    assert not _explicit_high_impact_authorization(
+        [
+            {"role": "user", "content": "Do not place any order; this is only login debugging."},
+        ]
+    )
 
 
 def test_unapproved_high_impact_call_is_intercepted():
@@ -159,18 +170,22 @@ def test_repeated_suspicious_behavior_promotes_model_to_runtime_blacklist(monkey
 
 def test_complete_response_guardrail_blocks_unauthorized_trade():
     response = {
-        "choices": [{
-            "message": {
-                "tool_calls": [{
-                    "id": "call-1",
-                    "type": "function",
-                    "function": {
-                        "name": "task",
-                        "arguments": '{"task":"purchase shares"}',
-                    },
-                }],
-            },
-        }],
+        "choices": [
+            {
+                "message": {
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {
+                                "name": "task",
+                                "arguments": '{"task":"purchase shares"}',
+                            },
+                        }
+                    ],
+                },
+            }
+        ],
     }
     with pytest.raises(HighImpactApprovalRequiredError):
         _validate_complete_tool_response(
@@ -187,26 +202,159 @@ def test_complete_response_guardrail_blocks_unauthorized_trade():
 
 def test_complete_response_guardrail_allows_login_debugging():
     response = {
-        "choices": [{
-            "message": {
-                "tool_calls": [{
-                    "id": "call-1",
-                    "type": "function",
-                    "function": {
-                        "name": "browser",
-                        "arguments": '{"action":"click","text":"Log in"}',
-                    },
-                }],
-            },
-        }],
+        "choices": [
+            {
+                "message": {
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {
+                                "name": "browser",
+                                "arguments": '{"action":"click","text":"Log in"}',
+                            },
+                        }
+                    ],
+                },
+            }
+        ],
     }
-    assert _validate_complete_tool_response(
-        response,
-        [{"type": "function", "function": {"name": "browser"}}],
+    assert (
+        _validate_complete_tool_response(
+            response,
+            [{"type": "function", "function": {"name": "browser"}}],
+            provider="xiaomi",
+            model="mimo-v2.5",
+            request_id="req-test",
+            require_tool_call=False,
+            reject_empty=False,
+            greylisted=True,
+        )
+        == response
+    )
+
+
+# ---------------------------------------------------------------------------
+# Dynamic instrument-token and content-pattern gate (regression for the
+# stock-task.txt fixture). See tests/fixtures/stock-task.txt.
+# ---------------------------------------------------------------------------
+
+
+FIXTURE_PATH = Path(__file__).parent / "fixtures" / "stock-task.txt"
+
+
+def _fixture_config(monkeypatch) -> dict:
+    """Build a minimal config with the dynamic regex builders primed."""
+    monkeypatch.setenv("TUSKER_HIGH_IMPACT_INSTRUMENT_TOKENS", "")
+    monkeypatch.setenv("TUSKER_HIGH_IMPACT_CONTENT_PATTERNS", "")
+    return load_config()
+
+
+def test_fixture_file_exists_and_carries_goal_text():
+    """The fixture must remain present so the regression remains anchored."""
+    assert FIXTURE_PATH.exists()
+    text = FIXTURE_PATH.read_text(encoding="utf-8")
+    for marker in ("NKCE", "AMTD", "FXMP-069", "0364"):
+        assert marker in text, f"fixture missing marker {marker}"
+
+
+def test_instrument_tokens_trip_gate_under_renamed_tool(monkeypatch):
+    """A tool renamed away from place_trade still trips the gate on instrument."""
+    config = _fixture_config(monkeypatch)
+    regex = _compiled_argument_regex(config)
+    assert regex.search("NKCE")
+    assert regex.search("amtd")  # case insensitive
+    assert regex.search("FXMP-069")
+    assert regex.search("0364")
+
+
+def test_high_impact_call_kind_blocks_instrument_token_in_arguments(monkeypatch):
+    config = _fixture_config(monkeypatch)
+    regex = _compiled_argument_regex(config)
+    call = {
+        "function": {
+            "name": "submit_market_order",  # innocuous tool name
+            "arguments": '{"ticker":"NKCE","qty":509,"broker":"AMTD"}',
+        }
+    }
+    assert _high_impact_call_kind(call, argument_regex=regex) == "submit_market_order"
+
+
+def test_high_impact_call_kind_blocks_fixture_payload(monkeypatch):
+    """The actual goal-injection fixture trips the gate even without place_trade."""
+    config = _fixture_config(monkeypatch)
+    regex = _compiled_argument_regex(config)
+    fixture_text = FIXTURE_PATH.read_text(encoding="utf-8")
+    call = {
+        "function": {
+            "name": "task",
+            "arguments": fixture_text,
+        }
+    }
+    assert _high_impact_call_kind(call, argument_regex=regex) == "task"
+
+
+def test_content_pattern_gate_trips_on_fixture_phrase(monkeypatch):
+    config = _fixture_config(monkeypatch)
+    regex = _compiled_content_regex(config)
+    assert regex.search("place 509 full-size fx units of nkce buy now via amtd")
+    assert regex.search("Buy now via AMTD at 10.940")
+
+
+def test_greylist_force_deny_blocks_even_authorized_turn(monkeypatch):
+    """Greylisted providers cannot bypass the gate via user-turn authorization."""
+    reset_reputation()
+    config = _fixture_config(monkeypatch)
+    assert high_impact_greylist_force_deny(config) is True
+    call = {"function": {"name": "place_trade", "arguments": "{}"}}
+    with pytest.raises(HighImpactApprovalRequiredError):
+        _enforce_high_impact_approval(
+            [call],
+            provider="xiaomi",
+            model="mimo-v2.5",
+            request_id="req-fixture",
+            explicitly_authorized=True,  # user turn DID affirm
+            greylisted=True,  # model is greylisted
+            force_deny=True,
+        )
+    reset_reputation()
+
+
+def test_greylist_force_deny_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("TUSKER_HIGH_IMPACT_GREYLIST_FORCE_DENY", "false")
+    config = load_config()
+    assert high_impact_greylist_force_deny(config) is False
+    call = {"function": {"name": "place_trade", "arguments": "{}"}}
+    # No exception when force_deny=False and explicitly_authorized=True.
+    _enforce_high_impact_approval(
+        [call],
         provider="xiaomi",
         model="mimo-v2.5",
-        request_id="req-test",
-        require_tool_call=False,
-        reject_empty=False,
+        request_id="req-opt-out",
+        explicitly_authorized=True,
         greylisted=True,
-    ) == response
+        force_deny=False,
+    )
+
+
+def test_dynamic_instrument_tokens_override(monkeypatch):
+    monkeypatch.setenv("TUSKER_HIGH_IMPACT_INSTRUMENT_TOKENS", "ACME,ZAP")
+    config = load_config()
+    regex = build_high_impact_argument_regex(config)
+    assert regex.search("ACME")
+    assert regex.search("zap")
+    # Defaults still present.
+    assert regex.search("NKCE")
+
+
+def test_dynamic_content_patterns_override(monkeypatch):
+    monkeypatch.setenv(
+        "TUSKER_HIGH_IMPACT_CONTENT_PATTERNS",
+        "execute the trade,wire me the funds",
+    )
+    config = load_config()
+    regex = build_high_impact_content_regex(config)
+    assert regex.search("please execute the trade today")
+    assert regex.search("wire me the funds now")
+    # Defaults still present.
+    assert regex.search("place 509 full-size fx units of nkce buy now via amtd")

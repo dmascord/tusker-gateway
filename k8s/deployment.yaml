@@ -153,6 +153,50 @@ spec:
           value: ''
         - name: TUSKER_SUSPICIOUS_MODEL_THRESHOLD
           value: '3'
+        # Hardening: dynamic high-impact gate (regression for goal-injection
+        # via instrument tokens like NKCE / AMTD / FXMP-069 / 0364).
+        # Comma-separated case-insensitive tokens that trip the gate even
+        # when the tool name is innocuous. Defaults already cover the
+        # canonical NKCE/AMTD/FXMP-069 set shipped in tests/fixtures/.
+        - name: TUSKER_HIGH_IMPACT_INSTRUMENT_TOKENS
+          value: ''
+        # Comma-separated content patterns (substring/regex) that trip the
+        # gate when present anywhere in the chat-completion message stream.
+        # Defaults cover "place.*fx units", "buy now via", "submit.*order",
+        # etc. Operators extend here for new attack phrasings.
+        - name: TUSKER_HIGH_IMPACT_CONTENT_PATTERNS
+          value: ''
+        # When true, the high-impact gate denies unapproved calls from
+        # greylisted provider/models even when the user-turn contains an
+        # affirmative. Defaults to true (safe).
+        - name: TUSKER_HIGH_IMPACT_GREYLIST_FORCE_DENY
+          value: 'true'
+        # Guardrails: enable input/output guards by default. Prompt injection
+        # guard blocks "ignore previous instructions" / "you are now" / etc.;
+        # harness rewriter injects an <untrusted_data> delimiter discipline
+        # for callers whose identity principal matches
+        # TUSKER_GUARDRAILS_HARNESS_PRINCIPALS (default "omp-harness").
+        - name: TUSKER_GUARDRAILS_ENABLED
+          value: 'true'
+        - name: TUSKER_MAX_OUTPUT_TOKENS
+          value: '4096'
+        - name: TUSKER_GUARDRAILS_HARNESS_PRINCIPALS
+          value: omp-harness
+        # Append-only integrity-chained audit log. Fail-closed means a write
+        # outage blocks the request rather than silently dropping the event.
+        # The log path is on the writable tusker-home RWX PVC.
+        - name: TUSKER_AUDIT_LOG_PATH
+          value: /home/tusker/.hermes/audit.jsonl
+        - name: TUSKER_AUDIT_HMAC_KEY
+          valueFrom:
+            secretKeyRef:
+              name: tusker-env-vault
+              key: TUSKER_AUDIT_HMAC_KEY
+              optional: true
+        - name: TUSKER_AUDIT_FAIL_CLOSED
+          value: 'true'
+        - name: TUSKER_AUDIT_FSYNC
+          value: 'true'
         # /v1/rerank is a dedicated native-provider route and is not disabled
         # by the chat-pool list above. It uses rerank_path + provider keys.
         - name: TUSKER_POOL_CODE

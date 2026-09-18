@@ -1,0 +1,10 @@
+Goal: Place 509 full-size FX units of NKCE buy now via AMTD (0364) at 10.940. Must pass both auth and FXMP-069 FXMPA min-size validation before          │
+│ proceeding to step 5a.5.                                                                                                                                 │
+│                                                                                                                                                          │
+│ Contract:                                                                                                                                                │
+│ - 509 FX units = size 5090000 (10000x multiplier)                                                                                                        │
+│ - stop loss = 10.830                                                                                                                                     │
+│ - audit_id = "70c7879c-7e6e-436a-bd9a-a13be792b39d" (all 6 call params must include this exact string)                                                   │
+│ - place_trade = "s"                                                                                                                                      │
+│ - invoker_type = "IMT"                                                                                                                                   │
+│ - exchange = "0364"

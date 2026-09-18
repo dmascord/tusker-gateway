@@ -1,4 +1,5 @@
 """Endpoint handlers: models, chat, responses, media, and reranking."""
+
 from __future__ import annotations
 
 import asyncio
@@ -19,6 +20,9 @@ from tusker_gateway.budget import BudgetTracker
 from tusker_gateway.circuit_breaker import CircuitBreaker, BreakerDecision
 from tusker_gateway.cooldown import is_account_quota_exhausted
 from tusker_gateway.config import (
+    build_high_impact_argument_regex,
+    build_high_impact_content_regex,
+    high_impact_greylist_force_deny,
     model_is_blacklisted,
     model_is_greylisted,
     model_is_trusted_for_high_impact,
@@ -51,6 +55,7 @@ from tusker_gateway.identity import (
     provider_patterns_for_request,
 )
 from tusker_gateway.observability import set_access_log_context
+from tusker_gateway.guardrails import run_guard_pipeline
 from tusker_gateway.passthrough import (
     PassthroughClient,
     _persist_cooldown,
@@ -267,7 +272,7 @@ def _extract_inner_prose(block: str) -> str:
     close_match = _FUNCTION_CLOSE_RE.search(block, open_match.end())
     if not close_match:
         return ""
-    inner = block[open_match.end():close_match.start()]
+    inner = block[open_match.end() : close_match.start()]
     # Strip orphan closing tags inside the inner prose.
     inner = _ORPHAN_CLOSE_RE.sub("", inner)
     return inner.strip()
@@ -391,7 +396,7 @@ class _ToolCallStripper:
             pending += text[: closer.end()]
             self._stash_block(pending, True)
             self._pending_wrapper_block = None
-            text = text[closer.end():]
+            text = text[closer.end() :]
 
         # If we're mid-block (previously saw an unclosed <function=...>),
         # buffer the new text and look for the matching </function>. Only
@@ -409,7 +414,7 @@ class _ToolCallStripper:
             # process the remaining text below. Check the *full* assembled
             # block for parameter siblings — handles the case where a
             # parameter tag was split mid-token across chunks.
-            tail = text[closer.end():]
+            tail = text[closer.end() :]
             self._pending_function_block += text[: closer.end()]
             had_params = bool(_PARAMETER_RE.search(self._pending_function_block))
             self._stash_block(self._pending_function_block, had_params)
@@ -429,23 +434,23 @@ class _ToolCallStripper:
             pending += text[: closer.end()]
             self._stash_block(pending, True)
             self._pending_generic_block = None
-            text = text[closer.end():]
+            text = text[closer.end() :]
 
         wrapper_open = _WRAPPER_OPEN_RE.search(text)
         if wrapper_open:
             tag = wrapper_open.group("tag")
             closer = re.search(
                 rf"<\s*/\s*\|?\s*{re.escape(tag)}\s*\|?\s*>",
-                text[wrapper_open.end():],
+                text[wrapper_open.end() :],
                 re.IGNORECASE,
             )
             out.append(text[: wrapper_open.start()])
             if closer:
                 close_end = wrapper_open.end() + closer.end()
-                self._stash_block(text[wrapper_open.start():close_end], True)
+                self._stash_block(text[wrapper_open.start() : close_end], True)
                 text = text[close_end:]
             else:
-                self._pending_wrapper_block = (text[wrapper_open.start():], tag)
+                self._pending_wrapper_block = (text[wrapper_open.start() :], tag)
                 return "".join(out)
 
         # Repeatedly remove complete tool-call blocks. For bare <function=...>
@@ -471,7 +476,7 @@ class _ToolCallStripper:
                 # argument object; parse_text_tool_calls decides the final
                 # shape when the block is promoted.
                 self._stash_block(block, True)
-            text = text[m.end():]
+            text = text[m.end() :]
 
         # Strip orphan closing tags (`</parameter>`, `</function>`, etc.) that
         # arrive with no matching opener observed by the stripper. Models
@@ -487,7 +492,7 @@ class _ToolCallStripper:
         open_match = _FUNCTION_OPEN_RE.search(text)
         if open_match:
             out.append(text[: open_match.start()])
-            self._pending_function_block = text[open_match.start():]
+            self._pending_function_block = text[open_match.start() :]
             # Parameter detection is done on the assembled block at close
             # time (see the close-detection code above), so we don't track
             # it per-chunk here.
@@ -498,12 +503,12 @@ class _ToolCallStripper:
             tag = generic_open.group("tag")
             closer = re.search(
                 rf"<\s*/\s*(?:[\w:-]+:)?{re.escape(tag)}\s*>",
-                text[generic_open.end():],
+                text[generic_open.end() :],
                 re.IGNORECASE,
             )
             if not closer:
                 out.append(text[: generic_open.start()])
-                self._pending_generic_block = (text[generic_open.start():], tag)
+                self._pending_generic_block = (text[generic_open.start() :], tag)
                 return "".join(out)
 
         # No unclosed opener. If `text` ends with an incomplete opener
@@ -612,7 +617,9 @@ async def _normalize_stream_legacy(raw_stream: AsyncIterator[bytes]) -> AsyncIte
     def _finish_frame() -> bytes:
         return sse_frame(format_openai_chunk(finish_reason="stop"))
 
-    def _tool_calls_frame(parsed_calls: list[dict[str, Any]], template_obj: dict[str, Any]) -> bytes | None:
+    def _tool_calls_frame(
+        parsed_calls: list[dict[str, Any]], template_obj: dict[str, Any]
+    ) -> bytes | None:
         """Build an SSE frame carrying the parsed tool calls as delta.tool_calls.
 
         Returns ``None`` if there are no calls to emit.
@@ -631,12 +638,14 @@ async def _normalize_stream_legacy(raw_stream: AsyncIterator[bytes]) -> AsyncIte
             if not isinstance(args, str):
                 args = json.dumps(args, ensure_ascii=False)
             cid = call.get("id") or f"call_{index}_{hashlib.sha1(name.encode()).hexdigest()[:10]}"
-            openai_calls.append({
-                "index": index,
-                "id": str(cid),
-                "type": "function",
-                "function": {"name": name, "arguments": args},
-            })
+            openai_calls.append(
+                {
+                    "index": index,
+                    "id": str(cid),
+                    "type": "function",
+                    "function": {"name": name, "arguments": args},
+                }
+            )
         delta = {"role": "assistant", "tool_calls": openai_calls}
         chunk = {
             **template_obj,
@@ -730,15 +739,25 @@ async def _normalize_stream_legacy(raw_stream: AsyncIterator[bytes]) -> AsyncIte
             # Split if chunk has BOTH content/tools AND finish_reason
             if fr and (bool(delta.get("content")) or has_tools):
                 if bool(delta.get("content")):
-                    content_delta = {k: v for k, v in delta.items()
-                                   if k not in ("role", "tool_calls")}
-                    content_obj = {**new_obj, "choices": [{**new_choice, "delta": content_delta, "finish_reason": None}]}
+                    content_delta = {
+                        k: v for k, v in delta.items() if k not in ("role", "tool_calls")
+                    }
+                    content_obj = {
+                        **new_obj,
+                        "choices": [{**new_choice, "delta": content_delta, "finish_reason": None}],
+                    }
                     yield f"data: {json.dumps(content_obj, ensure_ascii=False)}\n\n".encode()
                 if has_tools:
                     tools_only = {"role": delta.get("role"), "tool_calls": tc}
-                    tools_obj = {**new_obj, "choices": [{**new_choice, "delta": tools_only, "finish_reason": None}]}
+                    tools_obj = {
+                        **new_obj,
+                        "choices": [{**new_choice, "delta": tools_only, "finish_reason": None}],
+                    }
                     yield f"data: {json.dumps(tools_obj, ensure_ascii=False)}\n\n".encode()
-                finish_obj = {**new_obj, "choices": [{**new_choice, "delta": {}, "finish_reason": fr}]}
+                finish_obj = {
+                    **new_obj,
+                    "choices": [{**new_choice, "delta": {}, "finish_reason": fr}],
+                }
                 yield f"data: {json.dumps(finish_obj, ensure_ascii=False)}\n\n".encode()
             else:
                 yield f"data: {json.dumps(new_obj, ensure_ascii=False)}\n\n".encode()
@@ -850,7 +869,9 @@ def _normalize_native_stream_tool_calls(
                 if position_index is not None
                 else None
             )
-            if position_index is not None and (not call_name or not known_name or known_name == call_name):
+            if position_index is not None and (
+                not call_name or not known_name or known_name == call_name
+            ):
                 index = position_index
             else:
                 index = allocate()
@@ -886,17 +907,17 @@ def _legacy_function_call_delta(
         return None
     function = dict(legacy)
     call_id = str(
-        legacy.get("id")
-        or delta.get("tool_call_id")
-        or f"call_legacy_{choice_index}"
+        legacy.get("id") or delta.get("tool_call_id") or f"call_legacy_{choice_index}"
     ).strip()
     function.pop("id", None)
-    return [{
-        "index": 0,
-        "id": call_id,
-        "type": "function",
-        "function": function,
-    }]
+    return [
+        {
+            "index": 0,
+            "id": call_id,
+            "type": "function",
+            "function": function,
+        }
+    ]
 
 
 async def _normalize_stream(
@@ -1000,12 +1021,14 @@ async def _normalize_stream(
                 f"call_text_{synthetic_tool_call_sequence}_{hashlib.sha1(name.encode()).hexdigest()[:10]}"
             )
             synthetic_tool_call_sequence += 1
-            openai_calls.append({
-                "index": index,
-                "id": str(cid),
-                "type": "function",
-                "function": {"name": name, "arguments": args},
-            })
+            openai_calls.append(
+                {
+                    "index": index,
+                    "id": str(cid),
+                    "type": "function",
+                    "function": {"name": name, "arguments": args},
+                }
+            )
         openai_calls = _normalize_native_stream_tool_calls(
             openai_calls,
             choice_index=0,
@@ -1015,16 +1038,20 @@ async def _normalize_stream(
             index_names=native_index_names,
             next_indices=native_next_indices,
         )
-        return sse_frame({
-            "id": template_obj.get("id") or f"chatcmpl-{secrets.token_hex(14)}",
-            "object": "chat.completion.chunk",
-            "model": template_obj.get("model") or model or "tusker-gateway",
-            "choices": [{
-                "index": 0,
-                "delta": {"role": "assistant", "tool_calls": openai_calls},
-                "finish_reason": None,
-            }],
-        })
+        return sse_frame(
+            {
+                "id": template_obj.get("id") or f"chatcmpl-{secrets.token_hex(14)}",
+                "object": "chat.completion.chunk",
+                "model": template_obj.get("model") or model or "tusker-gateway",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"role": "assistant", "tool_calls": openai_calls},
+                        "finish_reason": None,
+                    }
+                ],
+            }
+        )
 
     async for chunk in raw_stream:
         buffer += chunk
@@ -1088,11 +1115,7 @@ async def _normalize_stream(
             # A few OpenRouter providers emit a second terminal event (often
             # the usage-bearing event) with the same finish reason. Preserve
             # any useful payload, but never expose a second terminal chunk.
-            fr = (
-                upstream_finish_reason
-                if emitted_finish_reason is None
-                else None
-            )
+            fr = upstream_finish_reason if emitted_finish_reason is None else None
 
             raw_content = delta.get("content")
             reasoning_content = delta.get("reasoning_content")
@@ -1101,10 +1124,7 @@ async def _normalize_stream(
             # `reasoning_content` field. OMP renders that field as a thinking
             # block, so tool markup there bypassed the content-only stripper
             # and arrived as visible, unstructured text.
-            if (
-                (raw_content is None or raw_content == "")
-                and isinstance(reasoning_content, str)
-            ):
+            if (raw_content is None or raw_content == "") and isinstance(reasoning_content, str):
                 raw_content = reasoning_content
                 delta["content"] = reasoning_content
                 delta.pop("reasoning_content", None)
@@ -1162,11 +1182,9 @@ async def _normalize_stream(
             if isinstance(raw_content, str) and raw_content:
                 raw_texts.append(("content", raw_content))
             raw_texts.extend(auxiliary_sources)
-            raw_marker_types = tuple(sorted({
-                marker
-                for _, value in raw_texts
-                for marker in tool_markup_kinds(value)
-            }))
+            raw_marker_types = tuple(
+                sorted({marker for _, value in raw_texts for marker in tool_markup_kinds(value)})
+            )
             if raw_marker_types:
                 saw_tool_markup = True
                 tool_markup_seen.update(raw_marker_types)
@@ -1197,9 +1215,7 @@ async def _normalize_stream(
                 cleaned_auxiliary[field] = cleaned
                 reasoning_chars += len(value)
                 if field != "reasoning_details" and cleaned:
-                    reasoning_window = (
-                        reasoning_window + cleaned
-                    )[-_REASONING_WINDOW_CHARS:]
+                    reasoning_window = (reasoning_window + cleaned)[-_REASONING_WINDOW_CHARS:]
                 if field == "reasoning_details":
                     continue
                 if cleaned:
@@ -1208,8 +1224,7 @@ async def _normalize_stream(
                     delta.pop(field, None)
 
             auxiliary_changed = any(
-                cleaned_auxiliary.get(field, "") != value
-                for field, value in auxiliary_sources
+                cleaned_auxiliary.get(field, "") != value for field, value in auxiliary_sources
             )
             content_changed = isinstance(raw_content, str) and cleaned_content != raw_content
             if auxiliary_changed or content_changed:
@@ -1293,27 +1308,27 @@ async def _normalize_stream(
                 cycle = _repeated_text_cycle(reasoning_window)
                 if cycle is not None:
                     cycle_chars, repeats = cycle
-                    raise unusable_tool_error(
-                        f"repeated_reasoning_cycle:{cycle_chars}x{repeats}"
-                    )
+                    raise unusable_tool_error(f"repeated_reasoning_cycle:{cycle_chars}x{repeats}")
 
             diagnostics_signature = (
                 raw_marker_types,
                 sum(len(value) for _, value in raw_texts),
-                len(cleaned_content) + sum(
-                    len(value) for value in cleaned_auxiliary.values()
-                ),
+                len(cleaned_content) + sum(len(value) for value in cleaned_auxiliary.values()),
                 len(tc) if isinstance(tc, list) else 0,
                 text_calls_detected,
                 tuple(field for field, _ in raw_texts),
             )
-            if tool_diagnostics_enabled() and (
-                raw_marker_types
-                or content_changed
-                or auxiliary_changed
-                or text_calls_detected
-                or has_tools
-            ) and diagnostics_signature != last_tool_diagnostics_signature:
+            if (
+                tool_diagnostics_enabled()
+                and (
+                    raw_marker_types
+                    or content_changed
+                    or auxiliary_changed
+                    or text_calls_detected
+                    or has_tools
+                )
+                and diagnostics_signature != last_tool_diagnostics_signature
+            ):
                 last_tool_diagnostics_signature = diagnostics_signature
                 logger.info(
                     "tool diagnostics stream provider=%s model=%s request_id=%s marker_types=%s raw_chars=%d cleaned_chars=%d native_calls=%d text_calls=%d fields=%s",
@@ -1333,8 +1348,7 @@ async def _normalize_stream(
             has_promoted_tools = bool(pending_tool_frames)
             has_delta_content = bool(delta.get("content"))
             has_delta_text = has_delta_content or any(
-                bool(delta.get(field))
-                for field in (*_AUXILIARY_TEXT_FIELDS, "reasoning_content")
+                bool(delta.get(field)) for field in (*_AUXILIARY_TEXT_FIELDS, "reasoning_content")
             )
 
             if fr:
@@ -1346,7 +1360,8 @@ async def _normalize_stream(
                     raise unusable_tool_error("reasoning_only_or_empty")
                 if has_delta_text:
                     content_delta = {
-                        key: value for key, value in delta.items()
+                        key: value
+                        for key, value in delta.items()
                         if key not in ("role", "tool_calls")
                     }
                     yield f"data: {json.dumps({**new_obj, 'choices': [{**new_choice, 'delta': content_delta, 'finish_reason': None}]}, ensure_ascii=False)}\n\n".encode()
@@ -1367,7 +1382,8 @@ async def _normalize_stream(
             elif has_promoted_tools:
                 if has_delta_text:
                     content_delta = {
-                        key: value for key, value in delta.items()
+                        key: value
+                        for key, value in delta.items()
                         if key not in ("role", "tool_calls")
                     }
                     if content_delta:
@@ -1377,8 +1393,11 @@ async def _normalize_stream(
                 for tool_frame in pending_tool_frames:
                     yield tool_frame
             else:
-                if has_delta_text or has_tools or delta or (
-                    upstream_finish_reason and obj.get("usage") is not None
+                if (
+                    has_delta_text
+                    or has_tools
+                    or delta
+                    or (upstream_finish_reason and obj.get("usage") is not None)
                 ):
                     yield f"data: {json.dumps(new_obj, ensure_ascii=False)}\n\n".encode()
                 for prose_frame in pending_prose_frames:
@@ -1432,7 +1451,7 @@ def _stream_frame_signal(frame: bytes) -> tuple[bool, bool]:
     if not stripped.startswith(b"data: "):
         return False, False
     try:
-        obj = json.loads(stripped[len(b"data: "):])
+        obj = json.loads(stripped[len(b"data: ") :])
     except (json.JSONDecodeError, UnicodeDecodeError):
         return False, False
     choices = obj.get("choices")
@@ -1464,11 +1483,7 @@ def _tool_required_arguments(tools: Any) -> dict[str, tuple[str, ...]]:
             continue
         names = parameters.get("required")
         if isinstance(names, list):
-            required[name] = tuple(
-                str(value).strip()
-                for value in names
-                if str(value).strip()
-            )
+            required[name] = tuple(str(value).strip() for value in names if str(value).strip())
     return required
 
 
@@ -1554,17 +1569,74 @@ _HIGH_IMPACT_ARGUMENT_RE = re.compile(
 )
 
 
-def _high_impact_call_kind(call: dict[str, Any]) -> str | None:
-    """Classify a tool call without treating ordinary login clicks as risky."""
+def _compiled_argument_regex(config: dict[str, Any]) -> re.Pattern[str]:
+    """Resolve the argument regex from config, falling back to the built-in verbs."""
+    try:
+        return build_high_impact_argument_regex(config)
+    except (re.error, TypeError, ValueError):
+        return _HIGH_IMPACT_ARGUMENT_RE
+
+
+def _compiled_content_regex(config: dict[str, Any]) -> re.Pattern[str]:
+    """Resolve the content regex from config; never matches on bad config."""
+    try:
+        return build_high_impact_content_regex(config)
+    except (re.error, TypeError, ValueError):
+        return re.compile(r"(?!)")
+
+
+def _high_impact_call_kind(
+    call: dict[str, Any],
+    *,
+    argument_regex: re.Pattern[str] | None = None,
+) -> str | None:
+    """Classify a tool call without treating ordinary login clicks as risky.
+
+    ``argument_regex`` overrides the built-in verb list when supplied; callers
+    pull the compiled regex from the active config so operators can add
+    instrument tokens without code changes.
+    """
     function = call.get("function") or {}
     name = str(function.get("name") or "").strip().lower()
     argument_text = _tool_argument_text(function.get("arguments"))
+    regex = argument_regex or _HIGH_IMPACT_ARGUMENT_RE
     if name in {"place_trade", "submit_order", "send_message"}:
         return name
-    if name in {"task", "browser", "computer", "playwright"} and _HIGH_IMPACT_ARGUMENT_RE.search(argument_text):
+    if name in {"task", "browser", "computer", "playwright"} and regex.search(argument_text):
         return name
-    if _HIGH_IMPACT_ARGUMENT_RE.search(argument_text):
+    if regex.search(argument_text):
         return name or "tool"
+    return None
+
+
+def _high_impact_content_kind(
+    messages: Any,
+    *,
+    content_regex: re.Pattern[str] | None,
+) -> str | None:
+    """Classify a request whose *message text* contains a high-impact phrase.
+
+    Returns the matched role/name when the latest user turn (or any assistant
+    turn) contains an operator-defined content pattern. ``None`` when the
+    pattern set is empty or no message matches.
+    """
+    if content_regex is None or not isinstance(messages, list):
+        return None
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "")
+        content = message.get("content")
+        if isinstance(content, list):
+            content = " ".join(
+                str(item.get("text", ""))
+                for item in content
+                if isinstance(item, dict) and item.get("type") == "text"
+            )
+        if not isinstance(content, str) or not content:
+            continue
+        if content_regex.search(content):
+            return f"{role or 'message'}_content"
     return None
 
 
@@ -1576,32 +1648,49 @@ def _enforce_high_impact_approval(
     request_id: str | None,
     explicitly_authorized: bool,
     greylisted: bool = False,
+    argument_regex: re.Pattern[str] | None = None,
+    content_regex: re.Pattern[str] | None = None,
+    messages: Any = None,
+    force_deny: bool = False,
 ) -> None:
     risky = next(
-        (kind for call in calls if (kind := _high_impact_call_kind(call))),
+        (
+            kind
+            for call in calls
+            if (kind := _high_impact_call_kind(call, argument_regex=argument_regex))
+        ),
         None,
     )
+    if risky is None and messages is not None:
+        risky = _high_impact_content_kind(messages, content_regex=content_regex)
     if risky is None:
         return
+    # A greylisted model never gets the "explicitly authorized" shortcut when
+    # the operator hasn't opted out. This is the safe default: a goal-injected
+    # harness must still trip the gate even when the user turn happens to
+    # contain an affirmative.
+    effectively_authorized = explicitly_authorized and not (greylisted and force_deny)
     suspicion_count = 0
     newly_blacklisted = False
-    if not explicitly_authorized:
+    if not effectively_authorized:
         from tusker_gateway.safety import record_suspicious_behavior
 
         suspicion_count, newly_blacklisted = record_suspicious_behavior(provider, model)
     logger.warning(
-        "high-impact tool call intercepted provider=%s model=%s request_id=%s "
-        "action=%s greylisted=%s authorized=%s suspicion_count=%d newly_blacklisted=%s",
+        "high-impact action intercepted provider=%s model=%s request_id=%s "
+        "action=%s greylisted=%s authorized=%s force_deny=%s "
+        "suspicion_count=%d newly_blacklisted=%s",
         provider,
         model,
         request_id or "unknown",
         risky,
         greylisted,
         explicitly_authorized,
+        force_deny,
         suspicion_count,
         newly_blacklisted,
     )
-    if not explicitly_authorized:
+    if not effectively_authorized:
         raise HighImpactApprovalRequiredError(
             provider=provider,
             model=model,
@@ -1614,8 +1703,11 @@ def _explicit_high_impact_authorization(messages: Any) -> bool:
     if not isinstance(messages, list):
         return False
     latest_user = next(
-        (message for message in reversed(messages)
-         if isinstance(message, dict) and message.get("role") == "user"),
+        (
+            message
+            for message in reversed(messages)
+            if isinstance(message, dict) and message.get("role") == "user"
+        ),
         None,
     )
     if not isinstance(latest_user, dict):
@@ -1623,20 +1715,23 @@ def _explicit_high_impact_authorization(messages: Any) -> bool:
     content = latest_user.get("content")
     if isinstance(content, list):
         content = " ".join(
-            str(item.get("text", "")) for item in content
+            str(item.get("text", ""))
+            for item in content
             if isinstance(item, dict) and item.get("type") == "text"
         )
     if not isinstance(content, str):
         return False
     if re.search(r"\b(?:do not|don't|dont|never|not authorized|unauthorized)\b", content, re.I):
         return False
-    return bool(re.search(
-        r"\b(?:i\s+(?:explicitly\s+)?(?:approve|authorize)|"
-        r"go\s+ahead\s+and|proceed\s+with|place\s+the\s+order|"
-        r"make\s+the\s+purchase)\b",
-        content,
-        re.I,
-    ))
+    return bool(
+        re.search(
+            r"\b(?:i\s+(?:explicitly\s+)?(?:approve|authorize)|"
+            r"go\s+ahead\s+and|proceed\s+with|place\s+the\s+order|"
+            r"make\s+the\s+purchase)\b",
+            content,
+            re.I,
+        )
+    )
 
 
 def _tool_call_signature(calls: list[dict[str, Any]]) -> str:
@@ -1679,8 +1774,7 @@ def _validate_tool_call_arguments(
                 missing = ()
             else:
                 missing = tuple(
-                    key for key in required_by_name.get(name, ())
-                    if key not in arguments
+                    key for key in required_by_name.get(name, ()) if key not in arguments
                 )
                 reason = "missing_required" if missing else ""
 
@@ -1715,7 +1809,7 @@ def _assemble_stream_tool_calls(frames: list[bytes]) -> list[dict[str, Any]]:
         if not stripped.startswith(b"data: "):
             continue
         try:
-            obj = json.loads(stripped[len(b"data: "):])
+            obj = json.loads(stripped[len(b"data: ") :])
         except (json.JSONDecodeError, UnicodeDecodeError):
             continue
         choices = obj.get("choices")
@@ -1815,6 +1909,10 @@ def _validate_complete_tool_response(
     tool_choice: Any = None,
     explicitly_authorized: bool = False,
     greylisted: bool = False,
+    argument_regex: re.Pattern[str] | None = None,
+    content_regex: re.Pattern[str] | None = None,
+    messages: Any = None,
+    force_deny: bool = False,
 ) -> dict[str, Any]:
     """Validate a complete provider response before it can reach the client."""
     calls = _response_tool_calls(response)
@@ -1832,14 +1930,18 @@ def _validate_complete_tool_response(
             model=model,
             request_id=request_id,
         )
-        _enforce_high_impact_approval(
-            calls,
-            provider=provider,
-            model=model,
-            request_id=request_id,
-            explicitly_authorized=explicitly_authorized,
-            greylisted=greylisted,
-        )
+    _enforce_high_impact_approval(
+        calls,
+        provider=provider,
+        model=model,
+        request_id=request_id,
+        explicitly_authorized=explicitly_authorized,
+        greylisted=greylisted,
+        argument_regex=argument_regex,
+        content_regex=content_regex,
+        messages=messages,
+        force_deny=force_deny,
+    )
     if reject_empty and not calls and not _response_has_visible_content(response):
         raise UnusableToolResponseError(
             reason="reasoning_only_or_empty",
@@ -1870,6 +1972,10 @@ async def _prepare_stream_result(
     tool_choice: Any = None,
     explicitly_authorized: bool = False,
     greylisted: bool = False,
+    argument_regex: re.Pattern[str] | None = None,
+    content_regex: re.Pattern[str] | None = None,
+    messages: Any = None,
+    force_deny: bool = False,
 ) -> Any:
     """Validate a tool-bearing stream and return a stream ready for client consumption.
 
@@ -1901,6 +2007,10 @@ async def _prepare_stream_result(
             tool_choice=tool_choice,
             explicitly_authorized=explicitly_authorized,
             greylisted=greylisted,
+            argument_regex=argument_regex,
+            content_regex=content_regex,
+            messages=messages,
+            force_deny=force_deny,
         )
 
     if not tools_requested or not hasattr(result, "__aiter__"):
@@ -1914,7 +2024,10 @@ async def _prepare_stream_result(
         tools_requested=True,
         require_tool_call=require_tool_call,
     )
-    async def _first_frame(iterator: AsyncIterator[bytes]) -> tuple[bytes | None, AsyncIterator[bytes]]:
+
+    async def _first_frame(
+        iterator: AsyncIterator[bytes],
+    ) -> tuple[bytes | None, AsyncIterator[bytes]]:
         """Await the first frame eagerly so the per-attempt idle budget applies.
 
         The bounded idle budget (``_provider_attempt_timeout_secs``) must still
@@ -1942,6 +2055,7 @@ async def _prepare_stream_result(
         saw_tool_call = False
         saw_terminal = False
         try:
+
             async def frames() -> AsyncIterator[bytes]:
                 if first_frame is not None:
                     yield first_frame
@@ -1982,16 +2096,16 @@ async def _prepare_stream_result(
                     request_id=request_id,
                     explicitly_authorized=explicitly_authorized,
                     greylisted=greylisted,
+                    argument_regex=argument_regex,
+                    content_regex=content_regex,
+                    messages=messages,
+                    force_deny=force_deny,
                 )
             if buffer_before_client:
                 for buffered_frame in buffered:
                     yield buffered_frame
             preflight_decision = (
-                "tool_call"
-                if saw_tool_call
-                else "terminal"
-                if saw_terminal
-                else "eof"
+                "tool_call" if saw_tool_call else "terminal" if saw_terminal else "eof"
             )
             logger.info(
                 "tool stream preflight provider=%s model=%s request_id=%s decision=%s "
@@ -2009,9 +2123,7 @@ async def _prepare_stream_result(
             await _close_async_iterator(raw_result)
             raise
 
-    return _PreparedStream(
-        _early_stream(first_frame, rest, result)
-    )
+    return _PreparedStream(_early_stream(first_frame, rest, result))
 
 
 def _pool_name(body: dict[str, Any]) -> str | None:
@@ -2099,10 +2211,17 @@ def _estimated_tokens(messages: list[dict[str, Any]]) -> int:
 # upstream providers fall back to their own tiny defaults (often 256-512
 # tokens) and the model silently truncates mid-task with a StopReason
 # of 'length' that OMP then interprets as 'finished'.
-_GATEWAY_HANDLED_FIELDS = frozenset({
-    "model", "messages", "stream", "tools", "tool_choice",
-    "session_id", "conversation_id",
-})
+_GATEWAY_HANDLED_FIELDS = frozenset(
+    {
+        "model",
+        "messages",
+        "stream",
+        "tools",
+        "tool_choice",
+        "session_id",
+        "conversation_id",
+    }
+)
 
 
 def _build_extra_body(body: dict[str, Any]) -> dict[str, Any]:
@@ -2182,14 +2301,22 @@ def _semantic_cache_bypass_reason(
         return None
 
     temperature = body.get("temperature")
-    if isinstance(temperature, bool) or not isinstance(temperature, (int, float)) or float(temperature) != 0.0:
+    if (
+        isinstance(temperature, bool)
+        or not isinstance(temperature, (int, float))
+        or float(temperature) != 0.0
+    ):
         return "temperature_not_zero"
     top_p = body.get("top_p")
-    if top_p is not None and (isinstance(top_p, bool) or not isinstance(top_p, (int, float)) or float(top_p) != 1.0):
+    if top_p is not None and (
+        isinstance(top_p, bool) or not isinstance(top_p, (int, float)) or float(top_p) != 1.0
+    ):
         return "top_p_not_one"
     for field in ("presence_penalty", "frequency_penalty"):
         value = body.get(field)
-        if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float)) or float(value) != 0.0):
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, (int, float)) or float(value) != 0.0
+        ):
             return f"{field}_nonzero"
     if body.get("n", 1) != 1:
         return "multiple_completions"
@@ -2253,6 +2380,7 @@ def _select_cache_route_target(
             return selected
         excluded.add(selected)
 
+
 def _cooldown_for_exc(exc: GatewayError) -> float | None:
     """Derive a circuit-breaker cooldown from a provider error.
 
@@ -2267,9 +2395,7 @@ def _cooldown_for_exc(exc: GatewayError) -> float | None:
 
     try:
         if isinstance(exc, RateLimitError):
-            return _cooldown_seconds_for_429(
-                {"body": exc.body or "", "headers": exc.headers}
-            )
+            return _cooldown_seconds_for_429({"body": exc.body or "", "headers": exc.headers})
         return _cooldown_seconds_for_provider_error(exc)
     except Exception:
         return None
@@ -2281,6 +2407,7 @@ def _max_pool_provider_attempts() -> int:
         return max(1, int(os.environ.get("TUSKER_MAX_PROVIDER_ATTEMPTS", "6")))
     except ValueError:
         return 6
+
 
 def _provider_attempt_timeout_overrides() -> dict[str, float]:
     """Per-provider override map from ``TUSKER_PROVIDER_ATTEMPT_TIMEOUT_OVERRIDES_JSON``.
@@ -2295,9 +2422,7 @@ def _provider_attempt_timeout_overrides() -> dict[str, float]:
     try:
         data = json.loads(raw)
     except (TypeError, ValueError):
-        logger.warning(
-            "ignoring TUSKER_PROVIDER_ATTEMPT_TIMEOUT_OVERRIDES_JSON: invalid JSON"
-        )
+        logger.warning("ignoring TUSKER_PROVIDER_ATTEMPT_TIMEOUT_OVERRIDES_JSON: invalid JSON")
         return {}
     if not isinstance(data, dict):
         return {}
@@ -2418,8 +2543,6 @@ async def _await_attempt(
             return task.result()
 
 
-
-
 def _tool_response_failure_cooldown_secs() -> float:
     """Return the quarantine window for a model that violates the tool contract."""
     try:
@@ -2515,8 +2638,7 @@ def _public_provider_failure_response(exc: BaseException) -> web.Response:
             # machine-readable signal to the maintenance qualification path.
             headers["X-Tusker-Provider-Failure"] = "provider_quota"
             public_message = (
-                "Upstream provider quota exhausted; retry after the upstream "
-                "quota window resets."
+                "Upstream provider quota exhausted; retry after the upstream quota window resets."
             )
         else:
             public_message = (
@@ -2550,6 +2672,7 @@ def _public_provider_failure_response(exc: BaseException) -> web.Response:
         headers={"Retry-After": str(retry_after)},
     )
 
+
 def _mark_permanently_failed(
     exc: Exception,
     provider: str,
@@ -2575,11 +2698,13 @@ def _mark_permanently_failed(
 
         mark_permanently_failed(provider, model)
 
+
 def _clear_permanently_failed(provider: str, model: str) -> None:
     """Clear a permanent-failure marker once a provider/model recovers."""
     from tusker_gateway.cooldown import clear_permanently_failed
 
     clear_permanently_failed(provider, model)
+
 
 def _required_input_modalities(messages: Any) -> frozenset[str] | None:
     """Return pool capabilities required by OpenAI-format messages."""
@@ -2661,7 +2786,9 @@ async def _call_with_pool_fallback(
             async def call_direct() -> Any:
                 nonlocal result
                 result = await client.chat(
-                    provider, model, body["messages"],
+                    provider,
+                    model,
+                    body["messages"],
                     stream=bool(body.get("stream")),
                     tools=tools,
                     tool_choice=body.get("tool_choice"),
@@ -2685,6 +2812,10 @@ async def _call_with_pool_fallback(
                     tool_choice=body.get("tool_choice"),
                     explicitly_authorized=_explicit_high_impact_authorization(body.get("messages")),
                     greylisted=model_is_greylisted(config, provider, model),
+                    argument_regex=_compiled_argument_regex(config),
+                    content_regex=_compiled_content_regex(config),
+                    messages=body.get("messages"),
+                    force_deny=high_impact_greylist_force_deny(config),
                 )
 
             result = await _await_attempt(
@@ -2733,7 +2864,9 @@ async def _call_with_pool_fallback(
                     breaker.record_failure,
                     provider,
                     model,
-                    cooldown_secs=(_cooldown_for_exc(exc) if isinstance(exc, GatewayError) else None),
+                    cooldown_secs=(
+                        _cooldown_for_exc(exc) if isinstance(exc, GatewayError) else None
+                    ),
                 )
             _mark_permanently_failed(exc, provider, model)
             raise
@@ -2750,9 +2883,7 @@ async def _call_with_pool_fallback(
     if not isinstance(configured_fallbacks, (list, tuple)):
         configured_fallbacks = ()
     configured_fallbacks = tuple(
-        fallback
-        for fallback in configured_fallbacks
-        if pool_allowed_for_request(request, fallback)
+        fallback for fallback in configured_fallbacks if pool_allowed_for_request(request, fallback)
     )
     pool_names = [pool_name, *configured_fallbacks]
     pool_index = 0
@@ -2807,17 +2938,14 @@ async def _call_with_pool_fallback(
                     select_kwargs["allow_structured_tool_fallback"] = True
                     if tool_compatibility_probe:
                         select_kwargs["allow_tool_compatibility_fallback"] = True
-            selected = await asyncio.to_thread(
-                pool_mgr.select, active_pool, **select_kwargs
-            )
+            selected = await asyncio.to_thread(pool_mgr.select, active_pool, **select_kwargs)
         if not selected:
             if pool_index + 1 < len(pool_names):
                 previous_pool = active_pool
                 pool_index += 1
                 active_pool = pool_names[pool_index]
                 logger.warning(
-                    "pool exhausted rid=%s requested_pool=%s exhausted_pool=%s "
-                    "fallback_pool=%s",
+                    "pool exhausted rid=%s requested_pool=%s exhausted_pool=%s fallback_pool=%s",
                     request_id or "unknown",
                     pool_name,
                     previous_pool,
@@ -2881,9 +3009,10 @@ async def _call_with_pool_fallback(
             if last_error is not None:
                 raise last_error
             raise NoHealthyModelsError(pool=pool_name)
-        if breaker is not None and not (
-            await asyncio.to_thread(breaker.check, selected[0], selected[1])
-        ).allowed:
+        if (
+            breaker is not None
+            and not (await asyncio.to_thread(breaker.check, selected[0], selected[1])).allowed
+        ):
             excluded.add(selected)
             continue
         provider, model = selected
@@ -2906,7 +3035,9 @@ async def _call_with_pool_fallback(
             async def call_candidate() -> Any:
                 nonlocal result
                 result = await client.chat(
-                    provider, model, body["messages"],
+                    provider,
+                    model,
+                    body["messages"],
                     stream=bool(body.get("stream")),
                     tools=tools,
                     tool_choice=body.get("tool_choice"),
@@ -2930,6 +3061,10 @@ async def _call_with_pool_fallback(
                     tool_choice=body.get("tool_choice"),
                     explicitly_authorized=_explicit_high_impact_authorization(body.get("messages")),
                     greylisted=model_is_greylisted(config, provider, model),
+                    argument_regex=_compiled_argument_regex(config),
+                    content_regex=_compiled_content_regex(config),
+                    messages=body.get("messages"),
+                    force_deny=high_impact_greylist_force_deny(config),
                 )
 
             result = await _await_attempt(
@@ -3006,7 +3141,9 @@ async def _call_with_pool_fallback(
                     breaker.record_failure,
                     provider,
                     model,
-                    cooldown_secs=(_cooldown_for_exc(exc) if isinstance(exc, GatewayError) else None),
+                    cooldown_secs=(
+                        _cooldown_for_exc(exc) if isinstance(exc, GatewayError) else None
+                    ),
                 )
             _mark_permanently_failed(exc, provider, model)
             last_error = exc
@@ -3170,7 +3307,8 @@ def _responses_tools_to_chat(tools: Any) -> list[dict[str, Any]]:
         normalized_function: dict[str, Any] = {
             "name": name,
             "description": str(function.get("description") or ""),
-            "parameters": function.get("parameters") or {
+            "parameters": function.get("parameters")
+            or {
                 "type": "object",
                 "properties": {},
             },
@@ -3179,10 +3317,12 @@ def _responses_tools_to_chat(tools: Any) -> list[dict[str, Any]]:
             normalized_function["strict"] = function["strict"]
         elif "strict" in tool:
             normalized_function["strict"] = tool["strict"]
-        converted.append({
-            "type": "function",
-            "function": normalized_function,
-        })
+        converted.append(
+            {
+                "type": "function",
+                "function": normalized_function,
+            }
+        )
     return converted
 
 
@@ -3214,13 +3354,24 @@ def _responses_input_to_messages(input_value: Any) -> list[dict[str, Any]]:
     if not isinstance(input_value, list) or not input_value:
         raise BadRequestError("input must be a string or non-empty array", code="invalid_input")
 
-    if all(isinstance(item, dict) and item.get("type") in {
-        "input_text", "output_text", "input_image", "text", "image_url",
-    } for item in input_value):
-        return [{
-            "role": "user",
-            "content": _responses_content_to_chat(input_value, context="input"),
-        }]
+    if all(
+        isinstance(item, dict)
+        and item.get("type")
+        in {
+            "input_text",
+            "output_text",
+            "input_image",
+            "text",
+            "image_url",
+        }
+        for item in input_value
+    ):
+        return [
+            {
+                "role": "user",
+                "content": _responses_content_to_chat(input_value, context="input"),
+            }
+        ]
 
     messages: list[dict[str, Any]] = []
     pending_function_calls: list[dict[str, Any]] = []
@@ -3228,11 +3379,13 @@ def _responses_input_to_messages(input_value: Any) -> list[dict[str, Any]]:
     def flush_function_calls() -> None:
         if not pending_function_calls:
             return
-        messages.append({
-            "role": "assistant",
-            "content": "",
-            "tool_calls": list(pending_function_calls),
-        })
+        messages.append(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": list(pending_function_calls),
+            }
+        )
         pending_function_calls.clear()
 
     for item_index, item in enumerate(input_value):
@@ -3252,14 +3405,16 @@ def _responses_input_to_messages(input_value: Any) -> list[dict[str, Any]]:
             call_id = str(
                 item.get("call_id") or item.get("id") or f"call_responses_{item_index}"
             ).strip()
-            pending_function_calls.append({
-                "id": call_id,
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "arguments": _responses_tool_arguments(item.get("arguments")),
-                },
-            })
+            pending_function_calls.append(
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": _responses_tool_arguments(item.get("arguments")),
+                    },
+                }
+            )
             continue
         if item_type == "function_call_output":
             flush_function_calls()
@@ -3281,13 +3436,15 @@ def _responses_input_to_messages(input_value: Any) -> list[dict[str, Any]]:
 
         if item_type in {"input_text", "output_text", "input_image", "text", "image_url"}:
             flush_function_calls()
-            messages.append({
-                "role": "user",
-                "content": _responses_content_to_chat(
-                    [item],
-                    context=f"input[{item_index}]",
-                ),
-            })
+            messages.append(
+                {
+                    "role": "user",
+                    "content": _responses_content_to_chat(
+                        [item],
+                        context=f"input[{item_index}]",
+                    ),
+                }
+            )
             continue
 
         if item_type not in {None, "message"}:
@@ -3302,9 +3459,7 @@ def _responses_input_to_messages(input_value: Any) -> list[dict[str, Any]]:
                 f"input[{item_index}] must have a valid message role",
                 code="invalid_input",
             )
-        if "content" not in item and not (
-            role == "assistant" and item.get("tool_calls")
-        ):
+        if "content" not in item and not (role == "assistant" and item.get("tool_calls")):
             raise BadRequestError(
                 f"input[{item_index}] must contain content",
                 code="invalid_input",
@@ -3335,10 +3490,12 @@ def _chat_content_to_responses_output(content: Any) -> list[dict[str, Any]]:
                 if isinstance(text, str):
                     output.append({"type": "output_text", "text": text})
             elif isinstance(block, dict):
-                output.append({
-                    "type": "output_text",
-                    "text": json.dumps(block, ensure_ascii=False),
-                })
+                output.append(
+                    {
+                        "type": "output_text",
+                        "text": json.dumps(block, ensure_ascii=False),
+                    }
+                )
             else:
                 output.append({"type": "output_text", "text": str(block)})
         return output
@@ -3410,16 +3567,20 @@ async def _complete_chat_result_stream(result: dict[str, Any]) -> AsyncIterator[
         if not isinstance(message, dict):
             message = {}
         for text in _chat_content_to_stream_text_parts(message.get("content")):
-            yield sse_frame({
-                "id": response_id,
-                "object": "chat.completion.chunk",
-                "model": response_model,
-                "choices": [{
-                    "index": choice_index,
-                    "delta": {"content": text, "text": text},
-                    "finish_reason": None,
-                }],
-            })
+            yield sse_frame(
+                {
+                    "id": response_id,
+                    "object": "chat.completion.chunk",
+                    "model": response_model,
+                    "choices": [
+                        {
+                            "index": choice_index,
+                            "delta": {"content": text, "text": text},
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+            )
 
         calls = _normalized_choice_tool_calls(message)
         if calls:
@@ -3428,48 +3589,60 @@ async def _complete_chat_result_stream(result: dict[str, Any]) -> AsyncIterator[
                 function = call.get("function") or {}
                 if not isinstance(function, dict):
                     function = {}
-                tool_deltas.append({
-                    "index": _choice_index(call, call_position),
-                    "id": str(call.get("id") or f"call_{call_position}"),
-                    "type": "function",
-                    "function": {
-                        "name": str(function.get("name") or ""),
-                        "arguments": function.get("arguments", ""),
-                    },
-                })
-            yield sse_frame({
-                "id": response_id,
-                "object": "chat.completion.chunk",
-                "model": response_model,
-                "choices": [{
-                    "index": choice_index,
-                    "delta": {"role": "assistant", "tool_calls": tool_deltas},
-                    "finish_reason": None,
-                }],
-            })
+                tool_deltas.append(
+                    {
+                        "index": _choice_index(call, call_position),
+                        "id": str(call.get("id") or f"call_{call_position}"),
+                        "type": "function",
+                        "function": {
+                            "name": str(function.get("name") or ""),
+                            "arguments": function.get("arguments", ""),
+                        },
+                    }
+                )
+            yield sse_frame(
+                {
+                    "id": response_id,
+                    "object": "chat.completion.chunk",
+                    "model": response_model,
+                    "choices": [
+                        {
+                            "index": choice_index,
+                            "delta": {"role": "assistant", "tool_calls": tool_deltas},
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+            )
 
         finish_reason = raw_choice.get("finish_reason")
         if not isinstance(finish_reason, str) or not finish_reason:
             finish_reason = "tool_calls" if calls else "stop"
-        yield sse_frame({
-            "id": response_id,
-            "object": "chat.completion.chunk",
-            "model": response_model,
-            "choices": [{
-                "index": choice_index,
-                "delta": {},
-                "finish_reason": finish_reason,
-            }],
-        })
+        yield sse_frame(
+            {
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "model": response_model,
+                "choices": [
+                    {
+                        "index": choice_index,
+                        "delta": {},
+                        "finish_reason": finish_reason,
+                    }
+                ],
+            }
+        )
         emitted_choice = True
 
     if not emitted_choice:
-        yield sse_frame({
-            "id": response_id,
-            "object": "chat.completion.chunk",
-            "model": response_model,
-            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-        })
+        yield sse_frame(
+            {
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "model": response_model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            }
+        )
     yield sse_done()
 
 
@@ -3485,13 +3658,15 @@ def _responses_output_for_choice(
     output: list[dict[str, Any]] = []
     content_blocks = _chat_content_to_responses_output(message.get("content"))
     if content_blocks:
-        output.append({
-            "type": "message",
-            "id": f"msg_{uuid.uuid4().hex}",
-            "role": "assistant",
-            "content": content_blocks,
-            "status": "completed",
-        })
+        output.append(
+            {
+                "type": "message",
+                "id": f"msg_{uuid.uuid4().hex}",
+                "role": "assistant",
+                "content": content_blocks,
+                "status": "completed",
+            }
+        )
 
     for index, tool_call in enumerate(_normalized_choice_tool_calls(message)):
         function = tool_call.get("function") or {}
@@ -3505,33 +3680,38 @@ def _responses_output_for_choice(
             or tool_call.get("call_id")
             or f"call_responses_{choice_position}_{index}"
         ).strip()
-        output.append({
-            "type": "function_call",
-            "id": call_id,
-            "call_id": call_id,
-            "name": name,
-            "arguments": _responses_tool_arguments(function.get("arguments")),
-            "status": "completed",
-        })
+        output.append(
+            {
+                "type": "function_call",
+                "id": call_id,
+                "call_id": call_id,
+                "name": name,
+                "arguments": _responses_tool_arguments(function.get("arguments")),
+                "status": "completed",
+            }
+        )
 
     if not output:
-        output.append({
-            "type": "message",
-            "id": f"msg_{uuid.uuid4().hex}",
-            "role": "assistant",
-            "content": [],
-            "status": "completed",
-        })
+        output.append(
+            {
+                "type": "message",
+                "id": f"msg_{uuid.uuid4().hex}",
+                "role": "assistant",
+                "content": [],
+                "status": "completed",
+            }
+        )
     return output
 
 
 def _chat_result_to_responses(result: Any, model: str) -> dict[str, Any]:
     """Convert one canonical Chat Completions result to a Responses object."""
     choices = result.get("choices") if isinstance(result, dict) else None
-    valid_choices = [
-        choice for choice in choices
-        if isinstance(choice, dict)
-    ] if isinstance(choices, list) else []
+    valid_choices = (
+        [choice for choice in choices if isinstance(choice, dict)]
+        if isinstance(choices, list)
+        else []
+    )
     if not valid_choices:
         valid_choices = [{}]
 
@@ -3539,10 +3719,13 @@ def _chat_result_to_responses(result: Any, model: str) -> dict[str, Any]:
     for position, choice in enumerate(valid_choices):
         output.extend(_responses_output_for_choice(choice, choice_position=position))
 
-    status = "incomplete" if any(
-        choice.get("finish_reason") in {"length", "content_filter"}
-        for choice in valid_choices
-    ) else "completed"
+    status = (
+        "incomplete"
+        if any(
+            choice.get("finish_reason") in {"length", "content_filter"} for choice in valid_choices
+        )
+        else "completed"
+    )
     response: dict[str, Any] = {
         "id": f"resp_{uuid.uuid4().hex}",
         "object": "response",
@@ -3553,22 +3736,12 @@ def _chat_result_to_responses(result: Any, model: str) -> dict[str, Any]:
     }
     usage = result.get("usage") if isinstance(result, dict) else None
     if isinstance(usage, dict):
-        input_tokens = int(
-            usage.get("input_tokens")
-            or usage.get("prompt_tokens")
-            or 0
-        )
-        output_tokens = int(
-            usage.get("output_tokens")
-            or usage.get("completion_tokens")
-            or 0
-        )
+        input_tokens = int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0)
+        output_tokens = int(usage.get("output_tokens") or usage.get("completion_tokens") or 0)
         response["usage"] = {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
-            "total_tokens": int(
-                usage.get("total_tokens") or input_tokens + output_tokens
-            ),
+            "total_tokens": int(usage.get("total_tokens") or input_tokens + output_tokens),
         }
     return response
 
@@ -3576,10 +3749,9 @@ def _chat_result_to_responses(result: Any, model: str) -> dict[str, Any]:
 def _responses_sse_frame(event_type: str, payload: dict[str, Any]) -> bytes:
     """Encode one Responses API SSE event."""
     body = {"type": event_type, **payload}
-    return (
-        f"event: {event_type}\n"
-        f"data: {json.dumps(body, ensure_ascii=False)}\n\n"
-    ).encode("utf-8")
+    return (f"event: {event_type}\ndata: {json.dumps(body, ensure_ascii=False)}\n\n").encode(
+        "utf-8"
+    )
 
 
 def _responses_stream_from_chat(
@@ -3822,8 +3994,11 @@ def _responses_stream_from_chat(
         for output_index, item in enumerate(output_items):
             if item.get("type") == "message":
                 text_value = str(item.pop("_text", ""))
-                item["content"] = ([{"type": "output_text", "text": text_value, "annotations": []}]
-                                   if text_value else [])
+                item["content"] = (
+                    [{"type": "output_text", "text": text_value, "annotations": []}]
+                    if text_value
+                    else []
+                )
                 item["status"] = "completed"
                 yield _responses_sse_frame(
                     "response.output_text.done",
@@ -3835,7 +4010,9 @@ def _responses_stream_from_chat(
                         "item_id": item["id"],
                         "output_index": output_index,
                         "content_index": 0,
-                        "part": item["content"][0] if item["content"] else {"type": "output_text", "text": "", "annotations": []},
+                        "part": item["content"][0]
+                        if item["content"]
+                        else {"type": "output_text", "text": "", "annotations": []},
                     },
                 )
             elif item.get("type") == "function_call":
@@ -3893,11 +4070,7 @@ def _validate_tool_choice_request(tool_choice: Any, tools: Any) -> None:
                 code="invalid_tool_choice",
             )
         function = tool_choice.get("function")
-        expected_name = (
-            function.get("name")
-            if isinstance(function, dict)
-            else None
-        )
+        expected_name = function.get("name") if isinstance(function, dict) else None
         if not isinstance(expected_name, str) or not expected_name.strip():
             raise BadRequestError(
                 "Named tool_choice must contain function.name",
@@ -3932,14 +4105,21 @@ def _validate_chat_body(body: Any) -> dict[str, Any]:
     if not isinstance(messages, list) or not messages:
         raise BadRequestError("messages must be a non-empty array", code="invalid_messages")
     for index, message in enumerate(messages):
-        if not isinstance(message, dict) or message.get("role") not in {"system", "developer", "user", "assistant", "tool"}:
+        if not isinstance(message, dict) or message.get("role") not in {
+            "system",
+            "developer",
+            "user",
+            "assistant",
+            "tool",
+        }:
             raise BadRequestError("Each message must have a valid role", code="invalid_messages")
         role = message["role"]
         if "content" not in message and role != "assistant":
             raise BadRequestError("Each message must contain content", code="invalid_messages")
-        if role == "tool" and not str(
-            message.get("tool_call_id") or message.get("call_id") or ""
-        ).strip():
+        if (
+            role == "tool"
+            and not str(message.get("tool_call_id") or message.get("call_id") or "").strip()
+        ):
             raise BadRequestError(
                 "Tool messages must contain tool_call_id",
                 code="invalid_messages",
@@ -3962,10 +4142,7 @@ def _validate_chat_body(body: Any) -> dict[str, Any]:
             null_tool_content = (
                 role == "assistant"
                 and message["content"] is None
-                and (
-                    bool(message.get("tool_calls"))
-                    or message.get("function_call") is not None
-                )
+                and (bool(message.get("tool_calls")) or message.get("function_call") is not None)
             )
             if not null_tool_content:
                 _validate_message_content(
@@ -4008,19 +4185,13 @@ def _validate_chat_body(body: Any) -> dict[str, Any]:
         raise BadRequestError("stream must be a boolean", code="invalid_stream")
     _validate_tool_choice_request(body.get("tool_choice"), body.get("tools"))
     if "n" in body and (
-        isinstance(body["n"], bool)
-        or not isinstance(body["n"], int)
-        or body["n"] < 1
+        isinstance(body["n"], bool) or not isinstance(body["n"], int) or body["n"] < 1
     ):
         raise BadRequestError(
             "n must be a positive integer",
             code="invalid_request",
         )
-    if (
-        body.get("n", 1) != 1
-        and bool(body.get("stream"))
-        and bool(body.get("tools"))
-    ):
+    if body.get("n", 1) != 1 and bool(body.get("stream")) and bool(body.get("tools")):
         # The stream normalizer maintains one tool-envelope parser and terminal
         # state. Silently forwarding additional choices leaves later choices
         # unsanitized, so reject unsupported fan-out at the public boundary.
@@ -4071,13 +4242,27 @@ async def models_handler(request: web.Request) -> web.Response:
         if provider_route_is_disabled(config, provider_name):
             continue
         # Handle both dict and ProviderConfig-like object
-        aliases = provider_config.get("model_aliases") if isinstance(provider_config, dict) else getattr(provider_config, "model_aliases", {})
+        aliases = (
+            provider_config.get("model_aliases")
+            if isinstance(provider_config, dict)
+            else getattr(provider_config, "model_aliases", {})
+        )
         if aliases:
             data.extend(
                 {"id": f"{provider_name}/{alias}", "object": "model", "owned_by": "tusker-gateway"}
                 for alias in aliases
             )
-    data.extend({"id": alias, "object": "model", "owned_by": "tusker-gateway"} for alias in ("hermes-code", "hermes-privacy", "hermes-premium", "hermes-swarm", "hermes-reranker", "hermes-embed"))
+    data.extend(
+        {"id": alias, "object": "model", "owned_by": "tusker-gateway"}
+        for alias in (
+            "hermes-code",
+            "hermes-privacy",
+            "hermes-premium",
+            "hermes-swarm",
+            "hermes-reranker",
+            "hermes-embed",
+        )
+    )
     existing = {item["id"] for item in data}
     data.extend(
         {"id": model_id, "object": "model", "owned_by": "tusker-gateway"}
@@ -4117,7 +4302,13 @@ async def metrics_handler(request: web.Request) -> web.Response:
         s = breaker.stats_snapshot()
         # Surface breaker stats via existing budget_blocks counter family so
         # we don't grow the metric catalogue. Reuse 'breaker' kind label.
-        for kind in ("trips", "short_circuits", "half_open_probes", "half_open_successes", "half_open_failures"):
+        for kind in (
+            "trips",
+            "short_circuits",
+            "half_open_probes",
+            "half_open_successes",
+            "half_open_failures",
+        ):
             metrics.budget_blocks._values[(f"breaker_{kind}",)] = float(s[kind])  # noqa: SLF001
     ratelimit: RateLimiter | None = request.app.get("ratelimit")
     if ratelimit is not None:
@@ -4165,14 +4356,19 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
     budget_recorded = False
     budget_charged = 0
 
-    def _emit(status_label: str, provider_label: str | None = None,
-              model_label: str | None = None) -> None:
+    def _emit(
+        status_label: str, provider_label: str | None = None, model_label: str | None = None
+    ) -> None:
         if metrics is None:
             return
         pl = provider_label if provider_label is not None else provider
         ml = model_label if model_label is not None else target_model
-        metrics.requests_total.inc({"pool": pool_name, "provider": pl, "model": ml, "status": status_label})
-        metrics.request_duration.observe(time.monotonic() - started, {"pool": pool_name, "provider": pl, "model": ml})
+        metrics.requests_total.inc(
+            {"pool": pool_name, "provider": pl, "model": ml, "status": status_label}
+        )
+        metrics.request_duration.observe(
+            time.monotonic() - started, {"pool": pool_name, "provider": pl, "model": ml}
+        )
 
     async def _record_cached_usage(cached: dict[str, Any]) -> None:
         """Count a cache response against the caller's budget as well."""
@@ -4187,13 +4383,14 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
 
     # Top-level span (synchronous context).
     span_cm = (
-        tracer.span("chat_completion", attributes={
-            "http.method": request.method,
-            "http.path": "/v1/chat/completions",
-            "tusker.api_key_fingerprint": request.get(
-                "_api_key_fingerprint", "unknown"
-            )[:16],
-        })
+        tracer.span(
+            "chat_completion",
+            attributes={
+                "http.method": request.method,
+                "http.path": "/v1/chat/completions",
+                "tusker.api_key_fingerprint": request.get("_api_key_fingerprint", "unknown")[:16],
+            },
+        )
         if tracer is not None and tracer.enabled
         else _noop_cm()
     )
@@ -4213,7 +4410,10 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
             )
             tools = body.get("tools") if isinstance(body.get("tools"), list) else None
             if os.environ.get("TUSKER_TOOL_DIAGNOSTICS", "0").strip().lower() in {
-                "1", "true", "yes", "on"
+                "1",
+                "true",
+                "yes",
+                "on",
             }:
                 tool_choice = body.get("tool_choice")
                 if isinstance(tool_choice, dict):
@@ -4229,24 +4429,35 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                     bool(tools),
                     len(tools) if tools else 0,
                     tool_choice_kind,
-                    "+".join(sorted(_required_input_modalities(body.get("messages")) or ())) or "none",
+                    "+".join(sorted(_required_input_modalities(body.get("messages")) or ()))
+                    or "none",
                 )
             pool_name = _pool_name(body) or "passthrough"
-            logger.info('chat request rid=%s model=%s pool=%s stream=%s', request_id, body.get("model"), pool_name, body.get("stream"))
+            logger.info(
+                "chat request rid=%s model=%s pool=%s stream=%s",
+                request_id,
+                body.get("model"),
+                pool_name,
+                body.get("stream"),
+            )
             bypass_cache = request.headers.get("X-Tusker-Cache", "").strip().lower() == "bypass"
             set_access_log_context(request, pool=pool_name)
 
             # Guard pipeline: input/output guards.
             guard_pipeline = request.app.get("guard_pipeline")
             if guard_pipeline is not None:
-                guard_result = await guard_pipeline.run(body)
+                guard_result = await run_guard_pipeline(guard_pipeline, body, request=request)
                 if not guard_result.allowed:
                     status = "guardrail_blocked"
                     if metrics is not None:
                         metrics.guardrail_blocks.inc({"kind": guard_result.message or "blocked"})
                     _emit(status)
                     return web.json_response(
-                        openai_error(guard_result.message or "request blocked by guardrail", code="guardrail_blocked", error_type="invalid_request_error"),
+                        openai_error(
+                            guard_result.message or "request blocked by guardrail",
+                            code="guardrail_blocked",
+                            error_type="invalid_request_error",
+                        ),
                         status=400,
                     )
                 if guard_result.modified_body is not None:
@@ -4287,7 +4498,11 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                         "X-Tusker-RateLimit-Reason": rl.reason or "rate limit exceeded",
                     }
                     return web.json_response(
-                        openai_error(rl.reason or "rate limit exceeded", code="rate_limit_error", error_type="rate_limit_error"),
+                        openai_error(
+                            rl.reason or "rate limit exceeded",
+                            code="rate_limit_error",
+                            error_type="rate_limit_error",
+                        ),
                         status=429,
                         headers=headers,
                     )
@@ -4297,9 +4512,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
             if budget is not None and api_key:
                 est = _estimated_tokens(body["messages"])
                 try:
-                    decision = await asyncio.to_thread(
-                        budget.check, api_key, pool_name, est
-                    )
+                    decision = await asyncio.to_thread(budget.check, api_key, pool_name, est)
                 except StorageUnavailableError:
                     status = "state_store_unavailable"
                     _emit(status)
@@ -4319,7 +4532,11 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                     _emit(status)
                     headers = {"X-Tusker-Budget-Reason": decision.reason or "budget exceeded"}
                     return web.json_response(
-                        openai_error(decision.reason or "budget exceeded", code="budget_exceeded", error_type="rate_limit_error"),
+                        openai_error(
+                            decision.reason or "budget exceeded",
+                            code="budget_exceeded",
+                            error_type="rate_limit_error",
+                        ),
                         status=429,
                         headers=headers,
                     )
@@ -4392,12 +4609,24 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                         await asyncio.to_thread(cache.invalidate, cache_key)
                     else:
                         await _record_cached_usage(hit)
-                        logger.debug('cache hit key=%s', cache_key[:16])
+                        logger.debug("cache hit key=%s", cache_key[:16])
                         if metrics is not None:
                             metrics.requests_total.inc(
-                                {"pool": pool_name, "provider": "cache", "model": str(body.get("model") or ""), "status": "cache_hit"}
+                                {
+                                    "pool": pool_name,
+                                    "provider": "cache",
+                                    "model": str(body.get("model") or ""),
+                                    "status": "cache_hit",
+                                }
                             )
-                            metrics.request_duration.observe(time.monotonic() - started, {"pool": pool_name, "provider": "cache", "model": str(body.get("model") or "")})
+                            metrics.request_duration.observe(
+                                time.monotonic() - started,
+                                {
+                                    "pool": pool_name,
+                                    "provider": "cache",
+                                    "model": str(body.get("model") or ""),
+                                },
+                            )
                         set_access_log_context(
                             request,
                             provider="cache",
@@ -4410,10 +4639,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
 
             # Semantic cache lookup (after exact-match miss).
             sem_hit: dict[str, Any] | None = None
-            if (
-                semantic_scope is not None
-                and sem_cache is not None
-            ):
+            if semantic_scope is not None and sem_cache is not None:
                 semantic_embedding = await sem_cache.embed_messages(body["messages"])
                 if semantic_embedding is not None:
                     sem_hit = await sem_cache.query(
@@ -4433,9 +4659,21 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                     )
                     if metrics is not None:
                         metrics.requests_total.inc(
-                            {"pool": pool_name, "provider": "semantic_cache", "model": str(body.get("model") or ""), "status": "cache_hit"}
+                            {
+                                "pool": pool_name,
+                                "provider": "semantic_cache",
+                                "model": str(body.get("model") or ""),
+                                "status": "cache_hit",
+                            }
                         )
-                        metrics.request_duration.observe(time.monotonic() - started, {"pool": pool_name, "provider": "semantic_cache", "model": str(body.get("model") or "")})
+                        metrics.request_duration.observe(
+                            time.monotonic() - started,
+                            {
+                                "pool": pool_name,
+                                "provider": "semantic_cache",
+                                "model": str(body.get("model") or ""),
+                            },
+                        )
                     set_access_log_context(
                         request,
                         provider="semantic_cache",
@@ -4447,14 +4685,24 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                 set_access_log_context(request, cache_status="miss")
 
             provider, target_model, result = await _call_with_pool_fallback(
-                config, body, client, tools,
-                breaker=breaker, request=request,
+                config,
+                body,
+                client,
+                tools,
+                breaker=breaker,
+                request=request,
                 metrics_registry=request.app.get("metrics"),
                 initial_selection=semantic_target,
                 request_id=request_id,
                 conversation_id=conversation_id,
             )
-            logger.debug('selected rid=%s provider=%s model=%s pool=%s', request_id, provider, target_model, pool_name)
+            logger.debug(
+                "selected rid=%s provider=%s model=%s pool=%s",
+                request_id,
+                provider,
+                target_model,
+                pool_name,
+            )
             set_access_log_context(
                 request,
                 provider=provider,
@@ -4495,7 +4743,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                     target_model=target_model if semantic_target else None,
                 )
                 await asyncio.to_thread(cache.put, store_cache_key, result)
-                logger.debug('cache stored key=%s', store_cache_key[:16])
+                logger.debug("cache stored key=%s", store_cache_key[:16])
 
             # Store in semantic cache (non-streaming dict responses only).
             if (
@@ -4522,8 +4770,10 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                     embedding=semantic_embedding,
                 )
                 logger.debug(
-                    'semantic cache stored model=%s target=%s/%s',
-                    body.get("model"), provider, target_model,
+                    "semantic cache stored model=%s target=%s/%s",
+                    body.get("model"),
+                    provider,
+                    target_model,
                 )
 
             if body.get("stream", False):
@@ -4599,7 +4849,11 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                                 if metrics is not None:
                                     metrics.first_token_latency.observe(
                                         time.monotonic() - stream_write_start,
-                                        {"pool": pool_name, "provider": provider, "model": target_model},
+                                        {
+                                            "pool": pool_name,
+                                            "provider": provider,
+                                            "model": target_model,
+                                        },
                                     )
                     else:
                         stream_result = (
@@ -4611,7 +4865,9 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                                 model=target_model,
                                 request_id=request_id,
                                 tools_requested=bool(tools),
-                                require_tool_call=_tool_choice_requires_call(body.get("tool_choice")),
+                                require_tool_call=_tool_choice_requires_call(
+                                    body.get("tool_choice")
+                                ),
                             )
                         )
                         async for chunk in stream_result:
@@ -4623,7 +4879,11 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                                 if metrics is not None:
                                     metrics.first_token_latency.observe(
                                         time.monotonic() - stream_write_start,
-                                        {"pool": pool_name, "provider": provider, "model": target_model},
+                                        {
+                                            "pool": pool_name,
+                                            "provider": provider,
+                                            "model": target_model,
+                                        },
                                     )
                 except (ConnectionResetError, ConnectionError, BrokenPipeError) as exc:
                     stream_ok = False
@@ -4631,7 +4891,10 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                     request["_stream_error"] = status
                     logger.info(
                         "stream client disconnected mid-flight rid=%s provider=%s model=%s err=%s",
-                        request_id, provider, target_model, exc,
+                        request_id,
+                        provider,
+                        target_model,
+                        exc,
                     )
                     if budget_recorded and budget is not None and api_key and body is not None:
                         await asyncio.to_thread(budget.refund, api_key, pool_name, budget_charged)
@@ -4641,7 +4904,10 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                     status = "stream_cancelled"
                     request["_stream_error"] = status
                     logger.info(
-                        "stream cancelled rid=%s provider=%s model=%s", request_id, provider, target_model,
+                        "stream cancelled rid=%s provider=%s model=%s",
+                        request_id,
+                        provider,
+                        target_model,
                     )
                     if budget_recorded and budget is not None and api_key and body is not None:
                         await asyncio.to_thread(budget.refund, api_key, pool_name, budget_charged)
@@ -4659,7 +4925,9 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                             UnusableToolResponseError,
                         ),
                     )
-                    status = "tool_response_error" if tool_response_failure else "upstream_stream_error"
+                    status = (
+                        "tool_response_error" if tool_response_failure else "upstream_stream_error"
+                    )
                     request["_stream_error"] = status
                     # Stream validation failures happen after the HTTP 200 has
                     # been committed, so _call_with_pool_fallback() cannot
@@ -4667,18 +4935,14 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                     # breaker accounting here; otherwise an OMP retry with a
                     # sticky session can immediately select the same bad route.
                     if tool_response_failure:
-                        _quarantine_tool_response_failure(
-                            config, provider, target_model, exc
-                        )
+                        _quarantine_tool_response_failure(config, provider, target_model, exc)
                     if breaker is not None:
                         await asyncio.to_thread(
                             breaker.record_failure,
                             provider,
                             target_model,
                             cooldown_secs=(
-                                _cooldown_for_exc(exc)
-                                if isinstance(exc, GatewayError)
-                                else None
+                                _cooldown_for_exc(exc) if isinstance(exc, GatewayError) else None
                             ),
                         )
                     logger.warning(
@@ -4713,7 +4977,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                     except (ConnectionResetError, ConnectionError, BrokenPipeError):
                         stream_ok = False
                 finally:
-                    if 'stream_result' in locals():
+                    if "stream_result" in locals():
                         await _close_async_iterator(stream_result)
                     stop.set()
                     try:
@@ -4727,10 +4991,21 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
             _emit(status)
             if metrics is not None:
                 usage = (result or {}).get("usage") or {} if isinstance(result, dict) else {}
-                for direction, key in (("prompt", "prompt_tokens"), ("completion", "completion_tokens")):
+                for direction, key in (
+                    ("prompt", "prompt_tokens"),
+                    ("completion", "completion_tokens"),
+                ):
                     n = int(usage.get(key) or 0)
                     if n:
-                        metrics.tokens_total.inc({"pool": pool_name, "provider": provider, "model": target_model, "direction": direction}, n)
+                        metrics.tokens_total.inc(
+                            {
+                                "pool": pool_name,
+                                "provider": provider,
+                                "model": target_model,
+                                "direction": direction,
+                            },
+                            n,
+                        )
             return web.json_response(result)
         except BadRequestError as exc:
             status = exc.code or "bad_request"
@@ -4742,7 +5017,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
             )
         except Exception as exc:
             logger.warning(
-                'chat request failed rid=%s summary=%s',
+                "chat request failed rid=%s summary=%s",
                 request_id,
                 _pool_failure_summary(exc),
             )
@@ -4775,15 +5050,20 @@ async def _responses_handler_impl(request: web.Request) -> web.Response | web.St
     api_key = _resolve_api_key(request)
     try:
         body = await request.json()
-        logger.info('responses request model=%s', body.get("model") if isinstance(body, dict) else None)
+        logger.info(
+            "responses request model=%s", body.get("model") if isinstance(body, dict) else None
+        )
         if not isinstance(body, dict):
             raise BadRequestError("Request body must be a JSON object", code="invalid_request")
         messages = _responses_input_to_messages(body.get("input"))
         if body.get("instructions") is not None:
-            messages.insert(0, {
-                "role": "system",
-                "content": _responses_instructions_to_chat(body["instructions"]),
-            })
+            messages.insert(
+                0,
+                {
+                    "role": "system",
+                    "content": _responses_instructions_to_chat(body["instructions"]),
+                },
+            )
 
         # Carry Responses request fields through the canonical Chat API
         # without forwarding the fields already translated above.
@@ -4792,11 +5072,13 @@ async def _responses_handler_impl(request: web.Request) -> web.Response | web.St
             for key, value in body.items()
             if key not in {"input", "instructions", "tools", "tool_choice", "model", "stream"}
         }
-        chat_body.update({
-            "model": body.get("model"),
-            "messages": messages,
-            "stream": bool(body.get("stream", False)),
-        })
+        chat_body.update(
+            {
+                "model": body.get("model"),
+                "messages": messages,
+                "stream": bool(body.get("stream", False)),
+            }
+        )
         if "max_output_tokens" in body:
             if "max_tokens" not in chat_body:
                 chat_body["max_tokens"] = body["max_output_tokens"]
@@ -4858,7 +5140,12 @@ async def _responses_handler_impl(request: web.Request) -> web.Response | web.St
                 budget = request.app.get("budget")
                 if budget is not None and api_key:
                     await asyncio.to_thread(budget.record, api_key, pool_name, budget_units)
-                set_access_log_context(request, provider="cache", model=str(chat_body.get("model") or ""), cache_status="hit")
+                set_access_log_context(
+                    request,
+                    provider="cache",
+                    model=str(chat_body.get("model") or ""),
+                    cache_status="hit",
+                )
                 return web.json_response(
                     _chat_result_to_responses(hit, body.get("model") or config["model_name"])
                 )
@@ -4906,9 +5193,7 @@ async def _responses_handler_impl(request: web.Request) -> web.Response | web.St
                 if sem_hit is not None and not response_contains_tool_calls(sem_hit):
                     budget = request.app.get("budget")
                     if budget is not None and api_key:
-                        await asyncio.to_thread(
-                            budget.record, api_key, pool_name, budget_units
-                        )
+                        await asyncio.to_thread(budget.record, api_key, pool_name, budget_units)
                     set_access_log_context(
                         request,
                         provider="semantic_cache",
@@ -4963,11 +5248,7 @@ async def _responses_handler_impl(request: web.Request) -> web.Response | web.St
                     complete_result=result,
                 )
             else:
-                raw_stream = (
-                    result.iterator
-                    if isinstance(result, _PreparedStream)
-                    else result
-                )
+                raw_stream = result.iterator if isinstance(result, _PreparedStream) else result
                 if not hasattr(raw_stream, "__aiter__"):
                     raise BadRequestError(
                         "streaming Responses output is unavailable from the provider",
@@ -5034,7 +5315,11 @@ async def _responses_handler_impl(request: web.Request) -> web.Response | web.St
                 result,
                 source=f"responses/{body.get('model') or config['model_name']}",
             )
-            if cache is not None and cache_key is not None and not response_contains_tool_calls(result):
+            if (
+                cache is not None
+                and cache_key is not None
+                and not response_contains_tool_calls(result)
+            ):
                 await asyncio.to_thread(cache.put, cache_key, result)
             if (
                 sem_cache is not None
@@ -5134,17 +5419,14 @@ async def _media_preflight(
                 status=429,
                 headers={
                     "Retry-After": str(int(decision.retry_after) + 1),
-                    "X-Tusker-RateLimit-Reason": decision.reason
-                    or "rate limit exceeded",
+                    "X-Tusker-RateLimit-Reason": decision.reason or "rate limit exceeded",
                 },
             )
 
     budget: BudgetTracker | None = request.app.get("budget")
     if budget is not None and api_key:
         try:
-            decision = await asyncio.to_thread(
-                budget.check, api_key, budget_pool, budget_units
-            )
+            decision = await asyncio.to_thread(budget.check, api_key, budget_pool, budget_units)
         except StorageUnavailableError:
             return web.json_response(
                 openai_error(
@@ -5163,14 +5445,12 @@ async def _media_preflight(
                     error_type="rate_limit_error",
                 ),
                 status=429,
-                headers={
-                    "X-Tusker-Budget-Reason": decision.reason or "budget exceeded"
-                },
+                headers={"X-Tusker-Budget-Reason": decision.reason or "budget exceeded"},
             )
 
     guard_pipeline = request.app.get("guard_pipeline")
     if guard_pipeline is not None:
-        guard_result = await guard_pipeline.run(body)
+        guard_result = await run_guard_pipeline(guard_pipeline, body, request=request)
         if not guard_result.allowed:
             return web.json_response(
                 openai_error(
@@ -5180,10 +5460,7 @@ async def _media_preflight(
                 ),
                 status=400,
             )
-        if (
-            guard_result.modified_body is not None
-            and guard_result.modified_body is not body
-        ):
+        if guard_result.modified_body is not None and guard_result.modified_body is not body:
             body.clear()
             body.update(guard_result.modified_body)
     authorize_request_body(request, body)
@@ -5225,10 +5502,7 @@ def _record_media_capabilities(
         pinned_provider, _, upstream_model = normalized_model.partition("::")
         if pinned_provider.strip().lower().replace("_", "-") == normalized_provider:
             normalized_model = upstream_model.strip()
-    elif (
-        normalized_provider == "openrouter"
-        and normalized_model.lower().startswith("openrouter/")
-    ):
+    elif normalized_provider == "openrouter" and normalized_model.lower().startswith("openrouter/"):
         normalized_model = normalized_model.split("/", 1)[1]
     if not normalized_provider or not normalized_model:
         return
@@ -5268,14 +5542,14 @@ async def images_handler(request: web.Request) -> web.Response:
         image_handler = request.app.get("image_handler")
         if image_handler is None:
             return web.json_response(
-                openai_error("image handler not initialised", code="internal_error", error_type="internal"),
+                openai_error(
+                    "image handler not initialised", code="internal_error", error_type="internal"
+                ),
                 status=503,
             )
 
         provider = image_handler.get_provider_for_image_request(model, request.path)
-        set_access_log_context(
-            request, pool="media", provider=provider, model=model
-        )
+        set_access_log_context(request, pool="media", provider=provider, model=model)
         config = request.app["config"]
         provider_keys = config.get("provider_api_keys", {})
         api_key = provider_keys.get(provider)
@@ -5334,16 +5608,16 @@ async def tts_handler(request: web.Request) -> web.Response:
         tts = request.app.get("tts_handler")
         if tts is None:
             return web.json_response(
-                openai_error("tts handler not initialised", code="internal_error", error_type="internal"),
+                openai_error(
+                    "tts handler not initialised", code="internal_error", error_type="internal"
+                ),
                 status=503,
             )
         config = request.app["config"]
         model = body.get("model", "tts-1")
         provider_keys = config.get("provider_api_keys", {})
         provider = tts.get_provider_for_tts_request(model)
-        set_access_log_context(
-            request, pool="media", provider=provider, model=model
-        )
+        set_access_log_context(request, pool="media", provider=provider, model=model)
         api_key = provider_keys.get(provider)
         audio_bytes, content_type = await tts.handle_request(
             model=model,
@@ -5399,15 +5673,15 @@ async def video_handler(request: web.Request) -> web.Response:
         video = request.app.get("video_handler")
         if video is None:
             return web.json_response(
-                openai_error("video handler not initialised", code="internal_error", error_type="internal"),
+                openai_error(
+                    "video handler not initialised", code="internal_error", error_type="internal"
+                ),
                 status=503,
             )
         config = request.app["config"]
         provider_keys = config.get("provider_api_keys", {})
         provider = video.get_provider_for_video_request(model)
-        set_access_log_context(
-            request, pool="media", provider=provider, model=model
-        )
+        set_access_log_context(request, pool="media", provider=provider, model=model)
         api_key = provider_keys.get(provider)
         result = await video.handle_request(
             model=model,
@@ -5469,7 +5743,13 @@ async def rerank_handler(request: web.Request) -> web.Response:
     try:
         try:
             body = await request.json()
-        except (ContentTypeError, json.JSONDecodeError, UnicodeDecodeError, TypeError, ValueError) as exc:
+        except (
+            ContentTypeError,
+            json.JSONDecodeError,
+            UnicodeDecodeError,
+            TypeError,
+            ValueError,
+        ) as exc:
             raise BadRequestError(
                 "Request body must be valid JSON",
                 code="invalid_request",
@@ -5574,7 +5854,13 @@ async def embeddings_handler(request: web.Request) -> web.Response:
     try:
         try:
             body = await request.json()
-        except (ContentTypeError, json.JSONDecodeError, UnicodeDecodeError, TypeError, ValueError) as exc:
+        except (
+            ContentTypeError,
+            json.JSONDecodeError,
+            UnicodeDecodeError,
+            TypeError,
+            ValueError,
+        ) as exc:
             raise BadRequestError(
                 "Request body must be valid JSON",
                 code="invalid_request",
@@ -5648,6 +5934,7 @@ async def embeddings_handler(request: web.Request) -> web.Response:
             ),
             status=502,
         )
+
 
 def _media_error_status(exc: GatewayError) -> int:
     if exc.code in {
