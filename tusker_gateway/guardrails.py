@@ -28,10 +28,15 @@ class OutputLengthGuard:
 
     async def check(self, body: dict[str, Any]) -> GuardResult:
         requested = body.get("max_tokens", 0)
+        if requested is None or requested == 0:
+            # No explicit output budget: let the provider use its default.
+            return GuardResult()
         if requested > self.max_tokens:
+            clamped = dict(body)
+            clamped["max_tokens"] = self.max_tokens
             return GuardResult(
-                allowed=False,
-                message=f"output exceeds max_tokens limit of {self.max_tokens}",
+                allowed=True,
+                modified_body=clamped,
             )
         return GuardResult()
 
@@ -85,7 +90,15 @@ _DEFAULT_INJECTION_PATTERNS: list[str] = [
 
 @dataclass
 class PromptInjectionGuard:
-    """Block requests that contain suspected prompt-injection text."""
+    """Block suspected injection text in user-authored messages.
+
+    Assistant and tool messages commonly contain source code, documentation,
+    or untrusted external data. Those messages can legitimately quote
+    injection-shaped phrases, so treating every message role as user input
+    causes normal agent/tool loops to fail closed. System/developer messages
+    are caller-controlled instructions and are likewise outside this input
+    guard's scope.
+    """
 
     extra_patterns: list[str] = field(default_factory=list)
 
@@ -98,10 +111,22 @@ class PromptInjectionGuard:
             return GuardResult()
 
         for msg in messages:
-            content = msg.get("content")
-            if not isinstance(content, str):
+            if not isinstance(msg, dict) or msg.get("role") != "user":
                 continue
-            lower = content.lower()
+            content = msg.get("content")
+            if isinstance(content, list):
+                text_parts = []
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        part = block.get("text")
+                        if isinstance(part, str):
+                            text_parts.append(part)
+                text = "\n".join(text_parts)
+            elif isinstance(content, str):
+                text = content
+            else:
+                continue
+            lower = text.lower()
             for pat in self._patterns:
                 if pat.lower() in lower:
                     return GuardResult(allowed=False, message="possible prompt injection detected")
