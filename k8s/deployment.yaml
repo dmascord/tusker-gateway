@@ -352,6 +352,43 @@ spec:
           value: '45'
         - name: TUSKER_STRUCTURED_QUALIFICATION_MAX_AGE_SECS
           value: '21600'
+        # Input-modality probe is the missing link for vision+tool requests:
+        # the pool-eligibility filter reads input_modalities from the live
+        # provider catalog, but several providers (minimax, synthetic,
+        # github-copilot, opencode-go) return text-only rows for models that
+        # actually support images, locking them out before cooldown or
+        # heavyweight checks run. A bounded image probe against the gateway
+        # boundary stamps authoritative ``passed`` records into the capability
+        # DB so the filter admits them again.
+        #
+        # Polite-provider cadence: probes are sequential
+        # (``max_concurrency=1`` in modality_qualification.run_qualification)
+        # with a small inter-probe delay, only ``LIMIT`` candidates per cycle,
+        # quarantined routes are skipped (no probe storm during known
+        # outages), and ``passed``/``unsupported`` evidence is cached for
+        # ``MAX_AGE_SECS`` while transient ``unavailable`` evidence is cached
+        # only for ``TRANSIENT_MAX_AGE_SECS`` so a recovered provider is
+        # re-tested within hours rather than days.
+        - name: TUSKER_MODALITY_QUALIFICATION_ENABLED
+          value: 'true'
+        - name: TUSKER_MODALITY_QUALIFICATION_POOLS
+          value: code,premium,swarm
+        - name: TUSKER_MODALITY_QUALIFICATION_MODALITY
+          value: image
+        - name: TUSKER_MODALITY_QUALIFICATION_LIMIT
+          value: '6'
+        - name: TUSKER_MODALITY_QUALIFICATION_TIMEOUT_SECS
+          value: '45'
+        - name: TUSKER_MODALITY_QUALIFICATION_MAX_AGE_SECS
+          value: '86400'
+        - name: TUSKER_MODALITY_QUALIFICATION_TRANSIENT_MAX_AGE_SECS
+          value: '21600'
+        - name: TUSKER_MODALITY_QUALIFICATION_PER_PROBE_DELAY_SECS
+          value: '2'
+        - name: TUSKER_MODALITY_QUALIFICATION_INITIAL_DELAY_SECS
+          value: '600'
+        - name: TUSKER_MODALITY_QUALIFICATION_INTERVAL_SECS
+          value: '43200'
         - name: TUSKER_CATALOG_STARTUP_TIMEOUT_SECS
           value: '30'
         - name: TUSKER_UPSTREAM_SOCK_READ_SECS

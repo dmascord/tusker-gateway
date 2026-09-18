@@ -228,7 +228,7 @@ class QualityDB:
         """Sort (provider, model) candidates by quality score (highest first).
 
         Candidates with no recorded data use an adaptive floor computed
-        from the median score of the pool, clamped to a minimum of 20.0.
+        from the median score of the pool, clamped between 10.0 and 50.0.
         """
         scored: list[tuple[str, str, float]] = []
         known_scores: list[float] = []
@@ -243,7 +243,10 @@ class QualityDB:
             known_scores.sort()
             n = len(known_scores)
             median = known_scores[n // 2] if n % 2 else (known_scores[n // 2 - 1] + known_scores[n // 2]) / 2.0
-            floor = max(20.0, median - 20.0)
+            floor = max(10.0, median - 20.0)
+            # Cap the adaptive floor so a pool with uniformly mediocre models
+            # doesn't promote unknown catalog entries above proven ones.
+            floor = min(floor, 50.0)
         else:
             floor = 50.0  # no data at all — keep legacy default
         if default_score is not None:

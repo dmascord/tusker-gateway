@@ -44,7 +44,31 @@ def test_quality_db_ranking():
         assert ranked[0][0] in {"p1", "p2"}
         assert ranked[1][0] in {"p1", "p2"}
 
+def test_quality_rank_adaptive_floor_is_bounded():
+    """Unknown candidates use a floor no lower than 10 or higher than 50."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = QualityDB(os.path.join(tmpdir, "test.db"))
 
+        known = ("healthy", "known-model")
+        unknown = ("unknown", "unknown-model")
+
+        # A very healthy known model would otherwise produce a floor above 50.
+        for _ in range(QUALITY_WINDOW):
+            db.record(*known, success=True, latency_ms=0.0)
+        ranked_scores = dict(
+            (model, score)
+            for _provider, model, score in db.rank([known, unknown])
+        )
+        assert ranked_scores[unknown[1]] == 50.0
+
+        # A very poor known model would otherwise produce a floor below 10.
+        for _ in range(QUALITY_WINDOW):
+            db.record(*known, success=False, latency_ms=10_000.0)
+        ranked = db.rank([known, unknown])
+        unknown_score = next(
+            score for provider, model, score in ranked if provider == unknown[0]
+        )
+        assert unknown_score == 10.0
 def test_quality_windowed_recovery():
     """Old failures fall out of the window once enough new successes accumulate."""
     with tempfile.TemporaryDirectory() as tmpdir:

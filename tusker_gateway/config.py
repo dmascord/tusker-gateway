@@ -602,23 +602,15 @@ def _load_pools() -> dict[str, PoolConfig]:
         pools["code"] = PoolConfig(
             name="code",
             models=[
-                # Mix of free/cheap models (kept) and heavyweight slugs (dropped
-                # automatically by the heavyweight gate in pools.py).
-                {"provider": "minimax", "model": "MiniMax-M3", "input_modalities": ["text", "image"]},
-                {"provider": "minimax", "model": "MiniMax-M2.7-highspeed", "input_modalities": ["text"]},
-                {"provider": "synthetic", "model": "syn:large:text", "input_modalities": ["text"]},
-                {"provider": "synthetic", "model": "syn:large:vision", "input_modalities": ["text", "image"]},
+                # Minimum curated seeds that test_default_code_pool_includes_current_provider_routes
+                # relies on. Everything else is contributed by the auto_catalog merge.
                 {"provider": "groq", "model": "openai/gpt-oss-120b", "input_modalities": ["text"]},
                 {"provider": "groq", "model": "openai/gpt-oss-20b", "input_modalities": ["text"]},
                 {"provider": "groq", "model": "qwen/qwen3.6-27b", "input_modalities": ["text", "image"]},
                 {"provider": "arcee", "model": "trinity-mini", "input_modalities": ["text"]},
-                {"provider": "github-copilot", "model": "gpt-5.5"},
-                {"provider": "github-copilot", "model": "claude-sonnet-4.6"},
-                {"provider": "openai-codex", "model": "gpt-5.6-luna"},
-                {"provider": "openai-codex", "model": "gpt-5.4-mini"},
-                {"provider": "openrouter", "model": "openai/gpt-oss-20b:free"},
             ],
             fallback_pools=("premium", "swarm"),
+            auto_catalog=True,
             auto_catalog_providers=(
                 default_auto_catalog_providers
                 or (
@@ -646,13 +638,11 @@ def _load_pools() -> dict[str, PoolConfig]:
                 {"provider": "synthetic", "model": "syn:small:text", "input_modalities": ["text"]},
                 {"provider": "synthetic", "model": "syn:large:vision", "input_modalities": ["text", "image"]},
                 {"provider": "synthetic", "model": "syn:small:vision", "input_modalities": ["text", "image"]},
-                {"provider": "openai-codex", "model": "gpt-5.6-luna"},
-                {"provider": "openai-codex", "model": "gpt-5.4-mini"},
             ],
             zdr=True,
+            auto_catalog=True,
             auto_catalog_providers=(
-                default_auto_catalog_providers
-                or ("synthetic", "github-copilot")
+                default_auto_catalog_providers or ("synthetic", "github-copilot")
             ),
         )
     if "premium" not in pools:
@@ -661,11 +651,8 @@ def _load_pools() -> dict[str, PoolConfig]:
             models=[
                 {"provider": "openai-codex", "model": "gpt-5.6-sol"},
                 {"provider": "openai-codex", "model": "gpt-5.6-terra"},
-                {"provider": "synthetic", "model": "syn:large:text", "input_modalities": ["text"]},
-                {"provider": "synthetic", "model": "syn:large:vision", "input_modalities": ["text", "image"]},
-                {"provider": "minimax", "model": "MiniMax-M2.7-highspeed", "input_modalities": ["text"]},
-                {"provider": "arcee", "model": "trinity-large-preview", "input_modalities": ["text"]},
             ],
+            auto_catalog=True,
             auto_catalog_providers=default_auto_catalog_providers,
         )
     if "swarm" not in pools:
@@ -673,8 +660,8 @@ def _load_pools() -> dict[str, PoolConfig]:
             name="swarm",
             models=[
                 {"provider": "github-copilot", "model": "gpt-5.5"},
-                {"provider": "github-copilot", "model": "claude-sonnet-4.6"},
             ],
+            auto_catalog=True,
             auto_catalog_providers=default_auto_catalog_providers,
         )
 

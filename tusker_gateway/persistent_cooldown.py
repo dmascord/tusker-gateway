@@ -62,6 +62,17 @@ class PersistentCooldownStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS permanent_failures (
+                    provider TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    failed_at REAL NOT NULL,
+                    expires_at REAL,
+                    PRIMARY KEY (provider, model)
+                )
+                """
+            )
             conn.commit()
 
     def _connect(self):

@@ -5,11 +5,13 @@ only schedules small batches of the existing tool probes, rotates through the
 configured pools, and purges expired persistent cooldown rows. It never
 probes media-generation endpoints.
 """
+
 from __future__ import annotations
 
 import asyncio
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +27,14 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_POOL_ORDER = ("code", "privacy", "premium", "swarm")
 _DEFAULT_STRUCTURED_POOL = "privacy"
+# Vision+tool requests are bottlenecked when the live catalog loses the
+# input_modalities field for models that actually support image input (the
+# pool-eligibility filter strips them before any other fallback can run).
+# A periodic modality probe against the gateway boundary keeps the capability
+# DB authoritative, so a stale catalog row does not lock vision-capable
+# routes out of selection.
+_DEFAULT_MODALITY_POOL_ORDER = ("code", "premium", "swarm")
+_DEFAULT_MODALITY = "image"
 
 
 def _env_float(name: str, default: float, *, minimum: float = 0.0) -> float:
@@ -130,6 +140,52 @@ def _structured_pool_name(config: dict[str, Any]) -> str:
     )
 
 
+def _modality_qualification_enabled(config: dict[str, Any]) -> bool:
+    """Return whether the input-modality probe maintenance is enabled.
+
+    Off by default — an operator opts in once vision+tool traffic is observed
+    failing the pool-eligibility filter. The probe is bounded and read-only
+    (1×1px image / 1×16-byte wav) but still costs an upstream round trip per
+    candidate, so the operator retains explicit control.
+    """
+    raw = os.environ.get("TUSKER_MODALITY_QUALIFICATION_ENABLED", "0")
+    if raw.strip().lower() in {"0", "false", "no", "off"}:
+        return False
+    pools = _modality_pool_order(config)
+    return bool(pools)
+
+
+def _modality_pool_order(config: dict[str, Any]) -> tuple[str, ...]:
+    """Return the operator-overridable rotation order for modality probes.
+
+    Unlike the tool-qualification rotation, modality probes are explicitly
+    scoped to ``code``/``premium``/``swarm`` by default. The ``privacy``
+    pool is excluded on purpose — image-bearing requests never go there, and
+    keeping the probe set small avoids spending maintenance cycles on routes
+    the filter would never select. Operator overrides are honoured but
+    never extended with leftovers; an unknown pool name silently drops.
+    """
+    configured = {
+        str(name).strip().lower().replace("_", "-")
+        for name in config.get("pools", {})
+        if str(name).strip()
+    }
+    requested = tuple(
+        item.strip().lower().replace("_", "-")
+        for item in os.environ.get("TUSKER_MODALITY_QUALIFICATION_POOLS", "").split(",")
+        if item.strip()
+    )
+    order = requested or _DEFAULT_MODALITY_POOL_ORDER
+    return tuple(name for name in order if name in configured)
+
+
+def _modality_name() -> str:
+    raw = (
+        os.environ.get("TUSKER_MODALITY_QUALIFICATION_MODALITY", _DEFAULT_MODALITY).strip().lower()
+    )
+    return raw or _DEFAULT_MODALITY
+
+
 async def run_structured_maintenance_cycle(
     *,
     pool_name: str = _DEFAULT_STRUCTURED_POOL,
@@ -176,6 +232,77 @@ async def run_structured_maintenance_cycle(
     return summary
 
 
+async def run_modality_maintenance_cycle(
+    *,
+    pool_names: tuple[str, ...],
+    base_url: str = "http://127.0.0.1:8642",
+    input_modality: str = _DEFAULT_MODALITY,
+    limit: int = 8,
+    timeout_secs: float = 45.0,
+    max_age_secs: float = 86_400.0,
+    transient_max_age_secs: float | None = None,
+    per_probe_delay_secs: float = 0.0,
+) -> dict[str, Any]:
+    """Probe input modality on a small batch of candidates across the pool set.
+
+    The runner refreshes the catalog once, picks candidates whose catalog row
+    advertises the modality (or every general-chat candidate when
+    ``include_unadvertised`` is forced), stamps ``passed``/``unsupported``
+    records into ``ModelCapabilityDB`` and reports a single summary line. The
+    capability DB is then consulted by ``_input_modalities_allowed`` in
+    ``pools.py``, so vision+tool requests stop being filtered by stale catalog
+    rows within one probe cycle.
+
+    Polite-provider semantics:
+
+    * ``max_concurrency`` is forced to ``1`` so probes are sequential — no
+      fan-out against a single upstream.
+    * ``per_probe_delay_secs`` adds a small gap between consecutive probes
+      so a flaky provider gets a chance to recover before the next attempt.
+    * Authoritative ``passed`` / ``unsupported`` records are cached for
+      ``max_age_secs`` (typically 24h — a capability claim is stable).
+      ``unavailable`` records (transient 5xx / timeout / auth) are cached for
+      ``transient_max_age_secs`` (typically a few hours) so the runner
+      retries them sooner without re-probing every cycle.
+    * Quarantined routes are skipped — the gateway's persistent and
+      in-memory cooldowns prevent the maintenance cycle from turning a known
+      outage into a probe storm.
+    """
+    from tusker_gateway.modality_qualification import run_qualification
+
+    config = load_config()
+    api_key = os.environ.get("API_KEYS", "").split(",", 1)[0].strip()
+    if not api_key:
+        # Mirrors the structured/tool runners — the gateway caller key is
+        # always present in production via the env vault, so we treat absence
+        # as a configuration error rather than silently skipping the probe.
+        raise RuntimeError("API_KEYS must contain the gateway caller key")
+    results = await run_qualification(
+        pool_names=list(pool_names),
+        base_url=base_url,
+        input_modality=input_modality,
+        max_concurrency=1,
+        timeout_secs=timeout_secs,
+        max_age_secs=max_age_secs,
+        transient_max_age_secs=transient_max_age_secs,
+        per_probe_delay_secs=per_probe_delay_secs,
+        limit=limit,
+        ignore_cooldowns=False,
+    )
+    counts: dict[str, int] = {}
+    for result in results:
+        status = str(result.get("status", "unavailable"))
+        counts[status] = counts.get(status, 0) + 1
+    return {
+        "modality": input_modality,
+        "pools": ",".join(pool_names),
+        "tested": len(results),
+        "passed": counts.get("passed", 0),
+        "unsupported": counts.get("unsupported", 0),
+        "unavailable": counts.get("unavailable", 0),
+    }
+
+
 async def qualification_maintenance_loop(stop_event: asyncio.Event) -> None:
     """Rotate small qualification batches without blocking gateway startup."""
     config = load_config()
@@ -209,10 +336,13 @@ async def qualification_maintenance_loop(stop_event: asyncio.Event) -> None:
         86_400.0,
         minimum=60.0,
     )
-    base_url = os.environ.get(
-        "TUSKER_TOOL_QUALIFICATION_BASE_URL",
-        "http://127.0.0.1:8642",
-    ).strip() or "http://127.0.0.1:8642"
+    base_url = (
+        os.environ.get(
+            "TUSKER_TOOL_QUALIFICATION_BASE_URL",
+            "http://127.0.0.1:8642",
+        ).strip()
+        or "http://127.0.0.1:8642"
+    )
     structured_enabled = _structured_qualification_enabled(config)
     structured_pool = _structured_pool_name(config)
     structured_limit = _env_int(
@@ -230,10 +360,47 @@ async def qualification_maintenance_loop(stop_event: asyncio.Event) -> None:
         21_600.0,
         minimum=60.0,
     )
+    modality_enabled = _modality_qualification_enabled(config)
+    modality_pools = _modality_pool_order(config)
+    modality_name = _modality_name()
+    modality_limit = _env_int(
+        "TUSKER_MODALITY_QUALIFICATION_LIMIT",
+        8,
+        minimum=1,
+    )
+    modality_timeout_secs = _env_float(
+        "TUSKER_MODALITY_QUALIFICATION_TIMEOUT_SECS",
+        45.0,
+        minimum=5.0,
+    )
+    modality_max_age_secs = _env_float(
+        "TUSKER_MODALITY_QUALIFICATION_MAX_AGE_SECS",
+        86_400.0,
+        minimum=60.0,
+    )
+    modality_transient_max_age_secs = _env_float(
+        "TUSKER_MODALITY_QUALIFICATION_TRANSIENT_MAX_AGE_SECS",
+        21_600.0,
+        minimum=60.0,
+    )
+    modality_per_probe_delay_secs = _env_float(
+        "TUSKER_MODALITY_QUALIFICATION_PER_PROBE_DELAY_SECS",
+        2.0,
+        minimum=0.0,
+    )
+    modality_initial_delay_secs = _env_float(
+        "TUSKER_MODALITY_QUALIFICATION_INITIAL_DELAY_SECS",
+        600.0,
+        minimum=0.0,
+    )
+    modality_interval_secs = _env_float(
+        "TUSKER_MODALITY_QUALIFICATION_INTERVAL_SECS",
+        43_200.0,
+        minimum=60.0,
+    )
 
     logger.info(
-        "qualification maintenance started interval=%.0fs initial_delay=%.0fs "
-        "limit=%d pools=%s",
+        "qualification maintenance started interval=%.0fs initial_delay=%.0fs limit=%d pools=%s",
         interval_secs,
         initial_delay_secs,
         limit,
@@ -247,8 +414,26 @@ async def qualification_maintenance_loop(stop_event: asyncio.Event) -> None:
             structured_timeout_secs,
             structured_max_age_secs,
         )
+    if modality_enabled:
+        logger.info(
+            "modality qualification enabled modality=%s pools=%s limit=%d "
+            "timeout=%.0fs max_age=%.0fs transient_max_age=%.0fs "
+            "per_probe_delay=%.1fs interval=%.0fs initial_delay=%.0fs",
+            modality_name,
+            ",".join(modality_pools),
+            modality_limit,
+            modality_timeout_secs,
+            modality_max_age_secs,
+            modality_transient_max_age_secs,
+            modality_per_probe_delay_secs,
+            modality_interval_secs,
+            modality_initial_delay_secs,
+        )
     first_cycle = True
     pool_index = 0
+    modality_next_due_at = (
+        time.monotonic() + modality_initial_delay_secs if modality_enabled else None
+    )
     while not stop_event.is_set():
         delay = initial_delay_secs if first_cycle else interval_secs
         first_cycle = False
@@ -277,6 +462,31 @@ async def qualification_maintenance_loop(stop_event: asyncio.Event) -> None:
                     "structured qualification result=%s",
                     structured_summary,
                 )
+            if (
+                modality_enabled
+                and modality_next_due_at is not None
+                and time.monotonic() >= modality_next_due_at
+            ):
+                try:
+                    modality_summary = await run_modality_maintenance_cycle(
+                        pool_names=modality_pools,
+                        base_url=base_url,
+                        input_modality=modality_name,
+                        limit=modality_limit,
+                        timeout_secs=modality_timeout_secs,
+                        max_age_secs=modality_max_age_secs,
+                        transient_max_age_secs=modality_transient_max_age_secs,
+                        per_probe_delay_secs=modality_per_probe_delay_secs,
+                    )
+                    logger.info(
+                        "modality qualification result=%s",
+                        modality_summary,
+                    )
+                finally:
+                    # Reschedule the next probe relative to *now*, not to the
+                    # wall-clock time the cycle started — a slow tool probe
+                    # must not stack up extra modality probes immediately.
+                    modality_next_due_at = time.monotonic() + modality_interval_secs
         except asyncio.CancelledError:
             raise
         except Exception as exc:

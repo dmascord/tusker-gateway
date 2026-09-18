@@ -17,6 +17,7 @@ calls can be billable or create asynchronous jobs; use the existing provider
 capability discovery for non-billable catalog/endpoint evidence and add an
 explicit provider-approved generation probe before enabling such calls.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -49,9 +50,7 @@ _TINY_IMAGE_DATA_URL = (
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
     "YAAAAAYAAjCB0C8AAAAASUVORK5CYII="
 )
-_TINY_WAV_BASE64 = (
-    "UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAAA"
-)
+_TINY_WAV_BASE64 = "UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAAA"
 _MODALITY_TO_CAPABILITY = {
     "text": "input_text",
     "image": "input_image",
@@ -99,22 +98,28 @@ def _messages_for_modality(modality: str) -> list[dict[str, Any]]:
         {"type": "text", "text": "Describe the supplied media in one word."},
     ]
     if modality == "image":
-        content.append({
-            "type": "image_url",
-            "image_url": {"url": _TINY_IMAGE_DATA_URL, "detail": "low"},
-        })
+        content.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": _TINY_IMAGE_DATA_URL, "detail": "low"},
+            }
+        )
     elif modality == "audio":
-        content.append({
-            "type": "input_audio",
-            "input_audio": {"data": _TINY_WAV_BASE64, "format": "wav"},
-        })
+        content.append(
+            {
+                "type": "input_audio",
+                "input_audio": {"data": _TINY_WAV_BASE64, "format": "wav"},
+            }
+        )
     elif modality == "video":
         # Video input is provider-specific. This intentionally uses the
         # standard URL block so a provider can explicitly accept or reject it.
-        content.append({
-            "type": "video_url",
-            "video_url": {"url": "data:video/mp4;base64,AAAA"},
-        })
+        content.append(
+            {
+                "type": "video_url",
+                "video_url": {"url": "data:video/mp4;base64,AAAA"},
+            }
+        )
     else:
         raise ValueError(f"unsupported input modality: {modality}")
     return [{"role": "user", "content": content}]
@@ -175,8 +180,7 @@ async def probe_input_model(
                 result["failure_class"] = "invalid_response"
                 return _finish_result(result, started)
             if isinstance(body, dict) and (
-                isinstance(body.get("choices"), list)
-                or isinstance(body.get("output"), list)
+                isinstance(body.get("choices"), list) or isinstance(body.get("output"), list)
             ):
                 result["status"] = "passed"
             else:
@@ -268,14 +272,30 @@ def _needs_probe(
     *,
     force: bool,
     max_age_secs: float,
+    transient_max_age_secs: float | None = None,
 ) -> bool:
+    """Decide whether a candidate is still due for a fresh probe.
+
+    Authoritative capability claims (``passed`` / ``unsupported``) are cached
+    for ``max_age_secs`` — the model either advertises image input or it
+    doesn't, and that does not flip at runtime. Transient evidence
+    (``unavailable`` from a 5xx / timeout / auth-error) is cached only for
+    ``transient_max_age_secs`` so a flaky provider can be re-probed sooner.
+    Without this split the runner would either hammer every flaky provider every
+    cycle, or wait a full 24h before retrying one that just recovered.
+    """
     if force or record is None:
         return True
     if record.source != "modality_probe":
         return True
     if record.probe_version != MODEL_CAPABILITY_PROBE_VERSION:
         return True
-    return (time.time() - record.checked_at) >= max_age_secs
+    age_secs = time.time() - record.checked_at
+    if record.status == "unavailable":
+        if transient_max_age_secs is None:
+            transient_max_age_secs = max_age_secs
+        return age_secs >= transient_max_age_secs
+    return age_secs >= max_age_secs
 
 
 def _route_is_quarantined(
@@ -295,8 +315,7 @@ def _route_is_quarantined(
         return False
     try:
         return bool(
-            cooldown_store.is_active(provider, model)
-            or cooldown_store.is_provider_active(provider)
+            cooldown_store.is_active(provider, model) or cooldown_store.is_provider_active(provider)
         )
     except Exception:
         logger.debug("persistent cooldown check failed", exc_info=True)
@@ -311,6 +330,8 @@ async def run_qualification(
     max_concurrency: int = 1,
     timeout_secs: float = 45.0,
     max_age_secs: float = 86_400.0,
+    transient_max_age_secs: float | None = None,
+    per_probe_delay_secs: float = 0.0,
     force: bool = False,
     limit: int | None = None,
     providers: set[str] | None = None,
@@ -325,16 +346,13 @@ async def run_qualification(
         raise RuntimeError("API_KEYS must contain the gateway caller key")
     quality_path = config.get("quality_db_path", "data/quality.db")
     capability_db = ModelCapabilityDB(
-        config.get("model_capability_db_path")
-        or default_model_capability_db_path(quality_path)
+        config.get("model_capability_db_path") or default_model_capability_db_path(quality_path)
     )
     cooldown_store = None
     if not ignore_cooldowns and quality_path != ":memory:":
         from tusker_gateway.persistent_cooldown import PersistentCooldownStore
 
-        cooldown_store = PersistentCooldownStore(
-            Path(quality_path).parent / "cooldowns.db"
-        )
+        cooldown_store = PersistentCooldownStore(Path(quality_path).parent / "cooldowns.db")
     selected_pools = pool_names or ["code"]
     provider_filter = {
         str(provider).strip().lower().replace("_", "-")
@@ -349,9 +367,7 @@ async def run_qualification(
         for provider, model in (model_pairs or set())
         if str(provider).strip() and str(model).strip()
     }
-    async with aiohttp.ClientSession(
-        timeout=aiohttp.ClientTimeout(total=timeout_secs)
-    ) as session:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_secs)) as session:
         registry = _catalog_registry(config, capability_db, session)
         await registry.refresh_all(session)
         manager = PoolManager(config)
@@ -374,6 +390,7 @@ async def run_qualification(
                 capability_db.get(pair[0], pair[1], capability),
                 force=force,
                 max_age_secs=max_age_secs,
+                transient_max_age_secs=transient_max_age_secs,
             )
         ]
         skipped_quarantine = 0
@@ -403,6 +420,7 @@ async def run_qualification(
                 skipped_quarantine,
             )
         semaphore = asyncio.Semaphore(max(1, max_concurrency))
+        probe_delay = max(0.0, per_probe_delay_secs)
 
         async def one(pair: tuple[str, str]) -> dict[str, Any]:
             async with semaphore:
@@ -426,6 +444,12 @@ async def run_qualification(
                     latency_ms=result.get("latency_ms"),
                     failure_class=result.get("failure_class"),
                 )
+                # Polite gap between consecutive probes even when concurrency
+                # is 1: gives a transient provider time to recover between
+                # attempts without prolonging the cycle by orders of magnitude
+                # (e.g. 8 probes × 2s delay ≈ 16s of breathing room).
+                if probe_delay > 0:
+                    await asyncio.sleep(probe_delay)
                 return result
 
         return await asyncio.gather(*(one(pair) for pair in pairs))
@@ -445,8 +469,7 @@ def _print_results(results: list[dict[str, Any]], *, modality: str) -> None:
             f" latency={latency_text} failure={result.get('failure_class') or '-'}"
         )
     print(
-        f"modality={modality} tested={len(results)} "
-        f"statuses={json.dumps(counts, sort_keys=True)}"
+        f"modality={modality} tested={len(results)} statuses={json.dumps(counts, sort_keys=True)}"
     )
 
 
@@ -480,6 +503,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-concurrency", type=int, default=1)
     parser.add_argument("--timeout-secs", type=float, default=45.0)
     parser.add_argument("--max-age-secs", type=float, default=86_400.0)
+    parser.add_argument(
+        "--transient-max-age-secs",
+        type=float,
+        default=None,
+        help=(
+            "Override for ``unavailable`` records only. Authoritative "
+            "``passed`` / ``unsupported`` records always use "
+            "``--max-age-secs``. Defaults to ``--max-age-secs`` when unset."
+        ),
+    )
+    parser.add_argument(
+        "--per-probe-delay-secs",
+        type=float,
+        default=0.0,
+        help="Sleep this many seconds between consecutive probes within a cycle.",
+    )
     parser.add_argument("--limit", type=int)
     parser.add_argument("--force", action="store_true")
     parser.add_argument(
@@ -513,6 +552,8 @@ def main(argv: list[str] | None = None) -> int:
             max_concurrency=args.max_concurrency,
             timeout_secs=args.timeout_secs,
             max_age_secs=args.max_age_secs,
+            transient_max_age_secs=args.transient_max_age_secs,
+            per_probe_delay_secs=args.per_probe_delay_secs,
             force=args.force,
             limit=args.limit,
             providers=set(args.provider),
