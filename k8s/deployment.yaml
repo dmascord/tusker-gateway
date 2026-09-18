@@ -415,7 +415,7 @@ spec:
         - name: TUSKER_MODALITY_QUALIFICATION_ENABLED
           value: 'true'
         - name: TUSKER_MODALITY_QUALIFICATION_POOLS
-          value: code,premium,swarm
+          value: code,privacy,premium,swarm
         - name: TUSKER_MODALITY_QUALIFICATION_MODALITY
           value: image
         - name: TUSKER_MODALITY_QUALIFICATION_LIMIT
