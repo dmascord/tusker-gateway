@@ -122,7 +122,10 @@ spec:
           value: "true"
         # Local hardware routes use LAN endpoints, never pod loopback.
         - name: PROVIDER_REGISTRY_JSON
-          value: '{"local-llm":{"kind":"local","base_url":"http://10.0.0.212:11434","chat_path":"/v1/chat/completions","models_path":"/api/tags","embed_path":"/v1/embeddings","zdr_ok":true},"mlx-mac":{"kind":"local","base_url":"http://10.0.0.141:11435","chat_path":"/v1/chat/completions","models_path":"/v1/models","zdr_ok":true,"model_aliases":{"qwen3-coder-30b-a3b-instruct-4bit":"/Users/tusker/models/Qwen3-Coder-30B-A3B-Instruct-4bit"}},"groq":{"kind":"bearer","base_url":"https://api.groq.com/openai","chat_path":"/v1/chat/completions","zdr_ok":true},"workers-ai":{"kind":"bearer","base_url":"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai","chat_path":"/v1/chat/completions","zdr_ok":true},"alibaba":{"kind":"bearer","base_url":"https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode","chat_path":"/v1/chat/completions","zdr_ok":false}}'
+          # Both hardware routes use Ollama's OpenAI-compatible API.  The
+          # MLX host serves the complete multimodal Ornith artifact through
+          # Ollama on 11434; its old mlx_lm server on 11435 is text-only.
+          value: '{"local-llm":{"kind":"local","base_url":"http://10.0.0.212:11434","chat_path":"/v1/chat/completions","models_path":"/api/tags","embed_path":"/v1/embeddings","zdr_ok":true},"mlx-mac":{"kind":"local","base_url":"http://10.0.0.141:11434","chat_path":"/v1/chat/completions","models_path":"/api/tags","embed_path":"/v1/embeddings","zdr_ok":true,"model_aliases":{"qwen3-coder-30b-a3b-instruct-4bit":"/Users/tusker/models/Qwen3-Coder-30B-A3B-Instruct-4bit"}},"groq":{"kind":"bearer","base_url":"https://api.groq.com/openai","chat_path":"/v1/chat/completions","zdr_ok":true},"workers-ai":{"kind":"bearer","base_url":"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai","chat_path":"/v1/chat/completions","zdr_ok":true},"alibaba":{"kind":"bearer","base_url":"https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode","chat_path":"/v1/chat/completions","zdr_ok":false}}'
         - name: TUSKER_AUTO_CATALOG_EXCLUDED_PROVIDERS
           value: nvidia
         # Do not poll provider catalogs that are intentionally unavailable or
