@@ -58,7 +58,7 @@ def test_modality_pool_order_defaults_to_vision_pools(monkeypatch):
 
     assert _modality_pool_order(
         {"pools": {"code": object(), "premium": object(), "swarm": object(), "privacy": object()}}
-    ) == ("code", "premium", "swarm")
+    ) == ("code", "privacy", "premium", "swarm")
 
 
 def test_modality_pool_order_honours_env_override(monkeypatch):

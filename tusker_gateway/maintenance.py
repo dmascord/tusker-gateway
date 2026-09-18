@@ -33,7 +33,7 @@ _DEFAULT_STRUCTURED_POOL = "privacy"
 # A periodic modality probe against the gateway boundary keeps the capability
 # DB authoritative, so a stale catalog row does not lock vision-capable
 # routes out of selection.
-_DEFAULT_MODALITY_POOL_ORDER = ("code", "premium", "swarm")
+_DEFAULT_MODALITY_POOL_ORDER = ("code", "privacy", "premium", "swarm")
 _DEFAULT_MODALITY = "image"
 
 

@@ -12,11 +12,45 @@ from tusker_gateway.model_capability import (
     ModelCapabilityDB,
 )
 from tusker_gateway.modality_qualification import (
+    _candidate_pairs,
     _classify_http_failure,
     _messages_for_modality,
     probe_input_model,
 )
 from tusker_gateway.endpoints import _record_media_capabilities
+
+
+def test_modality_runner_probes_ollama_cloud_without_catalog_image_metadata():
+    """Ollama UI capabilities are absent from its /v1/models response."""
+    from types import SimpleNamespace
+
+    manager = SimpleNamespace(
+        models={
+            "privacy": [
+                SimpleNamespace(
+                    provider="ollama-cloud",
+                    model="glm-5.3-flash",
+                    input_modalities=frozenset({"text"}),
+                ),
+                SimpleNamespace(
+                    provider="synthetic",
+                    model="text-only",
+                    input_modalities=frozenset({"text"}),
+                ),
+            ]
+        },
+        _catalog_entry_for=lambda spec: None,
+    )
+
+    assert _candidate_pairs(
+        manager,
+        object(),
+        ["privacy"],
+        modality="image",
+        include_unadvertised=False,
+        providers=set(),
+        model_pairs=set(),
+    ) == [("ollama-cloud", "glm-5.3-flash")]
 
 
 class _Response:

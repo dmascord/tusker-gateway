@@ -43,6 +43,7 @@ The slug override set is curated and currently includes:
 | Google (paid) | `gemini-2.5-pro`, `gemini-3-pro` |
 | Cohere (paid) | `command-a-plus-05-2026`, `command-a-03-2025` |
 | Other | `mistral-large-3:675b`, `deepseek-v4-pro` |
+| MiniMax highspeed | `MiniMax-M2.1-highspeed`, `MiniMax-M2.5-highspeed`, `MiniMax-M2.7-highspeed` |
 | Ollama Cloud (usage-heavy) | `kimi-k3` |
 
 **Ollama Cloud pricing overlay.** Neither ollama's `/v1/models` payload nor

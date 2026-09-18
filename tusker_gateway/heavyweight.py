@@ -57,6 +57,12 @@ HEAVYWEIGHT_SLUG_OVERRIDES: frozenset[str] = frozenset({
     # Slug is case-sensitive; synthetic.new returns "Kimi-K3" while
     # ollama.com returns "kimi-k3". Both are covered.
     "Kimi-K3",
+    # MiniMax highspeed variants are billed at roughly 2x the standard
+    # per-token rate.  Keep them available to premium callers, but out of
+    # the ordinary code rotation even when catalog pricing is unavailable.
+    "MiniMax-M2.1-highspeed",
+    "MiniMax-M2.5-highspeed",
+    "MiniMax-M2.7-highspeed",
 })
 
 

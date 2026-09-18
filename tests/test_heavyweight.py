@@ -33,6 +33,23 @@ def test_gpt_5_6_luna_is_not_heavyweight_slug():
     assert is_heavyweight_slug("gpt-5.4-mini") is False
 
 
+def test_minimax_highspeed_variants_are_heavyweight():
+    """Highspeed MiniMax variants stay out of the cheap code rotation."""
+    for slug in (
+        "MiniMax-M2.1-highspeed",
+        "MiniMax-M2.5-highspeed",
+        "MiniMax-M2.7-highspeed",
+    ):
+        assert is_heavyweight_slug(slug) is True
+        assert is_heavyweight(slug) is True
+
+
+def test_minimax_standard_models_are_not_heavyweight_by_slug():
+    """Standard MiniMax pricing is comparable to M3 and remains code-eligible."""
+    for slug in ("MiniMax-M2.1", "MiniMax-M2.5", "MiniMax-M2.7", "MiniMax-M3"):
+        assert is_heavyweight_slug(slug) is False
+
+
 def test_claude_opus_is_heavyweight_slug():
     assert is_heavyweight_slug("claude-opus-4.6") is True
     assert is_heavyweight_slug("claude-sonnet-4.6") is True

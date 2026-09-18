@@ -58,6 +58,13 @@ _MODALITY_TO_CAPABILITY = {
     "video": "input_video",
 }
 
+# Ollama's web catalog exposes vision/tools/cloud badges, but its
+# OpenAI-compatible ``/v1/models`` response omits those capabilities. The
+# generic catalog adapter consequently supplies a conservative text default.
+# Let the behavioral probe discover image support for this provider instead of
+# requiring a hand-maintained per-model capability overlay.
+_PROBE_UNADVERTISED_MODALITY_PROVIDERS = frozenset({"ollama-cloud"})
+
 
 def _classify_http_failure(status: int, body: str) -> tuple[str, str]:
     """Classify a failure without retaining the upstream response body."""
@@ -261,7 +268,10 @@ def _candidate_pairs(
                 advertised = spec.input_modalities
                 if advertised is None:
                     advertised = advertised_input_modalities(entry)
-                if not advertised or modality not in advertised:
+                if (
+                    pair[0] not in _PROBE_UNADVERTISED_MODALITY_PROVIDERS
+                    and (not advertised or modality not in advertised)
+                ):
                     continue
             pairs.add(pair)
     return sorted(pairs)
