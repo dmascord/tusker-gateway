@@ -1075,6 +1075,7 @@ _PROVIDER_SETTINGS_FIELDS = frozenset({
 _POOL_FIELDS = frozenset({
     "name", "models", "context_window", "zdr",
     "provider_warmup_secs", "auto_catalog", "heavyweight_only",
+    "require_tool_qualification",
     "auto_catalog_providers", "fallback_pools",
 })
 _IDENTITY_PROFILE_FIELDS = frozenset({
@@ -1441,5 +1442,4 @@ def register_admin_config_routes(app: web.Application) -> None:
     app.router.add_put("/admin/providers/{provider}/credentials", admin_providers_credentials_put)
     app.router.add_put("/admin/pools/{pool}", admin_pools_put)
     app.router.add_delete("/admin/pools/{pool}", admin_pools_delete)
-
 

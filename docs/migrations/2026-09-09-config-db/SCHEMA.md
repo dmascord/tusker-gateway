@@ -106,6 +106,7 @@ CREATE TABLE IF NOT EXISTS tusker_config_pools (
     heavyweight_only    INTEGER NOT NULL DEFAULT 0,
     auto_catalog_providers TEXT,                         -- JSON array
     fallback_pools      TEXT,                            -- JSON array
+    require_tool_qualification INTEGER NOT NULL DEFAULT 0,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -175,4 +176,3 @@ each reload.
   same error.
 - Schema drift: table creation is idempotent. New columns require a
   migration script (`tools/migrate_config_schema.py`).
-

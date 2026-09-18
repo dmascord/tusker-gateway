@@ -124,6 +124,13 @@ class ConfigStore:
                 new_column="auto_catalog",
                 is_pg=is_pg,
             )
+            self._ensure_column(
+                conn,
+                table="tusker_config_pools",
+                column="require_tool_qualification",
+                definition="INTEGER NOT NULL DEFAULT 0",
+                is_pg=is_pg,
+            )
 
             if is_pg:
                 conn.execute(
@@ -199,6 +206,31 @@ class ConfigStore:
             table,
             new_column,
         )
+
+    def _ensure_column(
+        self,
+        conn: Any,
+        *,
+        table: str,
+        column: str,
+        definition: str,
+        is_pg: bool,
+    ) -> None:
+        """Add a missing additive column to an existing config table."""
+        if is_pg:
+            cur = conn.execute(
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_name = %s AND column_name = %s",
+                (table, column),
+            )
+            present = cur.fetchone() is not None
+        else:
+            cur = conn.execute(f"PRAGMA table_info({table})")
+            present = any(row[1] == column for row in cur.fetchall())
+        if present:
+            return
+        conn.execute(f'ALTER TABLE "{table}" ADD COLUMN "{column}" {definition}')
+        logger.info("schema migration: added %s.%s", table, column)
 
     # ─── Encryption helpers ────────────────────────────────────────────────────
     def _encryption_key(self) -> str:
@@ -324,11 +356,13 @@ class ConfigStore:
             pools: dict[str, PoolConfig] = {}
             cursor = conn.execute(
                 "SELECT name, models, context_window, zdr, provider_warmup_secs, "
-                "auto_catalog, heavyweight_only, auto_catalog_providers, fallback_pools "
+                "auto_catalog, heavyweight_only, require_tool_qualification, "
+                "auto_catalog_providers, fallback_pools "
                 "FROM tusker_config_pools"
             )
             for (name, models_raw, context_window, zdr, warmup, auto_catalog,
-                 heavyweight_only, ac_providers_raw, fallback_pools_raw) in cursor:
+                 heavyweight_only, require_tool_qualification, ac_providers_raw,
+                 fallback_pools_raw) in cursor:
                 ac_providers: tuple[str, ...] = ()
                 if ac_providers_raw:
                     try:
@@ -355,6 +389,7 @@ class ConfigStore:
                     provider_warmup_secs=int(warmup or 300),
                     auto_catalog=bool(auto_catalog),
                     heavyweight_only=bool(heavyweight_only),
+                    require_tool_qualification=bool(require_tool_qualification),
                     auto_catalog_providers=ac_providers,
                     fallback_pools=fallback_pools,
                 )
@@ -527,7 +562,8 @@ class ConfigStore:
             # pools
             cursor = conn.execute(
                 "SELECT name, models, context_window, zdr, provider_warmup_secs, "
-                "auto_catalog, heavyweight_only, auto_catalog_providers, fallback_pools, "
+                "auto_catalog, heavyweight_only, require_tool_qualification, "
+                "auto_catalog_providers, fallback_pools, "
                 "created_at, updated_at FROM tusker_config_pools"
             )
             for row in cursor:
@@ -540,10 +576,11 @@ class ConfigStore:
                     "provider_warmup_secs": int(row[4] or 300),
                     "auto_catalog": bool(row[5]),
                     "heavyweight_only": bool(row[6]),
-                    "auto_catalog_providers": _try_json(row[7]),
-                    "fallback_pools": _try_json(row[8]),
-                    "created_at": str(row[9]) if row[9] else None,
-                    "updated_at": str(row[10]) if row[10] else None,
+                    "require_tool_qualification": bool(row[7]),
+                    "auto_catalog_providers": _try_json(row[8]),
+                    "fallback_pools": _try_json(row[9]),
+                    "created_at": str(row[10]) if row[10] else None,
+                    "updated_at": str(row[11]) if row[11] else None,
                 }
 
             # client_keys (redacted)
@@ -786,12 +823,14 @@ class ConfigStore:
                 conn.execute(
                     "INSERT INTO tusker_config_pools "
                     "(name, models, context_window, zdr, provider_warmup_secs, "
-                    "auto_catalog, heavyweight_only, auto_catalog_providers, fallback_pools) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "auto_catalog, heavyweight_only, require_tool_qualification, "
+                    "auto_catalog_providers, fallback_pools) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT (name) DO UPDATE SET "
                     "models=excluded.models, context_window=excluded.context_window, "
                     "zdr=excluded.zdr, provider_warmup_secs=excluded.provider_warmup_secs, "
                     "auto_catalog=excluded.auto_catalog, heavyweight_only=excluded.heavyweight_only, "
+                    "require_tool_qualification=excluded.require_tool_qualification, "
                     "auto_catalog_providers=excluded.auto_catalog_providers, "
                     "fallback_pools=excluded.fallback_pools, "
                     "updated_at=CURRENT_TIMESTAMP",
@@ -803,6 +842,7 @@ class ConfigStore:
                         int(body.get("provider_warmup_secs") or 300),
                         int(bool(body.get("auto_catalog"))),
                         int(bool(body.get("heavyweight_only"))),
+                        int(bool(body.get("require_tool_qualification"))),
                         ac_raw,
                         fb_raw,
                     ),
@@ -1238,6 +1278,7 @@ _TABLE_SCHEMAS: dict[str, tuple[str, str]] = {
         "provider_warmup_secs INTEGER NOT NULL DEFAULT 300, "
         "auto_catalog INTEGER NOT NULL DEFAULT 0, "
         "heavyweight_only INTEGER NOT NULL DEFAULT 0, "
+        "require_tool_qualification INTEGER NOT NULL DEFAULT 0, "
         "auto_catalog_providers TEXT, fallback_pools TEXT, "
         "created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP, "
         "updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP",
