@@ -121,6 +121,7 @@ class PoolConfig:
         auto_free: bool | None = None,
         auto_catalog_providers: list[str] | tuple[str, ...] | str = (),
         heavyweight_only: bool = False,
+        require_tool_qualification: bool = False,
         fallback_pools: list[str] | tuple[str, ...] | str = (),
     ):
         self.name = name
@@ -132,6 +133,10 @@ class PoolConfig:
         # When True, auto-catalog discovery only adds entries the
         # heavyweight classifier marks heavy. Static entries are unaffected.
         self.heavyweight_only = heavyweight_only
+        # When enabled, every candidate in this pool must have a passing
+        # behavioral tool-contract qualification before it can be selected,
+        # even for requests that do not themselves carry tools.
+        self.require_tool_qualification = bool(require_tool_qualification)
         if isinstance(auto_catalog_providers, str):
             auto_catalog_providers = auto_catalog_providers.split(",")
         elif not isinstance(auto_catalog_providers, (list, tuple)):
@@ -921,6 +926,7 @@ def _load_pools() -> dict[str, PoolConfig]:
                 zdr=data.get("zdr", False),
                 auto_catalog=bool(data.get("auto_catalog", data.get("auto_catalog", False))),
                 heavyweight_only=bool(data.get("heavyweight_only", False)),
+                require_tool_qualification=bool(data.get("require_tool_qualification", False)),
                 auto_catalog_providers=data.get(
                     "auto_catalog_providers",
                     default_auto_catalog_providers,
@@ -970,31 +976,17 @@ def _load_pools() -> dict[str, PoolConfig]:
     if "privacy" not in pools:
         pools["privacy"] = PoolConfig(
             name="privacy",
-            models=[
-                {"provider": "synthetic", "model": "syn:large:text", "input_modalities": ["text"]},
-                {"provider": "synthetic", "model": "syn:small:text", "input_modalities": ["text"]},
-                {
-                    "provider": "synthetic",
-                    "model": "syn:large:vision",
-                    "input_modalities": ["text", "image"],
-                },
-                {
-                    "provider": "synthetic",
-                    "model": "syn:small:vision",
-                    "input_modalities": ["text", "image"],
-                },
-                # openai-codex seed retained for tests that patch the provider
-                # endpoint to a fake capture server. In production, auto_catalog
-                # will pull openai-codex free models, but tests need this entry
-                # to route hermes-privacy requests through the patched endpoint.
-                {"provider": "openai-codex", "model": "gpt-5.6-luna"},
-                {"provider": "openai-codex", "model": "gpt-5.4-mini"},
-            ],
+            models=[],
             zdr=True,
             auto_catalog=True,
-            auto_catalog_providers=(
-                default_auto_catalog_providers or ("synthetic", "github-copilot")
+            auto_catalog_providers=default_auto_catalog_providers or (
+                "local-llm",
+                "mlx-mac",
+                "openai-codex",
+                "github-copilot-enterprise",
+                "ollama-cloud",
             ),
+            require_tool_qualification=True,
         )
     if "premium" not in pools:
         pools["premium"] = PoolConfig(

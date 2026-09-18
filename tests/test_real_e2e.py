@@ -17,7 +17,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from tusker_gateway.app import create_app
-from tusker_gateway.config import load_config
+from tusker_gateway.config import PoolConfig, load_config
 from tusker_gateway.passthrough import PROVIDER_ENDPOINTS
 
 OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "")
@@ -51,6 +51,13 @@ def _real_config(
     quality_path: str, *, api_keys: list[str] | None = None, openai_codex_port: int | None = None
 ) -> dict[str, Any]:
     cfg = load_config()
+    # This test intentionally supplies one fake provider route; production
+    # privacy configuration has no manual routes.
+    cfg["pools"]["privacy"] = PoolConfig(
+        name="privacy",
+        models=[{"provider": "openai-codex", "model": "e2e-fake"}],
+        zdr=True,
+    )
     cfg["api_keys"] = api_keys or [SHARED_KEY]
     cfg["quality_db_path"] = quality_path
     # Ensure openai-codex (patched to OpenRouter) can find its bearer key.

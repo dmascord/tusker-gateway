@@ -31,21 +31,21 @@ def test_default_code_pool_includes_current_provider_routes(monkeypatch):
     assert "opencode-go" in pool.auto_catalog_providers
 
 
-def test_synthetic_is_eligible_for_privacy_pool(monkeypatch):
+def test_default_privacy_pool_has_no_manual_routes_and_requires_qualification(monkeypatch):
     for key in tuple(os.environ):
         if key.startswith("TUSKER_POOL_") or key == "TUSKER_AUTO_CATALOG_PROVIDERS":
             monkeypatch.delenv(key, raising=False)
 
-    from tusker_gateway.config import DEFAULT_PROVIDER_REGISTRY
-
-    assert DEFAULT_PROVIDER_REGISTRY["synthetic"].zdr_ok is True
-    routes = {(model["provider"], model["model"]) for model in _load_pools()["privacy"].models}
-    assert {
-        ("synthetic", "syn:large:text"),
-        ("synthetic", "syn:small:text"),
-        ("synthetic", "syn:large:vision"),
-        ("synthetic", "syn:small:vision"),
-    } <= routes
+    pool = _load_pools()["privacy"]
+    assert pool.models == []
+    assert pool.require_tool_qualification is True
+    assert pool.auto_catalog_providers == (
+        "local-llm",
+        "mlx-mac",
+        "openai-codex",
+        "github-copilot-enterprise",
+        "ollama-cloud",
+    )
 
 
 def test_new_privacy_eligible_providers_load(monkeypatch):
@@ -155,7 +155,7 @@ def test_local_hardware_routes_in_privacy_pool(monkeypatch):
     } <= routes
 
 
-def test_business_copilot_is_available_to_privacy_catalog(monkeypatch):
+def test_public_copilot_is_not_available_to_privacy_catalog(monkeypatch):
     for key in tuple(os.environ):
         if key.startswith("TUSKER_POOL_") or key == "TUSKER_AUTO_CATALOG_PROVIDERS":
             monkeypatch.delenv(key, raising=False)
@@ -163,7 +163,8 @@ def test_business_copilot_is_available_to_privacy_catalog(monkeypatch):
 
     pool = _load_pools()["privacy"]
 
-    assert "github-copilot" in pool.auto_catalog_providers
+    assert "github-copilot" not in pool.auto_catalog_providers
+    assert "github-copilot-enterprise" in pool.auto_catalog_providers
 
 
 def test_load_config_normalizes_auto_catalog_provider_exclusions(monkeypatch):

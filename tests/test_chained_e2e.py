@@ -21,7 +21,7 @@ import pytest_asyncio
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from tusker_gateway.app import create_app
-from tusker_gateway.config import load_config
+from tusker_gateway.config import PoolConfig, load_config
 from tusker_gateway.quality import QualityDB
 
 
@@ -117,6 +117,14 @@ def _base_config(
     openai_codex_auth_type: str = "bearer",
 ) -> dict[str, Any]:
     cfg = load_config()
+    # This test intentionally supplies one fake provider route; production
+    # privacy configuration has no manual routes.
+    cfg["pools"]["privacy"] = PoolConfig(
+        name="privacy",
+        models=[{"provider": "openai-codex", "model": "e2e-fake"}],
+        zdr=True,
+    )
+    cfg["provider_api_keys"]["openai-codex"] = "test-key"
     cfg["quality_db_path"] = quality_path
     # Test default: only accept the well-known dev key so chained tests work.
     cfg["api_keys"] = ["sk-secret-dev"]

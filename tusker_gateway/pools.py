@@ -937,6 +937,7 @@ class PoolManager:
         spec: ModelSpec,
         *,
         capability_cache: dict[tuple[str, str], Any] | None = None,
+        require_qualified: bool = False,
         allow_unqualified_static_tools: bool = False,
         allow_structured_tool_fallback: bool = False,
         allow_tool_compatibility_fallback: bool = False,
@@ -950,6 +951,15 @@ class PoolManager:
         excluded, while transient availability results are retried after their
         provider/model cooldown instead of becoming permanent exclusions.
         """
+        if require_qualified:
+            if self._tool_capabilities is None:
+                return False
+            if capability_cache is None:
+                result = self._tool_capabilities.get(spec.provider, spec.model)
+            else:
+                result = capability_cache.get((spec.provider, spec.model))
+            return bool(result is not None and result.qualified_for_tools)
+
         mode = os.environ.get("TUSKER_TOOL_CAPABILITY_GATE", "auto").strip().lower()
         if mode in {"0", "false", "no", "off", "disabled"}:
             return True
@@ -1069,6 +1079,10 @@ class PoolManager:
             for modality in (required_input_modalities or ())
             if _normalise_input_modality(modality)
         )
+        pool_config = self.pools.get(pool_name)
+        qualification_required = bool(
+            pool_config and getattr(pool_config, "require_tool_qualification", False)
+        )
         specs = self.models.get(pool_name, [])
         if allowed_providers is not None:
             specs = [
@@ -1138,7 +1152,7 @@ class PoolManager:
                 key: tuple(records) for key, records in grouped_records.items()
             }
         tool_capability_cache: dict[tuple[str, str], Any] | None = None
-        if requires_tools and self._tool_capabilities is not None:
+        if (requires_tools or qualification_required) and self._tool_capabilities is not None:
             # Selection may inspect hundreds of candidates. Read the compact
             # qualification table once instead of opening/reconfiguring a
             # SQLite connection for every candidate on the RWX volume.
@@ -1205,9 +1219,10 @@ class PoolManager:
                         ):
                             self._drop_stickiness(key)
                             break
-                        if requires_tools and not self._tool_capability_allowed(
+                        if (requires_tools or qualification_required) and not self._tool_capability_allowed(
                             s,
                             capability_cache=tool_capability_cache,
+                            require_qualified=qualification_required,
                             allow_unqualified_static_tools=allow_unqualified_static_tools,
                             allow_structured_tool_fallback=allow_structured_tool_fallback,
                             allow_tool_compatibility_fallback=allow_tool_compatibility_fallback,
@@ -1298,9 +1313,10 @@ class PoolManager:
                 filter_counts["advertised_tools"] += 1
                 filtered_tool_models.append(f"{s.provider}/{s.model}")
                 continue
-            if requires_tools and not self._tool_capability_allowed(
+            if (requires_tools or qualification_required) and not self._tool_capability_allowed(
                 s,
                 capability_cache=tool_capability_cache,
+                require_qualified=qualification_required,
                 allow_unqualified_static_tools=allow_unqualified_static_tools,
                 allow_structured_tool_fallback=allow_structured_tool_fallback,
                 allow_tool_compatibility_fallback=allow_tool_compatibility_fallback,

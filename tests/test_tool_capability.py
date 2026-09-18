@@ -134,6 +134,8 @@ def test_auto_discovered_model_requires_qualified_stream_probe(tmp_path):
     assert manager.auto_added["code"] == {("openrouter", "new-model:free")}
     assert manager.select("code", requires_tools=True) is None
 
+    assert manager.select("privacy") is None
+
     manager._tool_capabilities.record(
         provider="openrouter",
         model="new-model:free",
@@ -150,6 +152,42 @@ def test_auto_discovered_model_requires_qualified_stream_probe(tmp_path):
         "openrouter",
         "new-model:free",
     )
+
+
+def test_strict_pool_requires_qualification_without_tools(tmp_path):
+    manager = PoolManager(
+        {
+            "pools": {
+                "privacy": PoolConfig(
+                    name="privacy",
+                    models=[
+                        {"provider": "synthetic", "model": "qualified"},
+                        {"provider": "synthetic", "model": "unknown"},
+                    ],
+                    zdr=True,
+                    require_tool_qualification=True,
+                ),
+            },
+            "quality_db_path": str(tmp_path / "quality.db"),
+            "tool_capability_db_path": str(tmp_path / "capability.db"),
+            "excluded_providers": [],
+            "provider_api_keys": {"synthetic": "test-key"},
+        }
+    )
+    manager._tool_capabilities.record(
+        provider="synthetic",
+        model="qualified",
+        level=ToolCapabilityLevel.STRICT_STRUCTURED_STREAM,
+        status="passed",
+        http_status=200,
+        tool_call_count=1,
+        structured_stream=True,
+        arguments_valid=True,
+        arguments_match=True,
+        finish_reason="tool_calls",
+    )
+
+    assert manager.select("privacy") == ("synthetic", "qualified")
 
 
 def test_failed_probe_keeps_auto_discovered_model_out_of_tool_pool(tmp_path):

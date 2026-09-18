@@ -14,6 +14,14 @@ The gateway has four pools, each with a different tier of models:
 | `premium` | Paid tier | Yes (kept) | No |
 | `swarm` | Local / self-hosted | Yes (kept) | No |
 
+The privacy pool is intentionally not a manually curated fallback list. Its
+deployment configuration starts with no static models and discovers only
+approved ZDR providers. Every discovered privacy candidate must first pass the
+current behavioral tool-call qualification before it is selectable, including
+requests that do not contain tools. This keeps catalog metadata, stale manual
+entries, and models that merely claim tool support from entering the privacy
+pool.
+
 The tier is the source of truth — `PoolManager.pool_keeps_heavyweight()` returns
 `True` for `premium`/`swarm` and `False` for `code`/`privacy`. Callers can override
 per-request by passing `heavyweight_ok=True/False` to `PoolManager.select()`.
@@ -75,6 +83,8 @@ For each request to `hermes-code`/`hermes-privacy`/etc:
    - **Privacy provider policy** (`zdr_ok`) for the privacy pool
    - Cooldown active for this (provider, model)
    - Required input modalities (for example, image requests skip known text-only models)
+   - Behavioral tool qualification for the privacy pool (a passing current
+     streaming tool contract is required even for ordinary chat)
    - ZDR + EXCLUDED_PROVIDERS env var (privacy pool only)
 3. **Rank by quality score** (descending) from `model_quality.db`. New models
    use an adaptive floor (median - 20.0 clamped to 20.0).
@@ -234,7 +244,10 @@ database; response bodies and credentials are not retained.
 The privacy pool applies the provider policy before catalog pricing. The
 default registry currently allows local `local-llm`, Ollama Cloud, OpenCode
 Go, OpenAI Codex, GitHub Copilot Enterprise, Xiaomi MiMo, and the public
-Copilot route (via the `TUSKER_COPILOT_BUSINESS` opt-in below). Deployment
+Copilot route (via the `TUSKER_COPILOT_BUSINESS` opt-in below). The strict
+privacy pool discovers Ollama Cloud as a ZDR-eligible provider; models such as
+`glm-5.3-flash` still require a passing behavioral qualification before use.
+Deployment
 overrides register the local hardware routes explicitly; runtime provider
 configuration takes precedence over built-in endpoint defaults.
 Public GitHub Copilot,
