@@ -176,6 +176,7 @@ spec:
         # harness rewriter injects an <untrusted_data> delimiter discipline
         # for callers whose identity principal matches
         # TUSKER_GUARDRAILS_HARNESS_PRINCIPALS (default "omp-harness").
+        - name: TUSKER_GUARDRAILS_ENABLED
           value: 'true'
         - name: TUSKER_MAX_OUTPUT_TOKENS
           value: '16384'
