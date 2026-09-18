@@ -144,7 +144,7 @@ spec:
         # tool plans. The gateway also has a built-in deny-list entry for
         # xiaomi/mimo-v2.5; this env var is for operator extensions.
         - name: TUSKER_BLACKLISTED_MODELS
-          value: 'synthetic/*Kimi-K3*'
+          value: 'synthetic/*Kimi-K3*,*/kimi-k3*'
         - name: TUSKER_GREYLISTED_MODELS
           value: ''
         # Comma-separated provider/model globs allowed to emit direct
