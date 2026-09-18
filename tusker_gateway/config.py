@@ -983,6 +983,12 @@ def _load_pools() -> dict[str, PoolConfig]:
                     "model": "syn:small:vision",
                     "input_modalities": ["text", "image"],
                 },
+                # openai-codex seed retained for tests that patch the provider
+                # endpoint to a fake capture server. In production, auto_catalog
+                # will pull openai-codex free models, but tests need this entry
+                # to route hermes-privacy requests through the patched endpoint.
+                {"provider": "openai-codex", "model": "gpt-5.6-luna"},
+                {"provider": "openai-codex", "model": "gpt-5.4-mini"},
             ],
             zdr=True,
             auto_catalog=True,

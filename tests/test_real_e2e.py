@@ -3,6 +3,7 @@
 Requires OPENROUTER_API_KEY in the environment.
 Uses openai/gpt-4o-mini as the low-cost real target model.
 """
+
 from __future__ import annotations
 
 import os
@@ -37,10 +38,18 @@ def _test_app(config: dict[str, Any]) -> web.Application:
     app["http_session"] = aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=120),
     )
+    # Rebuild pool_manager from the test config so pool entries reflect
+    # the test-specific provider patch (e.g. openai-codex → capture server).
+    from tusker_gateway.pools import PoolManager
+
+    app["pool_manager"] = PoolManager(config)
+    app["pool_manager"]._quality = app["quality_db"]
     return app
 
 
-def _real_config(quality_path: str, *, api_keys: list[str] | None = None, openai_codex_port: int | None = None) -> dict[str, Any]:
+def _real_config(
+    quality_path: str, *, api_keys: list[str] | None = None, openai_codex_port: int | None = None
+) -> dict[str, Any]:
     cfg = load_config()
     cfg["api_keys"] = api_keys or [SHARED_KEY]
     cfg["quality_db_path"] = quality_path
@@ -54,6 +63,7 @@ def _real_config(quality_path: str, *, api_keys: list[str] | None = None, openai
             "base_url": f"http://127.0.0.1:{openai_codex_port}",
             "chat_path": "/chat/completions",
             "auth_type": "bearer",
+            "zdr_ok": True,
         }
     return cfg
 
@@ -67,13 +77,21 @@ async def test_real_single_gateway_chat():
         async def capture_handler(request: web.Request) -> web.Response:
             body = await request.json()
             captured_requests.append(body)
-            return web.json_response({
-                "id": "test",
-                "object": "chat.completion",
-                "model": body.get("model", "unknown"),
-                "choices": [{"index": 0, "message": {"role": "assistant", "content": "E2E_TEST_OK"}, "finish_reason": "stop"}],
-                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-            })
+            return web.json_response(
+                {
+                    "id": "test",
+                    "object": "chat.completion",
+                    "model": body.get("model", "unknown"),
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "E2E_TEST_OK"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                }
+            )
 
         capture_app = web.Application()
         capture_app.router.add_post("/chat/completions", capture_handler)
@@ -82,7 +100,9 @@ async def test_real_single_gateway_chat():
         await capture_client.start_server()
 
         try:
-            cfg = _real_config(os.path.join(tmpdir, "quality.db"), openai_codex_port=capture_server.port)
+            cfg = _real_config(
+                os.path.join(tmpdir, "quality.db"), openai_codex_port=capture_server.port
+            )
             app = _test_app(cfg)
             server = TestServer(app)
             client = TestClient(server)
@@ -112,29 +132,53 @@ async def test_real_single_gateway_chat():
         finally:
             await capture_client.close()
 
+
 @pytest.mark.asyncio
 async def test_real_single_gateway_stream():
     """Single tusker-gateway → fake OpenRouter-compatible capture server, streaming."""
     with tempfile.TemporaryDirectory() as tmpdir:
+
         async def capture_handler(request: web.Request) -> web.StreamResponse:
             body = await request.json()
             stream = bool(body and body.get("stream", False))
             if stream:
                 resp = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream"})
                 await resp.prepare(request)
-                chunk1 = {"id": "chatcmpl-fake1", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"role": "assistant", "content": "STREAM_OK"}, "finish_reason": None}]}
-                chunk2 = {"id": "chatcmpl-fake2", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": ""}, "finish_reason": "stop"}]}
+                chunk1 = {
+                    "id": "chatcmpl-fake1",
+                    "object": "chat.completion.chunk",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"role": "assistant", "content": "STREAM_OK"},
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+                chunk2 = {
+                    "id": "chatcmpl-fake2",
+                    "object": "chat.completion.chunk",
+                    "choices": [{"index": 0, "delta": {"content": ""}, "finish_reason": "stop"}],
+                }
                 await resp.write(f"data: {chunk1}\n\n".encode())
                 await resp.write(f"data: {chunk2}\n\n".encode())
                 await resp.write(b"data: [DONE]\n\n")
                 return resp
-            return web.json_response({
-                "id": "test",
-                "object": "chat.completion",
-                "model": body.get("model", "unknown") if body else "unknown",
-                "choices": [{"index": 0, "message": {"role": "assistant", "content": "STREAM_OK"}, "finish_reason": "stop"}],
-                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-            })
+            return web.json_response(
+                {
+                    "id": "test",
+                    "object": "chat.completion",
+                    "model": body.get("model", "unknown") if body else "unknown",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "STREAM_OK"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                }
+            )
 
         capture_app = web.Application()
         capture_app.router.add_post("/chat/completions", capture_handler)
@@ -143,7 +187,9 @@ async def test_real_single_gateway_stream():
         await capture_client.start_server()
 
         try:
-            cfg = _real_config(os.path.join(tmpdir, "quality.db"), openai_codex_port=capture_server.port)
+            cfg = _real_config(
+                os.path.join(tmpdir, "quality.db"), openai_codex_port=capture_server.port
+            )
             app = _test_app(cfg)
             server = TestServer(app)
             client = TestClient(server)
@@ -174,6 +220,7 @@ async def test_real_single_gateway_stream():
         finally:
             await capture_client.close()
 
+
 @pytest.mark.asyncio
 async def test_real_chained_gateways():
     """gateway-1 → gateway-2 → fake OpenRouter-compatible capture server."""
@@ -183,13 +230,21 @@ async def test_real_chained_gateways():
         async def capture_handler(request: web.Request) -> web.Response:
             body = await request.json()
             captured_requests.append(body)
-            return web.json_response({
-                "id": "test",
-                "object": "chat.completion",
-                "model": body.get("model", "unknown"),
-                "choices": [{"index": 0, "message": {"role": "assistant", "content": "CHAIN_OK"}, "finish_reason": "stop"}],
-                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-            })
+            return web.json_response(
+                {
+                    "id": "test",
+                    "object": "chat.completion",
+                    "model": body.get("model", "unknown"),
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "CHAIN_OK"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                }
+            )
 
         capture_app = web.Application()
         capture_app.router.add_post("/chat/completions", capture_handler)
@@ -199,14 +254,18 @@ async def test_real_chained_gateways():
 
         try:
             # gateway-2: routes to fake OpenRouter on capture server
-            cfg2 = _real_config(os.path.join(tmpdir, "g2.db"), openai_codex_port=capture_server.port)
+            cfg2 = _real_config(
+                os.path.join(tmpdir, "g2.db"), openai_codex_port=capture_server.port
+            )
             g2_app = _test_app(cfg2)
             g2_server = TestServer(g2_app)
             g2_client = TestClient(g2_server)
             await g2_client.start_server()
 
             # gateway-1: routes to gateway-2
-            cfg1 = _real_config(os.path.join(tmpdir, "g1.db"), openai_codex_port=capture_server.port)
+            cfg1 = _real_config(
+                os.path.join(tmpdir, "g1.db"), openai_codex_port=capture_server.port
+            )
             cfg1["upstream_gateway_url"] = f"http://127.0.0.1:{g2_server.port}"
             g1_app = _test_app(cfg1)
             g1_server = TestServer(g1_app)
@@ -248,13 +307,21 @@ async def test_real_virtual_alias_not_persisted():
         async def capture_handler(request: web.Request) -> web.Response:
             body = await request.json()
             captured_requests.append(body)
-            return web.json_response({
-                "id": "test",
-                "object": "chat.completion",
-                "model": body.get("model", "unknown"),
-                "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
-                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-            })
+            return web.json_response(
+                {
+                    "id": "test",
+                    "object": "chat.completion",
+                    "model": body.get("model", "unknown"),
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                }
+            )
 
         capture_app = web.Application()
         capture_app.router.add_post("/chat/completions", capture_handler)
@@ -264,7 +331,9 @@ async def test_real_virtual_alias_not_persisted():
 
         try:
             # Single gateway, route via fake OpenRouter-compatible server
-            cfg = _real_config(os.path.join(tmpdir, "quality.db"), openai_codex_port=capture_server.port)
+            cfg = _real_config(
+                os.path.join(tmpdir, "quality.db"), openai_codex_port=capture_server.port
+            )
             app = _test_app(cfg)
             server = TestServer(app)
             client = TestClient(server)
@@ -285,4 +354,3 @@ async def test_real_virtual_alias_not_persisted():
             await client.close()
         finally:
             await capture_client.close()
-

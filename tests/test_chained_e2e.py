@@ -8,6 +8,7 @@ Layout:
 Exercises passthrough through both hops, quality DB writes on both sides,
 auth at each hop, streaming, and cooldown propagation.
 """
+
 from __future__ import annotations
 
 import os
@@ -23,6 +24,7 @@ from tusker_gateway.app import create_app
 from tusker_gateway.config import load_config
 from tusker_gateway.quality import QualityDB
 
+
 def _test_app(config: dict[str, Any]) -> web.Application:
     """Build a test app with config set directly (no on_startup hook needed)."""
     app = create_app()
@@ -31,6 +33,12 @@ def _test_app(config: dict[str, Any]) -> web.Application:
     app["http_session"] = aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=120),
     )
+    # Rebuild pool_manager from the test config so pool entries reflect
+    # the test-specific provider patch (e.g. openai-codex → capture server).
+    from tusker_gateway.pools import PoolManager
+
+    app["pool_manager"] = PoolManager(config)
+    app["pool_manager"]._quality = app["quality_db"]
     return app
 
 
@@ -41,12 +49,22 @@ class FakeProvider:
         self.response_content = response_content
 
     async def handle(self, request: web.Request) -> web.Response:
-        body = await request.json() if request.headers.get("Content-Type") == "application/json" else None
+        body = (
+            await request.json()
+            if request.headers.get("Content-Type") == "application/json"
+            else None
+        )
         self.requests.append({"headers": dict(request.headers), "body": body})
 
         if self.fail_with:
             return web.json_response(
-                {"error": {"type": "rate_limit_error", "message": "throttled", "body_hint": "weekly limit"}},
+                {
+                    "error": {
+                        "type": "rate_limit_error",
+                        "message": "throttled",
+                        "body_hint": "weekly limit",
+                    }
+                },
                 status=self.fail_with,
             )
 
@@ -54,23 +72,50 @@ class FakeProvider:
         if stream:
             resp = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream"})
             await resp.prepare(request)
-            chunk1 = {"id": "chatcmpl-fake1", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"role": "assistant", "content": "hello "}, "finish_reason": None}]}
-            chunk2 = {"id": "chatcmpl-fake2", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": "world"}, "finish_reason": "stop"}]}
+            chunk1 = {
+                "id": "chatcmpl-fake1",
+                "object": "chat.completion.chunk",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"role": "assistant", "content": "hello "},
+                        "finish_reason": None,
+                    }
+                ],
+            }
+            chunk2 = {
+                "id": "chatcmpl-fake2",
+                "object": "chat.completion.chunk",
+                "choices": [{"index": 0, "delta": {"content": "world"}, "finish_reason": "stop"}],
+            }
             await resp.write(f"data: {chunk1}\n\n".encode())
             await resp.write(f"data: {chunk2}\n\n".encode())
             await resp.write(b"data: [DONE]\n\n")
             return resp
 
-        return web.json_response({
-            "id": "chatcmpl-fake",
-            "object": "chat.completion",
-            "model": body.get("model") if body else "unknown",
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": self.response_content}, "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-        })
+        return web.json_response(
+            {
+                "id": "chatcmpl-fake",
+                "object": "chat.completion",
+                "model": body.get("model") if body else "unknown",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": self.response_content},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            }
+        )
 
 
-def _base_config(quality_path: str, *, openai_codex_port: int | None = None, openai_codex_auth_type: str = "bearer") -> dict[str, Any]:
+def _base_config(
+    quality_path: str,
+    *,
+    openai_codex_port: int | None = None,
+    openai_codex_auth_type: str = "bearer",
+) -> dict[str, Any]:
     cfg = load_config()
     cfg["quality_db_path"] = quality_path
     # Test default: only accept the well-known dev key so chained tests work.
@@ -80,6 +125,7 @@ def _base_config(quality_path: str, *, openai_codex_port: int | None = None, ope
             "base_url": f"http://127.0.0.1:{openai_codex_port}",
             "chat_path": "/chat/completions",
             "auth_type": openai_codex_auth_type,
+            "zdr_ok": True,
         }
     return cfg
 
@@ -110,7 +156,9 @@ async def test_chain_full_passthrough_logs_on_both_sides():
         await g1_client.start_server()
 
         payload = {"model": "hermes-privacy", "messages": [{"role": "user", "content": "ping"}]}
-        resp = await g1_client.post("/v1/chat/completions", json=payload, headers={"Authorization": "Bearer sk-secret-dev"})
+        resp = await g1_client.post(
+            "/v1/chat/completions", json=payload, headers={"Authorization": "Bearer sk-secret-dev"}
+        )
         assert resp.status == 200, await resp.text()
         data = await resp.json()
         assert data["choices"][0]["message"]["content"] == "hello from fake provider"
@@ -162,11 +210,15 @@ async def test_chain_auth_required_at_each_hop():
         assert resp.status == 401
 
         # Wrong auth → 401
-        resp = await g1_client.post("/v1/chat/completions", json=payload, headers={"Authorization": "Bearer wrong-key"})
+        resp = await g1_client.post(
+            "/v1/chat/completions", json=payload, headers={"Authorization": "Bearer wrong-key"}
+        )
         assert resp.status == 401
 
         # Correct auth for g1, but g2 sees dev key (not g2's key) → 401 at g2
-        resp = await g1_client.post("/v1/chat/completions", json=payload, headers={"Authorization": "Bearer sk-secret-dev"})
+        resp = await g1_client.post(
+            "/v1/chat/completions", json=payload, headers={"Authorization": "Bearer sk-secret-dev"}
+        )
         assert resp.status == 401
 
         await g1_client.close()
@@ -185,7 +237,9 @@ async def test_chain_streaming_sse_passes_through_both_hops():
     await fake_client.start_server()
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        g2_app = _test_app(_base_config(os.path.join(tmpdir, "g2.db"), openai_codex_port=fake_server.port))
+        g2_app = _test_app(
+            _base_config(os.path.join(tmpdir, "g2.db"), openai_codex_port=fake_server.port)
+        )
         g2_server = TestServer(g2_app)
         g2_client = TestClient(g2_server)
         await g2_client.start_server()
@@ -197,8 +251,14 @@ async def test_chain_streaming_sse_passes_through_both_hops():
         g1_client = TestClient(g1_server)
         await g1_client.start_server()
 
-        payload = {"model": "hermes-privacy", "messages": [{"role": "user", "content": "stream please"}], "stream": True}
-        resp = await g1_client.post("/v1/chat/completions", json=payload, headers={"Authorization": "Bearer sk-secret-dev"})
+        payload = {
+            "model": "hermes-privacy",
+            "messages": [{"role": "user", "content": "stream please"}],
+            "stream": True,
+        }
+        resp = await g1_client.post(
+            "/v1/chat/completions", json=payload, headers={"Authorization": "Bearer sk-secret-dev"}
+        )
         assert resp.status == 200
         assert resp.headers["Content-Type"].startswith("text/event-stream")
 
@@ -226,19 +286,33 @@ async def test_chain_prompt_caching_headers_forwarded():
     await fake_client.start_server()
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        g2_app = _test_app(_base_config(os.path.join(tmpdir, "g2.db"), openai_codex_port=fake_server.port, openai_codex_auth_type="oauth"))
+        g2_app = _test_app(
+            _base_config(
+                os.path.join(tmpdir, "g2.db"),
+                openai_codex_port=fake_server.port,
+                openai_codex_auth_type="oauth",
+            )
+        )
         g2_server = TestServer(g2_app)
         g2_client = TestClient(g2_server)
         await g2_client.start_server()
 
-        base_g1 = _base_config(os.path.join(tmpdir, "g1.db"), openai_codex_port=fake_server.port, openai_codex_auth_type="oauth")
+        base_g1 = _base_config(
+            os.path.join(tmpdir, "g1.db"),
+            openai_codex_port=fake_server.port,
+            openai_codex_auth_type="oauth",
+        )
         base_g1["upstream_gateway_url"] = f"http://127.0.0.1:{g2_server.port}"
         g1_app = _test_app(base_g1)
         g1_server = TestServer(g1_app)
         g1_client = TestClient(g1_server)
         await g1_client.start_server()
 
-        resp = await g1_client.post("/v1/chat/completions", json={"model": "hermes-privacy", "messages": [{"role": "user", "content": "hi"}]}, headers={"Authorization": "Bearer sk-secret-dev"})
+        resp = await g1_client.post(
+            "/v1/chat/completions",
+            json={"model": "hermes-privacy", "messages": [{"role": "user", "content": "hi"}]},
+            headers={"Authorization": "Bearer sk-secret-dev"},
+        )
         assert resp.status == 200, await resp.text()
 
         await g1_client.close()
@@ -257,7 +331,9 @@ async def test_chain_provider_429_applies_cooldown():
     await fake_client.start_server()
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        g2_app = _test_app(_base_config(os.path.join(tmpdir, "g2.db"), openai_codex_port=fake_server.port))
+        g2_app = _test_app(
+            _base_config(os.path.join(tmpdir, "g2.db"), openai_codex_port=fake_server.port)
+        )
         g2_server = TestServer(g2_app)
         g2_client = TestClient(g2_server)
         await g2_client.start_server()
@@ -269,10 +345,13 @@ async def test_chain_provider_429_applies_cooldown():
         g1_client = TestClient(g1_server)
         await g1_client.start_server()
 
-        resp = await g1_client.post("/v1/chat/completions", json={"model": "hermes-privacy", "messages": [{"role": "user", "content": "hi"}]}, headers={"Authorization": "Bearer sk-secret-dev"})
+        resp = await g1_client.post(
+            "/v1/chat/completions",
+            json={"model": "hermes-privacy", "messages": [{"role": "user", "content": "hi"}]},
+            headers={"Authorization": "Bearer sk-secret-dev"},
+        )
         assert resp.status in {429, 502}
 
         await g1_client.close()
         await g2_client.close()
     await fake_client.close()
-

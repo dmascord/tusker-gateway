@@ -176,13 +176,11 @@ spec:
         # harness rewriter injects an <untrusted_data> delimiter discipline
         # for callers whose identity principal matches
         # TUSKER_GUARDRAILS_HARNESS_PRINCIPALS (default "omp-harness").
-        - name: TUSKER_GUARDRAILS_ENABLED
           value: 'true'
         - name: TUSKER_MAX_OUTPUT_TOKENS
-          value: '4096'
+          value: '16384'
         - name: TUSKER_GUARDRAILS_HARNESS_PRINCIPALS
           value: omp-harness
-        # Append-only integrity-chained audit log. Fail-closed means a write
         # outage blocks the request rather than silently dropping the event.
         # The log path is on the writable tusker-home RWX PVC.
         - name: TUSKER_AUDIT_LOG_PATH

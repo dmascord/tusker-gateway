@@ -1,0 +1,19 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: tusker-gateway
+  namespace: hermes
+  labels:
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: tusker-gateway
+  namespaceSelector:
+    matchNames:
+      - hermes
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
