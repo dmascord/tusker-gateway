@@ -159,6 +159,16 @@ class CircuitBreaker:
                     + ("IF NOT EXISTS " if self._db.is_postgres else "")
                     + "cooldown_secs REAL"
                 )
+            # A half-open reservation belongs to the process that made the
+            # probe. If that process was restarted or killed while the
+            # request was in flight, the persisted reservation would
+            # otherwise block this route forever. Re-open abandoned probes
+            # and restart their normal cooldown.
+            conn.execute(
+                "UPDATE breakers SET state = ?, half_open_probe_inflight = 0, "
+                "opened_at = ? WHERE state = ? AND half_open_probe_inflight = 1",
+                (BreakerState.OPEN.value, time.time(), BreakerState.HALF_OPEN.value),
+            )
             conn.commit()
 
     def _policy_for(self, provider: str) -> BreakerPolicy:

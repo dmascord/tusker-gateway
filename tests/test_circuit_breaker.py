@@ -114,6 +114,24 @@ def test_concurrent_probe_blocked(tmp_breaker_path):
     assert not second.allowed
 
 
+def test_restart_recovers_abandoned_half_open_probe(tmp_breaker_path):
+    """A killed worker must not permanently strand a persisted probe lock."""
+    cb = CircuitBreaker(_cfg(tmp_breaker_path, consecutive_failures=1, cooldown_secs=60))
+    cb.record_failure("p", "m")
+
+    # Simulate a worker that reached HALF_OPEN and then disappeared.
+    cb._update(
+        "p", "m",
+        state=BreakerState.HALF_OPEN.value,
+        half_open_probe_inflight=1,
+    )
+    restarted = CircuitBreaker(_cfg(tmp_breaker_path, consecutive_failures=1, cooldown_secs=60))
+    decision = restarted.check("p", "m")
+    assert not decision.allowed
+    assert decision.state == BreakerState.OPEN
+    assert "circuit open" in (decision.reason or "")
+
+
 def test_short_circuits_counter(tmp_breaker_path):
     cb = CircuitBreaker(_cfg(tmp_breaker_path, consecutive_failures=1, cooldown_secs=60))
     cb.record_failure("p", "m")

@@ -17,7 +17,7 @@ from aiohttp import ContentTypeError, web
 
 from tusker_gateway.cache import ResponseCache, make_cache_key, make_caller_scope
 from tusker_gateway.budget import BudgetTracker
-from tusker_gateway.circuit_breaker import CircuitBreaker, BreakerDecision
+from tusker_gateway.circuit_breaker import BreakerDecision, BreakerState, CircuitBreaker
 from tusker_gateway.cooldown import is_account_quota_exhausted
 from tusker_gateway.config import (
     build_high_impact_argument_regex,
@@ -2845,6 +2845,12 @@ async def _call_with_pool_fallback(
                 )
             _mark_permanently_failed(timeout_exc, provider, model)
             raise timeout_exc from exc
+        except asyncio.CancelledError:
+            # A cancelled half-open probe must release its persistent lease;
+            # otherwise a later worker can be stuck behind it indefinitely.
+            if breaker is not None and decision.state == BreakerState.HALF_OPEN:
+                await asyncio.to_thread(breaker.release_probe, provider, model)
+            raise
         except RateLimitError as exc:
             if breaker is not None:
                 await asyncio.to_thread(
@@ -3009,12 +3015,12 @@ async def _call_with_pool_fallback(
             if last_error is not None:
                 raise last_error
             raise NoHealthyModelsError(pool=pool_name)
-        if (
-            breaker is not None
-            and not (await asyncio.to_thread(breaker.check, selected[0], selected[1])).allowed
-        ):
-            excluded.add(selected)
-            continue
+        decision = BreakerDecision(allowed=True, state=None)
+        if breaker is not None:
+            decision = await asyncio.to_thread(breaker.check, selected[0], selected[1])
+            if not decision.allowed:
+                excluded.add(selected)
+                continue
         provider, model = selected
         attempts += 1
         logger.info(
@@ -3108,6 +3114,10 @@ async def _call_with_pool_fallback(
                 max_attempts,
                 _provider_attempt_timeout_secs(request, provider=provider),
             )
+        except asyncio.CancelledError:
+            if breaker is not None and decision.state == BreakerState.HALF_OPEN:
+                await asyncio.to_thread(breaker.release_probe, provider, model)
+            raise
         except RateLimitError as exc:
             if breaker is not None:
                 await asyncio.to_thread(
