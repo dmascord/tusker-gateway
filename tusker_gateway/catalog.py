@@ -86,7 +86,7 @@ AUTO_DISCOVERED_HEAVYWEIGHT_WEIGHT: float = 0.05
 
 # Ollama Cloud publishes per-1M-token prices on ollama.com/library pages but
 # neither its /v1/models payload nor models.dev carries cost data, so the
-# pricing-based heavyweight classifier ($1/M in, $8/M out) would see None
+# pricing-based heavyweight classifier ($1/M in, $3/M out) would see None
 # and treat every model as cheap. Verified 2026-09-09; base tier for
 # deepseek (peak varies). Slugs not listed here (gemma4, gpt-oss, kimi-k2.5,
 # minimax-m2.5, nemotron-3-nano/super, qwen3.5:397b, mistral-large-3:675b)

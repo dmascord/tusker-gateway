@@ -78,6 +78,18 @@ def test_ollama_cloud_usage_heavy_slugs():
     assert is_heavyweight(
         "glm-5.3-flash", cost_input=0.15, cost_output=0.50
     ) is False
+    # kimi-k2.6 / kimi-k2.7-code ($4/M out) are below the $3 output
+    # threshold for input ($0.95/M), so pricing alone leaves them cheap.
+    # Slug overrides keep static pool entries filtered even when the
+    # catalog overlay is unavailable.
+    assert is_heavyweight_slug("kimi-k2.6") is True
+    assert is_heavyweight("kimi-k2.6") is True
+    assert is_heavyweight_slug("kimi-k2.7-code") is True
+    assert is_heavyweight("kimi-k2.7-code") is True
+    # Slug overrides win even when pricing would say cheap (anti-default).
+    assert is_heavyweight(
+        "kimi-k2.6", cost_input=0.10, cost_output=0.10
+    ) is True
 
 
 # ---------------------------------------------------------------------------
@@ -87,12 +99,14 @@ def test_ollama_cloud_usage_heavy_slugs():
 
 def test_pricing_above_threshold_is_heavyweight():
     assert is_heavyweight_pricing(cost_input=2.0, cost_output=10.0) is True
-    assert is_heavyweight_pricing(cost_input=1.0, cost_output=8.0) is True  # exactly at threshold
+    assert is_heavyweight_pricing(cost_input=1.0, cost_output=3.0) is True  # $1/$3 thresholds
+    assert is_heavyweight_pricing(cost_input=0.95, cost_output=4.0) is True  # kimi-k2.6 tier ($4/M out)
 
 
 def test_pricing_below_threshold_is_not_heavyweight():
     assert is_heavyweight_pricing(cost_input=0.5, cost_output=2.0) is False
     assert is_heavyweight_pricing(cost_input=0.0, cost_output=0.0) is False
+    assert is_heavyweight_pricing(cost_input=0.6, cost_output=2.4) is False  # minimax-m3 stays cheap
 
 
 def test_pricing_with_missing_fields_is_not_heavyweight():

@@ -31,10 +31,8 @@ per-request by passing `heavyweight_ok=True/False` to `PoolManager.select()`.
 A model is **heavyweight** when *either*:
 
 1. Its slug is in `tusker_gateway.heavyweight.HEAVYWEIGHT_SLUG_OVERRIDES`, or
-2. Its pricing (per 1M tokens) exceeds `cost_input >= $1` OR `cost_output >= $8`
+2. Its pricing (per 1M tokens) exceeds `cost_input >= $1` OR `cost_output >= $3`
    AND pricing data is available from models.dev.
-
-The slug override set is curated and currently includes:
 
 | Family | Heavy slugs |
 |---|---|
@@ -43,19 +41,19 @@ The slug override set is curated and currently includes:
 | Google (paid) | `gemini-2.5-pro`, `gemini-3-pro` |
 | Cohere (paid) | `command-a-plus-05-2026`, `command-a-03-2025` |
 | Other | `mistral-large-3:675b`, `deepseek-v4-pro` |
-| MiniMax highspeed | `MiniMax-M2.1-highspeed`, `MiniMax-M2.5-highspeed`, `MiniMax-M2.7-highspeed` |
-| Ollama Cloud (usage-heavy) | `kimi-k3` |
-
+| Synthetic.new (usage-heavy) | `Kimi-K3`, `syn:large:vision` |
+| Ollama Cloud (usage-heavy) | `kimi-k2.6`, `kimi-k2.7-code`, `kimi-k3` |
 **Ollama Cloud pricing overlay.** Neither ollama's `/v1/models` payload nor
 models.dev carries cost data for ollama-cloud, so pricing-based detection
 would classify every model as cheap. `OLLAMA_CLOUD_PRICING`
 (`tusker_gateway/catalog.py`) overlays ollama.com's published per-1M-token
-prices onto catalog entries. Under the $1/$8 thresholds this marks
-`glm-5.1`, `glm-5.2`, `glm-5.3`, and `kimi-k3` heavyweight (plus
-`kimi-k3`'s slug entry, which also covers static pool lists that carry no
-cost data); `glm-5.3-flash`, `kimi-k2.6`, and the minimax/nemotron
-variants stay cheap-tier. Slugs with no published price stay
-non-heavyweight (conservative default).
+prices onto catalog entries. Under the $1/$3 thresholds this marks
+`glm-5.1`, `glm-5.2`, `glm-5.3`, `kimi-k2.6`, `kimi-k2.7-code`, `kimi-k3`, and
+`nemotron-3-ultra` heavyweight by pricing. Slug entries also cover
+`kimi-k2.6`, `kimi-k2.7-code`, `kimi-k3` (synthetic), and `Kimi-K3` so static
+pool lists (no cost data) stay filtered. `glm-5.3-flash`, `deepseek-v4-flash`,
+and the cheap minimax variants stay cheap-tier. Slugs with no published price
+stay non-heavyweight (conservative default).
 
 **Not** in the override set (cheap-tier codex slugs):
 
@@ -428,3 +426,8 @@ candidate's stored records.
   `glm-5.3`/`kimi-k3` previously passed the cheap-pool heavyweight gate
   and burned session quota (`kimi-k3` also added to
   `HEAVYWEIGHT_SLUG_OVERRIDES` for static pool lists).
+
+- **2026-09-19**: Global pricing threshold lowered from `$8/M` to `$3/M`
+  output (input remains `$1/M`). Added static slug overrides for
+  `kimi-k2.6` and `kimi-k2.7-code`; code/privacy pools now classify all
+  catalog models at or above either boundary as heavyweight.

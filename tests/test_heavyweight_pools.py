@@ -117,9 +117,11 @@ def test_code_pool_drops_heavyweights():
 
 def test_ollama_cloud_pricing_overlay_filters_heavyweight_from_code_pool():
     """Regression: ollama-cloud auto-catalog entries priced above the
-    $1/M-in or $8/M-out thresholds must be filtered from the cheap code
-    pool. kimi-k3 is heavy by slug override; glm-5.1/5.2/5.3 are heavy by
-    pricing; glm-5.3-flash, kimi-k2.6, minimax-m3 stay light."""
+    $1/M-in or $3/M-out thresholds must be filtered from the cheap code
+    pool. kimi-k3 is heavy by slug override; glm-5.1/5.2/5.3, kimi-k2.6/2.7-code
+    are heavy by pricing; glm-5.3-flash, minimax-m3 stay light."""
+    heavy = {"kimi-k3", "glm-5.1", "glm-5.2", "glm-5.3", "kimi-k2.6", "kimi-k2.7-code"}
+    light = {"glm-5.3-flash", "minimax-m3"}
     from tusker_gateway.catalog import (
         CatalogEntry,
         CatalogRegistry,
@@ -156,8 +158,14 @@ def test_ollama_cloud_pricing_overlay_filters_heavyweight_from_code_pool():
                      cost_input=0.15, cost_output=0.50),
         CatalogEntry(provider="ollama-cloud", model="kimi-k2.6",
                      cost_input=0.95, cost_output=4.00),
+        CatalogEntry(provider="ollama-cloud", model="kimi-k2.7-code",
+                     cost_input=0.95, cost_output=4.00),
         CatalogEntry(provider="ollama-cloud", model="minimax-m3",
                      cost_input=0.60, cost_output=2.40),
+        CatalogEntry(provider="ollama-cloud", model="nemotron-3-ultra",
+                     cost_input=0.10, cost_output=3.00),
+        CatalogEntry(provider="ollama-cloud", model="qwen3.5:397b",
+                     cost_input=0.60, cost_output=3.60),
     ]
     registry.register("ollama-cloud", ollama)
     pm.catalog_registry = registry
@@ -167,10 +175,10 @@ def test_ollama_cloud_pricing_overlay_filters_heavyweight_from_code_pool():
         (m["provider"], m["model"]): m
         for m in pm.pools["code"].models
     }
-    heavy = {"kimi-k3", "glm-5.1", "glm-5.2", "glm-5.3"}
-    light = {"glm-5.3-flash", "kimi-k2.6", "minimax-m3"}
+    heavy = {"kimi-k3", "glm-5.1", "glm-5.2", "glm-5.3", "kimi-k2.6", "kimi-k2.7-code",
+             "nemotron-3-ultra", "qwen3.5:397b"}
+    light = {"glm-5.3-flash", "minimax-m3"}
     for m in heavy | light:
-        assert ("ollama-cloud", m) in pool_by_pair
         assert pool_by_pair[("ollama-cloud", m)]["heavyweight"] is (m in heavy)
     # select() drops heavies; a light candidate serves the request.
     selected = pm.select("code")
@@ -232,7 +240,7 @@ def test_premium_heavyweight_only_adopts_heavy_catalog_entries():
     assert ("ollama-cloud", "kimi-k3") in premium      # heavy adopted
     assert ("ollama-cloud", "glm-5.3") in premium      # heavy adopted
     assert ("ollama-cloud", "glm-5.3-flash") not in premium  # light skipped
-    assert ("ollama-cloud", "kimi-k2.6") not in premium      # light skipped
+    assert ("ollama-cloud", "kimi-k2.6") in premium      # heavy by pricing ($4/M out)
     assert pm.select("premium") is not None
 
 

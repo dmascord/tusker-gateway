@@ -47,15 +47,16 @@ HEAVYWEIGHT_SLUG_OVERRIDES: frozenset[str] = frozenset({
     # Misc big models
     "mistral-large-3:675b",
     "deepseek-v4-pro",
-    # Ollama Cloud "extra high usage" tier (Ollama's own label for kimi-k3;
-    # $3/M in, $15/M out per ollama.com/library/kimi-k3). Auto-catalog
-    # entries are classified by pricing via the catalog's OLLAMA_CLOUD_PRICING
-    # overlay, but static pool lists carry no cost data — this slug entry
-    # keeps kimi-k3 out of cheap pools on that path too.
+    # Ollama Cloud "extra high usage" tier — kimi-k3 ($3/M in, $15/M out
+    # per ollama.com/library/kimi-k3).  Also kimi-k2.6 and kimi-k2.7-code
+    # ($4/M out) need slug overrides since pricing doesn't catch them
+    # ($0.95/M in, below the $1/M threshold).  Static pool lists carry no
+    # cost data so the catalog pricing overlay also doesn't help them.
+    "kimi-k2.6",
+    "kimi-k2.7-code",
     "kimi-k3",
     # Moonshot AI Kimi-K3 via synthetic.new (moonshotai/Kimi-K3).
-    # Slug is case-sensitive; synthetic.new returns "Kimi-K3" while
-    # ollama.com returns "kimi-k3". Both are covered.
+    # Slug is case-sensitive; synthetic.new returns "Kimi-K3".
     "Kimi-K3",
     # MiniMax highspeed variants are billed at roughly 2x the standard
     # per-token rate.  Keep them available to premium callers, but out of
@@ -70,10 +71,9 @@ HEAVYWEIGHT_SLUG_OVERRIDES: frozenset[str] = frozenset({
 
 
 # Pricing thresholds for the dynamic classifier (per 1M tokens).
-# A model is heavyweight if EITHER input >= HEAVY_INPUT_USD or output
-# >= HEAVY_OUTPUT_USD. Mirrors hermes-agent's models_dev.py thresholds.
+# A model is heavyweight if input >= $1/M OR output >= $3/M.
 HEAVY_INPUT_USD: float = 1.0
-HEAVY_OUTPUT_USD: float = 8.0
+HEAVY_OUTPUT_USD: float = 3.0  # $3/M output threshold (was $8)
 
 
 def is_heavyweight_slug(slug: str) -> bool:
