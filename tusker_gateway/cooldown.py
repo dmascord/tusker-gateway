@@ -89,6 +89,7 @@ def mark_permanently_failed(provider: str, model: str, *, seconds: float | None 
 def clear_permanently_failed(provider: str, model: str) -> None:
     """Clear a permanent-failure marker once the model recovers."""
     PERMANENTLY_FAILED_MODELS.pop((provider, model), None)
+    logger.debug("permanently failed cleared %s/%s", provider, model)
 
 
 def is_permanently_failed(provider: str, model: str) -> bool:

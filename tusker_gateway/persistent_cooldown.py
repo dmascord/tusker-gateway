@@ -199,6 +199,7 @@ class PersistentCooldownStore:
                 loaded += 1
         logger.info('hydrated %d provider cooldowns from store', loaded)
         return loaded
+
     def is_active(self, provider: str, model: str) -> bool:
         """Return True if (provider, model) cooldown is still active in storage."""
         with self._connect() as conn:
@@ -257,6 +258,40 @@ class PersistentCooldownStore:
                 (provider, model),
             )
             conn.commit()
+
+    def record_permanent_failure(self, provider: str, model: str) -> None:
+        """Persist a permanent failure marker for a model."""
+        now = time.time()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO permanent_failures (provider, model, failed_at, expires_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(provider, model) DO UPDATE SET
+                    failed_at = excluded.failed_at,
+                    expires_at = excluded.expires_at
+                """,
+                (provider, model, now, now + MAX_COOLDOWN_SECS),
+            )
+            conn.commit()
+        logger.info("recorded permanent failure %s/%s", provider, model)
+
+    def hydrate_permanent_failures(self) -> int:
+        """Load active permanent failure markers into the module-level registry."""
+        from tusker_gateway.cooldown import mark_permanently_failed
+
+        now = time.time()
+        loaded = 0
+        with self._connect() as conn:
+            for provider, model, _failed_at, expires_at in conn.execute(
+                "SELECT provider, model, failed_at, expires_at FROM permanent_failures"
+            ):
+                if expires_at is not None and expires_at <= now:
+                    continue
+                mark_permanently_failed(provider, model)
+                loaded += 1
+        logger.info('hydrated %d permanent failure markers from store', loaded)
+        return loaded
 
     def status(self) -> dict[str, Any]:
         with self._connect() as conn:

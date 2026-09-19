@@ -457,6 +457,25 @@ def _persist_capacity_group_cooldown(
         pass
 
 
+def _persist_permanent_failure(
+    config: dict[str, Any],
+    provider: str,
+    model: str,
+) -> None:
+    """Persist a permanent failure marker without making the provider path fail."""
+    try:
+        from pathlib import Path
+
+        from tusker_gateway.persistent_cooldown import PersistentCooldownStore
+
+        db_path = (
+            Path(config.get("quality_db_path", "data/quality.db")).parent
+            / "cooldowns.db"
+        )
+        PersistentCooldownStore(db_path=db_path).record_permanent_failure(provider, model)
+    except Exception:
+        pass
+
 def _capacity_failure_group(
     provider: str,
     model: str,
@@ -1612,6 +1631,7 @@ class PassthroughClient:
             from tusker_gateway.cooldown import mark_permanently_failed
 
             mark_permanently_failed(provider, model)
+            _persist_permanent_failure(self._config, provider, model)
 
         seconds = _upstream_failure_cooldown_seconds(exc)
         if seconds is not None:
@@ -1932,6 +1952,7 @@ class PassthroughClient:
                 from tusker_gateway.cooldown import mark_permanently_failed
 
                 mark_permanently_failed(provider, model)
+                _persist_permanent_failure(self._config, provider, model)
             logger.warning("provider error %s/%s: %s", provider, model, exc)
             if isinstance(exc, ProviderError):
                 raise

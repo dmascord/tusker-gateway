@@ -287,8 +287,9 @@ def create_app() -> web.Application:
             store = PersistentCooldownStore(db_path=db_dir / "cooldowns.db")
             loaded_models = store.hydrate(global_tracker())
             loaded_providers = store.hydrate_providers(global_tracker())
+            loaded_permanent = store.hydrate_permanent_failures()
             purged = store.purge_expired()
-            startup_log.info("cooldowns hydrated: %d model, %d provider cooldowns loaded, %d expired purged", loaded_models, loaded_providers, purged)
+            startup_log.info("cooldowns hydrated: %d model, %d provider, %d permanent, %d expired purged", loaded_models, loaded_providers, loaded_permanent, purged)
         except Exception as exc:
             startup_log.warning("cooldown hydration failed: %s", exc)
         # Start OTLP trace flusher.
