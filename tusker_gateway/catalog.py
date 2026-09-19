@@ -846,6 +846,16 @@ class WorkersAICatalog(CatalogClient):
     provider = "workers-ai"
     ttl_secs = 3600.0
 
+    # Cloudflare's model-search response does not currently expose the
+    # vision/function-calling flags needed by the gateway's conservative pool
+    # filter. Keep this small, source-backed overlay for models whose official
+    # catalog pages explicitly document the capability. The route still goes
+    # through the normal live modality/tool qualification and cooldown gates.
+    RESEARCHED_INPUT_MODALITIES: dict[str, frozenset[str]] = {
+        "@cf/meta/llama-4-scout-17b-16e-instruct": frozenset({"text", "image"}),
+        "@cf/meta/llama-3.2-11b-vision-instruct": frozenset({"text", "image"}),
+    }
+
     def __init__(self) -> None:
         super().__init__()
         from tusker_gateway.config import expand_env_placeholders
@@ -878,10 +888,40 @@ class WorkersAICatalog(CatalogClient):
             model = row.get("name")
             if not isinstance(model, str) or not model.strip():
                 continue
+            model = model.strip()
+            # The Workers model-search API exposes capability flags in a
+            # ``properties`` array rather than the architecture/capabilities
+            # shapes handled by the generic catalog parser. Normalize the
+            # documented flags so pool selection can enforce them.
+            raw = dict(row)
+            capabilities: dict[str, Any] = {}
+            properties = row.get("properties")
+            if isinstance(properties, list):
+                for prop in properties:
+                    if not isinstance(prop, dict):
+                        continue
+                    property_id = str(prop.get("property_id", "")).strip().lower()
+                    value = prop.get("value")
+                    enabled = value is True or str(value).strip().lower() == "true"
+                    if property_id == "vision" and enabled:
+                        capabilities["input_modalities"] = ["text", "image"]
+                    elif property_id == "function_calling" and enabled:
+                        capabilities["function_calling"] = True
+            if capabilities:
+                raw["capabilities"] = capabilities
+            input_modalities = (
+                self.RESEARCHED_INPUT_MODALITIES.get(model.lower())
+                or advertised_input_modalities(CatalogEntry(
+                    provider=self.provider,
+                    model=model,
+                    raw=raw,
+                ))
+            )
             out.append(CatalogEntry(
                 provider=self.provider,
-                model=model.strip(),
-                raw=row,
+                model=model,
+                raw=raw,
+                input_modalities=input_modalities,
             ))
         return out
 

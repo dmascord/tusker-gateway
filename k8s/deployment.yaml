@@ -422,7 +422,7 @@ spec:
         - name: TUSKER_MODALITY_QUALIFICATION_MODALITY
           value: image
         - name: TUSKER_MODALITY_QUALIFICATION_LIMIT
-          value: '6'
+          value: '12'
         - name: TUSKER_MODALITY_QUALIFICATION_TIMEOUT_SECS
           value: '45'
         - name: TUSKER_MODALITY_QUALIFICATION_MAX_AGE_SECS

@@ -648,6 +648,15 @@ async def test_workers_ai_catalog_parses_cf_envelope_and_filters_tasks():
                 "task": {"name": "Text Generation"},
             },
             {
+                "id": "vision-scout",
+                "name": "@cf/meta/llama-4-scout-17b-16e-instruct",
+                "task": {"name": "Text Generation"},
+                "properties": [
+                    {"property_id": "vision", "value": "true"},
+                    {"property_id": "function_calling", "value": "true"},
+                ],
+            },
+            {
                 "id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
                 "name": "@cf/stabilityai/stable-diffusion-xl-base-1.0",
                 "task": {"name": "Text-to-Image"},
@@ -665,10 +674,18 @@ async def test_workers_ai_catalog_parses_cf_envelope_and_filters_tasks():
         FakeSession({"default": FakeResponse(200, body)})
     )
     # Slugs come from row["name"] — the UUID "id" must never leak as a model.
-    assert {e.model for e in entries} == {"@cf/meta/llama-3.1-8b-instruct"}
+    assert {e.model for e in entries} == {
+        "@cf/meta/llama-3.1-8b-instruct",
+        "@cf/meta/llama-4-scout-17b-16e-instruct",
+    }
     assert all(e.provider == "workers-ai" for e in entries)
     for entry in entries:
         assert entry.model.startswith("@cf/")
+    vision = next(
+        e for e in entries if e.model == "@cf/meta/llama-4-scout-17b-16e-instruct"
+    )
+    assert vision.input_modalities == frozenset({"text", "image"})
+    assert vision.raw["capabilities"]["function_calling"] is True
 
 
 @pytest.mark.asyncio
