@@ -590,8 +590,17 @@ class PoolManager:
                     # free-price catalogue. Tool-bearing requests still need
                     # a passing behavioral qualification record.
                     mode = "catalog"
-                elif provider in {"opencode-zen", "opencode-go"}:
+                elif provider in {"opencode-zen", "opencode-go"} and not pool.zdr:
+                    # OpenCode's catalog is key-filtered, so it is useful for
+                    # ordinary cheap pools. Privacy pools must opt providers
+                    # in explicitly via auto_catalog_providers, even when a
+                    # provider is marked ZDR-capable in the registry.
                     mode = "all"
+                elif pool.zdr:
+                    # Do not implicitly discover authenticated providers into
+                    # privacy pools. The explicit allowlist above is the
+                    # privacy policy boundary.
+                    continue
                 elif provider == "xiaomi":
                     mode = "xiaomi"
                 else:
@@ -1557,6 +1566,20 @@ class PoolManager:
         for name, specs in self.models.items():
             pool = self.pools.get(name)
             catalog_unavailable = self._catalog_unavailable_routes(specs)
+            tool_capability_cache = None
+            requires_qualification = bool(
+                pool is not None
+                and getattr(pool, "require_tool_qualification", False)
+            )
+            if requires_qualification:
+                tool_capability_cache = (
+                    {
+                        (record.provider, record.model): record
+                        for record in self._tool_capabilities.records()
+                    }
+                    if self._tool_capabilities is not None
+                    else {}
+                )
             eligible = [
                 spec
                 for spec in specs
@@ -1569,6 +1592,14 @@ class PoolManager:
                 and (
                     self._provider_kind(spec.provider) not in {"oauth", "codex"}
                     or _spec_has_credentials(spec, credential_sizes)
+                )
+                and (
+                    not requires_qualification
+                    or self._tool_capability_allowed(
+                        spec,
+                        capability_cache=tool_capability_cache,
+                        require_qualified=True,
+                    )
                 )
             ]
             health[name] = {

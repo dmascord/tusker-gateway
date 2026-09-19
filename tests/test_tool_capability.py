@@ -190,6 +190,46 @@ def test_strict_pool_requires_qualification_without_tools(tmp_path):
     assert manager.select("privacy") == ("synthetic", "qualified")
 
 
+def test_readiness_excludes_unqualified_models_from_strict_pool(tmp_path):
+    manager = PoolManager(
+        {
+            "pools": {
+                "privacy": PoolConfig(
+                    name="privacy",
+                    models=[
+                        {"provider": "synthetic", "model": "qualified"},
+                        {"provider": "synthetic", "model": "unknown"},
+                    ],
+                    zdr=True,
+                    require_tool_qualification=True,
+                ),
+            },
+            "quality_db_path": str(tmp_path / "quality.db"),
+            "tool_capability_db_path": str(tmp_path / "capability.db"),
+            "excluded_providers": [],
+            "provider_api_keys": {"synthetic": "test-key"},
+        }
+    )
+    manager._tool_capabilities.record(
+        provider="synthetic",
+        model="qualified",
+        level=ToolCapabilityLevel.STRICT_STRUCTURED_STREAM,
+        status="passed",
+        http_status=200,
+        tool_call_count=1,
+        structured_stream=True,
+        arguments_valid=True,
+        arguments_match=True,
+        finish_reason="tool_calls",
+    )
+
+    health, empty = manager.readiness_status()
+
+    assert health["privacy"]["configured"] == 2
+    assert health["privacy"]["selectable"] == 1
+    assert empty == []
+
+
 def test_failed_probe_keeps_auto_discovered_model_out_of_tool_pool(tmp_path):
     manager = _manager(str(tmp_path))
     manager.catalog_registry = _Registry()

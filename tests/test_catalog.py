@@ -1392,6 +1392,38 @@ def test_poolmanager_auto_catalog_includes_opencode_zen_and_go():
     assert ("opencode-go", "kimi-k2.6") in pool_models
 
 
+def test_poolmanager_auto_catalog_does_not_implicitly_add_opencode_to_privacy():
+    """Privacy discovery requires an explicit provider allowlist."""
+    from tusker_gateway.config import PoolConfig
+    from tusker_gateway.pools import PoolManager
+
+    cfg = {
+        "pools": {
+            "privacy": PoolConfig(
+                name="privacy",
+                models=[],
+                auto_catalog=True,
+                auto_catalog_providers=(),
+                zdr=True,
+            ),
+        },
+        "excluded_providers": [],
+        "provider_api_keys": {"opencode-go": "k-go"},
+        "quality_db_path": "/tmp/_unused.db",
+    }
+    pm = PoolManager(cfg)
+
+    reg = CatalogRegistry()
+    go = OpenCodeGoCatalog()
+    go._entries = [CatalogEntry(provider="opencode-go", model="minimax-m3")]
+    reg.register("opencode-go", go)
+    pm.catalog_registry = reg
+
+    pm.extend_pools_with_auto_catalog()
+
+    assert pm.models["privacy"] == []
+
+
 def test_poolmanager_auto_catalog_drops_models_that_stop_being_free():
     """Idempotency: when a model goes paid, it must be removed from
     the pool on the next auto_catalog pass."""
