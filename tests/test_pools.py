@@ -931,7 +931,7 @@ def test_auto_discovered_unknown_non_text_modality_requires_evidence():
                             },
                             {
                                 "provider": "synthetic",
-                                "model": "syn:large:vision",
+                                "model": "syn:small:vision",
                                 "input_modalities": ["text", "image"],
                             },
                         ],
@@ -947,7 +947,7 @@ def test_auto_discovered_unknown_non_text_modality_requires_evidence():
         assert manager.select(
             "code",
             required_input_modalities={"image"},
-        ) == ("synthetic", "syn:large:vision")
+        ) == ("synthetic", "syn:small:vision")
 
         manager._model_capability_db.record(
             provider="groq",

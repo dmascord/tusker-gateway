@@ -63,6 +63,9 @@ HEAVYWEIGHT_SLUG_OVERRIDES: frozenset[str] = frozenset({
     "MiniMax-M2.1-highspeed",
     "MiniMax-M2.5-highspeed",
     "MiniMax-M2.7-highspeed",
+    # Synthetic.new large-vision route — backed by Kimi-K3 under the hood
+    # ($3/M in, $15/M out). Expensive; keep it out of cheap pools.
+    "syn:large:vision",
 })
 
 

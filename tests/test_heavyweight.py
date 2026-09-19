@@ -216,3 +216,16 @@ def test_override_set_includes_expected_slugs():
         "claude-sonnet-4.6", "claude-opus-4.6",
     }
     assert expected.issubset(HEAVYWEIGHT_SLUG_OVERRIDES)
+
+
+def test_syn_large_vision_is_heavyweight_slug():
+    """syn:large:vision routes through Kimi-K3 under the hood ($3/M in,
+    $15/M out). It must stay out of cheap code/privacy pools regardless of
+    whether it appears as a static entry or is auto-discovered from the
+    synthetic.new catalog."""
+    assert is_heavyweight_slug("syn:large:vision") is True
+
+
+def test_syn_small_vision_is_not_heavyweight_slug():
+    """syn:small:vision is the lightweight sibling — kept in cheap pools."""
+    assert is_heavyweight_slug("syn:small:vision") is False
