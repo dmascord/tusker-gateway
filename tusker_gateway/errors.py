@@ -106,6 +106,28 @@ class ProviderError(GatewayError):
     error_type = "provider_error"
 
 
+class ProviderStreamLoopError(ProviderError):
+    """An upstream stream repeated reasoning/content and was terminated."""
+
+    def __init__(
+        self,
+        *,
+        provider: str,
+        model: str,
+        cycle_chars: int,
+        repeats: int,
+    ) -> None:
+        self.provider = provider
+        self.model = model
+        self.cycle_chars = cycle_chars
+        self.repeats = repeats
+        super().__init__(
+            "upstream model emitted a repeated stream cycle; trying another "
+            "candidate",
+            code="provider_stream_loop",
+        )
+
+
 class ProviderCapacityError(ProviderError):
     """A provider worker-pool capacity failure handled by pool fallback."""
 

@@ -471,6 +471,34 @@ async def test_stream_normalizer_rejects_repeated_reasoning_cycle():
 
 
 @pytest.mark.asyncio
+async def test_stream_normalizer_rejects_repeated_reasoning_cycle_without_tools():
+    """Ordinary OMP streams must also stop pathological reasoning loops."""
+    import json as _json
+
+    from tusker_gateway.errors import ProviderStreamLoopError
+    from tusker_gateway.endpoints import _normalize_stream
+
+    cycle = "Planning the next step: inspect the repository and continue. "
+
+    async def repeated_stream():
+        for _ in range(5):
+            payload = {"choices": [{"delta": {"reasoning_content": cycle}}]}
+            yield f"data: {_json.dumps(payload)}\n\n".encode()
+
+    with pytest.raises(ProviderStreamLoopError) as error:
+        async for _ in _normalize_stream(
+            repeated_stream(),
+            provider="test-provider",
+            model="looping-model",
+            detect_repeated_reasoning=True,
+        ):
+            pass
+
+    assert error.value.provider == "test-provider"
+    assert error.value.model == "looping-model"
+
+
+@pytest.mark.asyncio
 async def test_stream_normalizer_emits_tool_calls_for_bare_function_blocks(client):
     """Models that emit bare <function=name>...</function> (no <​tool_call> wrapper)
     across multiple SSE deltas must not leak the XML into content and must

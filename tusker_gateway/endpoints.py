@@ -40,6 +40,7 @@ from tusker_gateway.errors import (
     ProviderCapacityError,
     ProviderError,
     ProviderRouteDisabledError,
+    ProviderStreamLoopError,
     RateLimitError,
     RequiredToolCallError,
     ToolCallContractError,
@@ -928,6 +929,7 @@ async def _normalize_stream(
     request_id: str | None = None,
     tools_requested: bool = False,
     require_tool_call: bool = False,
+    detect_repeated_reasoning: bool = False,
 ) -> AsyncIterator[bytes]:
     """Sanitize and normalize a provider's OpenAI-compatible SSE stream.
 
@@ -954,6 +956,7 @@ async def _normalize_stream(
     saw_tool_markup = False
     saw_visible_content = False
     reasoning_window = ""
+    promoted_reasoning_window = ""
     reasoning_chars = 0
     emitted_finish_reason: str | None = None
     native_call_indices: dict[tuple[int, str], int] = {}
@@ -1119,6 +1122,9 @@ async def _normalize_stream(
 
             raw_content = delta.get("content")
             reasoning_content = delta.get("reasoning_content")
+            promoted_reasoning = (
+                reasoning_content if isinstance(reasoning_content, str) else ""
+            )
             # OpenRouter's newer reasoning stream uses `reasoning` (and often
             # duplicates it in `reasoning_details`) rather than the older
             # `reasoning_content` field. OMP renders that field as a thinking
@@ -1299,16 +1305,29 @@ async def _normalize_stream(
             # Do this after draining complete blocks so a tool call that ends
             # the reasoning stream wins over the loop detector.
             if (
-                tools_requested
+                detect_repeated_reasoning
                 and not has_tools
                 and not saw_tool_call
                 and not pending_tool_frames
-                and not saw_visible_content
             ):
                 cycle = _repeated_text_cycle(reasoning_window)
+                if cycle is None and promoted_reasoning:
+                    promoted_reasoning_window = (
+                        promoted_reasoning_window + promoted_reasoning
+                    )[-_REASONING_WINDOW_CHARS:]
+                    cycle = _repeated_text_cycle(promoted_reasoning_window)
                 if cycle is not None:
                     cycle_chars, repeats = cycle
-                    raise unusable_tool_error(f"repeated_reasoning_cycle:{cycle_chars}x{repeats}")
+                    if tools_requested and not saw_visible_content:
+                        raise unusable_tool_error(
+                            f"repeated_reasoning_cycle:{cycle_chars}x{repeats}"
+                        )
+                    raise ProviderStreamLoopError(
+                        provider=provider or "unknown",
+                        model=model or "unknown",
+                        cycle_chars=cycle_chars,
+                        repeats=repeats,
+                    )
 
             diagnostics_signature = (
                 raw_marker_types,
@@ -2013,7 +2032,7 @@ async def _prepare_stream_result(
             force_deny=force_deny,
         )
 
-    if not tools_requested or not hasattr(result, "__aiter__"):
+    if not hasattr(result, "__aiter__"):
         return result
 
     normalized = _normalize_stream(
@@ -2021,8 +2040,9 @@ async def _prepare_stream_result(
         provider=provider,
         model=model,
         request_id=request_id,
-        tools_requested=True,
+        tools_requested=tools_requested,
         require_tool_call=require_tool_call,
+        detect_repeated_reasoning=True,
     )
 
     async def _first_frame(
@@ -2031,7 +2051,7 @@ async def _prepare_stream_result(
         """Await the first frame eagerly so the per-attempt idle budget applies.
 
         The bounded idle budget (``_provider_attempt_timeout_secs``) must still
-        fire when an upstream connects but never produces a first byte.  Awaiting
+        fire when an upstream connects but never produces a first byte. Awaiting
         the first frame inside the attempt window preserves that guarantee while
         keeping the rest of the stream delivered to the client as it arrives.
         """
@@ -2040,6 +2060,9 @@ async def _prepare_stream_result(
         except StopAsyncIteration:
             return None, iterator
         return first, iterator
+
+    if not tools_requested:
+        return _PreparedStream(normalized)
 
     first_frame, rest = await _first_frame(normalized)
 
@@ -2586,6 +2609,30 @@ def _quarantine_tool_response_failure(
     )
 
 
+def _quarantine_stream_loop(
+    config: dict[str, Any],
+    provider: str,
+    model: str,
+    exc: BaseException,
+) -> None:
+    """Temporarily exclude a route whose stream repeated a reasoning cycle."""
+    if not isinstance(exc, ProviderStreamLoopError):
+        return
+    seconds = _tool_response_failure_cooldown_secs()
+    from tusker_gateway.cooldown import global_tracker
+
+    global_tracker().cooldown(provider, model, seconds)
+    _persist_cooldown(config, provider, model, seconds)
+    logger.warning(
+        "stream loop quarantine provider=%s model=%s seconds=%.0f cycle_chars=%d repeats=%d",
+        provider,
+        model,
+        seconds,
+        exc.cycle_chars,
+        exc.repeats,
+    )
+
+
 def _pool_failure_summary(exc: BaseException) -> str:
     """Return a bounded, redacted provider failure for operational logs."""
     body = getattr(exc, "upstream_body", None) or getattr(exc, "body", None) or str(exc)
@@ -2865,6 +2912,7 @@ async def _call_with_pool_fallback(
             raise
         except Exception as exc:
             _quarantine_tool_response_failure(config, provider, model, exc)
+            _quarantine_stream_loop(config, provider, model, exc)
             if breaker is not None:
                 await asyncio.to_thread(
                     breaker.record_failure,
@@ -3146,6 +3194,7 @@ async def _call_with_pool_fallback(
             raise
         except Exception as exc:
             _quarantine_tool_response_failure(config, provider, model, exc)
+            _quarantine_stream_loop(config, provider, model, exc)
             if breaker is not None:
                 await asyncio.to_thread(
                     breaker.record_failure,
@@ -4924,6 +4973,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                         budget_recorded = False
                     raise
                 except Exception as exc:  # noqa: BLE001
+                    stream_loop_failure = isinstance(exc, ProviderStreamLoopError)
                     stream_ok = False
                     tool_response_failure = isinstance(
                         exc,
@@ -4936,7 +4986,11 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                         ),
                     )
                     status = (
-                        "tool_response_error" if tool_response_failure else "upstream_stream_error"
+                        "stream_loop"
+                        if stream_loop_failure
+                        else "tool_response_error"
+                        if tool_response_failure
+                        else "upstream_stream_error"
                     )
                     request["_stream_error"] = status
                     # Stream validation failures happen after the HTTP 200 has
@@ -4946,6 +5000,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                     # sticky session can immediately select the same bad route.
                     if tool_response_failure:
                         _quarantine_tool_response_failure(config, provider, target_model, exc)
+                    _quarantine_stream_loop(config, provider, target_model, exc)
                     if breaker is not None:
                         await asyncio.to_thread(
                             breaker.record_failure,
