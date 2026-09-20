@@ -1,7 +1,7 @@
 """Tests for behavioral tool-call qualification and pool gating."""
 from __future__ import annotations
 
-import os
+import asyncio
 
 from tusker_gateway.config import PoolConfig
 from tusker_gateway.pools import PoolManager
@@ -18,6 +18,7 @@ from tusker_gateway.tool_qualification import (
     _needs_probe,
     _route_is_quarantined,
     _result_from_stream,
+    probe_model,
 )
 
 
@@ -51,6 +52,70 @@ def _manager(tmp_path):
             "provider_api_keys": {"openrouter": "test-key"},
         }
     )
+
+
+class _ProbeResponse:
+    status = 200
+    headers: dict[str, str] = {}
+    content: "_ProbeResponse"
+
+    def __init__(self):
+        self.content = self
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        raise StopAsyncIteration
+
+
+class _ProbeSession:
+    def __init__(self):
+        self.headers: dict[str, str] | None = None
+
+    def post(self, _url, **kwargs):
+        self.headers = kwargs["headers"]
+        return _ProbeResponse()
+
+
+def test_opencode_probe_sends_isolated_session_header():
+    session = _ProbeSession()
+
+    asyncio.run(
+        probe_model(
+            session,
+            base_url="https://opencode.test",
+            api_key="test-key",
+            provider="opencode-zen",
+            model="test-model",
+        )
+    )
+
+    assert session.headers is not None
+    assert session.headers["X-Opencode-Session"].startswith("probe-")
+
+
+def test_non_opencode_probe_omits_session_header():
+    session = _ProbeSession()
+
+    asyncio.run(
+        probe_model(
+            session,
+            base_url="https://provider.test",
+            api_key="test-key",
+            provider="openrouter",
+            model="test-model",
+        )
+    )
+
+    assert session.headers is not None
+    assert "X-Opencode-Session" not in session.headers
 
 
 def test_tool_capability_db_round_trip_and_gate(tmp_path):

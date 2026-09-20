@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -331,6 +332,8 @@ async def probe_model(
         "X-Tusker-Cache": "bypass",
         "X-Tusker-Tool-Qualification": TOOL_CAPABILITY_PROBE_VERSION,
     }
+    if provider in {"opencode-zen", "opencode-go"}:
+        headers["X-Opencode-Session"] = f"probe-{uuid.uuid4().hex[:8]}"
     try:
         async with session.post(url, json=payload, headers=headers) as response:
             status_code = response.status
