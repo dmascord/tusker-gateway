@@ -45,6 +45,12 @@ class ConfigUnavailableError(Exception):
         self.code = code
 
 
+class ConfigConflictError(Exception):
+    """Raised when a conditional configuration write targets a stale generation."""
+
+
+
+
 class ConfigStore:
     """DB-backed config store; inert when neither DB path nor env flag is set."""
 
@@ -807,19 +813,53 @@ class ConfigStore:
 
     # ── Pool CRUD ──────────────────────────────────────────────────────────────
 
-    def upsert_pool(self, body: dict[str, Any]) -> dict[str, Any]:
+    def upsert_pool(
+        self,
+        body: dict[str, Any],
+        *,
+        expected_generation: int | None = None,
+    ) -> dict[str, Any]:
         """Create or replace a pool definition."""
         if not self._managed:
             raise ConfigUnavailableError("config store unavailable", code="store_unavailable")
         name = str(body.get("name") or "").strip().lower()
         if not name:
             raise ValueError("pool name is required")
+        # ``code`` is the gateway's primary route.  An empty primary pool
+        # with no configured fallback makes every pod fail readiness and
+        # removes the Service endpoint, even when premium/swarm capacity is
+        # healthy.  Auto-catalog discovery is intentionally allowed to leave
+        # secondary pools empty, but it must not be the sole availability
+        # mechanism for the primary route.
+        models = body.get("models")
+        fallback_pools = body.get("fallback_pools")
+        if name == "code" and not models and not fallback_pools:
+            raise ValueError(
+                "primary code pool must define static models or at least one fallback pool"
+            )
         self._ensure_db()
         try:
             models_raw = json.dumps(body.get("models") or [])
             ac_raw = json.dumps(body.get("auto_catalog_providers") or [])
             fb_raw = json.dumps(body.get("fallback_pools") or [])
             with self._conn as conn:
+                if expected_generation is not None:
+                    if self._db_connect().is_postgres:
+                        cur = conn.execute(
+                            "SELECT generation FROM tusker_config_meta WHERE id = 1 FOR UPDATE"
+                        )
+                    else:
+                        conn.execute("BEGIN IMMEDIATE")
+                        cur = conn.execute(
+                            "SELECT generation FROM tusker_config_meta WHERE id = 1"
+                        )
+                    row = cur.fetchone()
+                    current_generation = int(row[0]) if row else 0
+                    if current_generation != expected_generation:
+                        raise ConfigConflictError(
+                            f"configuration generation changed: expected "
+                            f"{expected_generation}, current {current_generation}"
+                        )
                 conn.execute(
                     "INSERT INTO tusker_config_pools "
                     "(name, models, context_window, zdr, provider_warmup_secs, "
@@ -850,13 +890,53 @@ class ConfigStore:
                 self._bump_generation(conn)
             self._refresh_after_write()
             return {"name": name, "ok": True}
+        except ConfigConflictError:
+            raise
         except Exception as exc:
             raise ConfigUnavailableError(str(exc), code="db_error") from exc
 
+    def get_pool(self, pool: str) -> dict[str, Any]:
+        """Return the stored pool definition by name, or raise KeyError."""
+        if not self._managed:
+            raise ConfigUnavailableError("config store unavailable", code="store_unavailable")
+        name = str(pool).strip().lower()
+        if not name:
+            raise KeyError("pool name is required")
+        self._ensure_db()
+        try:
+            with self._conn as conn:
+                cur = conn.execute(
+                    "SELECT name, models, context_window, zdr, provider_warmup_secs, "
+                    "auto_catalog, heavyweight_only, require_tool_qualification, "
+                    "auto_catalog_providers, fallback_pools "
+                    "FROM tusker_config_pools WHERE name = ?",
+                    (name,),
+                )
+                row = cur.fetchone()
+            if row is None:
+                raise KeyError(f"pool not found: {name}")
+            return {
+                "name": str(row[0]).lower(),
+                "models": _try_json(row[1]) or [],
+                "context_window": int(row[2] or 128000),
+                "zdr": bool(row[3]),
+                "provider_warmup_secs": int(row[4] or 300),
+                "auto_catalog": bool(row[5]),
+                "heavyweight_only": bool(row[6]),
+                "require_tool_qualification": bool(row[7]),
+                "auto_catalog_providers": _try_json(row[8]) or [],
+                "fallback_pools": _try_json(row[9]) or [],
+            }
+        except KeyError:
+            raise
+        except Exception as exc:
+            raise ConfigUnavailableError(str(exc), code="db_error") from exc
     def delete_pool(self, pool: str) -> None:
         if not self._managed:
             raise ConfigUnavailableError("config store unavailable", code="store_unavailable")
         name = str(pool).strip().lower()
+        if name == "code":
+            raise ValueError("primary code pool cannot be deleted")
         self._ensure_db()
         try:
             with self._conn as conn:

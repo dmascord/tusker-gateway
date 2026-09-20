@@ -57,14 +57,30 @@ def _auth_middleware(store: IdentityStore | None = None):
 _ADMIN_IDENTITY_KEY = "sk-admin-test"
 
 
-def _admin_identities():
+def _admin_identities(scopes=None):
     fingerprint = fingerprint_api_key(_ADMIN_IDENTITY_KEY)
     return load_identity_config_from_env({
         "TUSKER_IDENTITIES_JSON": json.dumps({
             fingerprint: {
                 "principal": "admin-test",
                 "tenant": "operations",
-                "scopes": ["admin:read"],
+                "scopes": scopes or ["admin:read"],
+            }
+        })
+    })
+
+
+_ADMIN_WRITE_IDENTITY_KEY = "sk-admin-write"
+
+
+def _admin_write_identities():
+    fingerprint = fingerprint_api_key(_ADMIN_WRITE_IDENTITY_KEY)
+    return load_identity_config_from_env({
+        "TUSKER_IDENTITIES_JSON": json.dumps({
+            fingerprint: {
+                "principal": "admin-write",
+                "tenant": "operations",
+                "scopes": ["admin:read", "admin:write"],
             }
         })
     })
@@ -443,5 +459,221 @@ async def test_bearer_still_works_alongside_sessions():
             "/admin/providers", headers={"Authorization": "Bearer sk-admin-test"}
         )
         assert resp.status == 200
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_patch_pool_preserves_omitted_fields(tmp_path):
+    """PATCH must update only supplied fields and preserve the rest."""
+    from tusker_gateway.config_store import ConfigStore
+
+    store = ConfigStore(database=tmp_path / "config.db")
+    store.upsert_client_key({
+        "api_key": _ADMIN_WRITE_IDENTITY_KEY,
+        "principal": "admin-write",
+        "tenant": "operations",
+        "scopes": ["admin:read", "admin:write"],
+    })
+    store.upsert_pool({
+        "name": "code",
+        "models": [{"provider": "minimax", "model": "MiniMax-M3"}],
+        "context_window": 128000,
+        "auto_catalog_providers": ["minimax"],
+    })
+
+    app = _admin_app(_ADMIN_WRITE_IDENTITY_KEY, identities=_admin_write_identities())
+    app["config_store"] = store
+    app["config_runtime"] = None
+    client = await _client(app)
+    try:
+        # Only update auto_catalog_providers; models and context_window must be preserved.
+        resp = await client.patch(
+            "/admin/pools/code",
+            json={"auto_catalog_providers": ["minimax", "xiaomi", "zai"]},
+            headers={"Authorization": f"Bearer {_ADMIN_WRITE_IDENTITY_KEY}"},
+        )
+        assert resp.status == 200
+        after = store.get_pool("code")
+        assert after["models"] == [{"provider": "minimax", "model": "MiniMax-M3"}]
+        assert after["context_window"] == 128000
+        assert after["auto_catalog_providers"] == ["minimax", "xiaomi", "zai"]
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_patch_pool_rejects_mismatched_body_name(tmp_path):
+    """PATCH body name must match the URL pool."""
+    from tusker_gateway.config_store import ConfigStore
+
+    store = ConfigStore(database=tmp_path / "config.db")
+    store.upsert_client_key({
+        "api_key": _ADMIN_WRITE_IDENTITY_KEY,
+        "principal": "admin-write",
+        "tenant": "operations",
+        "scopes": ["admin:read", "admin:write"],
+    })
+    store.upsert_pool({
+        "name": "code",
+        "models": [{"provider": "minimax", "model": "MiniMax-M3"}],
+    })
+
+    app = _admin_app(_ADMIN_WRITE_IDENTITY_KEY, identities=_admin_write_identities())
+    app["config_store"] = store
+    app["config_runtime"] = None
+    client = await _client(app)
+    try:
+        resp = await client.patch(
+            "/admin/pools/code",
+            json={"name": "privacy", "auto_catalog_providers": ["local-llm"]},
+            headers={"Authorization": f"Bearer {_ADMIN_WRITE_IDENTITY_KEY}"},
+        )
+        assert resp.status == 400
+        body = await resp.json()
+        assert "does not match" in body["error"]["message"]
+        # Code pool must be unchanged
+        after = store.get_pool("code")
+        assert after["name"] == "code"
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_patch_pool_404_for_missing_pool(tmp_path):
+    """PATCH on a nonexistent pool must return 404, not silently create."""
+    from tusker_gateway.config_store import ConfigStore
+
+    store = ConfigStore(database=tmp_path / "config.db")
+    store.upsert_client_key({
+        "api_key": _ADMIN_WRITE_IDENTITY_KEY,
+        "principal": "admin-write",
+        "tenant": "operations",
+        "scopes": ["admin:read", "admin:write"],
+    })
+
+    app = _admin_app(_ADMIN_WRITE_IDENTITY_KEY, identities=_admin_write_identities())
+    app["config_store"] = store
+    app["config_runtime"] = None
+    client = await _client(app)
+    try:
+        resp = await client.patch(
+            "/admin/pools/missing",
+            json={"auto_catalog": True},
+            headers={"Authorization": f"Bearer {_ADMIN_WRITE_IDENTITY_KEY}"},
+        )
+        assert resp.status == 404
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_put_pool_rejects_mismatched_body_name(tmp_path):
+    """PUT body name must match the URL pool."""
+    from tusker_gateway.config_store import ConfigStore
+
+    store = ConfigStore(database=tmp_path / "config.db")
+    store.upsert_client_key({
+        "api_key": _ADMIN_WRITE_IDENTITY_KEY,
+        "principal": "admin-write",
+        "tenant": "operations",
+        "scopes": ["admin:read", "admin:write"],
+    })
+    store.upsert_pool({
+        "name": "code",
+        "models": [{"provider": "minimax", "model": "MiniMax-M3"}],
+    })
+
+    app = _admin_app(_ADMIN_WRITE_IDENTITY_KEY, identities=_admin_write_identities())
+    app["config_store"] = store
+    app["config_runtime"] = None
+    client = await _client(app)
+    try:
+        resp = await client.put(
+            "/admin/pools/code",
+            json={"name": "privacy", "models": []},
+            headers={"Authorization": f"Bearer {_ADMIN_WRITE_IDENTITY_KEY}"},
+        )
+        assert resp.status == 400
+        after = store.get_pool("code")
+        assert after["name"] == "code"
+        assert after["models"] == [{"provider": "minimax", "model": "MiniMax-M3"}]
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_patch_pool_rejects_stale_generation(tmp_path):
+    """A stale config editor must not overwrite a newer pool definition."""
+    from tusker_gateway.config_store import ConfigStore
+
+    store = ConfigStore(database=tmp_path / "config.db")
+    store.upsert_client_key({
+        "api_key": _ADMIN_WRITE_IDENTITY_KEY,
+        "principal": "admin-write",
+        "tenant": "operations",
+        "scopes": ["admin:read", "admin:write"],
+    })
+    store.upsert_pool({
+        "name": "code",
+        "models": [{"provider": "minimax", "model": "MiniMax-M3"}],
+        "auto_catalog_providers": ["minimax"],
+    })
+    stale_generation = store.generation
+    store.upsert_pool({
+        "name": "code",
+        "models": [{"provider": "minimax", "model": "MiniMax-M3"}],
+        "auto_catalog_providers": ["minimax", "zai"],
+    })
+
+    app = _admin_app(_ADMIN_WRITE_IDENTITY_KEY, identities=_admin_write_identities())
+    app["config_store"] = store
+    app["config_runtime"] = None
+    client = await _client(app)
+    try:
+        resp = await client.patch(
+            "/admin/pools/code",
+            json={"auto_catalog_providers": ["minimax", "xiaomi"]},
+            headers={
+                "Authorization": f"Bearer {_ADMIN_WRITE_IDENTITY_KEY}",
+                "If-Match": f'"{stale_generation}"',
+            },
+        )
+        assert resp.status == 409
+        body = await resp.json()
+        assert body["error"]["code"] == "config_conflict"
+        assert store.get_pool("code")["auto_catalog_providers"] == ["minimax", "zai"]
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_put_pool_uses_url_name_when_body_omits_it(tmp_path):
+    """PUT cannot accidentally create an empty-name pool from a valid URL."""
+    from tusker_gateway.config_store import ConfigStore
+
+    store = ConfigStore(database=tmp_path / "config.db")
+    store.upsert_client_key({
+        "api_key": _ADMIN_WRITE_IDENTITY_KEY,
+        "principal": "admin-write",
+        "tenant": "operations",
+        "scopes": ["admin:read", "admin:write"],
+    })
+
+    app = _admin_app(_ADMIN_WRITE_IDENTITY_KEY, identities=_admin_write_identities())
+    app["config_store"] = store
+    app["config_runtime"] = None
+    client = await _client(app)
+    try:
+        resp = await client.put(
+            "/admin/pools/privacy",
+            json={"models": [], "auto_catalog": True},
+            headers={
+                "Authorization": f"Bearer {_ADMIN_WRITE_IDENTITY_KEY}",
+                "If-Match": f'"{store.generation}"',
+            },
+        )
+        assert resp.status == 200
+        assert store.get_pool("privacy")["auto_catalog"] is True
     finally:
         await client.close()

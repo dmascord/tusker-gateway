@@ -31,6 +31,7 @@ PUT  /admin/providers/{provider}       — create or replace a provider definiti
 DELETE /admin/providers/{provider}     — remove a provider
 PUT  /admin/providers/{provider}/settings  — update provider runtime settings
 PUT  /admin/providers/{provider}/credentials — update provider API key/credentials
+PATCH /admin/pools/{pool}       — update supplied pool fields conditionally
 PUT  /admin/pools/{pool}         — create or replace a pool definition
 DELETE /admin/pools/{pool}       — remove a pool
 
@@ -56,7 +57,7 @@ from urllib.parse import urlsplit
 
 from aiohttp import web
 
-from tusker_gateway.config_store import ConfigUnavailableError
+from tusker_gateway.config_store import ConfigConflictError, ConfigUnavailableError
 from tusker_gateway.errors import AuthorizationError, BadRequestError, GatewayError, NotFoundError
 from tusker_gateway.identity import CallerIdentity, fingerprint_api_key
 from tusker_gateway.storage import storage_status
@@ -790,11 +791,14 @@ ADMIN_CONSOLE_HTML = """<!DOCTYPE html>
     }
 
     // ─── write-side UI ───
-    async function writeJSON(method, path, body) {
+    async function writeJSON(method, path, body, generation = null) {
       const resp = await fetch(path, {
         method,
         credentials: 'same-origin',
-        headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
+        headers: Object.assign(
+          { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
+          generation === null ? {} : { 'If-Match': `"${generation}"` },
+        ),
         body: JSON.stringify(body),
       });
       if (resp.status === 401) { showLogin(); throw new Error('unauthenticated'); }
@@ -894,7 +898,7 @@ ADMIN_CONSOLE_HTML = """<!DOCTYPE html>
             await loadAll();
           } else if (act === 'pool-save') {
             const body = JSON.parse($('pool-json-' + name).value);
-            await writeJSON('PUT', `/admin/pools/${encodeURIComponent(name)}`, body);
+            await writeJSON('PATCH', `/admin/pools/${encodeURIComponent(name)}`, body, cfg.generation);
             errBox('pool-err-' + name, 'saved'); await loadAll();
           } else if (act === 'pool-del') {
             await writeJSON('DELETE', `/admin/pools/${encodeURIComponent(name)}`);
@@ -902,7 +906,7 @@ ADMIN_CONSOLE_HTML = """<!DOCTYPE html>
           } else if (act === 'pool-new') {
             const n = $('new-pool-name').value.trim();
             const body = JSON.parse($('new-pool-json').value);
-            await writeJSON('PUT', `/admin/pools/${encodeURIComponent(n)}`, body);
+            await writeJSON('PUT', `/admin/pools/${encodeURIComponent(n)}`, body, cfg.generation);
             await loadAll();
           }
         } catch (e) {
@@ -1100,6 +1104,24 @@ async def _apply_reload(request: web.Request) -> None:
     except Exception:
         logger.debug("post-write apply_reload failed", exc_info=True)
 
+
+def _expected_generation(request: web.Request) -> int | None:
+    """Parse the optional config generation precondition header."""
+    raw = request.headers.get("If-Match")
+    if raw is None:
+        return None
+    value = raw.strip()
+    if value.startswith("W/"):
+        value = value[2:].strip()
+    if len(value) >= 2 and value[0] == value[-1] == '"':
+        value = value[1:-1]
+    try:
+        generation = int(value)
+    except (TypeError, ValueError) as exc:
+        raise BadRequestError("If-Match must contain a configuration generation", code="malformed_payload") from exc
+    if generation < 0:
+        raise BadRequestError("If-Match generation must be non-negative", code="malformed_payload")
+    return generation
 
 
 def _reject_unknown_fields(body: dict, allowed: set[str], label: str) -> None:
@@ -1378,8 +1400,60 @@ async def admin_providers_credentials_put(request: web.Request) -> web.Response:
 
 
 @_admin_error_guard
+async def admin_pools_patch(request: web.Request) -> web.Response:
+    """PATCH /admin/pools/{pool} — update a pool definition with partial fields.
+
+    Only the supplied fields are written. Omitted fields are preserved
+    from the current store state. Array fields (models, fallback_pools,
+    auto_catalog_providers) replace rather than merge.
+    """
+    pool_name = request.match_info.get("pool", "")
+    if not pool_name:
+        return web.json_response(openai_error_shape("pool name required", "bad_request"), status=400)
+    body = await _json_body(request)
+    if not isinstance(body, dict):
+        return web.json_response(openai_error_shape("JSON body must be an object", "malformed_payload"), status=400)
+    _reject_unknown_fields(body, _POOL_FIELDS, "pool")
+    body_name = body.get("name")
+    if body_name is not None and str(body_name).strip().lower() != pool_name.lower():
+        return web.json_response(
+            openai_error_shape(
+                f"body name {body_name!r} does not match URL pool {pool_name!r}",
+                "malformed_payload",
+            ),
+            status=400,
+        )
+    try:
+        store = _get_config_store(request)
+        expected_generation = _expected_generation(request)
+        existing = store.get_pool(pool_name)
+        merged = {**existing, **{k: v for k, v in body.items() if k != "name"}}
+        result = store.upsert_pool(
+            merged,
+            expected_generation=expected_generation,
+        )
+    except ConfigConflictError as exc:
+        return web.json_response(openai_error_shape(str(exc), "config_conflict"), status=409)
+    except ConfigUnavailableError:
+        return web.json_response(_store_unavailable_shape(), status=503)
+    except KeyError as exc:
+        return web.json_response(openai_error_shape(str(exc), "not_found"), status=404)
+    except ValueError as exc:
+        return web.json_response(openai_error_shape(str(exc), "malformed_payload"), status=400)
+    except Exception:
+        logger.exception("patch pool failed")
+        return web.json_response(openai_error_shape("configuration unavailable", "store_unavailable"), status=503)
+    await _apply_reload(request)
+    return web.json_response(result)
+
+@_admin_error_guard
 async def admin_pools_put(request: web.Request) -> web.Response:
-    """PUT /admin/pools/{pool} — create or replace a pool definition."""
+    """PUT /admin/pools/{pool} — create or replace a pool definition.
+
+    Body name must match the URL pool; otherwise 400. The body is a
+    complete definition — omitted fields fall back to safe defaults,
+    so callers should PATCH for partial updates.
+    """
     pool = request.match_info.get("pool", "")
     if not pool:
         return web.json_response(openai_error_shape("pool name required", "bad_request"), status=400)
@@ -1387,9 +1461,24 @@ async def admin_pools_put(request: web.Request) -> web.Response:
     if not isinstance(body, dict):
         return web.json_response(openai_error_shape("JSON body must be an object", "malformed_payload"), status=400)
     _reject_unknown_fields(body, _POOL_FIELDS, "pool")
+    body_name = body.get("name")
+    if body_name is not None and str(body_name).strip().lower() != pool.lower():
+        return web.json_response(
+            openai_error_shape(
+                f"body name {body_name!r} does not match URL pool {pool!r}",
+                "malformed_payload",
+            ),
+            status=400,
+        )
+    body = {**body, "name": pool}
     try:
         store = _get_config_store(request)
-        result = store.upsert_pool(body)
+        result = store.upsert_pool(
+            body,
+            expected_generation=_expected_generation(request),
+        )
+    except ConfigConflictError as exc:
+        return web.json_response(openai_error_shape(str(exc), "config_conflict"), status=409)
     except ConfigUnavailableError:
         return web.json_response(_store_unavailable_shape(), status=503)
     except (KeyError, ValueError) as exc:
@@ -1440,6 +1529,7 @@ def register_admin_config_routes(app: web.Application) -> None:
     app.router.add_delete("/admin/providers/{provider}", admin_providers_delete)
     app.router.add_put("/admin/providers/{provider}/settings", admin_providers_settings_put)
     app.router.add_put("/admin/providers/{provider}/credentials", admin_providers_credentials_put)
+    app.router.add_patch("/admin/pools/{pool}", admin_pools_patch)
     app.router.add_put("/admin/pools/{pool}", admin_pools_put)
     app.router.add_delete("/admin/pools/{pool}", admin_pools_delete)
 
