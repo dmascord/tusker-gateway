@@ -210,7 +210,7 @@ spec:
         - name: TUSKER_POOL_SWARM
           value: '{"models":[{"provider":"opencode-go","model":"deepseek-v4-flash"},{"provider":"xiaomi","model":"mimo-v2.5","input_modalities":["text","image"]}],"context_window":128000}'
         - name: TUSKER_LOCAL_LLM_TIMEOUT_SECS
-          value: '60'
+          value: '240'
         - name: PROVIDER_GITHUB_COPILOT_API_KEY
           valueFrom:
             secretKeyRef:
