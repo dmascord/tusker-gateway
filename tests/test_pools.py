@@ -866,6 +866,38 @@ def test_minimax_m3_can_cover_image_tool_requests():
         ) == ("minimax", "MiniMax-M3")
 
 
+def test_explicit_text_only_route_cannot_be_admitted_by_stale_image_probe():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = PoolManager(
+            {
+                "pools": {
+                    "code": PoolConfig(
+                        name="code",
+                        models=[
+                            {
+                                "provider": "xiaomi",
+                                "model": "mimo-v2.5-pro",
+                                "input_modalities": ["text"],
+                            }
+                        ],
+                    )
+                },
+                "quality_db_path": os.path.join(tmpdir, "quality.db"),
+                "model_capability_db_path": os.path.join(tmpdir, "model-capability.db"),
+                "excluded_providers": [],
+                "provider_api_keys": {"xiaomi": "k-xiaomi"},
+            }
+        )
+        manager._model_capability_db.record(
+            provider="xiaomi",
+            model="mimo-v2.5-pro",
+            capability="input_image",
+            status="passed",
+            source="modality_probe",
+        )
+        assert manager.select("code", required_input_modalities={"image"}) is None
+
+
 def test_unknown_non_text_modalities_are_not_eligible_without_evidence():
     with tempfile.TemporaryDirectory() as tmpdir:
         manager = PoolManager(

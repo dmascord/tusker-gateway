@@ -21,6 +21,7 @@ from tusker_gateway.catalog import (
     advertised_input_modalities,
     advertised_output_modalities,
     advertised_tool_support,
+    researched_input_modalities,
 )
 from tusker_gateway.config import (
     DEFAULT_PROVIDER_REGISTRY,
@@ -195,6 +196,10 @@ class ModelSpec:
         else:
             hw = bool(hw)
         modalities = data.get("input_modalities")
+        if modalities is None:
+            researched = researched_input_modalities(provider, model)
+            if researched is not None:
+                modalities = researched
         try:
             weight = float(data.get("weight", 1.0))
         except (TypeError, ValueError):
@@ -829,6 +834,12 @@ class PoolManager:
                 if self._model_capability_db is not None
                 else None
             )
+            # An explicit pool/catalog declaration is a hard negative. A
+            # stale or overly broad successful probe must not turn a known
+            # text-only route (notably xiaomi/mimo-v2.5-pro) into a vision
+            # candidate.
+            if advertised_modalities is not None and modality not in advertised_modalities:
+                return False
             if record is not None:
                 if record.status == "passed":
                     continue

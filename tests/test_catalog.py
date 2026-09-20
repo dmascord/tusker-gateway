@@ -33,6 +33,7 @@ from tusker_gateway.catalog import (
     advertised_output_modalities,
     advertised_tool_support,
     catalog_refresh_loop,
+    researched_input_modalities,
 )
 from tusker_gateway.model_capability import ModelCapabilityDB
 
@@ -540,6 +541,31 @@ async def test_opencode_go_catalog_parses_models():
 
 # ---------------------------------------------------------------------------
 # XiaomiCatalog.fetch
+
+
+@pytest.mark.parametrize(
+    ("provider", "model"),
+    [
+        ("openai-codex", "gpt-5.6-luna"),
+        ("github-copilot-enterprise", "gpt-5.6-luna"),
+        ("google", "gemini-3.5-flash"),
+        ("minimax", "MiniMax-M3"),
+        ("xiaomi", "mimo-v2.5"),
+        ("zai", "glm-5.3-flash"),
+    ],
+)
+def test_researched_image_claims_are_provider_qualified(provider, model):
+    assert researched_input_modalities(provider, model) == frozenset({"text", "image"})
+
+
+def test_researched_claim_does_not_transfer_between_providers():
+    assert researched_input_modalities("github-copilot", "mimo-v2.5") is None
+
+
+def test_xiaomi_catalog_keeps_mimo_pro_text_only():
+    assert XiaomiCatalog.MODEL_METADATA["mimo-v2.5-pro"][0] == frozenset({"text"})
+
+
 # ---------------------------------------------------------------------------
 
 
@@ -686,6 +712,24 @@ async def test_workers_ai_catalog_parses_cf_envelope_and_filters_tasks():
     )
     assert vision.input_modalities == frozenset({"text", "image"})
     assert vision.raw["capabilities"]["function_calling"] is True
+
+
+@pytest.mark.asyncio
+async def test_workers_ai_catalog_applies_researched_vision_overlay():
+    client = WorkersAICatalog()
+    entries = await client.fetch(FakeSession({
+        "default": FakeResponse(200, {
+            "success": True,
+            "result": [{
+                "name": "@cf/moonshotai/kimi-k2.7-code",
+                "task": {"name": "Text Generation"},
+            }],
+        }),
+    }))
+    assert entries[0].input_modalities == frozenset({"text", "image"})
+    assert client.RESEARCHED_INPUT_MODALITIES[entries[0].model] == frozenset(
+        {"text", "image"}
+    )
 
 
 @pytest.mark.asyncio

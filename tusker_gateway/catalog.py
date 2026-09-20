@@ -130,6 +130,68 @@ class CatalogEntry:
     catalog_weight: float = 1.0
 
 
+# Provider/model capability claims that are backed by current provider
+# documentation rather than a name heuristic.  These are deliberately
+# provider-qualified: the same model slug can be exposed through a gateway
+# that does not preserve image blocks or tool calls.
+RESEARCHED_INPUT_MODALITIES: dict[str, dict[str, frozenset[str]]] = {
+    "openai-codex": {
+        "gpt-5.4": frozenset({"text", "image"}),
+        "gpt-5.4-mini": frozenset({"text", "image"}),
+        "gpt-5.5": frozenset({"text", "image"}),
+        "gpt-5.6-luna": frozenset({"text", "image"}),
+        "gpt-5.6-sol": frozenset({"text", "image"}),
+        "gpt-5.6-terra": frozenset({"text", "image"}),
+        "gpt-6-astra": frozenset({"text", "image"}),
+    },
+    "github-copilot": {
+        "gpt-5.4": frozenset({"text", "image"}),
+        "gpt-5.4-mini": frozenset({"text", "image"}),
+        "gpt-5.5": frozenset({"text", "image"}),
+        "gpt-5.6-luna": frozenset({"text", "image"}),
+        "gpt-5.6-sol": frozenset({"text", "image"}),
+        "gpt-5.6-terra": frozenset({"text", "image"}),
+        "gpt-6-astra": frozenset({"text", "image"}),
+    },
+    "github-copilot-enterprise": {
+        "gpt-5.4": frozenset({"text", "image"}),
+        "gpt-5.4-mini": frozenset({"text", "image"}),
+        "gpt-5.5": frozenset({"text", "image"}),
+        "gpt-5.6-luna": frozenset({"text", "image"}),
+        "gpt-5.6-sol": frozenset({"text", "image"}),
+        "gpt-5.6-terra": frozenset({"text", "image"}),
+        "gpt-6-astra": frozenset({"text", "image"}),
+    },
+    "google": {
+        "gemini-3.1-flash-lite": frozenset({"text", "image"}),
+        "gemini-3.1-flash-lite-preview": frozenset({"text", "image"}),
+        "gemini-3.5-flash": frozenset({"text", "image"}),
+        "gemini-3.6-flash": frozenset({"text", "image"}),
+        "gemini-3.7-flash": frozenset({"text", "image"}),
+        "gemini-3.8-flash": frozenset({"text", "image"}),
+        "gemini-3-pro": frozenset({"text", "image"}),
+    },
+    "minimax": {
+        "minimax-m3": frozenset({"text", "image"}),
+    },
+    "xiaomi": {
+        "mimo-v2.5": frozenset({"text", "image"}),
+    },
+    "zai": {
+        "glm-5.3-flash": frozenset({"text", "image"}),
+        "glm-4.6v": frozenset({"text", "image"}),
+        "glm-4.6v-flash": frozenset({"text", "image"}),
+    },
+}
+
+
+def researched_input_modalities(provider: str, model: str) -> frozenset[str] | None:
+    """Return an exact, provider-qualified image claim when researched."""
+    provider_key = str(provider).strip().lower().replace("_", "-")
+    model_key = str(model).strip().lower()
+    return RESEARCHED_INPUT_MODALITIES.get(provider_key, {}).get(model_key)
+
+
 def _capability_values(value: Any) -> frozenset[str] | None:
     """Normalize a catalog capability list without trusting arbitrary values."""
     if not isinstance(value, (list, tuple, set, frozenset)):
@@ -363,6 +425,17 @@ class CatalogClient:
             started = time.monotonic()
             try:
                 entries = await self.fetch(session)
+                # Provider catalogs often omit modality metadata even when
+                # their current model documentation is explicit. Enrich only
+                # missing metadata; an explicit provider claim (including a
+                # text-only claim) remains authoritative.
+                for entry in entries:
+                    if entry.input_modalities is None:
+                        researched = researched_input_modalities(
+                            entry.provider, entry.model
+                        )
+                        if researched is not None:
+                            entry.input_modalities = researched
                 self._entries = entries
                 self._fetched_at = time.monotonic()
                 self._last_error = None
@@ -854,6 +927,10 @@ class WorkersAICatalog(CatalogClient):
     RESEARCHED_INPUT_MODALITIES: dict[str, frozenset[str]] = {
         "@cf/meta/llama-4-scout-17b-16e-instruct": frozenset({"text", "image"}),
         "@cf/meta/llama-3.2-11b-vision-instruct": frozenset({"text", "image"}),
+        "@cf/google/gemma-4-26b-a4b-it": frozenset({"text", "image"}),
+        "@cf/moonshotai/kimi-k2.6": frozenset({"text", "image"}),
+        "@cf/moonshotai/kimi-k2.7-code": frozenset({"text", "image"}),
+        "@cf/qwen/qwen3.8-27b": frozenset({"text", "image"}),
     }
 
     def __init__(self) -> None:
