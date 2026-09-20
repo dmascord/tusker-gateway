@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 
 from tusker_gateway.config import PoolConfig
 from tusker_gateway.pools import PoolManager
