@@ -22,6 +22,7 @@ from tusker_gateway.endpoints import (
     _enforce_high_impact_approval,
     _explicit_high_impact_authorization,
     _high_impact_call_kind,
+    _high_impact_content_kind,
     _validate_complete_tool_response,
 )
 from tusker_gateway.errors import HighImpactApprovalRequiredError
@@ -105,6 +106,26 @@ def test_high_impact_tools_only_select_trusted_models(tmp_path):
 def test_login_debugging_browser_call_is_not_high_impact():
     call = {"function": {"name": "browser", "arguments": '{"action":"click","text":"Log in"}'}}
     assert _high_impact_call_kind(call) is None
+
+
+def test_normal_bash_command_is_not_high_impact():
+    call = {
+        "function": {
+            "name": "bash",
+            "arguments": '{"command":"git diff --name-status; grep delete README.md"}',
+        }
+    }
+    assert _high_impact_call_kind(call) is None
+
+
+def test_destructive_bash_command_is_high_impact():
+    call = {
+        "function": {
+            "name": "bash",
+            "arguments": '{"command":"kubectl delete pod gateway-abc"}',
+        }
+    }
+    assert _high_impact_call_kind(call) == "bash"
 
 
 def test_trade_task_is_high_impact():
@@ -299,6 +320,23 @@ def test_content_pattern_gate_trips_on_fixture_phrase(monkeypatch):
     regex = _compiled_content_regex(config)
     assert regex.search("place 509 full-size fx units of nkce buy now via amtd")
     assert regex.search("Buy now via AMTD at 10.940")
+
+
+def test_content_gate_ignores_untrusted_tool_and_assistant_text(monkeypatch):
+    config = _fixture_config(monkeypatch)
+    regex = _compiled_content_regex(config)
+    messages = [
+        {"role": "assistant", "content": "execute the order"},
+        {"role": "tool", "content": "execute the order"},
+    ]
+    assert _high_impact_content_kind(messages, content_regex=regex) is None
+
+
+def test_content_gate_still_checks_user_text(monkeypatch):
+    config = _fixture_config(monkeypatch)
+    regex = _compiled_content_regex(config)
+    messages = [{"role": "user", "content": "please execute the order"}]
+    assert _high_impact_content_kind(messages, content_regex=regex) == "user_content"
 
 
 def test_greylist_force_deny_blocks_even_authorized_turn(monkeypatch):

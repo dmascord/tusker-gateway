@@ -1587,6 +1587,25 @@ _HIGH_IMPACT_ARGUMENT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Shell tools are general-purpose coding tools. Applying the broad argument
+# regex to their entire JSON payload made harmless commands trip the gate when
+# they merely mentioned words such as "delete" in a path, comment, or output.
+# Keep a separate command-shaped detector for genuinely destructive shell
+# operations; financial/order verbs remain covered when used by explicit
+# action tools below.
+_SHELL_TOOL_NAMES = frozenset({"bash", "shell", "exec", "run_command", "terminal"})
+_SHELL_HIGH_IMPACT_RE = re.compile(
+    r"(?:^|[;&|]\s*|[\"'])\s*(?:sudo\s+)?(?:"
+    r"rm\s+-[a-z]*r[a-z]*f?\b|"
+    r"kubectl\s+(?:delete|drain)\b|"
+    r"git\s+push\b[^;&|]*--force(?:-with-lease)?\b|"
+    r"(?:drop|truncate)\s+(?:database|table|schema)\b|"
+    r"(?:mkfs|shutdown|reboot|poweroff)\b|"
+    r"dd\s+if=)"
+    r"|\b(?:place[_ -]?trade|submit[_ -]?order|wire\s+funds|withdraw)\b",
+    re.IGNORECASE,
+)
+
 
 def _compiled_argument_regex(config: dict[str, Any]) -> re.Pattern[str]:
     """Resolve the argument regex from config, falling back to the built-in verbs."""
@@ -1621,6 +1640,8 @@ def _high_impact_call_kind(
     regex = argument_regex or _HIGH_IMPACT_ARGUMENT_RE
     if name in {"place_trade", "submit_order", "send_message"}:
         return name
+    if name in _SHELL_TOOL_NAMES:
+        return name if _SHELL_HIGH_IMPACT_RE.search(argument_text) else None
     if name in {"task", "browser", "computer", "playwright"} and regex.search(argument_text):
         return name
     if regex.search(argument_text):
@@ -1635,9 +1656,10 @@ def _high_impact_content_kind(
 ) -> str | None:
     """Classify a request whose *message text* contains a high-impact phrase.
 
-    Returns the matched role/name when the latest user turn (or any assistant
-    turn) contains an operator-defined content pattern. ``None`` when the
-    pattern set is empty or no message matches.
+    Returns the matched role/name when user-authored content contains an
+    operator-defined high-impact pattern. Assistant/tool/provider content is
+    untrusted execution context and must not itself authorize or block a
+    normal follow-up turn.
     """
     if content_regex is None or not isinstance(messages, list):
         return None
@@ -1645,6 +1667,8 @@ def _high_impact_content_kind(
         if not isinstance(message, dict):
             continue
         role = str(message.get("role") or "")
+        if role != "user":
+            continue
         content = message.get("content")
         if isinstance(content, list):
             content = " ".join(
