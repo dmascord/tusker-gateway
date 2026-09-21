@@ -120,6 +120,31 @@ def test_question_result_authorizes_exact_call():
     assert question_authorized(messages, _trade_call()) is True
 
 
+def test_question_user_answer_authorizes_exact_call():
+    """OMP clients may return the selected option as a user turn."""
+    question = question_response_for_calls(_trade_call(), model="model")
+    question_message = question["choices"][0]["message"]
+    assert question_authorized(
+        [
+            question_message,
+            {"role": "user", "content": "Allow once"},
+        ],
+        _trade_call(),
+    ) is True
+
+
+def test_question_user_deny_answer_does_not_authorize_exact_call():
+    question = question_response_for_calls(_trade_call(), model="model")
+    question_message = question["choices"][0]["message"]
+    assert question_authorized(
+        [
+            question_message,
+            {"role": "user", "content": "Deny"},
+        ],
+        _trade_call(),
+    ) is False
+
+
 def test_question_deny_and_unrecognized_answer_do_not_authorize():
     question = question_response_for_calls(_trade_call(), model="model")
     call = question["choices"][0]["message"]["tool_calls"][0]

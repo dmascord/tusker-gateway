@@ -448,6 +448,7 @@ def question_authorized(
     if not isinstance(messages, list):
         return False
     expected_signature = _calls_signature(calls)
+    answer_found, answer_approved, _messages_without_answer = _latest_user_answer(messages)
     questions: dict[str, dict[str, Any]] = {}
     results: dict[str, Any] = {}
     for message in messages:
@@ -468,6 +469,11 @@ def question_authorized(
         if pending.get("signature") != expected_signature or call_id not in questions:
             continue
         found, approved = _extract_answer(results.get(call_id))
+        # OMP/OpenCode may submit the selected option as the next user turn
+        # instead of a role=tool result. Keep the exact question/call binding
+        # above; only the answer transport differs.
+        if not found and answer_found:
+            found, approved = answer_found, answer_approved
         if not found:
             continue
         _PENDING.pop(call_id, None)
