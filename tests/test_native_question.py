@@ -99,6 +99,23 @@ def test_content_request_becomes_native_question_and_accepts_exact_text():
     assert question_authorized_for_content(messages, "user_content") is True
 
 
+def test_content_question_explains_request_without_copying_secret():
+    question = question_response_for_content(
+        [{
+            "role": "user",
+            "content": "Please execute the order using Bearer super-secret-token-12345.",
+        }],
+        "user_content",
+        model="model",
+    )
+    call = question["choices"][0]["message"]["tool_calls"][0]
+    args = json.loads(call["function"]["arguments"])
+    text = args["questions"][0]["question"]
+    assert "execute the order" in text
+    assert "super-secret-token-12345" not in text
+    assert "Allow the model to continue this request?" in text
+
+
 def test_complete_content_guard_emits_native_question_then_accepts():
     response = {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
     tools = [{"type": "function", "function": {"name": "bash"}}]

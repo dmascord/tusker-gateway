@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import secrets
 import time
 from typing import Any
@@ -53,6 +54,36 @@ def _content_signature(messages: Any, action: str) -> str:
     return hashlib.sha256(
         _canonical({"action": action, "user_content": user_content}).encode()
     ).hexdigest()
+
+
+def _content_approval_preview(messages: Any, *, max_chars: int = 180) -> str:
+    """Return a short explanation for a content approval prompt."""
+    if not isinstance(messages, list):
+        return "the user request"
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, list):
+            content = " ".join(
+                str(item.get("text", ""))
+                for item in content
+                if isinstance(item, dict) and item.get("type") == "text"
+            )
+        if not isinstance(content, str) or not content.strip():
+            continue
+        preview = re.sub(r"\s+", " ", content).strip()
+        # Keep credential-shaped values out of the prompt while retaining
+        # enough context for the user to identify the request.
+        preview = re.sub(
+            r"(?i)\b(?:bearer\s+|sk-|gh[pousr]_)[A-Za-z0-9._~+/=-]{8,}",
+            "[redacted]",
+            preview,
+        )
+        if len(preview) > max_chars:
+            preview = preview[: max_chars - 1].rstrip() + "…"
+        return preview
+    return "the user request"
 
 
 def _extract_answer(value: Any) -> tuple[bool, bool]:
@@ -227,10 +258,21 @@ def question_response_for_content(
         "questions": [{
             "id": call_id,
             "header": "Approval",
-            "question": "Allow this high-impact action from the user request?",
+            "question": (
+                "The user request contains a high-impact instruction: "
+                f"\u201c{_content_approval_preview(messages)}\u201d\n"
+                "Allow the model to continue this request? Review the "
+                "instruction and any proposed tool action before approving."
+            ),
             "options": [
-                {"label": "Allow once", "description": "Continue this request once."},
-                {"label": "Deny", "description": "Do not continue this request."},
+                {
+                    "label": "Allow once",
+                    "description": "Continue this request with this approval only.",
+                },
+                {
+                    "label": "Deny",
+                    "description": "Stop this request without allowing the action.",
+                },
             ],
         }],
     }
