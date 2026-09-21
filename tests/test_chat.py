@@ -12,6 +12,7 @@ from tusker_gateway.budget import BudgetDecision
 import tusker_gateway.sse
 from tusker_gateway.errors import (
     HighImpactApprovalRequiredError,
+    InvalidToolCallArgumentsError,
     ProviderError,
     ProviderRouteDisabledError,
     RateLimitError,
@@ -104,6 +105,27 @@ def test_validation_stream_message_is_actionable_for_omp_clients():
     assert "Retry the request" in message
     assert "req-validation-1" in message
     assert "ended unexpectedly" in loop_message
+
+
+def test_validation_stream_message_explains_invalid_tool_arguments_safely():
+    message = _validation_stream_message(
+        "req-invalid-tool-1",
+        error=InvalidToolCallArgumentsError(
+            tool_name="write",
+            reason="missing_required",
+            missing=("i",),
+            argument_chars=949,
+        ),
+        provider="opencode-go",
+        model="minimax-m3",
+    )
+
+    assert "opencode-go/minimax-m3" in message
+    assert "tool 'write'" in message
+    assert "missing required argument(s): i" in message
+    assert "temporarily quarantined" in message
+    assert "req-invalid-tool-1" in message
+    assert "949" not in message
 
 
 def test_native_ask_payload_ignores_unrelated_declared_required_field():
@@ -1351,7 +1373,7 @@ async def test_chat_stream_reasoning_only_response_falls_back_before_client_resp
 
 @pytest.mark.asyncio
 async def test_chat_stream_rejects_empty_native_tool_args_and_accepts_fragments(app, client):
-    """An empty Codex-style call still delivers content before aborting; second provider not called."""
+    """An empty parseable call is forwarded so OMP can request corrected arguments."""
     pool_manager = MagicMock()
     pool_manager.select.side_effect = [
         ("openai-codex", "gpt-5.6-luna-empty-args"),
@@ -1435,8 +1457,8 @@ async def test_chat_stream_rejects_empty_native_tool_args_and_accepts_fragments(
         content = await resp.read()
 
     assert resp.status == 200
-    # Early streaming: first provider's content (including call-empty-args)
-    # is delivered before the error surfaces at drain. No fallback fires.
+    # The parseable incomplete call is delivered to OMP; the gateway does not
+    # fabricate the missing ``path`` or retry behind the client's back.
     assert b"call-empty-args" in content
     assert mock_chat.call_count == 1
     assert pool_manager.select.call_count == 1

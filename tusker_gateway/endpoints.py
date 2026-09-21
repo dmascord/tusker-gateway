@@ -1913,9 +1913,15 @@ def _validate_tool_call_arguments(
     model: str,
     request_id: str | None,
 ) -> None:
-    """Reject tool calls that are not complete JSON objects or miss required keys."""
-    required_by_name = _tool_required_arguments(tools)
-    if not required_by_name and not calls:
+    """Reject structurally unusable calls, leaving schema repair to OMP.
+
+    OMP owns the tool execution loop and can return a schema-validation error
+    to the model so it can supply missing fields. The gateway must not invent
+    values for required arguments (for example file contents or command
+    inputs). It still rejects malformed JSON and non-object arguments, and
+    separately enforces tool declarations and safety policy.
+    """
+    if not calls:
         return
 
     for call in calls:
@@ -1933,17 +1939,10 @@ def _validate_tool_call_arguments(
                 reason = "arguments_not_object"
                 missing = ()
             else:
-                # OMP's built-in ask tool has a stable interactive payload
-                # (questions/id/options). Some clients also declare an ask
-                # schema with unrelated required fields such as ``i``; those
-                # must not reject a valid native question.
-                missing = () if (
-                    name in {"ask", "question"}
-                    and _is_native_question_arguments(arguments)
-                ) else tuple(
-                    key for key in required_by_name.get(name, ()) if key not in arguments
-                )
-                reason = "missing_required" if missing else ""
+                # Required-field validation belongs to the connected OMP
+                # client. Preserve the call so OMP can return a tool error to
+                # the model and let it correct the arguments.
+                continue
 
         if not reason:
             continue
@@ -3068,13 +3067,27 @@ def _approval_stream_message(exc: HighImpactApprovalRequiredError, request_id: s
     )
 
 
-def _validation_stream_message(request_id: str, *, loop_failure: bool = False) -> str:
-    """Return actionable text for gateway-generated stream validation stops."""
+def _validation_stream_message(
+    request_id: str,
+    *,
+    loop_failure: bool = False,
+    error: BaseException | None = None,
+    provider: str | None = None,
+    model: str | None = None,
+) -> str:
+    """Return actionable, safe text for gateway-generated stream stops."""
     if loop_failure:
         detail = "The provider stream ended unexpectedly before it could be completed."
+    elif isinstance(error, InvalidToolCallArgumentsError):
+        missing = ", ".join(error.missing) if error.missing else "the tool schema"
+        route = f" from {provider}/{model}" if provider and model else ""
+        detail = (
+            f"The provider{route} returned invalid arguments for tool "
+            f"'{error.tool_name}': missing required argument(s): {missing}."
+        )
     else:
         detail = "The gateway could not use the provider's tool response."
-    return f"{detail} Retry the request. Request ID: {request_id}."
+    return f"{detail} The route was temporarily quarantined; Retry the request. Request ID: {request_id}."
 
 
 def _mark_permanently_failed(
@@ -5413,6 +5426,9 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                         stream_error_message = _validation_stream_message(
                             request_id,
                             loop_failure=stream_loop_failure,
+                            error=exc,
+                            provider=provider,
+                            model=target_model,
                         )
                     request["_stream_error_code"] = stream_error_code
                     request["_stream_error_detail"] = stream_error_message
@@ -5462,6 +5478,9 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                                 else _validation_stream_message(
                                     request_id,
                                     loop_failure=stream_loop_failure,
+                                    error=exc,
+                                    provider=provider,
+                                    model=target_model,
                                 )
                             )
                             await resp.write(
@@ -5589,6 +5608,9 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                     stream_error_message = _validation_stream_message(
                         request_id,
                         loop_failure=isinstance(exc, ProviderStreamLoopError),
+                        error=exc,
+                        provider=provider,
+                        model=target_model,
                     )
                     stream_error_code = "stream_validation_error"
                 request["_stream_error"] = status
@@ -5626,6 +5648,9 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                                     _validation_stream_message(
                                         request_id,
                                         loop_failure=isinstance(exc, ProviderStreamLoopError),
+                                        error=exc,
+                                        provider=provider,
+                                        model=target_model,
                                     ),
                                     model="tusker-gateway",
                                 )

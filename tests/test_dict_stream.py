@@ -216,12 +216,11 @@ async def test_streaming_dict_response_preserves_parallel_tool_call_indexes(clie
 
 
 @pytest.mark.asyncio
-async def test_streaming_dict_response_missing_required_tool_args_falls_back(app, client):
-    """Codex-style complete responses must not send ``read {}`` to OMP."""
+async def test_streaming_dict_response_missing_required_tool_args_reaches_omp(app, client):
+    """OMP receives parseable incomplete calls so it can ask the model to repair them."""
     pool_manager = MagicMock()
     pool_manager.select.side_effect = [
         ("openai-codex", "gpt-5.6-luna-bad"),
-        ("openrouter", "tool-capable-fallback"),
     ]
     app["pool_manager"] = pool_manager
 
@@ -253,28 +252,8 @@ async def test_streaming_dict_response_missing_required_tool_args_falls_back(app
             "finish_reason": "tool_calls",
         }],
     }
-    valid_response = {
-        "id": "chatcmpl-valid-tool-args",
-        "object": "chat.completion",
-        "choices": [{
-            "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [{
-                    "id": "call-valid-tool-args",
-                    "type": "function",
-                    "function": {
-                        "name": "read",
-                        "arguments": '{"path":"/tmp"}',
-                    },
-                }],
-            },
-            "finish_reason": "tool_calls",
-        }],
-    }
     with patch("tusker_gateway.endpoints.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
-        mock_chat.side_effect = [invalid_response, valid_response]
+        mock_chat.return_value = invalid_response
         resp = await client.post(
             "/v1/chat/completions",
             json={
@@ -289,9 +268,9 @@ async def test_streaming_dict_response_missing_required_tool_args_falls_back(app
 
     assert resp.status == 200
     assert b'"name": "read"' in content
-    assert b'\\"path\\":\\"/tmp\\"' in content
-    assert mock_chat.call_count == 2
-    assert pool_manager.select.call_count == 2
+    assert b"could not use the provider's tool response" not in content
+    assert mock_chat.call_count == 1
+    assert pool_manager.select.call_count == 1
 
 
 @pytest.mark.asyncio
