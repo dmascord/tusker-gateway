@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import re
+import uuid
 
 import pytest
 
@@ -45,6 +46,7 @@ def test_risky_call_becomes_native_question_tool_call():
     response = question_response_for_calls(_trade_call(), model="model")
     assert response is not None
     call = response["choices"][0]["message"]["tool_calls"][0]
+    assert str(uuid.UUID(call["id"])) == call["id"]
     assert call["function"]["name"] == "ask"
     args = json.loads(call["function"]["arguments"])
     assert args["questions"][0]["header"] == "Approval"

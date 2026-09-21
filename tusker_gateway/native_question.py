@@ -12,6 +12,7 @@ import json
 import re
 import secrets
 import time
+import uuid
 from typing import Any
 
 _PENDING: dict[str, dict[str, Any]] = {}
@@ -192,7 +193,8 @@ def question_response_for_calls(
     action = _risky_action(calls)
     if action is None:
         return None
-    call_id = "call_approval_" + secrets.token_urlsafe(12)
+    approval_id = str(uuid.uuid4())
+    call_id = approval_id
     _PENDING[call_id] = {
         "signature": _calls_signature(calls),
         "expires_at": time.time() + _TTL_SECS,
@@ -261,7 +263,8 @@ def question_response_for_content(
 ) -> dict[str, Any]:
     """Convert a risky user-content request into an OMP-native ask call."""
     _prune()
-    call_id = "call_approval_" + secrets.token_urlsafe(12)
+    approval_id = str(uuid.uuid4())
+    call_id = approval_id
     signature = _content_signature(messages, action)
     _PENDING[call_id] = {
         "signature": signature,
