@@ -17,6 +17,13 @@ _PENDING: dict[str, dict[str, Any]] = {}
 _TTL_SECS = 300
 
 
+def _audit(audit: Any, event: dict[str, Any]) -> None:
+    """Best-effort audit emission; the safety decision remains fail-closed."""
+    writer = getattr(audit, "write_sync", None)
+    if writer is not None:
+        writer(event)
+
+
 def _canonical(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -76,6 +83,16 @@ def _prune() -> None:
     now = time.time()
     for call_id, pending in list(_PENDING.items()):
         if float(pending.get("expires_at", 0)) <= now:
+            _audit(pending.get("audit"), {
+                "event_type": "tool.approval.decision",
+                "approval_id": call_id,
+                "request_id": pending.get("request_id", "unknown"),
+                "provider": pending.get("provider", "unknown"),
+                "model": pending.get("model", "unknown"),
+                "action": pending.get("action", "unknown"),
+                "call_signature": pending.get("signature"),
+                "decision": "expired",
+            })
             _PENDING.pop(call_id, None)
 
 
@@ -89,7 +106,14 @@ def _risky_action(calls: list[dict[str, Any]]) -> str | None:
     return None
 
 
-def question_response_for_calls(calls: list[dict[str, Any]], *, model: str) -> dict[str, Any] | None:
+def question_response_for_calls(
+    calls: list[dict[str, Any]],
+    *,
+    model: str,
+    provider: str | None = None,
+    request_id: str | None = None,
+    audit: Any = None,
+) -> dict[str, Any] | None:
     """Convert a risky provider response into an OMP-native ask call."""
     _prune()
     action = _risky_action(calls)
@@ -99,7 +123,26 @@ def question_response_for_calls(calls: list[dict[str, Any]], *, model: str) -> d
     _PENDING[call_id] = {
         "signature": _calls_signature(calls),
         "expires_at": time.time() + _TTL_SECS,
+        "request_id": request_id or "unknown",
+        "provider": provider or "unknown",
+        "model": model or "unknown",
+        "action": action,
+        "audit": audit,
     }
+    _audit(audit, {
+        "event_type": "tool.approval.proposed",
+        "approval_id": call_id,
+        "request_id": request_id or "unknown",
+        "provider": provider or "unknown",
+        "model": model or "unknown",
+        "action": action,
+        "tool_names": [
+            str((call.get("function") or {}).get("name") or "unknown")
+            for call in calls[:8]
+        ],
+        "call_signature": _calls_signature(calls),
+        "decision": "pending",
+    })
     question = {
         "questions": [{
             "header": "Approval",
@@ -132,7 +175,13 @@ def question_response_for_calls(calls: list[dict[str, Any]], *, model: str) -> d
     }
 
 
-def question_authorized(messages: Any, calls: list[dict[str, Any]]) -> bool:
+def question_authorized(
+    messages: Any,
+    calls: list[dict[str, Any]],
+    *,
+    request_id: str | None = None,
+    audit: Any = None,
+) -> bool:
     """Validate an OMP ask result against the exact pending tool call."""
     _prune()
     if not isinstance(messages, list):
@@ -159,6 +208,18 @@ def question_authorized(messages: Any, calls: list[dict[str, Any]]) -> bool:
         if not found:
             continue
         _PENDING.pop(call_id, None)
+        _audit(pending.get("audit") or audit, {
+            "event_type": "tool.approval.decision",
+            "approval_id": call_id,
+            "request_id": request_id or "unknown",
+            "original_request_id": pending.get("request_id", "unknown"),
+            "provider": pending.get("provider", "unknown"),
+            "model": pending.get("model", "unknown"),
+            "action": pending.get("action", "unknown"),
+            "call_signature": expected_signature,
+            "decision": "accepted" if approved else "denied",
+            "execution_result": "not_observed",
+        })
         return approved
     return False
 

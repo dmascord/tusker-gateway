@@ -365,6 +365,22 @@ class TestEnterpriseIdentity:
 
 
 class TestAuditLog:
+    def test_sync_tool_event_uses_same_integrity_chain(self, tmp_path):
+        path = tmp_path / "audit.jsonl"
+        config = AuditConfig(path=str(path), hmac_key="audit-secret", fsync=False)
+        audit = AuditLogger(config)
+        audit.write_sync({
+            "event_type": "tool.approval.proposed",
+            "action": "bash",
+            "call_signature": "abc123",
+        })
+        audit.write_sync({
+            "event_type": "tool.approval.decision",
+            "decision": "denied",
+        })
+
+        assert AuditLogger.verify_file(config) == (True, 2)
+
     @pytest.mark.asyncio
     async def test_hash_chain_detects_tampering(self, tmp_path):
         path = tmp_path / "audit.jsonl"

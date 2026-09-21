@@ -1961,6 +1961,7 @@ def _validate_complete_tool_response(
     messages: Any = None,
     force_deny: bool = False,
     native_questions: bool = False,
+    audit: Any = None,
 ) -> dict[str, Any]:
     """Validate a complete provider response before it can reach the client."""
     calls = _response_tool_calls(response)
@@ -1978,9 +1979,18 @@ def _validate_complete_tool_response(
             model=model,
             request_id=request_id,
         )
-    native_authorized = question_authorized(messages, calls) if calls else False
+    native_authorized = (
+        question_authorized(messages, calls, request_id=request_id, audit=audit)
+        if calls else False
+    )
     if calls and native_questions and not native_authorized:
-        question_response = question_response_for_calls(calls, model=model)
+        question_response = question_response_for_calls(
+            calls,
+            model=model,
+            provider=provider,
+            request_id=request_id,
+            audit=audit,
+        )
         if question_response is not None:
             return question_response
     _enforce_high_impact_approval(
@@ -2030,6 +2040,7 @@ async def _prepare_stream_result(
     content_regex: re.Pattern[str] | None = None,
     messages: Any = None,
     force_deny: bool = False,
+    audit: Any = None,
 ) -> Any:
     """Validate a tool-bearing stream and return a stream ready for client consumption.
 
@@ -2066,6 +2077,7 @@ async def _prepare_stream_result(
             messages=messages,
             force_deny=force_deny,
             native_questions=True,
+            audit=audit,
         )
 
     if not hasattr(result, "__aiter__"):
@@ -2152,11 +2164,19 @@ async def _prepare_stream_result(
                     model=model,
                     request_id=request_id,
                 )
-                native_authorized = question_authorized(messages, assembled_calls)
+                native_authorized = question_authorized(
+                    messages,
+                    assembled_calls,
+                    request_id=request_id,
+                    audit=audit,
+                )
                 if not native_authorized:
                     question_response = question_response_for_calls(
                         assembled_calls,
                         model=model,
+                        provider=provider,
+                        request_id=request_id,
+                        audit=audit,
                     )
                     if question_response is not None:
                         async for question_frame in _complete_chat_result_stream(
@@ -2923,6 +2943,7 @@ async def _call_with_pool_fallback(
                     content_regex=_compiled_content_regex(config),
                     messages=body.get("messages"),
                     force_deny=high_impact_greylist_force_deny(config),
+                    audit=(request.app.get("audit") if request is not None else None),
                 )
 
             result = await _await_attempt(
@@ -3179,6 +3200,7 @@ async def _call_with_pool_fallback(
                     content_regex=_compiled_content_regex(config),
                     messages=body.get("messages"),
                     force_deny=high_impact_greylist_force_deny(config),
+                    audit=(request.app.get("audit") if request is not None else None),
                 )
 
             result = await _await_attempt(

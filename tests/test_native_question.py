@@ -26,6 +26,14 @@ def _trade_call(qty=1):
     }]
 
 
+class _Audit:
+    def __init__(self):
+        self.events = []
+
+    def write_sync(self, event):
+        self.events.append(dict(event))
+
+
 def test_risky_call_becomes_native_question_tool_call():
     response = question_response_for_calls(_trade_call(), model="model")
     assert response is not None
@@ -72,6 +80,38 @@ def test_question_result_cannot_authorize_changed_arguments():
         {"role": "tool", "tool_call_id": call["id"], "content": "Allow once"},
     ]
     assert question_authorized(messages, _trade_call(qty=2)) is False
+
+
+def test_approval_audit_records_proposal_and_decision_without_raw_arguments():
+    audit = _Audit()
+    question = question_response_for_calls(
+        _trade_call(),
+        model="model",
+        provider="provider",
+        request_id="req-propose",
+        audit=audit,
+    )
+    call = question["choices"][0]["message"]["tool_calls"][0]
+    messages = [
+        question["choices"][0]["message"],
+        {
+            "role": "tool",
+            "tool_call_id": call["id"],
+            "content": json.dumps({
+                "results": [{"id": "?", "selectedOptions": ["Allow once"]}],
+            }),
+        },
+    ]
+    assert question_authorized(messages, _trade_call(), request_id="req-accept") is True
+    assert [event["event_type"] for event in audit.events] == [
+        "tool.approval.proposed",
+        "tool.approval.decision",
+    ]
+    decision = audit.events[-1]
+    assert decision["decision"] == "accepted"
+    assert decision["execution_result"] == "not_observed"
+    assert "arguments" not in decision
+    assert "qty" not in json.dumps(audit.events)
 
 
 def test_complete_guard_emits_question_then_accepts_original_call():

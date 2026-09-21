@@ -191,6 +191,24 @@ class AuditLogger:
                 raise AuditWriteError("required audit persistence failed") from exc
             return None
 
+    def write_sync(self, event: Mapping[str, Any]) -> dict[str, Any] | None:
+        """Synchronously append a non-request audit event.
+
+        Tool approval interception can occur inside a synchronous response
+        validator, including while an async stream is being assembled.  This
+        small adapter preserves the same chained format and failure policy
+        without scheduling a task that could outlive the request.
+        """
+        if not self.config.enabled:
+            return None
+        try:
+            return self._append(event)
+        except Exception as exc:
+            logger.error("audit write failed: %s", exc.__class__.__name__)
+            if self.config.fail_closed:
+                raise AuditWriteError("required audit persistence failed") from exc
+            return None
+
     @classmethod
     def verify_file(cls, config: AuditConfig) -> tuple[bool, int]:
         """Verify every hash link in an audit file; return (valid, count)."""

@@ -72,6 +72,22 @@ damage only. File appends use an exclusive lock, mode `0600`, flush, and fsync.
 Caller-derived metadata is bounded before serialization so an oversized model
 or routing label cannot make the next chain append unreadable.
 
+High-impact tool approvals use the same chain. When native OMP approval is
+enabled, the gateway records `tool.approval.proposed` and then
+`tool.approval.decision` events for `accepted`, `denied`, or `expired`
+decisions. These contain the request correlation ID, provider/model, action
+category, tool names, and a hash of the exact normalized call. They do not
+contain raw tool arguments, prompts, secrets, or file contents. The decision
+event also records `execution_result=not_observed`: the gateway can observe
+the approval, but the client executes the tool and must provide any later
+result separately.
+
+This provides an offline dataset for measuring approval rates, cancellations,
+decision latency, and outcomes by risk category without turning acceptance
+behavior into automatic authorization. Keep the audit file on immutable or
+access-controlled storage and apply the same retention policy as other
+security records.
+
 Operational knobs:
 
 - `TUSKER_AUDIT_FAIL_CLOSED=true` rejects unprepared responses if audit
