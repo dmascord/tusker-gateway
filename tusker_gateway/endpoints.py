@@ -1689,6 +1689,33 @@ def _high_impact_content_kind(
     return None
 
 
+def _high_impact_content_match(
+    messages: Any,
+    *,
+    content_regex: re.Pattern[str] | None,
+) -> str | None:
+    """Return the bounded phrase that caused the content-level match."""
+    if content_regex is None or not isinstance(messages, list):
+        return None
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, list):
+            content = " ".join(
+                str(item.get("text", ""))
+                for item in content
+                if isinstance(item, dict) and item.get("type") == "text"
+            )
+        if not isinstance(content, str) or not content:
+            continue
+        match = content_regex.search(content)
+        if match:
+            phrase = re.sub(r"\s+", " ", match.group(0)).strip()
+            return phrase[:160] + ("…" if len(phrase) > 160 else "")
+    return None
+
+
 def _enforce_high_impact_approval(
     calls: list[dict[str, Any]],
     *,
@@ -2012,6 +2039,7 @@ def _validate_complete_tool_response(
             messages,
             content_action,
             model=model,
+            matched_text=_high_impact_content_match(messages, content_regex=content_regex),
             provider=provider,
             request_id=request_id,
             audit=audit,
@@ -2201,6 +2229,7 @@ async def _prepare_stream_result(
                     messages,
                     content_action,
                     model=model,
+                    matched_text=_high_impact_content_match(messages, content_regex=content_regex),
                     provider=provider,
                     request_id=request_id,
                     audit=audit,
@@ -2255,6 +2284,7 @@ async def _prepare_stream_result(
                         messages,
                         content_action,
                         model=model,
+                        matched_text=_high_impact_content_match(messages, content_regex=content_regex),
                         provider=provider,
                         request_id=request_id,
                         audit=audit,
@@ -2287,6 +2317,7 @@ async def _prepare_stream_result(
                     messages,
                     content_action,
                     model=model,
+                    matched_text=_high_impact_content_match(messages, content_regex=content_regex),
                     provider=provider,
                     request_id=request_id,
                     audit=audit,

@@ -116,6 +116,18 @@ def test_content_question_explains_request_without_copying_secret():
     assert "Allow the model to continue this request?" in text
 
 
+def test_content_question_shows_the_detected_phrase():
+    question = question_response_for_content(
+        [{"role": "user", "content": "Continue the work."}],
+        "user_content",
+        model="model",
+        matched_text="submit the order",
+    )
+    call = question["choices"][0]["message"]["tool_calls"][0]
+    args = json.loads(call["function"]["arguments"])
+    assert "submit the order" in args["questions"][0]["question"]
+
+
 def test_content_question_accepts_result_with_embedded_question_id():
     original_messages = [{"role": "user", "content": "Please execute the order."}]
     question = question_response_for_content(original_messages, "user_content", model="model")

@@ -241,6 +241,7 @@ def question_response_for_content(
     action: str,
     *,
     model: str,
+    matched_text: str | None = None,
     provider: str | None = None,
     request_id: str | None = None,
     audit: Any = None,
@@ -275,8 +276,8 @@ def question_response_for_content(
             "id": call_id,
             "header": "Approval",
             "question": (
-                "The user request contains a high-impact instruction: "
-                f"\u201c{_content_approval_preview(messages)}\u201d\n"
+                "The gateway detected this high-impact phrase in the user request: "
+                f"\u201c{matched_text or _content_approval_preview(messages)}\u201d\n"
                 "Allow the model to continue this request? Review the "
                 "instruction and any proposed tool action before approving."
             ),
