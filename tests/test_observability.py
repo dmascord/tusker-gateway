@@ -96,6 +96,33 @@ class TestAccessLog:
         assert record["usage"] == {"in": 100, "out": 50}
         assert record["cache"] == "hit"
 
+    def test_access_log_includes_failure_route_context(self, caplog):
+        log = AccessLog()
+        request = make_mocked_request("POST", "/v1/chat/completions")
+        request["_request_id"] = "req_failure_context"
+
+        with caplog.at_level(logging.INFO, logger="tusker_gateway.access"):
+            log.log(
+                request,
+                502,
+                91.2,
+                provider="alibaba",
+                model="qwen3.6-flash",
+                pool="passthrough",
+                route_kind="direct",
+                requested_model="alibaba::qwen3.6-flash",
+                candidate_attempts=1,
+                failure_class="provider_error",
+                error_detail="upstream status=502",
+            )
+
+        record = json.loads(caplog.records[-1].message)
+        assert record["route_kind"] == "direct"
+        assert record["requested_model"] == "alibaba::qwen3.6-flash"
+        assert record["candidate_attempts"] == 1
+        assert record["failure_class"] == "provider_error"
+        assert record["error_detail"] == "upstream status=502"
+
     def test_access_log_includes_enterprise_identity(self, caplog):
         log = AccessLog()
         request = make_mocked_request("POST", "/v1/chat/completions")
@@ -292,6 +319,37 @@ class TestRequestIDMiddleware:
                 "pool": "code",
                 "cache_status": "miss",
             }
+        finally:
+            await client.close()
+
+    @pytest.mark.asyncio
+    async def test_middleware_merges_stream_error_detail_without_duplicate_kwargs(self):
+        app = web.Application()
+        access_log = Mock()
+        app["access_log"] = access_log
+
+        async def handler(request):
+            set_access_log_context(
+                request,
+                provider="alibaba",
+                model="qwen3.6-flash",
+                pool="passthrough",
+                error_detail="redacted upstream detail",
+            )
+            request["_stream_error"] = "upstream_stream_error"
+            request["_stream_error_detail"] = "client-visible stream detail"
+            return web.Response(status=200)
+
+        app.router.add_get("/stream-error", handler)
+        attach_request_id_middleware(app)
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.get("/stream-error")
+            assert response.status == 200
+            kwargs = access_log.log.call_args.kwargs
+            assert kwargs["error"] == "upstream_stream_error"
+            assert kwargs["error_detail"] == "client-visible stream detail"
         finally:
             await client.close()
 

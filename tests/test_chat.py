@@ -201,6 +201,17 @@ def test_public_provider_non_capacity_failure_does_not_leak_upstream_body():
     assert "X-Tusker-Provider-Failure" not in response.headers
 
 
+def test_public_direct_provider_failure_does_not_claim_pool_exhaustion():
+    response = _public_provider_failure_response(
+        ProviderError(message="upstream returned 502"),
+        route_kind="direct",
+    )
+    body = json.loads(response.body.decode("utf-8"))
+    assert response.status == 502
+    assert "requested upstream provider route failed" in body["error"]["message"]
+    assert "healthy candidate" not in body["error"]["message"]
+
+
 def test_public_provider_schema_error_does_not_leak_validation_details():
     """Schema mismatch details from the upstream (oneOf, required-property
     errors) expose the provider's internal API surface and must be redacted.

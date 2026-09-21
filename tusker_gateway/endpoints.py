@@ -2963,7 +2963,11 @@ def _is_capacity_failure(exc: BaseException | None) -> bool:
     return is_capacity_error(detail)
 
 
-def _public_provider_failure_response(exc: BaseException) -> web.Response:
+def _public_provider_failure_response(
+    exc: BaseException,
+    *,
+    route_kind: str | None = None,
+) -> web.Response:
     """Hide provider error details without changing other error semantics.
 
     Raw upstream error bodies (schema mismatches, quota messages, internal
@@ -2988,11 +2992,18 @@ def _public_provider_failure_response(exc: BaseException) -> web.Response:
                 "Upstream provider quota exhausted; retry after the upstream quota window resets."
             )
         else:
-            public_message = (
-                "Upstream provider request failed; the gateway could not find a "
-                "healthy candidate. Retry shortly or contact the gateway "
-                "operator with the request_id for triage."
-            )
+            if route_kind == "direct":
+                public_message = (
+                    "The requested upstream provider route failed; retry shortly "
+                    "or choose another provider. Contact the gateway operator "
+                    "with the request_id for triage."
+                )
+            else:
+                public_message = (
+                    "Upstream provider request failed; the gateway could not find a "
+                    "healthy candidate. Retry shortly or contact the gateway "
+                    "operator with the request_id for triage."
+                )
         return web.json_response(
             openai_error(
                 public_message,
@@ -3193,8 +3204,22 @@ async def _call_with_pool_fallback(
     high_impact_tools = tools_include_high_impact(tools)
     pool_name = _pool_name(body)
     requires_structured_output = _requires_structured_output(body, pool_name)
+    if request is not None:
+        set_access_log_context(
+            request,
+            requested_model=str(body.get("model") or ""),
+            route_kind="direct" if pool_name is None else "pool",
+            pool=pool_name or "passthrough",
+        )
     if pool_name is None:
         provider, model = _route_target(config, body)
+        if request is not None:
+            set_access_log_context(
+                request,
+                provider=provider,
+                model=model,
+                candidate_attempts=1,
+            )
         decision = (
             await asyncio.to_thread(breaker.check, provider, model)
             if breaker
@@ -3271,6 +3296,12 @@ async def _call_with_pool_fallback(
                     cooldown_secs=_cooldown_for_exc(timeout_exc),
                 )
             _mark_permanently_failed(timeout_exc, provider, model)
+            if request is not None:
+                set_access_log_context(
+                    request,
+                    failure_class=timeout_exc.code,
+                    error_detail=_pool_failure_summary(timeout_exc),
+                )
             raise timeout_exc from exc
         except asyncio.CancelledError:
             # A cancelled half-open probe must release its persistent lease;
@@ -3285,6 +3316,12 @@ async def _call_with_pool_fallback(
                     provider,
                     model,
                     cooldown_secs=_cooldown_for_exc(exc),
+                )
+            if request is not None:
+                set_access_log_context(
+                    request,
+                    failure_class=exc.code or type(exc).__name__,
+                    error_detail=_pool_failure_summary(exc),
                 )
             raise
         except HighImpactApprovalRequiredError:
@@ -3303,6 +3340,12 @@ async def _call_with_pool_fallback(
                     ),
                 )
             _mark_permanently_failed(exc, provider, model)
+            if request is not None:
+                set_access_log_context(
+                    request,
+                    failure_class=str(getattr(exc, "code", None) or type(exc).__name__),
+                    error_detail=_pool_failure_summary(exc),
+                )
             raise
 
     excluded: set[tuple[str, str]] = set()
@@ -3329,6 +3372,18 @@ async def _call_with_pool_fallback(
     tool_compatibility_probe = False
     while True:
         if attempts >= max_attempts:
+            if request is not None:
+                set_access_log_context(
+                    request,
+                    failure_class=(
+                        str(getattr(last_error, "code", None) or type(last_error).__name__)
+                        if last_error is not None
+                        else "attempt_limit"
+                    ),
+                    error_detail=(
+                        _pool_failure_summary(last_error) if last_error is not None else "attempt limit reached"
+                    ),
+                )
             logger.warning(
                 "pool fallback attempt limit reached rid=%s requested_pool=%s active_pool=%s "
                 "attempts=%d last_error=%s",
@@ -3440,6 +3495,20 @@ async def _call_with_pool_fallback(
                 recovery_probe,
                 tool_compatibility_probe,
             )
+            if request is not None:
+                set_access_log_context(
+                    request,
+                    failure_class=(
+                        str(getattr(last_error, "code", None) or type(last_error).__name__)
+                        if last_error is not None
+                        else "no_healthy_models"
+                    ),
+                    error_detail=(
+                        _pool_failure_summary(last_error)
+                        if last_error is not None
+                        else "no eligible candidate"
+                    ),
+                )
             if last_error is not None:
                 raise last_error
             raise NoHealthyModelsError(pool=pool_name)
@@ -3451,6 +3520,13 @@ async def _call_with_pool_fallback(
                 continue
         provider, model = selected
         attempts += 1
+        if request is not None:
+            set_access_log_context(
+                request,
+                provider=provider,
+                model=model,
+                candidate_attempts=attempts,
+            )
         logger.info(
             "pool fallback attempt rid=%s requested_pool=%s active_pool=%s "
             "candidate=%s/%s attempt=%d/%d",
@@ -3531,6 +3607,13 @@ async def _call_with_pool_fallback(
             _mark_permanently_failed(timeout_exc, provider, model)
             last_error = timeout_exc
             excluded.add(selected)
+            if request is not None:
+                set_access_log_context(
+                    request,
+                    failure_class=timeout_exc.code,
+                    error_detail=_pool_failure_summary(timeout_exc),
+                    candidate_attempts=attempts,
+                )
             logger.warning(
                 "pool candidate timed out rid=%s requested_pool=%s active_pool=%s "
                 "candidate=%s/%s attempt=%d/%d idle_budget=%ss",
@@ -3557,6 +3640,13 @@ async def _call_with_pool_fallback(
                 )
             last_error = exc
             excluded.add(selected)
+            if request is not None:
+                set_access_log_context(
+                    request,
+                    failure_class=exc.code or type(exc).__name__,
+                    error_detail=_pool_failure_summary(exc),
+                    candidate_attempts=attempts,
+                )
             logger.warning(
                 "pool candidate failed rid=%s requested_pool=%s active_pool=%s "
                 "candidate=%s/%s attempt=%d/%d status=%s body=%s",
@@ -3588,6 +3678,13 @@ async def _call_with_pool_fallback(
             _mark_permanently_failed(exc, provider, model)
             last_error = exc
             excluded.add(selected)
+            if request is not None:
+                set_access_log_context(
+                    request,
+                    failure_class=str(getattr(exc, "code", None) or type(exc).__name__),
+                    error_detail=_pool_failure_summary(exc),
+                    candidate_attempts=attempts,
+                )
             logger.warning(
                 "pool candidate failed rid=%s requested_pool=%s active_pool=%s "
                 "candidate=%s/%s attempt=%d/%d status=%s body=%s",
@@ -4888,7 +4985,12 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                 body.get("stream"),
             )
             bypass_cache = request.headers.get("X-Tusker-Cache", "").strip().lower() == "bypass"
-            set_access_log_context(request, pool=pool_name)
+            set_access_log_context(
+                request,
+                pool=pool_name,
+                requested_model=str(body.get("model") or ""),
+                route_kind="direct" if pool_name == "passthrough" else "pool",
+            )
 
             # Guard pipeline: input/output guards.
             guard_pipeline = request.app.get("guard_pipeline")
@@ -5691,7 +5793,10 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
             _emit(status)
             if budget_recorded and budget is not None and api_key and body is not None:
                 await asyncio.to_thread(budget.refund, api_key, pool_name, budget_charged)
-            return _public_provider_failure_response(exc)
+            return _public_provider_failure_response(
+                exc,
+                route_kind="direct" if pool_name == "passthrough" else "pool",
+            )
 
 
 async def responses_handler(request: web.Request) -> web.Response | web.StreamResponse:

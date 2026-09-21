@@ -38,6 +38,10 @@ _ACCESS_LOG_FIELDS = frozenset({
     "provider",
     "model",
     "pool",
+    "route_kind",
+    "requested_model",
+    "candidate_attempts",
+    "failure_class",
     "cache_status",
         "tokens_in",
         "tokens_out",
@@ -52,6 +56,10 @@ def set_access_log_context(request: web.Request, **fields: Any) -> None:
     or upstream completion).  Ignore unknown fields and retain earlier
     non-None values so a later partial update cannot erase useful context.
     """
+    # Some unit-level callers provide a lightweight request stand-in with
+    # only ``app``.  Context enrichment must never change routing behavior.
+    if not hasattr(request, "get"):
+        return
     context = request.get(_ACCESS_LOG_CONTEXT_KEY)
     if not isinstance(context, dict):
         context = {}
@@ -104,11 +112,15 @@ class AccessLog:
         provider: str | None = None,
         model: str | None = None,
         pool: str | None = None,
+        route_kind: str | None = None,
+        requested_model: str | None = None,
+        candidate_attempts: int | None = None,
         cache_status: str | None = None,
         tokens_in: int | None = None,
         tokens_out: int | None = None,
         error: str | None = None,
         error_detail: str | None = None,
+        failure_class: str | None = None,
     ) -> None:
         """Log a structured access record for one request.
 
@@ -153,6 +165,12 @@ class AccessLog:
             record["model"] = model
         if pool:
             record["pool"] = pool
+        if route_kind:
+            record["route_kind"] = route_kind
+        if requested_model:
+            record["requested_model"] = requested_model
+        if candidate_attempts is not None:
+            record["candidate_attempts"] = candidate_attempts
 
         # Token usage (from response body or context)
         if tokens_in is not None or tokens_out is not None:
@@ -173,6 +191,8 @@ class AccessLog:
             record["error"] = error
         if error_detail:
             record["error_detail"] = str(error_detail)[:512]
+        if failure_class:
+            record["failure_class"] = failure_class
 
         self.logger.info(json.dumps(record))
 
@@ -226,17 +246,20 @@ def attach_request_id_middleware(app: web.Application) -> None:
 
         if access_log is not None:
             stream_error = request.get("_stream_error")
+            access_context = _access_log_context(request)
+            if stream_error:
+                access_context["error"] = stream_error
+            if request.get("_stream_error_detail"):
+                # A stream failure may already have stored a redacted
+                # provider detail in the routing context. The client-facing
+                # stream detail is more actionable, so use it as the final
+                # value without passing duplicate keyword arguments.
+                access_context["error_detail"] = request["_stream_error_detail"]
             access_log.log(
                 request,
                 response.status,
                 (time.monotonic() - started) * 1000,
-                **_access_log_context(request),
-                **({"error": stream_error} if stream_error else {}),
-                **(
-                    {"error_detail": request.get("_stream_error_detail")}
-                    if request.get("_stream_error_detail")
-                    else {}
-                ),
+                **access_context,
             )
         # StreamResponse headers are immutable after prepare(). Streaming
         # handlers must set X-Request-ID in their initial headers.
