@@ -1670,6 +1670,45 @@ async def test_chat_completions_streaming_emits_role_chunk_first(client):
 
 
 @pytest.mark.asyncio
+async def test_chat_stream_sends_first_event_before_provider_dispatch(client):
+    """The first SSE data event must not wait for provider connection/prefetch."""
+    provider_started = asyncio.Event()
+
+    async def delayed_chat(*args, **kwargs):
+        provider_started.set()
+        await asyncio.sleep(0.2)
+
+        async def stream():
+            yield b'data: {"content": "after dispatch"}\n\n'
+
+        return stream()
+
+    with patch(
+        "tusker_gateway.endpoints.PassthroughClient.chat",
+        new_callable=AsyncMock,
+        side_effect=delayed_chat,
+    ):
+        payload = {
+            "model": "hermes-code",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+        }
+        started = asyncio.get_running_loop().time()
+        resp = await client.post("/v1/chat/completions", json=payload, headers=HEADERS_AUTH)
+        elapsed = asyncio.get_running_loop().time() - started
+        first_event = await resp.content.readuntil(b"\n\n")
+
+        content = first_event
+        content += await resp.read()
+
+    assert provider_started.is_set()
+    assert elapsed < 0.15
+    assert json.loads(first_event[len(b"data: ") : -2])["choices"][0]["delta"]["role"] == "assistant"
+    assert b'after dispatch' in content
+    assert b"data: [DONE]" in content
+
+
+@pytest.mark.asyncio
 async def test_chat_completions_streaming_emits_heartbeat_when_upstream_is_slow(
     client, monkeypatch,
 ):

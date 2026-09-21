@@ -4414,6 +4414,13 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
     api_key = _resolve_api_key(request)
     budget_recorded = False
     budget_charged = 0
+    # A streaming response is opened before provider dispatch so clients that
+    # enforce a first-event deadline receive a valid SSE data frame while the
+    # pool is selecting/falling back between providers.
+    stream_resp: web.StreamResponse | None = None
+    stream_stop: asyncio.Event | None = None
+    stream_hb_task: asyncio.Task[None] | None = None
+    stream_hb_interval = 0.0
 
     def _emit(
         status_label: str, provider_label: str | None = None, model_label: str | None = None
@@ -4743,6 +4750,44 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                     return web.json_response(sem_hit)
                 set_access_log_context(request, cache_status="miss")
 
+            # Commit streaming responses before provider dispatch. The old
+            # order waited for _call_with_pool_fallback() (including upstream
+            # connection and first-frame prefetch) before sending any bytes.
+            # That is safe for HTTP error responses but trips clients such as
+            # OMP that have a separate "waiting for first event" watchdog.
+            # Cache hits cannot reach this point for stream requests, and all
+            # validation/authorization/guard/budget checks have completed.
+            if body.get("stream", False):
+                stream_resp = web.StreamResponse(
+                    status=200,
+                    headers={
+                        "Content-Type": "text/event-stream",
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                        "X-Request-ID": request_id,
+                        "X-Accel-Buffering": "no",
+                    },
+                )
+                await stream_resp.prepare(request)
+                role_frame = sse_frame(format_openai_chunk(role="assistant"))
+                await stream_resp.write(role_frame)
+                stream_stop = asyncio.Event()
+                stream_hb_interval = _sse_heartbeat_secs()
+                stream_hb_task = asyncio.create_task(
+                    sse_heartbeat_loop(
+                        stream_resp.write,
+                        stream_stop,
+                        interval_secs=stream_hb_interval,
+                        comment="keepalive",
+                    ),
+                    name="sse-heartbeat",
+                )
+                # Give the heartbeat task a scheduling opportunity before the
+                # provider call begins. The role data event above is the
+                # first-event signal; comments protect the already-open stream
+                # during a long provider wait.
+                await asyncio.sleep(0)
+
             provider, target_model, result = await _call_with_pool_fallback(
                 config,
                 body,
@@ -4845,44 +4890,13 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                     )
                     budget_recorded = True
                     budget_charged = _estimated_tokens(body["messages"])
-                resp = web.StreamResponse(
-                    status=200,
-                    headers={
-                        "Content-Type": "text/event-stream",
-                        "Cache-Control": "no-cache",
-                        "Connection": "keep-alive",
-                        "X-Request-ID": request_id,
-                        # Disable nginx-style response buffering so SSE events
-                        # flush immediately. Traefik honors this too.
-                        "X-Accel-Buffering": "no",
-                    },
-                )
-                await resp.prepare(request)
-
-                # Send the role chunk *before* the first upstream byte. This
-                # (a) gives the client a parseable first event immediately, and
-                # (b) forces the first bytes through any proxy buffer so
-                # subsequent heartbeats aren't held back. OpenAI's reference
-                # streaming behavior starts with `delta: {role: "assistant"}`.
-                role_frame = sse_frame(format_openai_chunk(role="assistant"))
-                await resp.write(role_frame)
-
-                stop = asyncio.Event()
-                hb_interval = _sse_heartbeat_secs()
-                hb_task = asyncio.create_task(
-                    sse_heartbeat_loop(
-                        resp.write,
-                        stop,
-                        interval_secs=hb_interval,
-                        comment="keepalive",
-                    ),
-                    name="sse-heartbeat",
-                )
-                # Yield to event loop so heartbeat task can start before we await the
-                # upstream. Without this, the event loop blocks on the first await in
-                # the stream-consumption loop and the heartbeat task never gets scheduled
-                # → Cloudflare times out waiting for response body bytes.
-                await asyncio.sleep(0)
+                resp = stream_resp
+                assert resp is not None
+                stop = stream_stop
+                hb_interval = stream_hb_interval
+                hb_task = stream_hb_task
+                assert stop is not None
+                assert hb_task is not None
                 stream_write_start = time.monotonic()
                 _first_token_recorded = False
                 stream_ok = True
@@ -5049,6 +5063,9 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                         await asyncio.wait_for(hb_task, timeout=hb_interval + 1.0)
                     except asyncio.TimeoutError:
                         hb_task.cancel()
+                    stream_resp = None
+                    stream_stop = None
+                    stream_hb_task = None
                 status = "ok" if stream_ok else status
                 _emit(status)
                 return resp
@@ -5074,6 +5091,25 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
             return web.json_response(result)
         except BadRequestError as exc:
             status = exc.code or "bad_request"
+            if stream_resp is not None and stream_stop is not None and stream_hb_task is not None:
+                stream_stop.set()
+                try:
+                    await asyncio.wait_for(stream_hb_task, timeout=stream_hb_interval + 1.0)
+                except asyncio.TimeoutError:
+                    stream_hb_task.cancel()
+                try:
+                    await stream_resp.write(
+                        sse_frame({
+                            "error": openai_error(
+                                exc.message, code=exc.code, error_type=exc.error_type
+                            )
+                        })
+                    )
+                    await stream_resp.write(sse_done())
+                except (ConnectionResetError, ConnectionError, BrokenPipeError):
+                    pass
+                _emit(status)
+                return stream_resp
             _emit(status)
             return web.json_response(
                 openai_error(exc.message, code=exc.code, error_type=exc.error_type),
@@ -5087,6 +5123,28 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                 _pool_failure_summary(exc),
             )
             status = "provider_unavailable"
+            if stream_resp is not None and stream_stop is not None and stream_hb_task is not None:
+                stream_stop.set()
+                try:
+                    await asyncio.wait_for(stream_hb_task, timeout=stream_hb_interval + 1.0)
+                except asyncio.TimeoutError:
+                    stream_hb_task.cancel()
+                try:
+                    await stream_resp.write(
+                        sse_frame({
+                            "error": openai_error(
+                                "Upstream provider request failed; the gateway could not find a healthy candidate."
+                                " Retry shortly or contact the gateway operator with the request_id for triage.",
+                                code="provider_error",
+                                error_type="provider_error",
+                            )
+                        })
+                    )
+                    await stream_resp.write(sse_done())
+                except (ConnectionResetError, ConnectionError, BrokenPipeError):
+                    pass
+                _emit(status)
+                return stream_resp
             _emit(status)
             if budget_recorded and budget is not None and api_key and body is not None:
                 await asyncio.to_thread(budget.refund, api_key, pool_name, budget_charged)
