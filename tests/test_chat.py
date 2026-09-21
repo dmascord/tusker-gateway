@@ -19,6 +19,7 @@ from tusker_gateway.errors import (
 from tusker_gateway.endpoints import (
     _call_with_pool_fallback,
     _public_provider_failure_response,
+    _public_stream_error,
     _request_conversation_id,
     _required_input_modalities,
     _validate_chat_body,
@@ -56,6 +57,24 @@ def test_public_provider_quota_failure_has_safe_machine_signal():
 
     assert response.status == 502
     assert response.headers["X-Tusker-Provider-Failure"] == "provider_quota"
+
+
+def test_public_stream_error_contains_correlation_and_redacts_upstream_body():
+    exc = ProviderError(message="provider failed")
+    exc.code = "upstream_error"
+    exc.upstream_body = "secret-token=abc123 internal capacity error"
+
+    message, code = _public_stream_error(
+        exc,
+        request_id="req-stream-1",
+        provider="provider-a",
+        model="model-a",
+    )
+
+    assert code == "upstream_error"
+    assert "req-stream-1" in message
+    assert "Upstream provider error" in message
+    assert "abc123" not in message
 
 
 def test_public_provider_non_capacity_failure_does_not_leak_upstream_body():

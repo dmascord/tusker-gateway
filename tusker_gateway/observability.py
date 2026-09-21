@@ -39,8 +39,9 @@ _ACCESS_LOG_FIELDS = frozenset({
     "model",
     "pool",
     "cache_status",
-    "tokens_in",
-    "tokens_out",
+        "tokens_in",
+        "tokens_out",
+        "error_detail",
 })
 
 
@@ -107,6 +108,7 @@ class AccessLog:
         tokens_in: int | None = None,
         tokens_out: int | None = None,
         error: str | None = None,
+        error_detail: str | None = None,
     ) -> None:
         """Log a structured access record for one request.
 
@@ -169,6 +171,8 @@ class AccessLog:
         # Error if applicable
         if error:
             record["error"] = error
+        if error_detail:
+            record["error_detail"] = str(error_detail)[:512]
 
         self.logger.info(json.dumps(record))
 
@@ -228,6 +232,11 @@ def attach_request_id_middleware(app: web.Application) -> None:
                 (time.monotonic() - started) * 1000,
                 **_access_log_context(request),
                 **({"error": stream_error} if stream_error else {}),
+                **(
+                    {"error_detail": request.get("_stream_error_detail")}
+                    if request.get("_stream_error_detail")
+                    else {}
+                ),
             )
         # StreamResponse headers are immutable after prepare(). Streaming
         # handlers must set X-Request-ID in their initial headers.

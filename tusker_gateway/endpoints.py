@@ -2800,6 +2800,43 @@ def _public_provider_failure_response(exc: BaseException) -> web.Response:
     )
 
 
+def _public_stream_error(
+    exc: BaseException,
+    *,
+    request_id: str,
+    provider: str,
+    model: str,
+) -> tuple[str, str]:
+    """Return safe, actionable details for a prepared SSE error frame."""
+    if _is_capacity_failure(exc):
+        message = "Upstream provider capacity is unavailable; retry shortly."
+        code = "service_unavailable"
+    elif isinstance(
+        exc,
+        (
+            InvalidToolCallArgumentsError,
+            MalformedToolCallError,
+            RequiredToolCallError,
+            ToolCallContractError,
+            UnusableToolResponseError,
+            ProviderStreamLoopError,
+        ),
+    ):
+        message = (
+            "The gateway rejected the provider stream before it could be "
+            f"completed. Request ID: {request_id}."
+        )
+        code = "stream_validation_error"
+    else:
+        detail = _pool_failure_summary(exc)
+        message = (
+            f"Upstream provider error: {detail}. "
+            f"Request ID: {request_id}."
+        )
+        code = str(getattr(exc, "code", None) or "provider_error")
+    return message[:900], code
+
+
 def _mark_permanently_failed(
     exc: Exception,
     provider: str,
@@ -5089,6 +5126,14 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                         else "upstream_stream_error"
                     )
                     request["_stream_error"] = status
+                    stream_error_message, stream_error_code = _public_stream_error(
+                        exc,
+                        request_id=request_id,
+                        provider=provider,
+                        model=target_model,
+                    )
+                    request["_stream_error_code"] = stream_error_code
+                    request["_stream_error_detail"] = stream_error_message
                     # Stream validation failures happen after the HTTP 200 has
                     # been committed, so _call_with_pool_fallback() cannot
                     # quarantine the candidate. Apply the same quarantine and
@@ -5127,6 +5172,19 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                         _pool_failure_summary(exc),
                         exc_info=True,
                     )
+                    try:
+                        await resp.write(
+                            sse_frame({
+                                "error": openai_error(
+                                    stream_error_message,
+                                    code=stream_error_code,
+                                    error_type="provider_error",
+                                )
+                            })
+                        )
+                        await resp.write(sse_done())
+                    except (ConnectionResetError, ConnectionError, BrokenPipeError):
+                        stream_ok = False
                     if budget_recorded and budget is not None and api_key and body is not None:
                         await asyncio.to_thread(budget.refund, api_key, pool_name, budget_charged)
                         budget_recorded = False
@@ -5206,6 +5264,15 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
             )
             status = "provider_unavailable"
             if stream_resp is not None and stream_stop is not None and stream_hb_task is not None:
+                stream_error_message, stream_error_code = _public_stream_error(
+                    exc,
+                    request_id=request_id,
+                    provider=provider,
+                    model=target_model,
+                )
+                request["_stream_error"] = status
+                request["_stream_error_code"] = stream_error_code
+                request["_stream_error_detail"] = stream_error_message
                 stream_stop.set()
                 try:
                     await asyncio.wait_for(stream_hb_task, timeout=stream_hb_interval + 1.0)
@@ -5215,9 +5282,8 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                     await stream_resp.write(
                         sse_frame({
                             "error": openai_error(
-                                "Upstream provider request failed; the gateway could not find a healthy candidate."
-                                " Retry shortly or contact the gateway operator with the request_id for triage.",
-                                code="provider_error",
+                                stream_error_message,
+                                code=stream_error_code,
                                 error_type="provider_error",
                             )
                         })

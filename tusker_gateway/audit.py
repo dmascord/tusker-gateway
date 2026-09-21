@@ -262,6 +262,12 @@ def _base_event(request: web.Request, status: int, started: float) -> dict[str, 
     event.update(get_access_log_context(request))
     if request.get("_deadline_exceeded"):
         event["reason"] = "request_timeout"
+    if request.get("_stream_error"):
+        event["stream_error"] = request["_stream_error"]
+    if request.get("_stream_error_code"):
+        event["stream_error_code"] = request["_stream_error_code"]
+    if request.get("_stream_error_detail"):
+        event["stream_error_detail"] = request["_stream_error_detail"]
     if request.get("_idempotency_replayed"):
         event["idempotency_replayed"] = True
     return event
