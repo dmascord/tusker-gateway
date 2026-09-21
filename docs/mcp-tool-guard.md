@@ -35,7 +35,10 @@ is single-use. A changed tool call, invalid signature, malformed response, or
 replayed state cannot authorize execution. The endpoint only authorizes; the
 client remains responsible for executing the original tool.
 
-OpenAI-compatible `/v1/chat/completions` clients continue to use the existing
-gateway guard and receive the existing `approval_required` response because
-that protocol has no standard mid-request elicitation envelope. An MCP-aware
-client should call `tusker.guard_tool` before executing a consequential tool.
+OMP/OpenCode clients use their native built-in `question` tool for action-
+capable streaming and complete responses. The gateway replaces the risky
+provider call with a question tool call, then validates the returned answer
+against the exact pending call before allowing the next model turn to proceed.
+Other OpenAI-compatible clients continue to receive the existing
+`approval_required` response unless they implement the same question tool
+contract. MCP-aware clients can instead call `tusker.guard_tool` directly.

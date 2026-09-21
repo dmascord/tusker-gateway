@@ -65,6 +65,7 @@ from tusker_gateway.passthrough import (
     _stable_opencode_session_id,
 )
 from tusker_gateway.max_tokens import apply_max_tokens_floor
+from tusker_gateway.native_question import question_authorized, question_response_for_calls
 from tusker_gateway.pools import PoolManager
 from tusker_gateway.provider_usage import is_capacity_error
 from tusker_gateway.quality import QualityDB
@@ -1695,6 +1696,7 @@ def _enforce_high_impact_approval(
     content_regex: re.Pattern[str] | None = None,
     messages: Any = None,
     force_deny: bool = False,
+    native_authorized: bool = False,
 ) -> None:
     risky = next(
         (
@@ -1712,7 +1714,9 @@ def _enforce_high_impact_approval(
     # the operator hasn't opted out. This is the safe default: a goal-injected
     # harness must still trip the gate even when the user turn happens to
     # contain an affirmative.
-    effectively_authorized = explicitly_authorized and not (greylisted and force_deny)
+    effectively_authorized = (explicitly_authorized or native_authorized) and not (
+        greylisted and force_deny and not native_authorized
+    )
     suspicion_count = 0
     newly_blacklisted = False
     if not effectively_authorized:
@@ -1956,6 +1960,7 @@ def _validate_complete_tool_response(
     content_regex: re.Pattern[str] | None = None,
     messages: Any = None,
     force_deny: bool = False,
+    native_questions: bool = False,
 ) -> dict[str, Any]:
     """Validate a complete provider response before it can reach the client."""
     calls = _response_tool_calls(response)
@@ -1973,6 +1978,11 @@ def _validate_complete_tool_response(
             model=model,
             request_id=request_id,
         )
+    native_authorized = question_authorized(messages, calls) if calls else False
+    if calls and native_questions and not native_authorized:
+        question_response = question_response_for_calls(calls, model=model)
+        if question_response is not None:
+            return question_response
     _enforce_high_impact_approval(
         calls,
         provider=provider,
@@ -1984,6 +1994,7 @@ def _validate_complete_tool_response(
         content_regex=content_regex,
         messages=messages,
         force_deny=force_deny,
+        native_authorized=native_authorized,
     )
     if reject_empty and not calls and not _response_has_visible_content(response):
         raise UnusableToolResponseError(
@@ -2054,6 +2065,7 @@ async def _prepare_stream_result(
             content_regex=content_regex,
             messages=messages,
             force_deny=force_deny,
+            native_questions=True,
         )
 
     if not hasattr(result, "__aiter__"):
@@ -2090,6 +2102,10 @@ async def _prepare_stream_result(
 
     first_frame, rest = await _first_frame(normalized)
 
+    # Buffer tools that are known to be action-capable so a risky call can be
+    # replaced with OMP's native question tool. Preserve early streaming for
+    # ordinary read-only tools; custom tools with risk-bearing arguments still
+    # receive the complete-response guard on non-streaming requests.
     buffer_before_client = tools_may_produce_high_impact(tools)
 
     async def _early_stream(
@@ -2136,6 +2152,25 @@ async def _prepare_stream_result(
                     model=model,
                     request_id=request_id,
                 )
+                native_authorized = question_authorized(messages, assembled_calls)
+                if not native_authorized:
+                    question_response = question_response_for_calls(
+                        assembled_calls,
+                        model=model,
+                    )
+                    if question_response is not None:
+                        async for question_frame in _complete_chat_result_stream(
+                            question_response
+                        ):
+                            if question_frame != sse_done():
+                                yield question_frame
+                        logger.info(
+                            "native question approval requested provider=%s model=%s request_id=%s",
+                            provider,
+                            model,
+                            request_id or "unknown",
+                        )
+                        return
                 _enforce_high_impact_approval(
                     assembled_calls,
                     provider=provider,
@@ -2147,6 +2182,7 @@ async def _prepare_stream_result(
                     content_regex=content_regex,
                     messages=messages,
                     force_deny=force_deny,
+                    native_authorized=native_authorized,
                 )
             if buffer_before_client:
                 for buffered_frame in buffered:
