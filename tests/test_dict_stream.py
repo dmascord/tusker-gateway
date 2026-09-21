@@ -294,6 +294,88 @@ async def test_streaming_dict_response_empty_content(client):
     assert b"data: [DONE]" in content
 
 
+def test_malformed_tool_argument_json_is_left_for_omp_to_repair():
+    """The gateway must not terminate OMP's argument-repair loop."""
+    from tusker_gateway.endpoints import _validate_tool_call_arguments
+
+    _validate_tool_call_arguments(
+        [{
+            "id": "call-bash",
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "arguments": '{"command":"pytest -q',
+            },
+        }],
+        [{
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                },
+            },
+        }],
+        provider="xiaomi",
+        model="mimo-v2.5",
+        request_id="req-malformed-json-omp",
+    )
+
+
+@pytest.mark.asyncio
+async def test_streaming_dict_response_malformed_tool_json_reaches_omp(client):
+    """Malformed argument text remains available for OMP's repair loop."""
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+            },
+        },
+    }]
+    response = {
+        "id": "chatcmpl-malformed-json",
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call-bash-malformed",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": '{"command":"pytest -q'},
+                }],
+            },
+            "finish_reason": "tool_calls",
+        }],
+    }
+    with patch("tusker_gateway.endpoints.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
+        mock_chat.return_value = response
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-code",
+                "messages": [{"role": "user", "content": "run the tests"}],
+                "tools": tools,
+                "stream": True,
+            },
+            headers=HEADERS_AUTH,
+        )
+        content = await resp.read()
+
+    assert resp.status == 200
+    assert b'"name": "bash"' in content
+    assert b"pytest -q" in content
+    assert b"could not use the provider's tool response" not in content
+    assert mock_chat.call_count == 1
+
+
 @pytest.mark.asyncio
 async def test_streaming_dict_response_long_content(client):
     """Long content in dict should be emitted as a single chunk (not split)."""

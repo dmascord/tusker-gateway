@@ -1926,13 +1926,13 @@ def _validate_tool_call_arguments(
     messages: Any = None,
     audit: Any = None,
 ) -> None:
-    """Reject structurally unusable calls, leaving schema repair to OMP.
+    """Leave tool-argument parsing and schema repair to OMP.
 
     OMP owns the tool execution loop and can return a schema-validation error
-    to the model so it can supply missing fields. The gateway must not invent
-    values for required arguments (for example file contents or command
-    inputs). It still rejects malformed JSON and non-object arguments, and
-    separately enforces tool declarations and safety policy.
+    to the model so it can supply missing fields or repair malformed/partial
+    JSON. The gateway must not invent values for required arguments (for
+    example file contents or command inputs). Tool declaration, tool-choice,
+    and safety checks remain separate responsibilities.
     """
     if not calls:
         return
@@ -1949,46 +1949,11 @@ def _validate_tool_call_arguments(
         audit=audit,
     )
 
-    for call in calls:
-        function = call.get("function") or {}
-        name = str(function.get("name") or "").strip()
-        argument_text = _tool_argument_text(function.get("arguments"))
-        argument_chars = len(argument_text)
-        try:
-            arguments = json.loads(argument_text or "{}")
-        except (TypeError, json.JSONDecodeError):
-            reason = "invalid_json"
-            missing: tuple[str, ...] = ()
-        else:
-            if not isinstance(arguments, dict):
-                reason = "arguments_not_object"
-                missing = ()
-            else:
-                # Required-field validation belongs to the connected OMP
-                # client. Preserve the call so OMP can return a tool error to
-                # the model and let it correct the arguments.
-                continue
-
-        if not reason:
-            continue
-        logger.warning(
-            "invalid tool arguments rejected provider=%s model=%s request_id=%s "
-            "tool=%s reason=%s missing=%s argument_chars=%d calls=%s",
-            provider or "unknown",
-            model or "unknown",
-            request_id or "unknown",
-            name or "unknown",
-            reason,
-            ",".join(missing) or "none",
-            argument_chars,
-            _tool_call_signature(calls),
-        )
-        raise InvalidToolCallArgumentsError(
-            tool_name=name or "unknown",
-            reason=reason,
-            missing=missing,
-            argument_chars=argument_chars,
-        )
+    # Do not parse or rewrite the argument string here. In particular, an
+    # incomplete JSON fragment is still useful to OMP: its tool executor can
+    # return a structured tool error to the model, which can then retry with
+    # corrected arguments. Rejecting it at the gateway terminates that loop.
+    return
 
 
 def _assemble_stream_tool_calls(frames: list[bytes]) -> list[dict[str, Any]]:
