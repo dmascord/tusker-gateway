@@ -2141,7 +2141,13 @@ async def _prepare_stream_result(
     # replaced with OMP's native question tool. Preserve early streaming for
     # ordinary read-only tools; custom tools with risk-bearing arguments still
     # receive the complete-response guard on non-streaming requests.
-    buffer_before_client = tools_may_produce_high_impact(tools)
+    # Content-level high-impact guards must also see the complete candidate
+    # before any provider tool frame is committed; otherwise the provider
+    # call can leak before the native approval question replaces it.
+    buffer_before_client = (
+        tools_may_produce_high_impact(tools)
+        or _high_impact_content_kind(messages, content_regex=content_regex) is not None
+    )
 
     async def _early_stream(
         first_frame: bytes | None,
@@ -2179,6 +2185,36 @@ async def _prepare_stream_result(
                 tool_choice=tool_choice,
                 require_tool_call=require_tool_call,
             )
+            content_action = _high_impact_content_kind(messages, content_regex=content_regex)
+            native_content_authorized = (
+                question_authorized_for_content(
+                    messages,
+                    content_action,
+                    request_id=request_id,
+                    audit=audit,
+                )
+                if content_action
+                else False
+            )
+            if content_action and not native_content_authorized and not assembled_calls:
+                question_response = question_response_for_content(
+                    messages,
+                    content_action,
+                    model=model,
+                    provider=provider,
+                    request_id=request_id,
+                    audit=audit,
+                )
+                async for question_frame in _complete_chat_result_stream(question_response):
+                    if question_frame != sse_done():
+                        yield question_frame
+                logger.info(
+                    "native content question approval requested provider=%s model=%s request_id=%s",
+                    provider,
+                    model,
+                    request_id or "unknown",
+                )
+                return
             if assembled_calls:
                 _validate_tool_call_arguments(
                     assembled_calls,
@@ -2214,6 +2250,25 @@ async def _prepare_stream_result(
                             request_id or "unknown",
                         )
                         return
+                if content_action and not native_content_authorized:
+                    question_response = question_response_for_content(
+                        messages,
+                        content_action,
+                        model=model,
+                        provider=provider,
+                        request_id=request_id,
+                        audit=audit,
+                    )
+                    async for question_frame in _complete_chat_result_stream(question_response):
+                        if question_frame != sse_done():
+                            yield question_frame
+                    logger.info(
+                        "native content question approval requested provider=%s model=%s request_id=%s",
+                        provider,
+                        model,
+                        request_id or "unknown",
+                    )
+                    return
                 _enforce_high_impact_approval(
                     assembled_calls,
                     provider=provider,
@@ -2223,21 +2278,10 @@ async def _prepare_stream_result(
                     greylisted=greylisted,
                     argument_regex=argument_regex,
                     content_regex=content_regex,
-                    messages=messages,
+                    messages=[] if native_content_authorized else messages,
                     force_deny=force_deny,
                     native_authorized=native_authorized,
                 )
-            content_action = _high_impact_content_kind(messages, content_regex=content_regex)
-            native_content_authorized = (
-                question_authorized_for_content(
-                    messages,
-                    content_action,
-                    request_id=request_id,
-                    audit=audit,
-                )
-                if content_action
-                else False
-            )
             if content_action and not native_content_authorized:
                 question_response = question_response_for_content(
                     messages,

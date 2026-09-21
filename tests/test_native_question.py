@@ -312,3 +312,41 @@ async def test_streaming_risky_user_content_is_replaced_with_question_tool():
     joined = b"".join([frame async for frame in result])
     assert b'"name": "ask"' in joined
     assert b"I can help" not in joined
+
+
+@pytest.mark.asyncio
+async def test_streaming_risky_user_content_precedes_guard_for_read_only_tool_call():
+    async def provider_stream():
+        yield sse_frame({
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call-list",
+                        "type": "function",
+                        "function": {
+                            "name": "list_files",
+                            "arguments": "{}",
+                        },
+                    }],
+                },
+                "finish_reason": "tool_calls",
+            }],
+        })
+        yield b"data: [DONE]\n\n"
+
+    result = await _prepare_stream_result(
+        provider_stream(),
+        tools=[{"type": "function", "function": {"name": "list_files"}}],
+        tools_requested=True,
+        provider="test",
+        model="model",
+        request_id="req-content-with-tool",
+        content_regex=re.compile(r"delete", re.IGNORECASE),
+        messages=[{"role": "user", "content": "Please delete the old file."}],
+    )
+    joined = b"".join([frame async for frame in result])
+    assert b'"name": "ask"' in joined
+    assert b'"name": "list_files"' not in joined
