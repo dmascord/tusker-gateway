@@ -48,6 +48,7 @@ def test_risky_call_becomes_native_question_tool_call():
     assert call["function"]["name"] == "ask"
     args = json.loads(call["function"]["arguments"])
     assert args["questions"][0]["header"] == "Approval"
+    assert args["questions"][0]["id"] == call["id"]
     assert {option["label"] for option in args["questions"][0]["options"]} == {
         "Allow once", "Deny"
     }
@@ -56,6 +57,8 @@ def test_risky_call_becomes_native_question_tool_call():
 def test_question_result_authorizes_exact_call():
     question = question_response_for_calls(_trade_call(), model="model")
     call = question["choices"][0]["message"]["tool_calls"][0]
+    args = json.loads(call["function"]["arguments"])
+    assert args["questions"][0]["id"] == call["id"]
     messages = [
         question["choices"][0]["message"],
         {

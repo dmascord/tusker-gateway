@@ -158,6 +158,7 @@ def question_response_for_calls(
     })
     question = {
         "questions": [{
+            "id": call_id,
             "header": "Approval",
             "question": f"Allow high-impact tool action '{action}'?",
             "options": [
@@ -224,6 +225,7 @@ def question_response_for_content(
     })
     question = {
         "questions": [{
+            "id": call_id,
             "header": "Approval",
             "question": "Allow this high-impact action from the user request?",
             "options": [
