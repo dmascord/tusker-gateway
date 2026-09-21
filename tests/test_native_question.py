@@ -178,6 +178,18 @@ def test_content_question_accepts_result_with_embedded_question_id():
     assert question_authorized_for_content(result_messages, "user_content") is True
 
 
+def test_content_question_accepts_unbound_omp_tool_result():
+    """OMP may return the selection without preserving tool_call_id."""
+    original_messages = [{"role": "user", "content": "Please submit_order now."}]
+    question = question_response_for_content(original_messages, "user_content", model="model")
+    result_messages = [
+        *original_messages,
+        question["choices"][0]["message"],
+        {"role": "tool", "content": "Allow once"},
+    ]
+    assert question_authorized_for_content(result_messages, "user_content") is True
+
+
 def test_content_question_accepts_follow_up_user_selection():
     original_messages = [{"role": "user", "content": "Please execute the order."}]
     question_response_for_content(original_messages, "user_content", model="model")

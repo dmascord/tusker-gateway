@@ -402,6 +402,7 @@ def question_authorized_for_content(
     questions: set[str] = set()
     result_ids: set[str] = set()
     results: dict[str, Any] = {}
+    unbound_results: list[Any] = []
     for message in messages:
         if not isinstance(message, dict):
             continue
@@ -417,6 +418,7 @@ def question_authorized_for_content(
             content = _message_content(message)
             results[tool_call_id] = content
             result_ids.add(tool_call_id)
+            unbound_results.append(content)
             for embedded_id in _embedded_ids(content):
                 results[embedded_id] = content
                 result_ids.add(embedded_id)
@@ -424,13 +426,20 @@ def question_authorized_for_content(
             # Some OMP-compatible clients put the ask question ID in the
             # result envelope rather than preserving tool_call_id.
             content = _message_content(message)
+            unbound_results.append(content)
             for embedded_id in _embedded_ids(content):
                 results[embedded_id] = content
                 result_ids.add(embedded_id)
+    unbound_answer_found, unbound_answer_approved = False, False
+    for content in unbound_results:
+        unbound_answer_found, unbound_answer_approved = _extract_answer(content)
+        if unbound_answer_found:
+            break
     logger.info(
         "content approval follow-up shape request_id=%s action=%s messages=%d roles=%s "
         "question_ids=%s result_ids=%s latest_user_answer=%s approved=%s "
-        "pending_content=%d signature=%s accepted_signatures=%d",
+        "unbound_answer=%s unbound_approved=%s pending_content=%d signature=%s "
+        "accepted_signatures=%d",
         request_id or "unknown",
         action,
         len(messages),
@@ -443,6 +452,8 @@ def question_authorized_for_content(
         ",".join(sorted(result_ids)) or "none",
         answer_found,
         answer_approved if answer_found else "n/a",
+        unbound_answer_found,
+        unbound_answer_approved if unbound_answer_found else "n/a",
         sum(1 for pending in _PENDING.values() if pending.get("scope") == "content"),
         expected_signature[:12],
         len(accepted_signatures),
@@ -456,12 +467,15 @@ def question_authorized_for_content(
                 call_id not in questions
                 and call_id not in result_ids
                 and not answer_found
+                and not unbound_answer_found
             )
         ):
             continue
         found, approved = _extract_answer(results.get(call_id))
         if not found and answer_found:
             found, approved = answer_found, answer_approved
+        if not found and unbound_answer_found:
+            found, approved = unbound_answer_found, unbound_answer_approved
         if not found:
             continue
         _PENDING.pop(call_id, None)
