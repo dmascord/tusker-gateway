@@ -1,6 +1,6 @@
-"""OpenCode/OMP native ``question`` tool approval bridge.
+"""OpenCode/OMP native ``ask`` tool approval bridge.
 
-OMP already renders its built-in question tool as an interactive prompt.  We
+OMP already renders its built-in ``ask`` tool as an interactive prompt.  We
 use that ordinary tool-call path for approval and keep the original action
 bound to the opaque question call id until the next request returns the
 answer.
@@ -36,7 +36,7 @@ def _calls_signature(calls: list[dict[str, Any]]) -> str:
 
 
 def _extract_answer(value: Any) -> tuple[bool, bool]:
-    """Return (answer_found, approved) from OMP question-tool result shapes."""
+    """Return (answer_found, approved) from OMP ask-tool result shapes."""
     if isinstance(value, bool):
         return True, value
     if isinstance(value, str):
@@ -90,7 +90,7 @@ def _risky_action(calls: list[dict[str, Any]]) -> str | None:
 
 
 def question_response_for_calls(calls: list[dict[str, Any]], *, model: str) -> dict[str, Any] | None:
-    """Convert a risky provider response into an OMP-native question call."""
+    """Convert a risky provider response into an OMP-native ask call."""
     _prune()
     action = _risky_action(calls)
     if action is None:
@@ -122,7 +122,9 @@ def question_response_for_calls(calls: list[dict[str, Any]], *, model: str) -> d
                 "tool_calls": [{
                     "id": call_id,
                     "type": "function",
-                    "function": {"name": "question", "arguments": _canonical(question)},
+                    # OMP/OpenCode calls this built-in interactive tool
+                    # ``ask`` (not ``question``).
+                    "function": {"name": "ask", "arguments": _canonical(question)},
                 }],
             },
             "finish_reason": "tool_calls",
@@ -131,7 +133,7 @@ def question_response_for_calls(calls: list[dict[str, Any]], *, model: str) -> d
 
 
 def question_authorized(messages: Any, calls: list[dict[str, Any]]) -> bool:
-    """Validate an OMP question result against the exact pending tool call."""
+    """Validate an OMP ask result against the exact pending tool call."""
     _prune()
     if not isinstance(messages, list):
         return False
@@ -146,7 +148,7 @@ def question_authorized(messages: Any, calls: list[dict[str, Any]]) -> bool:
                 if not isinstance(call, dict):
                     continue
                 function = call.get("function") or {}
-                if function.get("name") == "question" and call.get("id") in _PENDING:
+                if function.get("name") in {"ask", "question"} and call.get("id") in _PENDING:
                     questions[str(call["id"])] = call
         if message.get("role") in {"tool", "function"} and message.get("tool_call_id"):
             results[str(message["tool_call_id"])] = _message_content(message)

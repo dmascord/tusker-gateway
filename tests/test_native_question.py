@@ -30,7 +30,7 @@ def test_risky_call_becomes_native_question_tool_call():
     response = question_response_for_calls(_trade_call(), model="model")
     assert response is not None
     call = response["choices"][0]["message"]["tool_calls"][0]
-    assert call["function"]["name"] == "question"
+    assert call["function"]["name"] == "ask"
     args = json.loads(call["function"]["arguments"])
     assert args["questions"][0]["header"] == "Approval"
     assert {option["label"] for option in args["questions"][0]["options"]} == {
@@ -46,7 +46,9 @@ def test_question_result_authorizes_exact_call():
         {
             "role": "tool",
             "tool_call_id": call["id"],
-            "content": json.dumps({"answers": {"Approval": "Allow once"}}),
+            "content": json.dumps({
+                "results": [{"id": "?", "selectedOptions": ["Allow once"]}],
+            }),
         },
     ]
     assert question_authorized(messages, _trade_call()) is True
@@ -130,7 +132,7 @@ async def test_streaming_risky_call_is_replaced_with_question_tool():
     )
     frames = [frame async for frame in prepared]
     joined = b"".join(frames)
-    assert b'"name": "question"' in joined
+    assert b'"name": "ask"' in joined
 
 
 @pytest.mark.asyncio
@@ -173,6 +175,6 @@ async def test_streaming_destructive_bash_call_is_replaced_before_client_executi
         force_deny=False,
     )
     joined = b"".join([frame async for frame in result])
-    assert b'"name": "question"' in joined
+    assert b'"name": "ask"' in joined
     assert b'"name": "place_trade"' not in joined
     assert b'"name": "bash"' not in joined
