@@ -1912,6 +1912,8 @@ def _validate_tool_call_arguments(
     provider: str,
     model: str,
     request_id: str | None,
+    messages: Any = None,
+    audit: Any = None,
 ) -> None:
     """Reject structurally unusable calls, leaving schema repair to OMP.
 
@@ -1923,6 +1925,18 @@ def _validate_tool_call_arguments(
     """
     if not calls:
         return
+
+    from tusker_gateway.tool_learning import observe_tool_calls
+
+    observe_tool_calls(
+        calls,
+        tools,
+        messages=messages,
+        provider=provider,
+        model=model,
+        request_id=request_id,
+        audit=audit,
+    )
 
     for call in calls:
         function = call.get("function") or {}
@@ -2097,6 +2111,8 @@ def _validate_complete_tool_response(
             provider=provider,
             model=model,
             request_id=request_id,
+            messages=messages,
+            audit=audit,
         )
     content_action = _high_impact_content_kind(messages, content_regex=content_regex)
     native_authorized = (
@@ -2338,6 +2354,8 @@ async def _prepare_stream_result(
                     provider=provider,
                     model=model,
                     request_id=request_id,
+                    messages=messages,
+                    audit=audit,
                 )
                 native_authorized = question_authorized(
                     messages,

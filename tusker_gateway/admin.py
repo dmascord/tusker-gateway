@@ -257,6 +257,7 @@ async def admin_diagnostics(request: web.Request) -> web.Response:
     )
     from tusker_gateway.quality import QualityDB
     from tusker_gateway.pools import PoolManager
+    from tusker_gateway.tool_learning import snapshot as tool_shape_snapshot
 
     config = load_config()
     pools = request.app.get("pool_manager") or PoolManager(config)
@@ -285,6 +286,7 @@ async def admin_diagnostics(request: web.Request) -> web.Response:
         "circuit_breakers": breaker.snapshot() if breaker else {},
         "rate_limiter_stats": ratelimit.stats_snapshot() if ratelimit else {},
         "state_store": storage_status(),
+        "tool_shape_learning": tool_shape_snapshot(),
     }
 
     identity_store = request.app.get("identity_store")
@@ -1532,4 +1534,3 @@ def register_admin_config_routes(app: web.Application) -> None:
     app.router.add_patch("/admin/pools/{pool}", admin_pools_patch)
     app.router.add_put("/admin/pools/{pool}", admin_pools_put)
     app.router.add_delete("/admin/pools/{pool}", admin_pools_delete)
-
