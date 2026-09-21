@@ -2,13 +2,20 @@
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 
 from tusker_gateway.endpoints import _validate_complete_tool_response
 from tusker_gateway.endpoints import _prepare_stream_result
 from tusker_gateway.sse import sse_frame
-from tusker_gateway.native_question import question_authorized, question_response_for_calls, reset_pending
+from tusker_gateway.native_question import (
+    question_authorized,
+    question_authorized_for_content,
+    question_response_for_calls,
+    question_response_for_content,
+    reset_pending,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -70,6 +77,60 @@ def test_question_deny_and_unrecognized_answer_do_not_authorize():
         {"role": "tool", "tool_call_id": call["id"], "content": "Deny"},
     ]
     assert question_authorized(messages, _trade_call()) is False
+
+
+def test_content_request_becomes_native_question_and_accepts_exact_text():
+    original_messages = [{"role": "user", "content": "Please delete the old file."}]
+    question = question_response_for_content(
+        original_messages,
+        "user_content",
+        model="model",
+    )
+    call = question["choices"][0]["message"]["tool_calls"][0]
+    messages = [
+        *original_messages,
+        question["choices"][0]["message"],
+        {"role": "tool", "tool_call_id": call["id"], "content": "Allow once"},
+    ]
+
+    assert question_authorized_for_content(messages, "user_content") is True
+
+
+def test_complete_content_guard_emits_native_question_then_accepts():
+    response = {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+    tools = [{"type": "function", "function": {"name": "bash"}}]
+    original_messages = [{"role": "user", "content": "Please delete the old file."}]
+    question = _validate_complete_tool_response(
+        response,
+        tools,
+        provider="provider",
+        model="model",
+        request_id="req-content-1",
+        require_tool_call=False,
+        reject_empty=False,
+        content_regex=re.compile(r"delete", re.IGNORECASE),
+        messages=original_messages,
+        native_questions=True,
+    )
+    call = question["choices"][0]["message"]["tool_calls"][0]
+    approved_messages = [
+        *original_messages,
+        question["choices"][0]["message"],
+        {"role": "tool", "tool_call_id": call["id"], "content": "Allow once"},
+    ]
+    allowed = _validate_complete_tool_response(
+        response,
+        tools,
+        provider="provider",
+        model="model",
+        request_id="req-content-2",
+        require_tool_call=False,
+        reject_empty=False,
+        content_regex=re.compile(r"delete", re.IGNORECASE),
+        messages=approved_messages,
+        native_questions=True,
+    )
+    assert allowed == response
 
 
 def test_question_result_cannot_authorize_changed_arguments():
@@ -218,3 +279,33 @@ async def test_streaming_destructive_bash_call_is_replaced_before_client_executi
     assert b'"name": "ask"' in joined
     assert b'"name": "place_trade"' not in joined
     assert b'"name": "bash"' not in joined
+
+
+@pytest.mark.asyncio
+async def test_streaming_risky_user_content_is_replaced_with_question_tool():
+    async def provider_stream():
+        yield sse_frame({
+            "choices": [{
+                "index": 0,
+                "delta": {"role": "assistant", "content": "I can help."},
+                "finish_reason": None,
+            }],
+        })
+        yield sse_frame({
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        })
+        yield b"data: [DONE]\n\n"
+
+    result = await _prepare_stream_result(
+        provider_stream(),
+        tools=[{"type": "function", "function": {"name": "bash"}}],
+        tools_requested=True,
+        provider="test",
+        model="model",
+        request_id="req-content-stream",
+        content_regex=re.compile(r"delete", re.IGNORECASE),
+        messages=[{"role": "user", "content": "Please delete the old file."}],
+    )
+    joined = b"".join([frame async for frame in result])
+    assert b'"name": "ask"' in joined
+    assert b"I can help" not in joined

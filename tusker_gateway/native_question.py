@@ -42,6 +42,19 @@ def _calls_signature(calls: list[dict[str, Any]]) -> str:
     return hashlib.sha256(_canonical(normalized).encode()).hexdigest()
 
 
+def _content_signature(messages: Any, action: str) -> str:
+    """Bind a content-level approval to the user text that triggered it."""
+    user_content: list[Any] = []
+    if isinstance(messages, list):
+        for message in messages:
+            if not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            user_content.append(message.get("content"))
+    return hashlib.sha256(
+        _canonical({"action": action, "user_content": user_content}).encode()
+    ).hexdigest()
+
+
 def _extract_answer(value: Any) -> tuple[bool, bool]:
     """Return (answer_found, approved) from OMP ask-tool result shapes."""
     if isinstance(value, bool):
@@ -175,6 +188,70 @@ def question_response_for_calls(
     }
 
 
+def question_response_for_content(
+    messages: Any,
+    action: str,
+    *,
+    model: str,
+    provider: str | None = None,
+    request_id: str | None = None,
+    audit: Any = None,
+) -> dict[str, Any]:
+    """Convert a risky user-content request into an OMP-native ask call."""
+    _prune()
+    call_id = "call_approval_" + secrets.token_urlsafe(12)
+    signature = _content_signature(messages, action)
+    _PENDING[call_id] = {
+        "signature": signature,
+        "scope": "content",
+        "expires_at": time.time() + _TTL_SECS,
+        "request_id": request_id or "unknown",
+        "provider": provider or "unknown",
+        "model": model or "unknown",
+        "action": action,
+        "audit": audit,
+    }
+    _audit(audit, {
+        "event_type": "tool.approval.proposed",
+        "approval_id": call_id,
+        "request_id": request_id or "unknown",
+        "provider": provider or "unknown",
+        "model": model or "unknown",
+        "action": action,
+        "tool_names": [],
+        "call_signature": signature,
+        "decision": "pending",
+    })
+    question = {
+        "questions": [{
+            "header": "Approval",
+            "question": "Allow this high-impact action from the user request?",
+            "options": [
+                {"label": "Allow once", "description": "Continue this request once."},
+                {"label": "Deny", "description": "Do not continue this request."},
+            ],
+        }],
+    }
+    return {
+        "id": "chatcmpl-" + secrets.token_hex(12),
+        "object": "chat.completion",
+        "model": model or "tusker-gateway",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": "ask", "arguments": _canonical(question)},
+                }],
+            },
+            "finish_reason": "tool_calls",
+        }],
+    }
+
+
 def question_authorized(
     messages: Any,
     calls: list[dict[str, Any]],
@@ -202,6 +279,8 @@ def question_authorized(
         if message.get("role") in {"tool", "function"} and message.get("tool_call_id"):
             results[str(message["tool_call_id"])] = _message_content(message)
     for call_id, pending in list(_PENDING.items()):
+        if pending.get("scope", "calls") != "calls":
+            continue
         if pending.get("signature") != expected_signature or call_id not in questions:
             continue
         found, approved = _extract_answer(results.get(call_id))
@@ -216,6 +295,60 @@ def question_authorized(
             "provider": pending.get("provider", "unknown"),
             "model": pending.get("model", "unknown"),
             "action": pending.get("action", "unknown"),
+            "call_signature": expected_signature,
+            "decision": "accepted" if approved else "denied",
+            "execution_result": "not_observed",
+        })
+        return approved
+    return False
+
+
+def question_authorized_for_content(
+    messages: Any,
+    action: str,
+    *,
+    request_id: str | None = None,
+    audit: Any = None,
+) -> bool:
+    """Validate an OMP ask result for a content-level approval."""
+    _prune()
+    if not isinstance(messages, list):
+        return False
+    expected_signature = _content_signature(messages, action)
+    questions: set[str] = set()
+    results: dict[str, Any] = {}
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "assistant":
+            for call in message.get("tool_calls") or []:
+                if not isinstance(call, dict):
+                    continue
+                function = call.get("function") or {}
+                if function.get("name") in {"ask", "question"} and call.get("id") in _PENDING:
+                    questions.add(str(call["id"]))
+        if message.get("role") in {"tool", "function"} and message.get("tool_call_id"):
+            results[str(message["tool_call_id"])] = _message_content(message)
+    for call_id, pending in list(_PENDING.items()):
+        if (
+            pending.get("scope") != "content"
+            or pending.get("action") != action
+            or pending.get("signature") != expected_signature
+            or call_id not in questions
+        ):
+            continue
+        found, approved = _extract_answer(results.get(call_id))
+        if not found:
+            continue
+        _PENDING.pop(call_id, None)
+        _audit(pending.get("audit") or audit, {
+            "event_type": "tool.approval.decision",
+            "approval_id": call_id,
+            "request_id": request_id or "unknown",
+            "original_request_id": pending.get("request_id", "unknown"),
+            "provider": pending.get("provider", "unknown"),
+            "model": pending.get("model", "unknown"),
+            "action": action,
             "call_signature": expected_signature,
             "decision": "accepted" if approved else "denied",
             "execution_result": "not_observed",

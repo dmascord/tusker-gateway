@@ -65,7 +65,12 @@ from tusker_gateway.passthrough import (
     _stable_opencode_session_id,
 )
 from tusker_gateway.max_tokens import apply_max_tokens_floor
-from tusker_gateway.native_question import question_authorized, question_response_for_calls
+from tusker_gateway.native_question import (
+    question_authorized,
+    question_authorized_for_content,
+    question_response_for_calls,
+    question_response_for_content,
+)
 from tusker_gateway.pools import PoolManager
 from tusker_gateway.provider_usage import is_capacity_error
 from tusker_gateway.quality import QualityDB
@@ -1979,9 +1984,18 @@ def _validate_complete_tool_response(
             model=model,
             request_id=request_id,
         )
+    content_action = _high_impact_content_kind(messages, content_regex=content_regex)
     native_authorized = (
         question_authorized(messages, calls, request_id=request_id, audit=audit)
-        if calls else False
+        if calls
+        else question_authorized_for_content(
+            messages,
+            content_action,
+            request_id=request_id,
+            audit=audit,
+        )
+        if content_action
+        else False
     )
     if calls and native_questions and not native_authorized:
         question_response = question_response_for_calls(
@@ -1993,6 +2007,15 @@ def _validate_complete_tool_response(
         )
         if question_response is not None:
             return question_response
+    if content_action and native_questions and not native_authorized:
+        return question_response_for_content(
+            messages,
+            content_action,
+            model=model,
+            provider=provider,
+            request_id=request_id,
+            audit=audit,
+        )
     _enforce_high_impact_approval(
         calls,
         provider=provider,
@@ -2204,6 +2227,36 @@ async def _prepare_stream_result(
                     force_deny=force_deny,
                     native_authorized=native_authorized,
                 )
+            content_action = _high_impact_content_kind(messages, content_regex=content_regex)
+            native_content_authorized = (
+                question_authorized_for_content(
+                    messages,
+                    content_action,
+                    request_id=request_id,
+                    audit=audit,
+                )
+                if content_action
+                else False
+            )
+            if content_action and not native_content_authorized:
+                question_response = question_response_for_content(
+                    messages,
+                    content_action,
+                    model=model,
+                    provider=provider,
+                    request_id=request_id,
+                    audit=audit,
+                )
+                async for question_frame in _complete_chat_result_stream(question_response):
+                    if question_frame != sse_done():
+                        yield question_frame
+                logger.info(
+                    "native content question approval requested provider=%s model=%s request_id=%s",
+                    provider,
+                    model,
+                    request_id or "unknown",
+                )
+                return
             if buffer_before_client:
                 for buffered_frame in buffered:
                     yield buffered_frame
