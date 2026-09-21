@@ -85,3 +85,22 @@ See `TODO.md` for the active decision.
 Durable user preferences and project decisions live in the harness memory
 bank. Recall before answering questions about prior choices; retain when
 making new ones that should persist across sessions.
+
+## Runtime configuration (DB-backed config store)
+
+When `TUSKER_CONFIG_DATABASE_ENABLED=1` (production), the **database is the
+source of truth** for pool and provider configs. `TUSKER_POOL_*` environment
+variables in `k8s/deployment.yaml` are only a fallback if the database is
+unreachable.
+
+To change runtime configuration:
+
+1. Edit `k8s/deployment.yaml` (the yaml remains the durable source of truth)
+2. Sync into the DB: `python -m tusker_gateway.tools.migrate_config_to_db --update`
+   (run on visor against the state DB with the usual env vars set)
+3. Config hot-reloads (generation N → N+1), no pod restart needed
+
+**Never edit deployment.yaml alone and expect it to change live behavior** —
+the DB retains its previous definition and shadows the env vars. Use the
+migration tool (or the admin API `PUT /admin/pools/{pool}` / `PUT
+/admin/providers/{provider}`) to propagate changes.

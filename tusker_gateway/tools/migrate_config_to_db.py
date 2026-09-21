@@ -2,10 +2,12 @@
 
 Reads the env-derived gateway config (the same dict ``app["config"]`` is
 built from) and inserts any section that has content into the
-corresponding ConfigStore table. Rows that already exist (same primary
-key) are skipped, so re-running is a no-op.
+corresponding ConfigStore table. By default rows that already exist
+(same primary key) are skipped, so re-running is a no-op. With
+``--update`` existing rows are instead upserted, which propagates
+env/yaml changes into the DB-backed runtime config store.
 
-    python -m tusker_gateway.tools.migrate_config_to_db [--dry-run]
+    python -m tusker_gateway.tools.migrate_config_to_db [--dry-run] [--update]
 
 Sections migrated:
     providers          -> tusker_config_providers
@@ -30,18 +32,17 @@ from tusker_gateway.config import load_config
 from tusker_gateway.config_store import ConfigStore
 
 logger = logging.getLogger("tusker_gateway.migrate_config_to_db")
-
-
-def _section_counts(store: ConfigStore, config: dict, *, dry_run: bool) -> list[tuple[str, int, int, int]]:
-    """Migrate each section; returns (section, inserted, skipped, errors)."""
-    results: list[tuple[str, int, int, int]] = []
+def _section_counts(store: ConfigStore, config: dict, *, dry_run: bool, update: bool = False) -> list[tuple[str, int, int, int, int]]:
+    """Migrate each section; returns (section, inserted, updated, skipped, errors)."""
+    results: list[tuple[str, int, int, int, int]] = []
 
     # ── providers ─────────────────────────────────────────────────────
-    inserted = skipped = errors = 0
+    inserted = updated = skipped = errors = 0
     existing = {row["name"] for row in store.snapshot().get("providers", {}).values()}
     for name, provider in (config.get("providers") or {}).items():
         try:
-            if name.lower() in existing:
+            is_new = name.lower() not in existing
+            if not is_new and not update:
                 skipped += 1
                 continue
             if not dry_run:
@@ -58,34 +59,42 @@ def _section_counts(store: ConfigStore, config: dict, *, dry_run: bool) -> list[
                     "zdr_ok": provider.zdr_ok,
                     "heavyweight": provider.heavyweight,
                 })
-            inserted += 1
+            if is_new:
+                inserted += 1
+            else:
+                updated += 1
         except Exception as exc:
             errors += 1
             logger.warning("provider %s: %s", name, exc)
-    results.append(("providers", inserted, skipped, errors))
+    results.append(("providers", inserted, updated, skipped, errors))
 
     # ── provider_api_keys ─────────────────────────────────────────────
-    inserted = skipped = errors = 0
+    inserted = updated = skipped = errors = 0
     existing = set(store.snapshot().get("provider_api_keys", {}).keys())
     for name, key in (config.get("provider_api_keys") or {}).items():
         try:
-            if name.lower() in existing:
+            is_new = name.lower() not in existing
+            if not is_new and not update:
                 skipped += 1
                 continue
             if not dry_run:
                 store.upsert_provider_credentials(name, {"api_key": key})
-            inserted += 1
+            if is_new:
+                inserted += 1
+            else:
+                updated += 1
         except Exception as exc:
             errors += 1
             logger.warning("provider_api_key %s: %s", name, exc)
-    results.append(("provider_api_keys", inserted, skipped, errors))
+    results.append(("provider_api_keys", inserted, updated, skipped, errors))
 
     # ── pools ─────────────────────────────────────────────────────────
-    inserted = skipped = errors = 0
+    inserted = updated = skipped = errors = 0
     existing = set(store.snapshot().get("pools", {}).keys())
     for name, pool in (config.get("pools") or {}).items():
         try:
-            if name.lower() in existing:
+            is_new = name.lower() not in existing
+            if not is_new and not update:
                 skipped += 1
                 continue
             if not dry_run:
@@ -101,18 +110,22 @@ def _section_counts(store: ConfigStore, config: dict, *, dry_run: bool) -> list[
                     "auto_catalog_providers": list(pool.auto_catalog_providers),
                     "fallback_pools": list(pool.fallback_pools),
                 })
-            inserted += 1
+            if is_new:
+                inserted += 1
+            else:
+                updated += 1
         except Exception as exc:
             errors += 1
             logger.warning("pool %s: %s", name, exc)
-    results.append(("pools", inserted, skipped, errors))
+    results.append(("pools", inserted, updated, skipped, errors))
 
     # ── credential_pools (OAuth) ──────────────────────────────────────
-    inserted = skipped = errors = 0
+    inserted = updated = skipped = errors = 0
     existing = set(store.snapshot().get("oauth_credentials", {}).keys())
     for name, creds in (config.get("credential_pools") or {}).items():
         try:
-            if name.lower() in existing:
+            is_new = name.lower() not in existing
+            if not is_new and not update:
                 skipped += 1
                 continue
             if not creds:
@@ -121,28 +134,46 @@ def _section_counts(store: ConfigStore, config: dict, *, dry_run: bool) -> list[
             if not dry_run:
                 with store._conn as conn:
                     if store._db_connect().is_postgres:
+                        conflict = (
+                            "ON CONFLICT (provider) DO UPDATE SET "
+                            "credentials=excluded.credentials, updated_at=CURRENT_TIMESTAMP"
+                            if update else
+                            "ON CONFLICT (provider) DO NOTHING"
+                        )
                         conn.execute(
                             "INSERT INTO tusker_config_oauth_credentials "
                             "(provider, credentials) VALUES (?, ?) "
-                            "ON CONFLICT (provider) DO NOTHING",
+                            + conflict,
                             (name.lower(), store._encrypt(conn, json.dumps(list(creds)))),
                         )
                     else:
-                        conn.execute(
-                            "INSERT OR IGNORE INTO tusker_config_oauth_credentials "
-                            "(provider, credentials) VALUES (?, ?)",
-                            (name.lower(), store._encrypt(conn, json.dumps(list(creds)))),
-                        )
+                        if update:
+                            conn.execute(
+                                "INSERT INTO tusker_config_oauth_credentials "
+                                "(provider, credentials) VALUES (?, ?) "
+                                "ON CONFLICT(provider) DO UPDATE SET "
+                                "credentials=excluded.credentials, updated_at=CURRENT_TIMESTAMP",
+                                (name.lower(), store._encrypt(conn, json.dumps(list(creds)))),
+                            )
+                        else:
+                            conn.execute(
+                                "INSERT OR IGNORE INTO tusker_config_oauth_credentials "
+                                "(provider, credentials) VALUES (?, ?)",
+                                (name.lower(), store._encrypt(conn, json.dumps(list(creds)))),
+                            )
                     conn.execute(
                         "UPDATE tusker_config_meta SET generation = generation + 1, "
                         "updated_at = CURRENT_TIMESTAMP WHERE id = 1"
                     )
                     conn.commit()
-            inserted += 1
+            if is_new:
+                inserted += 1
+            else:
+                updated += 1
         except Exception as exc:
             errors += 1
             logger.warning("credential_pool %s: %s", name, exc)
-    results.append(("credential_pools", inserted, skipped, errors))
+    results.append(("credential_pools", inserted, updated, skipped, errors))
 
     return results
 
@@ -151,7 +182,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--dry-run", action="store_true",
-        help="Report what would be inserted without writing",
+        help="Report what would be changed without writing",
+    )
+    parser.add_argument(
+        "--update", action="store_true",
+        help="Update existing rows (propagate env/yaml changes to the DB)",
     )
     args = parser.parse_args(argv)
 
@@ -169,18 +204,22 @@ def main(argv: list[str] | None = None) -> int:
     store = ConfigStore(fallback_config=config)
     store.reload_now()
 
-    counts = _section_counts(store, config, dry_run=args.dry_run)
+    counts = _section_counts(store, config, dry_run=args.dry_run, update=args.update)
 
-    print("section,inserted,skipped,errors")
-    total_inserted = 0
-    for section, inserted, skipped, errors in counts:
-        print(f"{section},{inserted},{skipped},{errors}")
+    print("section,inserted,updated,skipped,errors")
+    total_inserted = total_updated = 0
+    for section, inserted, updated, skipped, errors in counts:
+        print(f"{section},{inserted},{updated},{skipped},{errors}")
         total_inserted += inserted
+        total_updated += updated
 
     if args.dry_run:
-        print(f"dry run: {total_inserted} rows would be inserted")
+        verb = "would be inserted" if total_inserted else "would be inserted/updated"
+        extra = f" ({total_updated} updated)" if total_updated else ""
+        print(f"dry run: {total_inserted} rows {verb}{extra}")
     else:
-        print(f"done: {total_inserted} rows inserted (generation {store.generation})")
+        extra = f", {total_updated} updated" if total_updated else ""
+        print(f"done: {total_inserted} inserted{extra} (generation {store.generation})")
     return 0
 
 
