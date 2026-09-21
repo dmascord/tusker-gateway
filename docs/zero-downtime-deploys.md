@@ -26,27 +26,17 @@ See "History" for the failed August 2026 attempts that delayed this.
        maxSurge: 1
        maxUnavailable: 0
    ```
-4. **SQLite WAL everywhere.** Every gateway SQLite store now sets
-   `PRAGMA journal_mode=WAL` at connect time (commit `1171e5a`):
-   budget, cache, circuit_breaker, model_capability,
-   persistent_cooldown, provider_usage, quality, rate_limit,
-   tool_capability (idempotency already had it).
+4. **PostgreSQL-backed shared state.** In production,
+   `TUSKER_STATE_DATABASE_URL` routes the mutable gateway stores through
+   PostgreSQL: budget, circuit breaker, model/capability evidence,
+   persistent cooldown, provider usage, quality, rate limit, tool
+   capability, config, and idempotency state. SQLite remains the default
+   backend for local development and tests.
 
-   **What WAL does and does not do.** WAL gives single-host SQLite
-   crash-consistency and lets a reader and a writer on the *same*
-   machine proceed concurrently. It does **not** work across hosts
-   on a network filesystem: the wal-index lives in shared memory,
-   which processes on separate machines cannot share. The
-   Longhorn RWX share is exposed to pods as an NFS mount, so two
-   pods writing the same SQLite file simultaneously are still
-   racing on advisory NFS file locks.
-
-   The deploy-time safety therefore does **not** come from WAL. It
-   comes from `maxUnavailable: 0` — the old pod keeps serving until
-   the new pod is Ready, so there is never a moment where two pods
-   are both accepting traffic and writing the same DB. WAL is a
-   crash-consistency measure for the single pod, not a
-   multi-writer safeguard.
+   PostgreSQL is authoritative in the cluster. If it is unavailable,
+   advisory stores enter process-local degraded mode, while correctness-
+   critical stores fail closed with a controlled `503`; they do not fall
+   back to shared SQLite files.
 
 5. **SSE smoke test in `k8s/deploy.sh`.** After `/health` and
    `/ready`, the deploy script posts a streaming
@@ -54,13 +44,18 @@ See "History" for the failed August 2026 attempts that delayed this.
    key from `tusker-env-vault` — proving end-to-end SSE delivery
    rather than just probe health. Non-fatal; log-only.
 
-## Audience note on replicas
+## Audience note on replicas and file state
 
-The deployment stays at `replicas: 1`. RWX + WAL makes the
-**deploy-time** 2-pod coexistence safe, but sustained two-pod
-operation keeps permanent dual-writer SQLite-on-NFS exposure
-(fcntl locking over NFS is weak). Zero-downtime deploys don't
-require steady-state redundancy. Chosen 2026-09-07.
+The deployment currently stays at `replicas: 1`. The database-backed
+stores are safe for rolling multi-pod writes because PostgreSQL is the
+shared authority. The audit trail is still an integrity-chained JSONL
+file at `/home/tusker/.hermes/audit.jsonl` on the RWX volume, so sustained
+active-active operation requires validating its cross-node append locking
+or moving audit events into PostgreSQL. This is the remaining reason not
+to increase steady-state replicas as part of an ordinary rollout.
+
+SQLite-on-RWX is no longer the production state design; SQLite is retained
+for local/test fallback behavior only.
 
 ## Validation evidence (2026-09-07)
 

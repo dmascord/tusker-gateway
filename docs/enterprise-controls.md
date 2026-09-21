@@ -118,7 +118,7 @@ second HTTP status line.
 
 Enable duplicate suppression with `TUSKER_IDEMPOTENCY_ENABLED=true`. A caller
 can then send `Idempotency-Key` on any non-streaming `/v1/*` POST. The key is
-scoped by API-key fingerprint, method, and path. The SQLite transaction reserves
+scoped by API-key fingerprint, method, and path. The database transaction reserves
 the operation before provider dispatch, so concurrent duplicates return 409;
 a completed 2xx response is replayed with `Idempotency-Replayed: true`. Reusing
 the key for a different canonical request returns `idempotency_conflict`.
@@ -132,10 +132,11 @@ cap release their reservation.
 - `TUSKER_IDEMPOTENCY_LOCK_SECS` defaults to 5 minutes.
 - `TUSKER_IDEMPOTENCY_MAX_RESPONSE_BYTES` defaults to 2 MiB.
 
-The database uses `BEGIN IMMEDIATE`, WAL, and a busy timeout for multi-process
-safety on a single host. Do not place SQLite on NFS for sustained multi-replica
-operation; move this store and the existing quota state to a transactional
-shared database before running active-active replicas.
+In production, this store resolves through `TUSKER_STATE_DATABASE_URL` to
+PostgreSQL, where the reservation transaction is coordinated across gateway
+pods. SQLite with `BEGIN IMMEDIATE`, WAL, and a busy timeout remains the local
+development/test fallback only; it must not be used on NFS for sustained
+multi-replica operation.
 Canonical request identity includes normalized query keys and values, so query
 ordering does not affect replay while a changed query conflicts. A cancelled or
 timed-out operation releases its processing reservation before propagating the
