@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import secrets
 import time
 import uuid
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 _PENDING: dict[str, dict[str, Any]] = {}
 _TTL_SECS = 300
@@ -424,6 +427,26 @@ def question_authorized_for_content(
             for embedded_id in _embedded_ids(content):
                 results[embedded_id] = content
                 result_ids.add(embedded_id)
+    logger.info(
+        "content approval follow-up shape request_id=%s action=%s messages=%d roles=%s "
+        "question_ids=%s result_ids=%s latest_user_answer=%s approved=%s "
+        "pending_content=%d signature=%s accepted_signatures=%d",
+        request_id or "unknown",
+        action,
+        len(messages),
+        ",".join(
+            str(message.get("role") or "?")
+            for message in messages
+            if isinstance(message, dict)
+        ),
+        ",".join(sorted(questions)) or "none",
+        ",".join(sorted(result_ids)) or "none",
+        answer_found,
+        answer_approved if answer_found else "n/a",
+        sum(1 for pending in _PENDING.values() if pending.get("scope") == "content"),
+        expected_signature[:12],
+        len(accepted_signatures),
+    )
     for call_id, pending in list(_PENDING.items()):
         if (
             pending.get("scope") != "content"
