@@ -1738,6 +1738,38 @@ def _high_impact_content_match(
     return None
 
 
+def _native_content_question_if_needed(
+    messages: Any,
+    *,
+    model: str,
+    content_regex: re.Pattern[str] | None,
+    request_id: str | None = None,
+    audit: Any = None,
+) -> dict[str, Any] | None:
+    """Build the one native approval response needed for risky user content.
+
+    This is deliberately a request preflight. Content approval does not
+    depend on which upstream model is selected, so waiting until provider
+    response validation makes pool fallback emit the same question once per
+    candidate. Returning the question before dispatch keeps provider retries
+    out of the approval protocol and guarantees a single OMP ask call.
+    """
+    action = _high_impact_content_kind(messages, content_regex=content_regex)
+    if not action or question_authorized_for_content(
+        messages, action, request_id=request_id, audit=audit
+    ):
+        return None
+    return question_response_for_content(
+        messages,
+        action,
+        model=model,
+        matched_text=_high_impact_content_match(messages, content_regex=content_regex),
+        provider="gateway-preflight",
+        request_id=request_id,
+        audit=audit,
+    )
+
+
 def _enforce_high_impact_approval(
     calls: list[dict[str, Any]],
     *,
@@ -5077,6 +5109,26 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                     return web.json_response(sem_hit)
                 set_access_log_context(request, cache_status="miss")
 
+            # Ask for content approval before provider selection. The risk is
+            # present in the caller's message, not in the eventual provider
+            # response; doing this after dispatch causes every fallback
+            # candidate to generate a duplicate OMP question.
+            native_content_question = _native_content_question_if_needed(
+                body["messages"],
+                model=str(body.get("model") or "tusker-gateway"),
+                content_regex=_compiled_content_regex(config),
+                request_id=request_id,
+                audit=request.app.get("audit"),
+            )
+            if native_content_question is not None and not body.get("stream", False):
+                logger.info(
+                    "native content question preflight rid=%s model=%s",
+                    request_id,
+                    body.get("model"),
+                )
+                _emit(status)
+                return web.json_response(native_content_question)
+
             # Commit streaming responses before provider dispatch. The old
             # order waited for _call_with_pool_fallback() (including upstream
             # connection and first-frame prefetch) before sending any bytes.
@@ -5115,18 +5167,28 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                 # during a long provider wait.
                 await asyncio.sleep(0)
 
-            provider, target_model, result = await _call_with_pool_fallback(
-                config,
-                body,
-                client,
-                tools,
-                breaker=breaker,
-                request=request,
-                metrics_registry=request.app.get("metrics"),
-                initial_selection=semantic_target,
-                request_id=request_id,
-                conversation_id=conversation_id,
-            )
+            if native_content_question is not None:
+                provider = "gateway"
+                target_model = str(body.get("model") or "tusker-gateway")
+                result = native_content_question
+                logger.info(
+                    "native content question preflight stream rid=%s model=%s",
+                    request_id,
+                    body.get("model"),
+                )
+            else:
+                provider, target_model, result = await _call_with_pool_fallback(
+                    config,
+                    body,
+                    client,
+                    tools,
+                    breaker=breaker,
+                    request=request,
+                    metrics_registry=request.app.get("metrics"),
+                    initial_selection=semantic_target,
+                    request_id=request_id,
+                    conversation_id=conversation_id,
+                )
             logger.debug(
                 "selected rid=%s provider=%s model=%s pool=%s",
                 request_id,

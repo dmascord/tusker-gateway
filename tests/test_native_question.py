@@ -7,6 +7,7 @@ import uuid
 
 import pytest
 
+from tusker_gateway.endpoints import _native_content_question_if_needed
 from tusker_gateway.endpoints import _validate_complete_tool_response
 from tusker_gateway.endpoints import _prepare_stream_result
 from tusker_gateway.sse import sse_frame
@@ -128,6 +129,35 @@ def test_content_question_shows_the_detected_phrase():
     call = question["choices"][0]["message"]["tool_calls"][0]
     args = json.loads(call["function"]["arguments"])
     assert "submit the order" in args["questions"][0]["question"]
+
+
+def test_content_question_preflight_is_single_and_avoids_provider_identity():
+    messages = [{"role": "user", "content": "Please submit_order now."}]
+    regex = re.compile(r"submit[_ -]?order", re.IGNORECASE)
+
+    first = _native_content_question_if_needed(
+        messages,
+        model="requested-model",
+        content_regex=regex,
+        request_id="req-preflight",
+    )
+    assert first is not None
+    call = first["choices"][0]["message"]["tool_calls"][0]
+    assert call["function"]["name"] == "ask"
+
+    # The approval is carried into the next client turn; once accepted, the
+    # preflight no longer emits another question before provider dispatch.
+    follow_up = [
+        *messages,
+        first["choices"][0]["message"],
+        {"role": "tool", "tool_call_id": call["id"], "content": "Allow once"},
+    ]
+    assert _native_content_question_if_needed(
+        follow_up,
+        model="requested-model",
+        content_regex=regex,
+        request_id="req-approved",
+    ) is None
 
 
 def test_content_question_accepts_result_with_embedded_question_id():

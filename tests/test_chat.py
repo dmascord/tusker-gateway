@@ -690,6 +690,30 @@ async def test_chat_completions_pool_dispatch(app, client):
         assert args[0] == "openai-codex"
         assert args[1] == "gpt-5.6-luna"
 
+
+@pytest.mark.asyncio
+async def test_chat_content_approval_preflight_does_not_call_provider(app, client):
+    """A risky user phrase yields one native ask before pool fallback begins."""
+    app["config"]["high_impact_content_patterns"] = (r"submit[_ -]?order",)
+    app["config"].pop("high_impact_content_regex", None)
+
+    with patch("tusker_gateway.endpoints.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-code",
+                "messages": [{"role": "user", "content": "Please submit_order now."}],
+            },
+            headers=HEADERS_AUTH,
+        )
+
+    assert resp.status == 200
+    payload = await resp.json()
+    call = payload["choices"][0]["message"]["tool_calls"][0]
+    assert call["function"]["name"] == "ask"
+    assert "submit_order" in json.loads(call["function"]["arguments"])["questions"][0]["question"]
+    mock_chat.assert_not_awaited()
+
 @pytest.mark.asyncio
 async def test_chat_completions_forwards_client_session_to_provider_call(app, client):
     pool_manager = MagicMock()
