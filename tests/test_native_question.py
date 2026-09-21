@@ -181,6 +181,28 @@ def test_repeated_content_preflight_reuses_same_question_id():
     assert first_call["id"] == retry_call["id"]
 
 
+def test_replayed_transcript_history_does_not_create_new_content_question():
+    regex = re.compile(r"submit[_ -]?order", re.IGNORECASE)
+    first = _native_content_question_if_needed(
+        [{"role": "user", "content": "Please submit_order now."}],
+        model="requested-model",
+        content_regex=regex,
+        request_id="req-first",
+    )
+    replay = [
+        {"role": "user", "content": "Earlier unrelated context."},
+        {"role": "assistant", "content": "Previous answer."},
+        {"role": "user", "content": "Please submit_order now."},
+    ]
+    retry = _native_content_question_if_needed(
+        replay,
+        model="requested-model",
+        content_regex=regex,
+        request_id="req-retry",
+    )
+    assert retry is first
+
+
 def test_content_question_accepts_result_with_embedded_question_id():
     original_messages = [{"role": "user", "content": "Please execute the order."}]
     question = question_response_for_content(original_messages, "user_content", model="model")

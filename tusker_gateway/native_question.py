@@ -48,15 +48,23 @@ def _calls_signature(calls: list[dict[str, Any]]) -> str:
 
 
 def _content_signature(messages: Any, action: str) -> str:
-    """Bind a content-level approval to the user text that triggered it."""
-    user_content: list[Any] = []
+    """Bind approval to the latest user content, not replayed transcript history.
+
+    OMP resends the full conversation and may append its own ask/tool turns on
+    every retry. Hashing every historical user message made those harmless
+    protocol additions look like a new risky request and generated another
+    approval. The detector has already established that the latest user turn
+    contains the risky phrase, so that turn is the correct approval boundary.
+    """
+    latest_user_content: Any = None
     if isinstance(messages, list):
-        for message in messages:
+        for message in reversed(messages):
             if not isinstance(message, dict) or message.get("role") != "user":
                 continue
-            user_content.append(message.get("content"))
+            latest_user_content = message.get("content")
+            break
     return hashlib.sha256(
-        _canonical({"action": action, "user_content": user_content}).encode()
+        _canonical({"action": action, "user_content": latest_user_content}).encode()
     ).hexdigest()
 
 
