@@ -37,6 +37,7 @@ from tusker_gateway.endpoints import (
     video_handler,
  )
 from tusker_gateway.anthropic_adapter import anthropic_messages_handler
+from tusker_gateway.mcp_guard import mcp_handler
 
 from tusker_gateway.errors import GatewayError, openai_error
 from tusker_gateway.health import health_handler, ready_handler, status_handler
@@ -573,6 +574,7 @@ def create_app() -> web.Application:
     app.router.add_post("/v1/chat/completions", chat_completions_handler)
     app.router.add_post("/v1/responses", responses_handler)
     app.router.add_post("/v1/messages", anthropic_messages_handler)
+    app.router.add_post("/mcp", mcp_handler)
 
     app.on_cleanup.append(on_cleanup)
 

@@ -21,6 +21,7 @@ from tusker_gateway.endpoints import (
 from tusker_gateway.anthropic_adapter import anthropic_messages_handler
 from tusker_gateway.errors import GatewayError, openai_error
 from tusker_gateway.health import health_handler, ready_handler, status_handler
+from tusker_gateway.mcp_guard import mcp_handler
 
 
 @pytest.fixture(autouse=True)
@@ -106,6 +107,7 @@ def _create_test_app(config=None):
     app.router.add_post("/v1/responses", responses_handler)
     app.router.add_post("/v1/messages", anthropic_messages_handler)
     app.router.add_post("/v1/rerank", rerank_handler)
+    app.router.add_post("/mcp", mcp_handler)
     return app
 
 
