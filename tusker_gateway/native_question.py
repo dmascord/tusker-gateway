@@ -105,6 +105,16 @@ def _extract_answer(value: Any) -> tuple[bool, bool]:
         for key in ("approved", "allow", "allowed", "confirm", "confirmed"):
             if key in value and isinstance(value[key], bool):
                 return True, value[key]
+        for key in ("selectedOptions", "selected_options", "selectedOption", "selected_option"):
+            if key in value:
+                selected = value[key]
+                if isinstance(selected, str):
+                    selected = [selected]
+                if isinstance(selected, list):
+                    for option in selected:
+                        found, approved = _extract_answer(option)
+                        if found:
+                            return found, approved
         for child in value.values():
             found, approved = _extract_answer(child)
             if found:
@@ -423,6 +433,17 @@ def question_authorized_for_content(
     result_ids: set[str] = set()
     results: dict[str, Any] = {}
     unbound_results: list[Any] = []
+
+    def record_result(result_id: str, content: Any) -> None:
+        """Keep every envelope; OMP may send an answer and a duplicate."""
+        previous = results.get(result_id)
+        if previous is None:
+            results[result_id] = content
+        elif isinstance(previous, list):
+            previous.append(content)
+        else:
+            results[result_id] = [previous, content]
+
     for message in messages:
         if not isinstance(message, dict):
             continue
@@ -436,11 +457,11 @@ def question_authorized_for_content(
         if message.get("role") in {"tool", "function"} and message.get("tool_call_id"):
             tool_call_id = str(message["tool_call_id"])
             content = _message_content(message)
-            results[tool_call_id] = content
+            record_result(tool_call_id, content)
             result_ids.add(tool_call_id)
             unbound_results.append(content)
             for embedded_id in _embedded_ids(content):
-                results[embedded_id] = content
+                record_result(embedded_id, content)
                 result_ids.add(embedded_id)
         elif message.get("role") in {"tool", "function"}:
             # Some OMP-compatible clients put the ask question ID in the
@@ -448,7 +469,7 @@ def question_authorized_for_content(
             content = _message_content(message)
             unbound_results.append(content)
             for embedded_id in _embedded_ids(content):
-                results[embedded_id] = content
+                record_result(embedded_id, content)
                 result_ids.add(embedded_id)
     unbound_answer_found, unbound_answer_approved = False, False
     for content in unbound_results:

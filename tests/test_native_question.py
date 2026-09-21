@@ -211,6 +211,25 @@ def test_content_question_accepts_unbound_omp_tool_result():
     assert question_authorized_for_content(result_messages, "user_content") is True
 
 
+def test_content_question_accepts_selected_options_after_duplicate_result():
+    original_messages = [{"role": "user", "content": "Please submit_order now."}]
+    question = question_response_for_content(original_messages, "user_content", model="model")
+    call = question["choices"][0]["message"]["tool_calls"][0]
+    result_messages = [
+        *original_messages,
+        question["choices"][0]["message"],
+        {"role": "tool", "tool_call_id": call["id"], "content": "pending"},
+        {
+            "role": "tool",
+            "tool_call_id": call["id"],
+            "content": json.dumps({
+                "results": [{"id": call["id"], "selectedOptions": ["Allow once"]}],
+            }),
+        },
+    ]
+    assert question_authorized_for_content(result_messages, "user_content") is True
+
+
 def test_content_question_accepts_follow_up_user_selection():
     original_messages = [{"role": "user", "content": "Please execute the order."}]
     question_response_for_content(original_messages, "user_content", model="model")
