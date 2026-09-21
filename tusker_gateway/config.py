@@ -42,6 +42,15 @@ ACTION_CAPABLE_TOOL_NAMES = frozenset(
         "browser",
         "computer",
         "playwright",
+        # Shell tools can be read-only or destructive depending on their
+        # arguments. Buffer streamed calls so the high-impact classifier can
+        # replace destructive commands with the native question tool before
+        # the client executes them.
+        "bash",
+        "shell",
+        "exec",
+        "run_command",
+        "terminal",
     }
 )
 # Default instrument/broker identifiers that should trip the high-impact gate

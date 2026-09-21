@@ -128,6 +128,17 @@ def test_destructive_bash_command_is_high_impact():
     assert _high_impact_call_kind(call) == "bash"
 
 
+def test_shell_tools_are_buffered_for_streaming_safety_preflight():
+    from tusker_gateway.config import tools_may_produce_high_impact
+
+    assert tools_may_produce_high_impact([
+        {"type": "function", "function": {"name": "bash"}},
+    ]) is True
+    assert tools_may_produce_high_impact([
+        {"type": "function", "function": {"name": "custom_read"}},
+    ]) is False
+
+
 def test_trade_task_is_high_impact():
     call = {
         "function": {

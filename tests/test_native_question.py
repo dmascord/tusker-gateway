@@ -131,4 +131,48 @@ async def test_streaming_risky_call_is_replaced_with_question_tool():
     frames = [frame async for frame in prepared]
     joined = b"".join(frames)
     assert b'"name": "question"' in joined
+
+
+@pytest.mark.asyncio
+async def test_streaming_destructive_bash_call_is_replaced_before_client_execution():
+    async def provider_stream():
+        payload = {
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call-bash",
+                        "type": "function",
+                        "function": {
+                            "name": "bash",
+                            "arguments": '{"command":"rm -rf /tmp/omp-proof"}',
+                        },
+                    }],
+                },
+                "finish_reason": "tool_calls",
+            }],
+        }
+        yield sse_frame(payload)
+        yield b"data: [DONE]\n\n"
+    result = await _prepare_stream_result(
+        provider_stream(),
+        tools=[{"type": "function", "function": {"name": "bash"}}],
+        tool_choice=None,
+        require_tool_call=False,
+        tools_requested=True,
+        provider="test",
+        model="model",
+        request_id="req-bash",
+        explicitly_authorized=False,
+        greylisted=False,
+        argument_regex=None,
+        content_regex=None,
+        messages=[],
+        force_deny=False,
+    )
+    joined = b"".join([frame async for frame in result])
+    assert b'"name": "question"' in joined
     assert b'"name": "place_trade"' not in joined
+    assert b'"name": "bash"' not in joined
