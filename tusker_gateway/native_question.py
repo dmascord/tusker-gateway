@@ -279,6 +279,7 @@ def question_response_for_calls(
     approval_id = str(uuid.uuid4())
     call_id = approval_id
     _PENDING[call_id] = {
+        "calls": json.loads(json.dumps(calls, ensure_ascii=False)),
         "signature": _calls_signature(calls),
         "expires_at": time.time() + _TTL_SECS,
         "request_id": request_id or "unknown",
@@ -336,6 +337,96 @@ def question_response_for_calls(
             "finish_reason": "tool_calls",
         }],
     }
+
+
+def replay_approved_tool_response(
+    messages: Any,
+    *,
+    request_id: str | None = None,
+    audit: Any = None,
+) -> dict[str, Any] | None:
+    """Return the exact approved tool call without another model round trip.
+
+    OMP may submit an ``ask`` selection as either a tool result or a user
+    answer. Once the answer is bound to the pending question ID, replay the
+    original normalized call directly to the client. The client remains the
+    tool executor; the gateway only brokers approval and replay.
+    """
+    _prune()
+    if not isinstance(messages, list):
+        return None
+    questions: set[str] = set()
+    results: dict[str, Any] = {}
+    unbound_results: list[Any] = []
+    answer_found, answer_approved, _ = _latest_user_answer(messages)
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "assistant":
+            for call in message.get("tool_calls") or []:
+                if not isinstance(call, dict):
+                    continue
+                function = call.get("function") or {}
+                if function.get("name") in {"ask", "question"}:
+                    call_id = call.get("id")
+                    if isinstance(call_id, str) and call_id in _PENDING:
+                        questions.add(call_id)
+        if message.get("role") in {"tool", "function"}:
+            content = _message_content(message)
+            tool_call_id = message.get("tool_call_id")
+            if tool_call_id:
+                results[str(tool_call_id)] = content
+            else:
+                unbound_results.append(content)
+
+    for call_id, pending in list(_PENDING.items()):
+        if pending.get("scope", "calls") != "calls" or call_id not in questions:
+            continue
+        found, approved = _extract_answer(results.get(call_id))
+        if not found and unbound_results:
+            for content in unbound_results:
+                found, approved = _extract_answer(content)
+                if found:
+                    break
+        if not found and answer_found:
+            found, approved = answer_found, answer_approved
+        if not found:
+            continue
+
+        _PENDING.pop(call_id, None)
+        _audit(pending.get("audit") or audit, {
+            "event_type": "tool.approval.decision",
+            "approval_id": call_id,
+            "request_id": request_id or "unknown",
+            "original_request_id": pending.get("request_id", "unknown"),
+            "provider": pending.get("provider", "unknown"),
+            "model": pending.get("model", "unknown"),
+            "action": pending.get("action", "unknown"),
+            "call_signature": pending.get("signature"),
+            "decision": "accepted" if approved else "denied",
+            "execution_result": "not_observed",
+            "replayed_directly": bool(approved),
+        })
+        if not approved:
+            return None
+        calls = pending.get("calls")
+        if not isinstance(calls, list) or not calls:
+            return None
+        return {
+            "id": "chatcmpl-" + secrets.token_hex(12),
+            "object": "chat.completion",
+            "model": pending.get("model") or "tusker-gateway",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": calls,
+                },
+                "finish_reason": "tool_calls",
+            }],
+        }
+    return None
 
 
 def question_response_for_content(

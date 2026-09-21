@@ -780,6 +780,64 @@ async def test_chat_content_approval_preflight_does_not_call_provider(app, clien
     assert "submit_order" in json.loads(call["function"]["arguments"])["questions"][0]["question"]
     mock_chat.assert_not_awaited()
 
+
+@pytest.mark.asyncio
+async def test_approved_high_impact_call_is_replayed_without_model_round_trip(app, client):
+    """An approved native ask replays the original call directly to OMP."""
+    app["pool_manager"] = MagicMock()
+    app["pool_manager"].select.return_value = ("alibaba", "qwen3.6-flash")
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
+        },
+    }]
+    original_call = {
+        "id": "call-bash-original",
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "arguments": json.dumps({"command": "rm -rf /tmp/export"}),
+        },
+    }
+
+    with patch("tusker_gateway.endpoints.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
+        mock_chat.return_value = {
+            "choices": [{
+                "message": {"role": "assistant", "tool_calls": [original_call]},
+            }],
+        }
+        first = await client.post(
+            "/v1/chat/completions",
+            json={"model": "hermes-code", "messages": [{"role": "user", "content": "export"}], "tools": tools},
+            headers=HEADERS_AUTH,
+        )
+        first_payload = await first.json()
+        ask_message = first_payload["choices"][0]["message"]
+        ask_call = ask_message["tool_calls"][0]
+
+        second = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-code",
+                "messages": [
+                    {"role": "user", "content": "export"},
+                    ask_message,
+                    {"role": "user", "content": "Allow once"},
+                ],
+                "tools": tools,
+            },
+            headers=HEADERS_AUTH,
+        )
+        replayed = await second.json()
+
+    assert first.status == 200
+    assert ask_call["function"]["name"] == "ask"
+    assert second.status == 200
+    assert replayed["choices"][0]["message"]["tool_calls"] == [original_call]
+    mock_chat.assert_awaited_once()
+
 @pytest.mark.asyncio
 async def test_chat_completions_forwards_client_session_to_provider_call(app, client):
     pool_manager = MagicMock()

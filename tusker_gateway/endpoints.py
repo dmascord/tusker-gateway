@@ -70,6 +70,7 @@ from tusker_gateway.native_question import (
     question_authorized_for_content,
     question_response_for_calls,
     question_response_for_content,
+    replay_approved_tool_response,
 )
 from tusker_gateway.pools import PoolManager
 from tusker_gateway.provider_usage import is_capacity_error
@@ -5233,17 +5234,29 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                     return web.json_response(sem_hit)
                 set_access_log_context(request, cache_status="miss")
 
+            # A previously approved high-impact tool call is replayed directly
+            # to OMP. This prevents the model from regenerating a slightly
+            # different shell command after the user has already approved the
+            # exact original call.
+            approved_tool_response = replay_approved_tool_response(
+                body["messages"],
+                request_id=request_id,
+                audit=request.app.get("audit"),
+            )
+
             # Ask for content approval before provider selection. The risk is
             # present in the caller's message, not in the eventual provider
             # response; doing this after dispatch causes every fallback
             # candidate to generate a duplicate OMP question.
-            native_content_question = _native_content_question_if_needed(
-                body["messages"],
-                model=str(body.get("model") or "tusker-gateway"),
-                content_regex=_compiled_content_regex(config),
-                request_id=request_id,
-                audit=request.app.get("audit"),
-            )
+            native_content_question = None
+            if approved_tool_response is None:
+                native_content_question = _native_content_question_if_needed(
+                    body["messages"],
+                    model=str(body.get("model") or "tusker-gateway"),
+                    content_regex=_compiled_content_regex(config),
+                    request_id=request_id,
+                    audit=request.app.get("audit"),
+                )
             if native_content_question is not None and not body.get("stream", False):
                 logger.info(
                     "native content question preflight rid=%s model=%s",
@@ -5291,7 +5304,16 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                 # during a long provider wait.
                 await asyncio.sleep(0)
 
-            if native_content_question is not None:
+            if approved_tool_response is not None:
+                provider = "gateway-approval"
+                target_model = str(body.get("model") or "tusker-gateway")
+                result = approved_tool_response
+                logger.info(
+                    "replayed approved tool call directly rid=%s model=%s",
+                    request_id,
+                    body.get("model"),
+                )
+            elif native_content_question is not None:
                 provider = "gateway"
                 target_model = str(body.get("model") or "tusker-gateway")
                 result = native_content_question

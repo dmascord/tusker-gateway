@@ -16,6 +16,7 @@ from tusker_gateway.native_question import (
     question_authorized_for_content,
     question_response_for_calls,
     question_response_for_content,
+    replay_approved_tool_response,
     reset_pending,
 )
 
@@ -143,6 +144,25 @@ def test_question_user_deny_answer_does_not_authorize_exact_call():
         ],
         _trade_call(),
     ) is False
+
+
+def test_approved_call_is_replayed_without_model_round_trip():
+    original = _trade_call(qty=7)
+    question = question_response_for_calls(original, model="model")
+    ask_message = question["choices"][0]["message"]
+    replay = replay_approved_tool_response([
+        ask_message,
+        {"role": "user", "content": "Allow once"},
+    ])
+
+    assert replay is not None
+    assert replay["choices"][0]["finish_reason"] == "tool_calls"
+    assert replay["choices"][0]["message"]["tool_calls"] == original
+    # One-time approval: a duplicate answer cannot replay the call again.
+    assert replay_approved_tool_response([
+        ask_message,
+        {"role": "user", "content": "Allow once"},
+    ]) is None
 
 
 def test_question_deny_and_unrecognized_answer_do_not_authorize():
