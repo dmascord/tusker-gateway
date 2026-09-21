@@ -11,6 +11,7 @@ import pytest
 from tusker_gateway.budget import BudgetDecision
 import tusker_gateway.sse
 from tusker_gateway.errors import (
+    HighImpactApprovalRequiredError,
     ProviderError,
     ProviderRouteDisabledError,
     RateLimitError,
@@ -20,6 +21,7 @@ from tusker_gateway.endpoints import (
     _call_with_pool_fallback,
     _public_provider_failure_response,
     _public_stream_error,
+    _approval_stream_message,
     _request_conversation_id,
     _required_input_modalities,
     _validate_chat_body,
@@ -75,6 +77,21 @@ def test_public_stream_error_contains_correlation_and_redacts_upstream_body():
     assert "req-stream-1" in message
     assert "Upstream provider error" in message
     assert "abc123" not in message
+
+
+def test_approval_stream_message_is_actionable_for_omp_clients():
+    exc = HighImpactApprovalRequiredError(
+        provider="zai",
+        model="glm-5.3-flash",
+        action="user_content",
+    )
+
+    message = _approval_stream_message(exc, "req-approval-1")
+
+    assert "Approval is required" in message
+    assert "user_content" in message
+    assert "Approve it explicitly" in message
+    assert "req-approval-1" in message
 
 
 def test_public_provider_non_capacity_failure_does_not_leak_upstream_body():

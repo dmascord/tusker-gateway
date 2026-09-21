@@ -2837,6 +2837,21 @@ def _public_stream_error(
     return message[:900], code
 
 
+def _approval_stream_message(exc: HighImpactApprovalRequiredError, request_id: str) -> str:
+    """Return client-visible guidance for a post-commit approval stop.
+
+    OMP deliberately collapses OpenAI ``error`` SSE events into a generic
+    banner. Approval is an expected interactive outcome rather than an
+    upstream failure, so expose it as ordinary assistant text after the
+    response has been committed.
+    """
+    action = str(getattr(exc, "action", "high-impact action") or "high-impact action")
+    return (
+        f"Approval is required before the high-impact action '{action}' can run. "
+        f"Approve it explicitly and retry. Request ID: {request_id}."
+    )
+
+
 def _mark_permanently_failed(
     exc: Exception,
     provider: str,
@@ -5108,6 +5123,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                 except Exception as exc:  # noqa: BLE001
                     stream_loop_failure = isinstance(exc, ProviderStreamLoopError)
                     stream_ok = False
+                    approval_required = isinstance(exc, HighImpactApprovalRequiredError)
                     tool_response_failure = isinstance(
                         exc,
                         (
@@ -5119,6 +5135,9 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                         ),
                     )
                     status = (
+                        "approval_required"
+                        if approval_required
+                        else
                         "stream_loop"
                         if stream_loop_failure
                         else "tool_response_error"
@@ -5132,6 +5151,9 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                         provider=provider,
                         model=target_model,
                     )
+                    if approval_required:
+                        stream_error_message = _approval_stream_message(exc, request_id)
+                        stream_error_code = "approval_required"
                     request["_stream_error_code"] = stream_error_code
                     request["_stream_error_detail"] = stream_error_message
                     # Stream validation failures happen after the HTTP 200 has
@@ -5173,15 +5195,34 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                         exc_info=True,
                     )
                     try:
-                        await resp.write(
-                            sse_frame({
-                                "error": openai_error(
-                                    stream_error_message,
-                                    code=stream_error_code,
-                                    error_type="provider_error",
+                        if approval_required:
+                            approval_message = _approval_stream_message(exc, request_id)
+                            await resp.write(
+                                sse_frame(
+                                    format_openai_chunk(
+                                        approval_message,
+                                        model=target_model,
+                                    )
                                 )
-                            })
-                        )
+                            )
+                            await resp.write(
+                                sse_frame(
+                                    format_openai_chunk(
+                                        finish_reason="stop",
+                                        model=target_model,
+                                    )
+                                )
+                            )
+                        else:
+                            await resp.write(
+                                sse_frame({
+                                    "error": openai_error(
+                                        stream_error_message,
+                                        code=stream_error_code,
+                                        error_type="provider_error",
+                                    )
+                                })
+                            )
                         await resp.write(sse_done())
                     except (ConnectionResetError, ConnectionError, BrokenPipeError):
                         stream_ok = False
@@ -5270,6 +5311,10 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                     provider=provider,
                     model=target_model,
                 )
+                if isinstance(exc, HighImpactApprovalRequiredError):
+                    status = "approval_required"
+                    stream_error_message = _approval_stream_message(exc, request_id)
+                    stream_error_code = "approval_required"
                 request["_stream_error"] = status
                 request["_stream_error_code"] = stream_error_code
                 request["_stream_error_detail"] = stream_error_message
@@ -5279,15 +5324,33 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                 except asyncio.TimeoutError:
                     stream_hb_task.cancel()
                 try:
-                    await stream_resp.write(
-                        sse_frame({
-                            "error": openai_error(
-                                stream_error_message,
-                                code=stream_error_code,
-                                error_type="provider_error",
+                    if isinstance(exc, HighImpactApprovalRequiredError):
+                        await stream_resp.write(
+                            sse_frame(
+                                format_openai_chunk(
+                                    _approval_stream_message(exc, request_id),
+                                    model=target_model,
+                                )
                             )
-                        })
-                    )
+                        )
+                        await stream_resp.write(
+                            sse_frame(
+                                format_openai_chunk(
+                                    finish_reason="stop",
+                                    model=target_model,
+                                )
+                            )
+                        )
+                    else:
+                        await stream_resp.write(
+                            sse_frame({
+                                "error": openai_error(
+                                    stream_error_message,
+                                    code=stream_error_code,
+                                    error_type="provider_error",
+                                )
+                            })
+                        )
                     await stream_resp.write(sse_done())
                 except (ConnectionResetError, ConnectionError, BrokenPipeError):
                     pass
