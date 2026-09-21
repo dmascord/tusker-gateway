@@ -190,7 +190,7 @@ def test_probe_payloads_cover_supported_input_shapes():
     assert _messages_for_modality("image")[0]["content"][1]["type"] == "image_url"
     assert _messages_for_modality("audio")[0]["content"][1]["type"] == "input_audio"
     assert _messages_for_modality("video")[0]["content"][1]["type"] == "video_url"
-    assert MODEL_CAPABILITY_PROBE_VERSION == "model-capability-v1"
+    assert MODEL_CAPABILITY_PROBE_VERSION == "model-capability-v2"
 
 
 def test_successful_media_capability_records_are_provider_model_scoped(tmp_path):

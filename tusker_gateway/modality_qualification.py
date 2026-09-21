@@ -45,10 +45,18 @@ from tusker_gateway.pools import PoolManager, is_general_chat_model
 
 logger = logging.getLogger(__name__)
 
+# 128x128 PNG: providers like DashScope reject 1x1 probes with an
+# "image length and width" 400, which would falsely mark vision-capable
+# models as unsupported. Keep it small (306 bytes) but above minimum-size
+# checks.
 _TINY_IMAGE_DATA_URL = (
     "data:image/png;base64,"
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
-    "YAAAAAYAAjCB0C8AAAAASUVORK5CYII="
+    "iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAIAAABMXPacAAAA+ElEQVR4nO3RMQ0A"
+    "MAzAsEIp/3sAB6NHLAVAJM/b1WFzfhAPAIB2AAC0AwCgHQAA7QAAaAcAQDsAANoB"
+    "ANAOAIB2AAC0AwCgHQAA7QAAaAcAQDsAANoBANAOAIB2AAC0AwCgHQAA7QAAaAcA"
+    "QDsAANoBANAOAIB2AAC0AwCgHQAA7QAAaAcAQDsAANoBANAOAIB2AAC0AwCgHQAA"
+    "7QAAaAcAQDsAANoBANAOAIB2AAC0AwCgHQAA7QAAaAcAQDsAANp925MD"
+    "lLkrqhMAAAAASUVORK5CYII="
 )
 _TINY_WAV_BASE64 = "UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAAA"
 _MODALITY_TO_CAPABILITY = {

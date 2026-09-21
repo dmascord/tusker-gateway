@@ -32,7 +32,7 @@ from typing import Iterator
 from tusker_gateway.storage import shared_database
 
 
-MODEL_CAPABILITY_PROBE_VERSION = "model-capability-v1"
+MODEL_CAPABILITY_PROBE_VERSION = "model-capability-v2"
 # Hindsight and other memory clients depend on a stricter contract than a
 # generic successful chat: the response must contain parseable JSON. Keep
 # this evidence in the same durable capability store so privacy-pool routing
