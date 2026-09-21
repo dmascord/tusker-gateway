@@ -1669,13 +1669,14 @@ def _high_impact_content_kind(
     """
     if content_regex is None or not isinstance(messages, list):
         return None
-    for message in messages:
+    for message_index, message in enumerate(messages):
         if not isinstance(message, dict):
             continue
         role = str(message.get("role") or "")
         if role != "user":
             continue
         content = message.get("content")
+        content_format = "parts" if isinstance(content, list) else type(content).__name__
         if isinstance(content, list):
             content = " ".join(
                 str(item.get("text", ""))
@@ -1684,7 +1685,23 @@ def _high_impact_content_kind(
             )
         if not isinstance(content, str) or not content:
             continue
-        if content_regex.search(content):
+        match = content_regex.search(content)
+        if match:
+            matched_text = re.sub(r"\s+", " ", match.group(0)).strip()
+            # Record provenance without retaining the user message. The hash
+            # lets operators correlate repeated payloads while the bounded
+            # match identifies which policy signal fired.
+            logger.warning(
+                "high-impact content source role=user message_index=%d "
+                "content_format=%s content_length=%d system_notice=%s "
+                "matched_text=%r content_sha256=%s",
+                message_index,
+                content_format,
+                len(content),
+                "<system-notice>" in content.lower(),
+                matched_text[:160],
+                hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            )
             return f"{role or 'message'}_content"
     return None
 
