@@ -113,6 +113,19 @@ def _extract_answer(value: Any) -> tuple[bool, bool]:
     return False, False
 
 
+def _latest_user_answer(messages: list[Any]) -> tuple[bool, bool, list[Any]]:
+    """Recognize an OMP client that submits the selection as user text."""
+    if not messages or not isinstance(messages[-1], dict):
+        return False, False, messages
+    if messages[-1].get("role") != "user":
+        return False, False, messages
+    content = messages[-1].get("content")
+    found, approved = _extract_answer(content)
+    if not found:
+        return False, False, messages
+    return True, approved, messages[:-1]
+
+
 def _message_content(message: dict[str, Any]) -> Any:
     content = message.get("content")
     if isinstance(content, str):
@@ -376,6 +389,10 @@ def question_authorized_for_content(
     if not isinstance(messages, list):
         return False
     expected_signature = _content_signature(messages, action)
+    answer_found, answer_approved, messages_without_answer = _latest_user_answer(messages)
+    accepted_signatures = {expected_signature}
+    if answer_found:
+        accepted_signatures.add(_content_signature(messages_without_answer, action))
     questions: set[str] = set()
     result_ids: set[str] = set()
     results: dict[str, Any] = {}
@@ -408,11 +425,17 @@ def question_authorized_for_content(
         if (
             pending.get("scope") != "content"
             or pending.get("action") != action
-            or pending.get("signature") != expected_signature
-            or (call_id not in questions and call_id not in result_ids)
+            or pending.get("signature") not in accepted_signatures
+            or (
+                call_id not in questions
+                and call_id not in result_ids
+                and not answer_found
+            )
         ):
             continue
         found, approved = _extract_answer(results.get(call_id))
+        if not found and answer_found:
+            found, approved = answer_found, answer_approved
         if not found:
             continue
         _PENDING.pop(call_id, None)

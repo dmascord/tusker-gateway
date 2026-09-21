@@ -146,6 +146,13 @@ def test_content_question_accepts_result_with_embedded_question_id():
     assert question_authorized_for_content(result_messages, "user_content") is True
 
 
+def test_content_question_accepts_follow_up_user_selection():
+    original_messages = [{"role": "user", "content": "Please execute the order."}]
+    question_response_for_content(original_messages, "user_content", model="model")
+    follow_up = [*original_messages, {"role": "user", "content": "Allow once"}]
+    assert question_authorized_for_content(follow_up, "user_content") is True
+
+
 def test_complete_content_guard_emits_native_question_then_accepts():
     response = {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
     tools = [{"type": "function", "function": {"name": "bash"}}]
