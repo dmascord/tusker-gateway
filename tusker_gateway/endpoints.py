@@ -1564,10 +1564,18 @@ def _validate_tool_call_contract(
         function = call.get("function") or {}
         actual_name = str(function.get("name") or "").strip()
         if actual_name not in declared:
-            raise ToolCallContractError(
-                reason="undeclared_tool",
-                actual_tool=actual_name or None,
+            logger.warning(
+                "forwarding undeclared tool call to client actual=%s declared=%s",
+                actual_name or "none",
+                ",".join(sorted(declared)) or "none",
             )
+            # The connected client is the authority for its tool registry.
+            # Some clients support native tools that are intentionally omitted
+            # from the provider-facing declaration. Preserve the call so the
+            # client can execute it or return a user-visible invalid-tool
+            # message; the gateway must not invent a schema or quarantine the
+            # provider based only on the name mismatch.
+            continue
         if mode == "named" and actual_name != expected_name:
             raise ToolCallContractError(
                 reason="named_tool_mismatch",
@@ -2896,6 +2904,9 @@ def _quarantine_tool_response_failure(
         seconds,
         getattr(exc, "reason", getattr(exc, "code", type(exc).__name__)),
     )
+
+    # An undeclared tool is deliberately forwarded to the connected client;
+    # it is not evidence that the provider route is unusable.
 
 
 def _quarantine_stream_loop(

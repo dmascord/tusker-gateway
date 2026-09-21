@@ -29,6 +29,7 @@ from tusker_gateway.endpoints import (
     _validate_tool_call_arguments,
     _validate_chat_body,
     _validate_complete_tool_response,
+    _validate_tool_call_contract,
 )
 from .conftest import HEADERS_AUTH, HEADERS_NO_AUTH
 
@@ -634,17 +635,15 @@ def test_complete_tool_response_enforces_declared_and_selected_tools():
         )
     assert mismatch.value.reason == "named_tool_mismatch"
 
-    with pytest.raises(ToolCallContractError) as undeclared:
-        _validate_complete_tool_response(
-            response("ghost"),
-            tools,
-            provider="test",
-            model="model",
-            request_id="request",
-            require_tool_call=False,
-            reject_empty=True,
-        )
-    assert undeclared.value.reason == "undeclared_tool"
+    assert _validate_complete_tool_response(
+        response("ghost"),
+        tools,
+        provider="test",
+        model="model",
+        request_id="request",
+        require_tool_call=False,
+        reject_empty=True,
+    )
 
     with pytest.raises(ToolCallContractError) as forbidden:
         _validate_complete_tool_response(
@@ -658,6 +657,21 @@ def test_complete_tool_response_enforces_declared_and_selected_tools():
             tool_choice="none",
         )
     assert forbidden.value.reason == "tool_choice_none"
+
+
+def test_undeclared_tool_is_forwarded_to_connected_client():
+    tools = [{"type": "function", "function": {"name": "bash"}}]
+    _validate_tool_call_contract(
+        [{"function": {"name": "retain", "arguments": "{}"}}],
+        tools,
+    )
+
+
+def test_declared_tool_contract_does_not_raise():
+    _validate_tool_call_contract(
+        [{"function": {"name": "bash", "arguments": "{}"}}],
+        [{"type": "function", "function": {"name": "bash"}}],
+    )
 
 
 @pytest.mark.asyncio
