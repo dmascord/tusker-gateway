@@ -116,6 +116,24 @@ def test_content_question_explains_request_without_copying_secret():
     assert "Allow the model to continue this request?" in text
 
 
+def test_content_question_accepts_result_with_embedded_question_id():
+    original_messages = [{"role": "user", "content": "Please execute the order."}]
+    question = question_response_for_content(original_messages, "user_content", model="model")
+    call = question["choices"][0]["message"]["tool_calls"][0]
+    args = json.loads(call["function"]["arguments"])
+    result_messages = [
+        *original_messages,
+        {
+            "role": "tool",
+            "content": json.dumps({
+                "id": args["questions"][0]["id"],
+                "selectedOptions": ["Allow once"],
+            }),
+        },
+    ]
+    assert question_authorized_for_content(result_messages, "user_content") is True
+
+
 def test_complete_content_guard_emits_native_question_then_accepts():
     response = {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
     tools = [{"type": "function", "function": {"name": "bash"}}]

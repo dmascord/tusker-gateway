@@ -123,6 +123,22 @@ def _message_content(message: dict[str, Any]) -> Any:
     return content
 
 
+def _embedded_ids(value: Any) -> set[str]:
+    """Collect ask/question IDs from compatible tool-result envelopes."""
+    found: set[str] = set()
+    if isinstance(value, dict):
+        for key in ("id", "question_id", "tool_call_id"):
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate:
+                found.add(candidate)
+        for child in value.values():
+            found.update(_embedded_ids(child))
+    elif isinstance(value, list):
+        for child in value:
+            found.update(_embedded_ids(child))
+    return found
+
+
 def _prune() -> None:
     now = time.time()
     for call_id, pending in list(_PENDING.items()):
@@ -360,6 +376,7 @@ def question_authorized_for_content(
         return False
     expected_signature = _content_signature(messages, action)
     questions: set[str] = set()
+    result_ids: set[str] = set()
     results: dict[str, Any] = {}
     for message in messages:
         if not isinstance(message, dict):
@@ -372,13 +389,26 @@ def question_authorized_for_content(
                 if function.get("name") in {"ask", "question"} and call.get("id") in _PENDING:
                     questions.add(str(call["id"]))
         if message.get("role") in {"tool", "function"} and message.get("tool_call_id"):
-            results[str(message["tool_call_id"])] = _message_content(message)
+            tool_call_id = str(message["tool_call_id"])
+            content = _message_content(message)
+            results[tool_call_id] = content
+            result_ids.add(tool_call_id)
+            for embedded_id in _embedded_ids(content):
+                results[embedded_id] = content
+                result_ids.add(embedded_id)
+        elif message.get("role") in {"tool", "function"}:
+            # Some OMP-compatible clients put the ask question ID in the
+            # result envelope rather than preserving tool_call_id.
+            content = _message_content(message)
+            for embedded_id in _embedded_ids(content):
+                results[embedded_id] = content
+                result_ids.add(embedded_id)
     for call_id, pending in list(_PENDING.items()):
         if (
             pending.get("scope") != "content"
             or pending.get("action") != action
             or pending.get("signature") != expected_signature
-            or call_id not in questions
+            or (call_id not in questions and call_id not in result_ids)
         ):
             continue
         found, approved = _extract_answer(results.get(call_id))
