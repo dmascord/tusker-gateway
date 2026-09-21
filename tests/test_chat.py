@@ -128,6 +128,25 @@ def test_validation_stream_message_explains_invalid_tool_arguments_safely():
     assert "949" not in message
 
 
+def test_validation_stream_message_distinguishes_invalid_json_from_missing_fields():
+    message = _validation_stream_message(
+        "req-invalid-json-1",
+        error=InvalidToolCallArgumentsError(
+            tool_name="bash",
+            reason="invalid_json",
+            argument_chars=212,
+        ),
+        provider="xiaomi",
+        model="mimo-v2.5",
+    )
+
+    assert "xiaomi/mimo-v2.5" in message
+    assert "tool 'bash'" in message
+    assert "not valid JSON" in message
+    assert "missing required argument(s)" not in message
+    assert "the tool schema" not in message
+
+
 def test_native_ask_payload_ignores_unrelated_declared_required_field():
     _validate_tool_call_arguments(
         [{

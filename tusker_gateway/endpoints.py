@@ -3108,12 +3108,16 @@ def _validation_stream_message(
     if loop_failure:
         detail = "The provider stream ended unexpectedly before it could be completed."
     elif isinstance(error, InvalidToolCallArgumentsError):
-        missing = ", ".join(error.missing) if error.missing else "the tool schema"
         route = f" from {provider}/{model}" if provider and model else ""
-        detail = (
-            f"The provider{route} returned invalid arguments for tool "
-            f"'{error.tool_name}': missing required argument(s): {missing}."
-        )
+        if error.reason == "invalid_json":
+            problem = "the arguments were not valid JSON"
+        elif error.reason == "arguments_not_object":
+            problem = "the arguments were not a JSON object"
+        elif error.missing:
+            problem = f"missing required argument(s): {', '.join(error.missing)}"
+        else:
+            problem = "the arguments did not satisfy the tool schema"
+        detail = f"The provider{route} returned invalid arguments for tool '{error.tool_name}': {problem}."
     else:
         detail = "The gateway could not use the provider's tool response."
     return f"{detail} The route was temporarily quarantined; Retry the request. Request ID: {request_id}."
