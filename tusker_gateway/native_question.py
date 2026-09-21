@@ -266,10 +266,28 @@ def question_response_for_content(
 ) -> dict[str, Any]:
     """Convert a risky user-content request into an OMP-native ask call."""
     _prune()
+    signature = _content_signature(messages, action)
+    # OMP can retry the original request while the interactive ask result is
+    # being assembled. Reusing the pending response makes that retry
+    # idempotent: it cannot create a second visible prompt or approval ID.
+    for pending in _PENDING.values():
+        if (
+            pending.get("scope") == "content"
+            and pending.get("action") == action
+            and pending.get("signature") == signature
+            and isinstance(pending.get("response"), dict)
+        ):
+            logger.info(
+                "reusing pending content question approval_id=%s request_id=%s",
+                pending.get("approval_id", "unknown"),
+                request_id or "unknown",
+            )
+            return pending["response"]
+
     approval_id = str(uuid.uuid4())
     call_id = approval_id
-    signature = _content_signature(messages, action)
     _PENDING[call_id] = {
+        "approval_id": call_id,
         "signature": signature,
         "scope": "content",
         "expires_at": time.time() + _TTL_SECS,
@@ -312,7 +330,7 @@ def question_response_for_content(
             ],
         }],
     }
-    return {
+    response = {
         "id": "chatcmpl-" + secrets.token_hex(12),
         "object": "chat.completion",
         "model": model or "tusker-gateway",
@@ -330,6 +348,8 @@ def question_response_for_content(
             "finish_reason": "tool_calls",
         }],
     }
+    _PENDING[call_id]["response"] = response
+    return response
 
 
 def question_authorized(

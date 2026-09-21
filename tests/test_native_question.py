@@ -160,6 +160,27 @@ def test_content_question_preflight_is_single_and_avoids_provider_identity():
     ) is None
 
 
+def test_repeated_content_preflight_reuses_same_question_id():
+    messages = [{"role": "user", "content": "Please submit_order now."}]
+    regex = re.compile(r"submit[_ -]?order", re.IGNORECASE)
+    first = _native_content_question_if_needed(
+        messages,
+        model="requested-model",
+        content_regex=regex,
+        request_id="req-first",
+    )
+    retry = _native_content_question_if_needed(
+        messages,
+        model="requested-model",
+        content_regex=regex,
+        request_id="req-retry",
+    )
+    assert first is retry
+    first_call = first["choices"][0]["message"]["tool_calls"][0]
+    retry_call = retry["choices"][0]["message"]["tool_calls"][0]
+    assert first_call["id"] == retry_call["id"]
+
+
 def test_content_question_accepts_result_with_embedded_question_id():
     original_messages = [{"role": "user", "content": "Please execute the order."}]
     question = question_response_for_content(original_messages, "user_content", model="model")
