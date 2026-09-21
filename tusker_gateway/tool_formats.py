@@ -130,6 +130,28 @@ def tool_markup_kinds(text: Any) -> tuple[str, ...]:
     return tuple(name for name, pattern in patterns if pattern.search(text))
 
 
+def tool_markup_has_opening(text: Any) -> bool:
+    """Return whether text contains an actual tool-envelope opener.
+
+    Closing tags are common residue when a model abandons a text-formatted
+    call.  They are safe to strip and must not be treated as evidence of an
+    incomplete tool call.  This helper deliberately distinguishes those
+    orphan closers from open envelopes, which still need failover handling.
+    """
+    if not isinstance(text, str) or not text:
+        return False
+    return bool(
+        re.search(
+            r"<\s*(?!/)(?:\|\s*)?(?:[\w-]+:)?(?:tool_call|function_call|tool_calls|function_calls|tool_use|tool_invocation|dots_function_call|dots_tool_call)(?::[^>\s]+)?\s*(?:\|)?\s*>",
+            text,
+            re.IGNORECASE,
+        )
+        or _GENERIC_TOOL_BLOCK_RE.search(text)
+        or _BARE_FUNCTION_BLOCK_RE.search(text)
+        or re.search(r"<\s*(?:invoke|function|tool)\s+name\s*=", text, re.IGNORECASE)
+    )
+
+
 def _openai_content_to_anthropic(content: Any) -> str | list[dict[str, Any]]:
     if isinstance(content, str):
         return content

@@ -648,6 +648,42 @@ def test_stripper_strips_orphan_closing_tags():
     assert "We need to decide next action" in out
 
 
+def test_tool_markup_opening_distinguishes_orphan_closers():
+    from tusker_gateway.tool_formats import tool_markup_has_opening
+
+    assert not tool_markup_has_opening("</tool_call>\n<|/tool_call|>")
+    assert tool_markup_has_opening("<tool_call>")
+    assert tool_markup_has_opening('<invoke name="bash">')
+
+
+@pytest.mark.asyncio
+async def test_stream_normalizer_tolerates_only_orphan_tool_closers():
+    """Abandoned closing tags must not quarantine an otherwise usable route."""
+    import json as _json
+    from tusker_gateway.endpoints import _normalize_stream
+
+    async def orphan_stream():
+        for value in ("</tool_call>\n", "<|/tool_call|>"):
+            payload = {"choices": [{"delta": {"content": value}}]}
+            yield f"data: {_json.dumps(payload)}\n\n".encode()
+        yield b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    frames = []
+    async for frame in _normalize_stream(
+        orphan_stream(),
+        provider="xiaomi",
+        model="mimo-v2.5",
+        tools_requested=True,
+    ):
+        frames.append(frame)
+
+    body = b"".join(frames)
+    assert b"</tool_call>" not in body
+    assert b"<|/tool_call|>" not in body
+    assert b'"finish_reason": "stop"' in body
+
+
 def test_stripper_handles_generic_invoke_block_split_across_chunks():
     s = _ToolCallStripper()
     assert s.feed('<invoke name="bash">') == ""

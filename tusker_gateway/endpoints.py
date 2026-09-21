@@ -950,6 +950,7 @@ async def _normalize_stream(
     from tusker_gateway.tool_formats import (
         parse_text_tool_calls,
         strip_tool_text,
+        tool_markup_has_opening,
         tool_diagnostics_enabled,
         tool_markup_kinds,
     )
@@ -960,6 +961,7 @@ async def _normalize_stream(
     saw_done = False
     saw_tool_call = False
     saw_tool_markup = False
+    saw_tool_markup_opening = False
     saw_visible_content = False
     reasoning_window = ""
     promoted_reasoning_window = ""
@@ -1078,10 +1080,11 @@ async def _normalize_stream(
                 tool_stripper.flush()
                 if require_tool_call and not saw_tool_call:
                     raise required_tool_error()
-                if tools_requested and saw_tool_markup and not saw_tool_call:
+                if tools_requested and saw_tool_markup_opening and not saw_tool_call:
                     raise malformed_tool_error()
                 if tools_requested and not saw_tool_call and not saw_visible_content:
-                    raise unusable_tool_error("reasoning_only_or_empty")
+                    if not saw_tool_markup or saw_tool_markup_opening:
+                        raise unusable_tool_error("reasoning_only_or_empty")
                 if emitted_finish_reason is None:
                     emitted_finish_reason = "tool_calls" if saw_tool_call else "stop"
                     yield finish_frame(emitted_finish_reason)
@@ -1200,6 +1203,8 @@ async def _normalize_stream(
             if raw_marker_types:
                 saw_tool_markup = True
                 tool_markup_seen.update(raw_marker_types)
+                if any(tool_markup_has_opening(value) for _, value in raw_texts):
+                    saw_tool_markup_opening = True
 
             cleaned_content = ""
             cleaned_auxiliary: dict[str, str] = {}
@@ -1379,9 +1384,14 @@ async def _normalize_stream(
             if fr:
                 # Finish is always last. In particular, a same-event text
                 # function block must be promoted before this frame.
-                if tools_requested and saw_tool_markup and not saw_tool_call:
+                if tools_requested and saw_tool_markup_opening and not saw_tool_call:
                     raise malformed_tool_error()
-                if tools_requested and not saw_tool_call and not saw_visible_content:
+                if (
+                    tools_requested
+                    and not saw_tool_call
+                    and not saw_visible_content
+                    and saw_tool_markup_opening
+                ):
                     raise unusable_tool_error("reasoning_only_or_empty")
                 if has_delta_text:
                     content_delta = {
@@ -1438,10 +1448,11 @@ async def _normalize_stream(
         )
     if require_tool_call and not saw_tool_call:
         raise required_tool_error()
-    if tools_requested and saw_tool_markup and not saw_tool_call:
+    if tools_requested and saw_tool_markup_opening and not saw_tool_call:
         raise malformed_tool_error()
     if tools_requested and not saw_tool_call and not saw_visible_content:
-        raise unusable_tool_error("reasoning_only_or_empty")
+        if not saw_tool_markup or saw_tool_markup_opening:
+            raise unusable_tool_error("reasoning_only_or_empty")
     if emitted_finish_reason is None:
         emitted_finish_reason = "tool_calls" if saw_tool_call else "stop"
         yield finish_frame(emitted_finish_reason)
