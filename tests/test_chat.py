@@ -25,6 +25,7 @@ from tusker_gateway.endpoints import (
     _validation_stream_message,
     _request_conversation_id,
     _required_input_modalities,
+    _validate_tool_call_arguments,
     _validate_chat_body,
     _validate_complete_tool_response,
 )
@@ -103,6 +104,33 @@ def test_validation_stream_message_is_actionable_for_omp_clients():
     assert "Retry the request" in message
     assert "req-validation-1" in message
     assert "ended unexpectedly" in loop_message
+
+
+def test_native_ask_payload_ignores_unrelated_declared_required_field():
+    _validate_tool_call_arguments(
+        [{
+            "function": {
+                "name": "ask",
+                "arguments": json.dumps({
+                    "questions": [{
+                        "id": "q-1",
+                        "question": "Continue?",
+                        "options": [{"label": "Allow once"}],
+                    }],
+                }),
+            },
+        }],
+        [{
+            "type": "function",
+            "function": {
+                "name": "ask",
+                "parameters": {"type": "object", "required": ["i"]},
+            },
+        }],
+        provider="google",
+        model="gemini",
+        request_id="req-native-ask",
+    )
 
 
 def test_public_provider_non_capacity_failure_does_not_leak_upstream_body():

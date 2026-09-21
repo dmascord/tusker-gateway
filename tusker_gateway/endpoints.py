@@ -1841,6 +1841,33 @@ def _tool_call_signature(calls: list[dict[str, Any]]) -> str:
     return ",".join(signature) or "none"
 
 
+def _is_native_question_arguments(arguments: Any) -> bool:
+    """Recognize the OMP built-in ``ask`` payload independent of its schema."""
+    if not isinstance(arguments, dict) or not isinstance(arguments.get("questions"), list):
+        return False
+    questions = arguments["questions"]
+    if not questions:
+        return False
+    for question in questions:
+        if not isinstance(question, dict):
+            return False
+        if not isinstance(question.get("id"), str) or not question["id"].strip():
+            return False
+        if not isinstance(question.get("question"), str) or not question["question"].strip():
+            return False
+        options = question.get("options")
+        if not isinstance(options, list) or not options:
+            return False
+        if any(
+            not isinstance(option, dict)
+            or not isinstance(option.get("label"), str)
+            or not option["label"].strip()
+            for option in options
+        ):
+            return False
+    return True
+
+
 def _validate_tool_call_arguments(
     calls: list[dict[str, Any]],
     tools: Any,
@@ -1869,7 +1896,14 @@ def _validate_tool_call_arguments(
                 reason = "arguments_not_object"
                 missing = ()
             else:
-                missing = tuple(
+                # OMP's built-in ask tool has a stable interactive payload
+                # (questions/id/options). Some clients also declare an ask
+                # schema with unrelated required fields such as ``i``; those
+                # must not reject a valid native question.
+                missing = () if (
+                    name in {"ask", "question"}
+                    and _is_native_question_arguments(arguments)
+                ) else tuple(
                     key for key in required_by_name.get(name, ()) if key not in arguments
                 )
                 reason = "missing_required" if missing else ""
