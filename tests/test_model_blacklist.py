@@ -312,6 +312,16 @@ def test_high_impact_call_kind_blocks_instrument_token_in_arguments(monkeypatch)
     assert _high_impact_call_kind(call, argument_regex=regex) == "submit_market_order"
 
 
+def test_native_question_tool_text_does_not_recurse_into_high_impact_gate():
+    call = {
+        "function": {
+            "name": "ask",
+            "arguments": '{"questions":[{"id":"q-1","question":"Approve submit_order?"}]}',
+        },
+    }
+    assert _high_impact_call_kind(call) is None
+
+
 def test_high_impact_call_kind_blocks_fixture_payload(monkeypatch):
     """The actual goal-injection fixture trips the gate even without place_trade."""
     config = _fixture_config(monkeypatch)

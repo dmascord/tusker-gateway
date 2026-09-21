@@ -1644,6 +1644,11 @@ def _high_impact_call_kind(
     name = str(function.get("name") or "").strip().lower()
     argument_text = _tool_argument_text(function.get("arguments"))
     regex = argument_regex or _HIGH_IMPACT_ARGUMENT_RE
+    # OMP's built-in interactive question tool may quote the risky action in
+    # its question text (for example, ``submit_order``). That text is not the
+    # action being executed and must not recursively trigger approval for ask.
+    if name in {"ask", "question"}:
+        return None
     if name in {"place_trade", "submit_order", "send_message"}:
         return name
     if name in _SHELL_TOOL_NAMES:
