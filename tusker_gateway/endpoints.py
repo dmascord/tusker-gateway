@@ -2905,6 +2905,15 @@ def _approval_stream_message(exc: HighImpactApprovalRequiredError, request_id: s
     )
 
 
+def _validation_stream_message(request_id: str, *, loop_failure: bool = False) -> str:
+    """Return actionable text for gateway-generated stream validation stops."""
+    if loop_failure:
+        detail = "The provider stream ended unexpectedly before it could be completed."
+    else:
+        detail = "The gateway could not use the provider's tool response."
+    return f"{detail} Retry the request. Request ID: {request_id}."
+
+
 def _mark_permanently_failed(
     exc: Exception,
     provider: str,
@@ -5207,6 +5216,11 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                     if approval_required:
                         stream_error_message = _approval_stream_message(exc, request_id)
                         stream_error_code = "approval_required"
+                    elif tool_response_failure or stream_loop_failure:
+                        stream_error_message = _validation_stream_message(
+                            request_id,
+                            loop_failure=stream_loop_failure,
+                        )
                     request["_stream_error_code"] = stream_error_code
                     request["_stream_error_detail"] = stream_error_message
                     # Stream validation failures happen after the HTTP 200 has
@@ -5248,13 +5262,20 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                         exc_info=True,
                     )
                     try:
-                        if approval_required:
-                            approval_message = _approval_stream_message(exc, request_id)
+                        if approval_required or tool_response_failure or stream_loop_failure:
+                            client_message = (
+                                _approval_stream_message(exc, request_id)
+                                if approval_required
+                                else _validation_stream_message(
+                                    request_id,
+                                    loop_failure=stream_loop_failure,
+                                )
+                            )
                             await resp.write(
                                 sse_frame(
                                     format_openai_chunk(
-                                        approval_message,
-                                        model=target_model,
+                                        client_message,
+                                        model="tusker-gateway",
                                     )
                                 )
                             )
@@ -5262,7 +5283,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                                 sse_frame(
                                     format_openai_chunk(
                                         finish_reason="stop",
-                                        model=target_model,
+                                        model="tusker-gateway",
                                     )
                                 )
                             )
@@ -5368,6 +5389,15 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                     status = "approval_required"
                     stream_error_message = _approval_stream_message(exc, request_id)
                     stream_error_code = "approval_required"
+                elif isinstance(exc, (ProviderStreamLoopError, InvalidToolCallArgumentsError,
+                                      MalformedToolCallError, RequiredToolCallError,
+                                      ToolCallContractError, UnusableToolResponseError)):
+                    status = "stream_validation_error"
+                    stream_error_message = _validation_stream_message(
+                        request_id,
+                        loop_failure=isinstance(exc, ProviderStreamLoopError),
+                    )
+                    stream_error_code = "stream_validation_error"
                 request["_stream_error"] = status
                 request["_stream_error_code"] = stream_error_code
                 request["_stream_error_detail"] = stream_error_message
@@ -5382,7 +5412,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                             sse_frame(
                                 format_openai_chunk(
                                     _approval_stream_message(exc, request_id),
-                                    model=target_model,
+                                    model="tusker-gateway",
                                 )
                             )
                         )
@@ -5390,7 +5420,29 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                             sse_frame(
                                 format_openai_chunk(
                                     finish_reason="stop",
-                                    model=target_model,
+                                    model="tusker-gateway",
+                                )
+                            )
+                        )
+                    elif isinstance(exc, (ProviderStreamLoopError, InvalidToolCallArgumentsError,
+                                          MalformedToolCallError, RequiredToolCallError,
+                                          ToolCallContractError, UnusableToolResponseError)):
+                        await stream_resp.write(
+                            sse_frame(
+                                format_openai_chunk(
+                                    _validation_stream_message(
+                                        request_id,
+                                        loop_failure=isinstance(exc, ProviderStreamLoopError),
+                                    ),
+                                    model="tusker-gateway",
+                                )
+                            )
+                        )
+                        await stream_resp.write(
+                            sse_frame(
+                                format_openai_chunk(
+                                    finish_reason="stop",
+                                    model="tusker-gateway",
                                 )
                             )
                         )

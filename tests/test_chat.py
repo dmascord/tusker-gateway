@@ -22,6 +22,7 @@ from tusker_gateway.endpoints import (
     _public_provider_failure_response,
     _public_stream_error,
     _approval_stream_message,
+    _validation_stream_message,
     _request_conversation_id,
     _required_input_modalities,
     _validate_chat_body,
@@ -92,6 +93,16 @@ def test_approval_stream_message_is_actionable_for_omp_clients():
     assert "user_content" in message
     assert "Approve it explicitly" in message
     assert "req-approval-1" in message
+
+
+def test_validation_stream_message_is_actionable_for_omp_clients():
+    message = _validation_stream_message("req-validation-1")
+    loop_message = _validation_stream_message("req-loop-1", loop_failure=True)
+
+    assert "could not use the provider's tool response" in message
+    assert "Retry the request" in message
+    assert "req-validation-1" in message
+    assert "ended unexpectedly" in loop_message
 
 
 def test_public_provider_non_capacity_failure_does_not_leak_upstream_body():
