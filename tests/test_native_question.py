@@ -57,6 +57,51 @@ def test_risky_call_becomes_native_question_tool_call():
     }
 
 
+def test_risky_call_question_shows_the_proposed_arguments_before_execution():
+    call = [{
+        "id": "call-bash",
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "arguments": json.dumps({
+                "command": "cd /srv/app && rsync -a ./build/ visor:/srv/app/ && rm -rf /tmp/build",
+            }),
+        },
+    }]
+    response = question_response_for_calls(call, model="model")
+    args = json.loads(
+        response["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+    )
+    question = args["questions"][0]["question"]
+    assert "bash command:" in question
+    assert "cd /srv/app && rsync -a ./build/ visor:/srv/app/ && rm -rf /tmp/build" in question
+    assert "Review these arguments before approving." in question
+
+
+def test_risky_call_question_redacts_credentials_and_bounds_preview():
+    secret = "sk-live-1234567890abcdef"
+    call = [{
+        "id": "call-bash",
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "arguments": json.dumps({
+                "command": f"rm -rf /tmp/build && curl -H 'Authorization: Bearer {secret}' " + "x" * 2000,
+                "api_key": "another-secret-value",
+            }),
+        },
+    }]
+    response = question_response_for_calls(call, model="model")
+    args = json.loads(
+        response["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+    )
+    question = args["questions"][0]["question"]
+    assert secret not in question
+    assert "another-secret-value" not in question
+    assert "[redacted]" in question
+    assert len(question) < 800
+
+
 def test_question_result_authorizes_exact_call():
     question = question_response_for_calls(_trade_call(), model="model")
     call = question["choices"][0]["message"]["tool_calls"][0]

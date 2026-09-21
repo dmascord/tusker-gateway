@@ -98,6 +98,68 @@ def _content_approval_preview(messages: Any, *, max_chars: int = 180) -> str:
     return "the user request"
 
 
+_SENSITIVE_ARGUMENT_KEY = re.compile(
+    r"(?i)(?:api[_-]?key|access[_-]?token|auth(?:orization)?|credential|password|secret|token)"
+)
+_CREDENTIAL_VALUE = re.compile(
+    r"(?i)\b(?:bearer\s+|sk-|gh[pousr]_)[A-Za-z0-9._~+/=-]{8,}"
+)
+
+
+def _redact_approval_value(value: Any, *, key: str = "") -> Any:
+    """Redact credentials from values copied into an interactive prompt."""
+    if _SENSITIVE_ARGUMENT_KEY.search(key):
+        return "[redacted]"
+    if isinstance(value, dict):
+        return {
+            str(child_key): _redact_approval_value(child_value, key=str(child_key))
+            for child_key, child_value in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_approval_value(child) for child in value]
+    if isinstance(value, str):
+        return _CREDENTIAL_VALUE.sub("[redacted]", value)
+    return value
+
+
+def _call_approval_preview(calls: list[dict[str, Any]], *, max_chars: int = 600) -> str:
+    """Describe the proposed tool call before asking the user to approve it.
+
+    Tool output cannot be shown yet because the tool has not run. The prompt
+    therefore shows the exact proposed arguments, with bounded length and
+    credential-shaped values removed.
+    """
+    previews: list[str] = []
+    for call in calls[:4]:
+        function = call.get("function") or {}
+        name = str(function.get("name") or "unknown")
+        arguments = function.get("arguments", {})
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments or "{}")
+            except (TypeError, json.JSONDecodeError):
+                arguments = _CREDENTIAL_VALUE.sub("[redacted]", arguments)
+        arguments = _redact_approval_value(arguments)
+
+        # Shell tools are much easier to review when the command is shown
+        # directly instead of buried in a JSON object.
+        if isinstance(arguments, dict) and isinstance(
+            arguments.get("command") or arguments.get("cmd") or arguments.get("script"),
+            str,
+        ):
+            command = arguments.get("command") or arguments.get("cmd") or arguments.get("script")
+            previews.append(f"{name} command:\n{command}")
+        else:
+            previews.append(f"{name} arguments: {_canonical(arguments)}")
+
+    if len(calls) > 4:
+        previews.append(f"… and {len(calls) - 4} more tool call(s)")
+    preview = "\n".join(previews) or "(no tool arguments were provided)"
+    if len(preview) > max_chars:
+        preview = preview[: max_chars - 1].rstrip() + "…"
+    return preview
+
+
 def _extract_answer(value: Any) -> tuple[bool, bool]:
     """Return (answer_found, approved) from OMP ask-tool result shapes."""
     if isinstance(value, bool):
@@ -243,7 +305,11 @@ def question_response_for_calls(
         "questions": [{
             "id": call_id,
             "header": "Approval",
-            "question": f"Allow high-impact tool action '{action}'?",
+            "question": (
+                f"Allow high-impact tool action '{action}'?\n"
+                f"Proposed action:\n{_call_approval_preview(calls)}\n"
+                "Review these arguments before approving."
+            ),
             "options": [
                 {"label": "Allow once", "description": "Execute this exact tool call once."},
                 {"label": "Deny", "description": "Do not execute this tool call."},
