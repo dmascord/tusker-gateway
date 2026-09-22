@@ -1893,6 +1893,33 @@ async def test_chat_completions_streaming_emits_role_chunk_first(client):
 
 
 @pytest.mark.asyncio
+async def test_chat_stream_provider_error_is_actionable_text_not_in_band_error(client):
+    """OMP must receive the sanitized provider error instead of its opaque banner."""
+    async def failing_stream(*args, **kwargs):
+        yield b'data: {"content": "before failure"}\n\n'
+        raise ProviderError("socket timed out", code="upstream_error")
+
+    with patch("tusker_gateway.endpoints.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
+        mock_chat.return_value = failing_stream()
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-code",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+            },
+            headers=HEADERS_AUTH,
+        )
+        body = await response.read()
+
+    assert response.status == 200
+    assert b"Upstream provider error" in body
+    assert b"socket timed out" in body
+    assert b'"error"' not in body
+    assert b"data: [DONE]" in body
+
+
+@pytest.mark.asyncio
 async def test_chat_stream_sends_first_event_before_provider_dispatch(client):
     """The first SSE data event must not wait for provider connection/prefetch."""
     provider_started = asyncio.Event()

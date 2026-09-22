@@ -5618,44 +5618,44 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                         exc_info=True,
                     )
                     try:
-                        if approval_required or tool_response_failure or stream_loop_failure:
-                            client_message = (
-                                _approval_stream_message(exc, request_id)
-                                if approval_required
-                                else _validation_stream_message(
-                                    request_id,
-                                    loop_failure=stream_loop_failure,
-                                    error=exc,
-                                    provider=provider,
-                                    model=target_model,
-                                )
-                            )
-                            await resp.write(
-                                sse_frame(
-                                    format_openai_chunk(
-                                        client_message,
-                                        model="tusker-gateway",
-                                    )
-                                )
-                            )
-                            await resp.write(
-                                sse_frame(
-                                    format_openai_chunk(
-                                        finish_reason="stop",
-                                        model="tusker-gateway",
-                                    )
-                                )
+                        # Once the 200/SSE response is committed, an OpenAI
+                        # ``error`` event is technically valid but OMP renders
+                        # it as the opaque banner ``Provider returned an
+                        # in-band ... stream error`` and discards the useful
+                        # request/provider details. Emit the sanitized error
+                        # as ordinary assistant text for every post-commit
+                        # failure, then close normally. This preserves the
+                        # actionable message for OMP and other conversational
+                        # clients while the access log retains structured
+                        # error fields and the route is still quarantined.
+                        if approval_required:
+                            client_message = _approval_stream_message(exc, request_id)
+                        elif tool_response_failure or stream_loop_failure:
+                            client_message = _validation_stream_message(
+                                request_id,
+                                loop_failure=stream_loop_failure,
+                                error=exc,
+                                provider=provider,
+                                model=target_model,
                             )
                         else:
-                            await resp.write(
-                                sse_frame({
-                                    "error": openai_error(
-                                        stream_error_message,
-                                        code=stream_error_code,
-                                        error_type="provider_error",
-                                    )
-                                })
+                            client_message = stream_error_message
+                        await resp.write(
+                            sse_frame(
+                                format_openai_chunk(
+                                    client_message,
+                                    model="tusker-gateway",
+                                )
                             )
+                        )
+                        await resp.write(
+                            sse_frame(
+                                format_openai_chunk(
+                                    finish_reason="stop",
+                                    model="tusker-gateway",
+                                )
+                            )
+                        )
                         await resp.write(sse_done())
                     except (ConnectionResetError, ConnectionError, BrokenPipeError):
                         stream_ok = False
