@@ -73,6 +73,25 @@ def _normalize_reasoning_effort(value: Any) -> Any:
     )
 
 
+# Providers whose reasoning-model deployments reject the legacy
+# ``max_tokens`` chat-completions parameter and require the modern
+# ``max_completion_tokens`` name (Azure APIM / Azure OpenAI gpt-5.x).
+_COMPLETION_TOKENS_PROVIDERS = frozenset({"apim"})
+
+
+def _rename_max_tokens_for_provider(body: dict[str, Any], provider: str) -> None:
+    """Rename ``max_tokens`` → ``max_completion_tokens`` for providers that
+    reject the legacy name. Mutates ``body`` in place.
+
+    The gateway's legacy-provider mapping (``_build_extra_body``) collapses
+    ``max_completion_tokens`` → ``max_tokens`` before the request body is
+    assembled, so this restores the modern name for providers that need it.
+    """
+    if provider.lower() in _COMPLETION_TOKENS_PROVIDERS:
+        if "max_tokens" in body and "max_completion_tokens" not in body:
+            body["max_completion_tokens"] = body.pop("max_tokens")
+
+
 def _sanitize_opencode_session_id(value: Any) -> str | None:
     """Return a safe, bounded OpenCode session header value."""
     if not isinstance(value, str):
@@ -2131,6 +2150,7 @@ class PassthroughClient:
             effort = body.get("reasoning_effort")
             if isinstance(effort, str):
                 body["reasoning_effort"] = _normalize_reasoning_effort(effort)
+        _rename_max_tokens_for_provider(body, provider)
         return headers, body
 
     async def _chat_codex(

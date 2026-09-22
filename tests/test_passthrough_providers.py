@@ -1363,3 +1363,47 @@ async def test_runtime_config_overrides_provider_endpoints(tmp_path, stream):
         assert seen_body["model"] == "llama3"
     finally:
         await runner.cleanup()
+
+
+# ---------------------------------------------------------------------------
+# APIM reasoning models require `max_completion_tokens`, not `max_tokens`
+# ---------------------------------------------------------------------------
+
+class TestCompletionTokensParam:
+    """Azure APIM's reasoning deployments reject the legacy `max_tokens` name."""
+
+    def test_apim_max_tokens_renamed(self):
+        from tusker_gateway.passthrough import _rename_max_tokens_for_provider
+
+        body = {"model": "gpt-5.6-luna", "max_tokens": 256}
+        _rename_max_tokens_for_provider(body, "apim")
+        assert body["max_completion_tokens"] == 256
+        assert "max_tokens" not in body
+
+    def test_apim_case_insensitive(self):
+        from tusker_gateway.passthrough import _rename_max_tokens_for_provider
+
+        body = {"max_tokens": 64}
+        _rename_max_tokens_for_provider(body, "APIM")
+        assert body == {"max_completion_tokens": 64}
+
+    def test_apim_explicit_completion_tokens_wins(self):
+        from tusker_gateway.passthrough import _rename_max_tokens_for_provider
+
+        body = {"max_tokens": 64, "max_completion_tokens": 512}
+        _rename_max_tokens_for_provider(body, "apim")
+        assert body == {"max_tokens": 64, "max_completion_tokens": 512}
+
+    def test_apim_without_token_limit_untouched(self):
+        from tusker_gateway.passthrough import _rename_max_tokens_for_provider
+
+        body = {"model": "gpt-5.6-luna", "messages": []}
+        _rename_max_tokens_for_provider(body, "apim")
+        assert body == {"model": "gpt-5.6-luna", "messages": []}
+
+    def test_other_providers_keep_max_tokens(self):
+        from tusker_gateway.passthrough import _rename_max_tokens_for_provider
+
+        body = {"max_tokens": 128}
+        _rename_max_tokens_for_provider(body, "openrouter")
+        assert body == {"max_tokens": 128}
