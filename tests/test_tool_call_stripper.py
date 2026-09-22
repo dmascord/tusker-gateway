@@ -12,6 +12,52 @@ from tusker_gateway.endpoints import _ToolCallStripper, _strip_xml_tool_calls
 
 
 @pytest.mark.asyncio
+async def test_stream_normalizer_promotes_fullwidth_dsml_calls():
+    """Fullwidth DSML must not leak into OMP as assistant text."""
+    from tusker_gateway.endpoints import _normalize_stream
+
+    text = (
+        '<｜DSML｜ calls>\n'
+        '<｜DSML｜ invoke name="edit">\n'
+        '<｜DSML｜ parameter name="i" string="true">reason</｜DSML｜ parameter>\n'
+        '<｜DSML｜ parameter name="input" string="true">body</｜DSML｜ parameter>\n'
+        '</｜DSML｜ invoke>\n'
+        '<｜DSML｜ invoke name="bash">\n'
+        '<｜DSML｜ parameter name="command" string="true">pwd</｜DSML｜ parameter>\n'
+        '</｜DSML｜ invoke>\n'
+        '</｜DSML｜ calls>'
+    )
+
+    async def upstream():
+        split_at = text.index('<｜DSML｜ invoke') + len('<｜DSML｜ inv')
+        for part in (text[:split_at], text[split_at:]):
+            yield f'data: {json.dumps({"choices": [{"delta": {"content": part}}]})}\n\n'.encode()
+        yield b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    frames = []
+    async for frame in _normalize_stream(
+        upstream(),
+        provider="xiaomi",
+        model="mimo-v2.5",
+        tools_requested=True,
+    ):
+        frames.append(frame)
+
+    body = b"".join(frames)
+    assert b"DSML" not in body
+    assert "<｜".encode() not in body
+    calls = [
+        call
+        for frame in frames
+        if frame.startswith(b"data: ") and frame.strip() != b"data: [DONE]"
+        for choice in json.loads(frame.removeprefix(b"data: ").strip()).get("choices", [])
+        for call in (choice.get("delta", {}) or {}).get("tool_calls", [])
+    ]
+    assert [call["function"]["name"] for call in calls] == ["edit", "bash"]
+
+
+@pytest.mark.asyncio
 async def test_stream_diagnostics_deduplicates_identical_native_frames(
     monkeypatch, caplog,
 ):

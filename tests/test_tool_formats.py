@@ -116,6 +116,26 @@ def test_parse_text_tool_calls():
     # TOOL_CALL
     assert parse_text_tool_calls("TOOL_CALL: bash({\"c\":\"ls\"})")[0]["function"]["name"] == "bash"
 
+def test_parse_fullwidth_dsml_calls_and_strip_markup():
+    text = (
+        '<｜DSML｜ calls>\n'
+        '<｜DSML｜ invoke name="edit">\n'
+        '<｜DSML｜ parameter name="i" string="true">reason</｜DSML｜ parameter>\n'
+        '<｜DSML｜ parameter name="input" string="true">body</｜DSML｜ parameter>\n'
+        '</｜DSML｜ invoke>\n'
+        '</｜DSML｜ calls>'
+    )
+
+    calls = parse_text_tool_calls(text)
+
+    assert len(calls) == 1
+    assert calls[0]["function"]["name"] == "edit"
+    assert json.loads(calls[0]["function"]["arguments"]) == {
+        "i": "reason",
+        "input": "body",
+    }
+    assert strip_tool_text(text) == ""
+
 def test_strip_tool_text():
     text = "Thinking... <tool_call>{}</tool_call>\nAfter tool."
     out = strip_tool_text(text)

@@ -64,6 +64,33 @@ _ID_SUFFIXED_TOOL_RE = re.compile(
 )
 _AUXILIARY_TEXT_FIELDS = ("reasoning_content", "reasoning", "thinking", "analysis")
 
+# DeepSeek/MiMo-style models sometimes emit DSML with fullwidth pipe
+# delimiters.  Canonicalize it before applying the ordinary XML/DSML parsers:
+# ``<｜DSML｜ invoke name="bash">`` -> ``<dsml:invoke name="bash">``.
+_FULLWIDTH_DSML_TAG_RE = re.compile(
+    r"<(?P<close>/?)\s*[|｜]\s*(?P<dialect>DSML|MiMoML)\s*[|｜]\s*"
+    r"(?P<tag>[\w.-]+)(?P<attrs>[^>]*)>",
+    re.IGNORECASE,
+)
+_FULLWIDTH_DSML_OPEN_RE = re.compile(
+    r"<\s*[|｜]\s*(?:DSML|MiMoML)\s*[|｜]\s*[\w.-]+\b",
+    re.IGNORECASE,
+)
+
+
+def _canonicalize_dsml_tags(text: str) -> str:
+    """Convert fullwidth-pipe DSML tags to namespaced XML equivalents."""
+    if "DSML" not in text and "dsml" not in text and "MiMoML" not in text and "mimoml" not in text:
+        return text
+    return _FULLWIDTH_DSML_TAG_RE.sub(
+        lambda match: (
+            f"<{match.group('close')}"
+            f"{match.group('dialect').lower()}:{match.group('tag')}"
+            f"{match.group('attrs')}>"
+        ),
+        text,
+    )
+
 # Inline `` markers used by some reasoning providers (DeepSeek R1, GLM
 # Air, MiniMax M-series) that emit their chain-of-thought inline with the
 # visible answer rather than in a separate `reasoning_content` field.
@@ -119,6 +146,7 @@ def tool_markup_kinds(text: Any) -> tuple[str, ...]:
     if not isinstance(text, str) or not text:
         return ()
     patterns = (
+        ("dsml", _FULLWIDTH_DSML_TAG_RE),
         ("text_fallback", _TEXT_FALLBACK_RE),
         ("id_suffixed", _ID_SUFFIXED_TOOL_RE),
         ("json_wrapper", _JSON_TOOL_BLOCK_RE),
@@ -141,6 +169,8 @@ def tool_markup_has_opening(text: Any) -> bool:
     if not isinstance(text, str) or not text:
         return False
     return bool(
+        _FULLWIDTH_DSML_OPEN_RE.search(text)
+        or
         re.search(
             r"<\s*(?!/)(?:\|\s*)?(?:[\w-]+:)?(?:tool_call|function_call|tool_calls|function_calls|tool_use|tool_invocation|dots_function_call|dots_tool_call)(?::[^>\s]+)?\s*(?:\|)?\s*>",
             text,
@@ -397,6 +427,7 @@ def parse_text_tool_calls(text: Any) -> list[dict[str, Any]]:
     """Parse common XML, DSML/MiMoML, JSON-fenced, and TOOL_CALL text forms."""
     if not isinstance(text, str) or not text.strip():
         return []
+    text = _canonicalize_dsml_tags(text)
     calls: list[dict[str, Any]] = []
     # 1. OMP/DOTS' ID-suffixed tool envelope.
     for match in _CUSTOM_TOOL_BLOCK_RE.finditer(text):
@@ -517,6 +548,7 @@ def strip_tool_text(text: Any) -> Any:
     """Remove recognized tool markup while retaining ordinary assistant text."""
     if not isinstance(text, str):
         return text
+    text = _canonicalize_dsml_tags(text)
     # Remove OMP/DOTS' ID-suffixed envelope before stripping individual tags.
     cleaned = _CUSTOM_TOOL_BLOCK_RE.sub("", text)
     # Only match the fallback call syntax, not the ``tool_call:ID`` XML tag

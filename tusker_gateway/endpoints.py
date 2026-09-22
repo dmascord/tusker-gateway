@@ -191,6 +191,10 @@ _CUSTOM_PARTIAL_OPEN_RE = re.compile(
     r"^<\s*\|?\s*(?:tool_calls?|function_calls?|dots_function_call|dots_tool_call)(?::[^>\s]*)?\s*\|?$",
     re.IGNORECASE,
 )
+_FULLWIDTH_DSML_PARTIAL_OPEN_RE = re.compile(
+    r"^<\s*[|｜]\s*(?:DSML|MiMoML)?\s*(?:[|｜])?[^>]*$",
+    re.IGNORECASE,
+)
 _WRAPPER_OPEN_RE = re.compile(
     r"<\s*\|?\s*(?P<tag>(?:tool_call|function_call|tool_calls|function_calls|tool_use|tool_invocation|dots_function_call|dots_tool_call)(?::[^>\s]+)?)\s*\|?\s*>",
     re.IGNORECASE,
@@ -375,6 +379,7 @@ class _ToolCallStripper:
             _PARTIAL_OPENER_TAIL_RE.search(text)
             or _GENERIC_PARTIAL_OPEN_RE.search(text)
             or _CUSTOM_PARTIAL_OPEN_RE.search(text)
+            or _FULLWIDTH_DSML_PARTIAL_OPEN_RE.search(text)
         )
 
     def _stash_block(self, block: str, had_params: bool) -> None:
@@ -384,7 +389,9 @@ class _ToolCallStripper:
         """Process a content chunk, returning the clean (emit-able) text."""
         if not chunk:
             return ""
-        text = self._carry + chunk
+        from tusker_gateway.tool_formats import _canonicalize_dsml_tags
+
+        text = _canonicalize_dsml_tags(self._carry + chunk)
         self._carry = ""
         out: list[str] = []
 
