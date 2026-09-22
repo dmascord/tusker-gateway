@@ -24,24 +24,48 @@ import asyncio
 import json
 import logging
 import sys
+import time
 from typing import Any
 
-from tusker_gateway.codex_oauth import CodexOAuthError, issue_codex_device_token
+from tusker_gateway.codex_oauth import CodexOAuthError, codex_token_profile, issue_codex_device_token
 from tusker_gateway.config_store import ConfigStore, ConfigUnavailableError
 
 logger = logging.getLogger(__name__)
 
 PROVIDER = "openai-codex"
 
+# OpenAI device codes stay valid for ~15 minutes after minting.  The API
+# response carries no expiry field, so the tool derives the countdown locally.
+CODEX_DEVICE_CODE_LIFETIME_SECONDS = 15 * 60
+
 
 def _account_id(credential: dict[str, Any]) -> str:
+    """Extract ChatGPT account_id, falling back to JWT extraction for legacy entries.
+
+    Entries enrolled before account metadata was captured carry only
+    ``access_token``/``id_token``; the same ChatGPT account is still
+    identifiable from those JWTs, which duplicate detection needs.
+    """
     value = credential.get("account_id")
-    return value.strip() if isinstance(value, str) else ""
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    id_token = credential.get("id_token") or ""
+    access_token = credential.get("access_token") or ""
+    if id_token or access_token:
+        return codex_token_profile(access_token, id_token).get("account_id", "")
+    return ""
 
 
 def _email(credential: dict[str, Any]) -> str:
+    """Extract email, falling back to JWT extraction for legacy entries."""
     value = credential.get("email")
-    return value.strip().lower() if isinstance(value, str) else ""
+    if isinstance(value, str) and value.strip():
+        return value.strip().lower()
+    id_token = credential.get("id_token") or ""
+    access_token = credential.get("access_token") or ""
+    if id_token or access_token:
+        return codex_token_profile(access_token, id_token).get("email", "").lower()
+    return ""
 
 
 def duplicate_account_indices(
@@ -51,8 +75,9 @@ def duplicate_account_indices(
     """Indices in ``credentials`` sharing ``credential``'s ChatGPT account.
 
     Two pool entries for one account cannot both stay usable: a refresh by
-    either rotates the account's token and invalidates the other.  An entry
-    with no recorded ``account_id`` is not treated as a duplicate.
+    either rotates the account's token and invalidates the other.  Entries
+    without a stored ``account_id`` are still compared via their JWT
+    identity, so legacy enrollments are recognised as duplicates too.
     """
     account = _account_id(credential)
     if not account:
@@ -182,7 +207,15 @@ def _summarise(credentials: list[dict[str, Any]]) -> str:
 
 def _run_device_flow(label: str | None, max_polls: int) -> dict[str, Any]:
     def on_authorize(url: str, user_code: str) -> None:
-        print(f"\n  Open {url} and enter code: {user_code}\n", flush=True)
+        minted = time.time()
+        expires_at = minted + CODEX_DEVICE_CODE_LIFETIME_SECONDS
+        stamp = "%Y-%m-%dT%H:%M:%SZ"
+        print(
+            f"\n  Open {url} and enter code: {user_code}\n"
+            f"  (minted {time.strftime(stamp, time.gmtime(minted))}, "
+            f"valid until {time.strftime(stamp, time.gmtime(expires_at))})\n",
+            flush=True,
+        )
 
     def on_progress(message: str) -> None:
         print(f"  {message}", flush=True)

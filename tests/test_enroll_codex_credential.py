@@ -104,10 +104,60 @@ def test_duplicate_indices_reports_every_entry_on_the_account() -> None:
     assert duplicate_account_indices(pool, incoming) == [0, 1, 2]
 
 
+def _legacy_jwt(account_id: str = "acct-A", email: str = "legacy@x.y") -> str:
+    """Minimal unsigned JWT carrying the ChatGPT account claim."""
+    import base64
+
+    def b64(segment: dict[str, Any]) -> str:
+        raw = json.dumps(segment).encode()
+        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+    payload = {
+        "https://api.openai.com/auth": {"chatgpt_account_id": account_id},
+        "email": email,
+    }
+    return f"{b64({'alg': 'none'})}.{b64(payload)}.sig"
+
+
+def test_duplicate_indices_resolves_legacy_account_via_jwt() -> None:
+    """The 2026-09-22 incident shape: legacy entries carry tokens but no
+    account_id field.  Their JWT identity must still collide."""
+    legacy = {
+        "id": "legacy-1",
+        "label": "legacy",
+        "auth_type": "oauth",
+        "provider": PROVIDER,
+        "access_token": "at-1",
+        "refresh_token": "rt-old",
+        "id_token": _legacy_jwt(account_id="acct-A"),
+        "expires_at_ms": 0,
+    }
+    pool = [legacy]
+    incoming = _credential(account_id="acct-A", refresh_token="rt-NEW")
+    assert duplicate_account_indices(pool, incoming) == [0]
+
+
+def test_duplicate_indices_ignores_non_jwt_legacy_tokens() -> None:
+    """Copilot-style opaque tokens carry no resolvable ChatGPT identity."""
+    pool = [{"token": "gho_x", "access_token": "gho_x"}]
+    assert duplicate_account_indices(pool, _credential(account_id="acct-A")) == []
+
+
 def test_duplicate_indices_ignores_missing_account_id() -> None:
     pool = [_credential(account_id="acct-A")]
     assert duplicate_account_indices(pool, _credential(account_id="")) == []
     assert duplicate_account_indices([], _credential(account_id="acct-A")) == []
+
+
+def test_email_falls_back_to_jwt_profile() -> None:
+    from tusker_gateway.tools.enroll_codex_credential import _email
+
+    legacy = {
+        "access_token": "at-1",
+        "id_token": _legacy_jwt(email="legacy@x.y"),
+    }
+    assert _email(legacy) == "legacy@x.y"
+
 
 
 # ---------------------------------------------------------------------------
