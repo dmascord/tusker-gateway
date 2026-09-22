@@ -81,6 +81,23 @@ def test_risky_call_question_shows_the_proposed_arguments_before_execution():
     assert "Review these arguments before approving." in question
 
 
+def test_repeated_identical_risky_call_reuses_pending_approval():
+    original = _trade_call(qty=3)
+    first = question_response_for_calls(original, model="model", request_id="req-1")
+    second = question_response_for_calls(original, model="model", request_id="req-2")
+
+    first_call = first["choices"][0]["message"]["tool_calls"][0]
+    second_call = second["choices"][0]["message"]["tool_calls"][0]
+    assert second_call["id"] == first_call["id"]
+
+    replay = replay_approved_tool_response([
+        second["choices"][0]["message"],
+        {"role": "user", "content": "Allow once"},
+    ])
+    assert replay is not None
+    assert replay["choices"][0]["message"]["tool_calls"] == original
+
+
 def test_risky_call_question_redacts_credentials_and_bounds_preview():
     secret = "sk-live-1234567890abcdef"
     call = [{

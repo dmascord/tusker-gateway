@@ -340,33 +340,65 @@ def question_response_for_calls(
     action = _risky_action(calls)
     if action is None:
         return None
-    approval_id = str(uuid.uuid4())
-    call_id = approval_id
-    _PENDING[call_id] = {
-        "calls": json.loads(json.dumps(calls, ensure_ascii=False)),
-        "signature": _calls_signature(calls),
-        "expires_at": time.time() + _TTL_SECS,
-        "request_id": request_id or "unknown",
-        "provider": provider or "unknown",
-        "model": model or "unknown",
-        "action": action,
-        "adapter": adapter.key,
-        "audit": audit,
-    }
-    _audit(audit, {
-        "event_type": "tool.approval.proposed",
-        "approval_id": call_id,
-        "request_id": request_id or "unknown",
-        "provider": provider or "unknown",
-        "model": model or "unknown",
-        "action": action,
-        "tool_names": [
-            str((call.get("function") or {}).get("name") or "unknown")
-            for call in calls[:8]
-        ],
-        "call_signature": _calls_signature(calls),
-        "decision": "pending",
-    })
+    signature = _calls_signature(calls)
+    call_id = next(
+        (
+            pending_id
+            for pending_id, pending in _PENDING.items()
+            if pending.get("scope", "calls") == "calls"
+            and pending.get("signature") == signature
+            and pending.get("action") == action
+        ),
+        None,
+    )
+    if call_id is None:
+        call_id = str(uuid.uuid4())
+        _PENDING[call_id] = {
+            "calls": json.loads(json.dumps(calls, ensure_ascii=False)),
+            "signature": signature,
+            "expires_at": time.time() + _TTL_SECS,
+            "request_id": request_id or "unknown",
+            "provider": provider or "unknown",
+            "model": model or "unknown",
+            "action": action,
+            "adapter": adapter.key,
+            "audit": audit,
+        }
+        _audit(audit, {
+            "event_type": "tool.approval.proposed",
+            "approval_id": call_id,
+            "request_id": request_id or "unknown",
+            "provider": provider or "unknown",
+            "model": model or "unknown",
+            "action": action,
+            "tool_names": [
+                str((call.get("function") or {}).get("name") or "unknown")
+                for call in calls[:8]
+            ],
+            "call_signature": signature,
+            "decision": "pending",
+        })
+        logger.info(
+            "native approval proposed request_id=%s approval_id=%s action=%s "
+            "signature=%s provider=%s model=%s",
+            request_id or "unknown",
+            call_id,
+            action,
+            signature,
+            provider or "unknown",
+            model or "unknown",
+        )
+    else:
+        pending = _PENDING[call_id]
+        pending["expires_at"] = time.time() + _TTL_SECS
+        logger.info(
+            "native approval reused request_id=%s approval_id=%s action=%s "
+            "signature=%s",
+            request_id or "unknown",
+            call_id,
+            action,
+            signature,
+        )
     question_prompt = (
         f"Allow high-impact tool action '{action}'?\n"
         f"Proposed action:\n{_call_approval_preview(calls)}\n"
