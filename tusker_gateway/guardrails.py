@@ -44,6 +44,88 @@ class OutputLengthGuard:
 _EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
 _CC_RE = re.compile(r"\b\d{4}[ -]?\d{4}[ -]?\d{4}[ -]?\d{4}\b")
 
+_LANGUAGE_WORDS: dict[str, frozenset[str]] = {
+    "en": frozenset("the and is are to of in for please what how can with this that you".split()),
+    "es": frozenset("el la los las de que por para con una un es como cómo puede puedes quiero este explicar favor".split()),
+    "fr": frozenset("le la les des de et pour avec une un est que comment vous".split()),
+    "de": frozenset("der die das und für mit ein eine ist wie nicht bitte".split()),
+    "pt": frozenset("o a os as de que para com uma um é como não por favor".split()),
+    "it": frozenset("il lo la gli le di che per con una un è come vuoi".split()),
+}
+_LANGUAGE_SCRIPT_RANGES: tuple[tuple[str, tuple[tuple[int, int], ...]], ...] = (
+    ("ja", ((0x3040, 0x30FF),)),
+    ("ko", ((0xAC00, 0xD7AF),)),
+    ("ar", ((0x0600, 0x06FF), (0x0750, 0x077F))),
+    ("he", ((0x0590, 0x05FF),)),
+    ("th", ((0x0E00, 0x0E7F),)),
+    ("hi", ((0x0900, 0x097F),)),
+    ("el", ((0x0370, 0x03FF),)),
+)
+_LANGUAGE_UNTRUSTED_RE = re.compile(r"<untrusted_data>.*?</untrusted_data>", re.I | re.S)
+_LANGUAGE_CODE_RE = re.compile(r"```.*?```|`[^`]*`", re.S)
+_LANGUAGE_TOKEN_RE = re.compile(r"[\wÀ-ÖØ-öø-ÿĀ-ž]+", re.UNICODE)
+
+
+def detect_message_language(text: str) -> tuple[str, float] | None:
+    """Detect a likely response language without network calls or persistence.
+
+    This intentionally returns ``None`` for short/ambiguous Latin text. A
+    wrong language instruction is more disruptive than leaving a capable
+    model to choose its default.
+    """
+    if not isinstance(text, str):
+        return None
+    sample = _LANGUAGE_CODE_RE.sub(" ", _LANGUAGE_UNTRUSTED_RE.sub(" ", text))
+    if len(sample.strip()) < 3:
+        return None
+    counts: dict[str, int] = {}
+    letters = sum(char.isalpha() for char in sample)
+    for language, ranges in _LANGUAGE_SCRIPT_RANGES:
+        count = sum(
+            1
+            for char in sample
+            if any(start <= ord(char) <= end for start, end in ranges)
+        )
+        if count >= 2 and count / max(letters, 1) >= 0.15:
+            counts[language] = count
+    if counts:
+        language, count = max(counts.items(), key=lambda item: item[1])
+        return language, min(0.99, count / max(letters, 1))
+
+    tokens = {token.lower() for token in _LANGUAGE_TOKEN_RE.findall(sample)}
+    scores = {
+        language: len(tokens.intersection(words))
+        for language, words in _LANGUAGE_WORDS.items()
+    }
+    language, score = max(scores.items(), key=lambda item: item[1])
+    ranked = sorted(scores.values(), reverse=True)
+    runner_up = ranked[1] if len(ranked) > 1 else 0
+    if score < 2 or score == runner_up:
+        return None
+    return language, min(0.95, 0.55 + (score - runner_up) * 0.1)
+
+
+def _latest_user_text(messages: Any) -> str:
+    """Return text from the latest user turn, excluding untrusted/code data."""
+    if not isinstance(messages, list):
+        return ""
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return "\n".join(
+                str(block.get("text"))
+                for block in content
+                if isinstance(block, dict)
+                and block.get("type") in {"text", "input_text"}
+                and isinstance(block.get("text"), str)
+            )
+        return ""
+    return ""
+
 
 @dataclass
 class PIIRedactionGuard:
@@ -161,6 +243,21 @@ _HARNESS_GUARDRAIL_SYSTEM_PROMPT = (
 )
 
 
+def _language_system_prompt(
+    language: str | None,
+    base_prompt: str = _HARNESS_GUARDRAIL_SYSTEM_PROMPT,
+) -> str:
+    if not language:
+        return base_prompt
+    return (
+        f"{base_prompt}"
+        f"Respond in the language of the latest user message ({language}). "
+        "If the user explicitly requests another language, follow that request. "
+        "Keep code, tool names, argument keys, paths, identifiers, and structured "
+        "tool arguments unchanged.\n"
+    )
+
+
 @dataclass
 class HarnessSystemPromptGuard:
     """Inject a delimiter-discipline system prompt for harness identities.
@@ -191,14 +288,25 @@ class HarnessSystemPromptGuard:
         messages = body.get("messages")
         if not isinstance(messages, list):
             return GuardResult()
+        detected = detect_message_language(_latest_user_text(messages))
+        language = detected[0] if detected else None
+        desired_prompt = _language_system_prompt(language, self.system_prompt)
         # Idempotency: skip when our sentinel is already at the head of the
         # message list, so multi-turn requests don't stack duplicates.
         if messages and isinstance(messages[0], dict):
             existing = messages[0].get("content")
             if isinstance(existing, str) and existing.startswith(self.system_prompt[:32]):
-                return GuardResult()
+                if existing == desired_prompt:
+                    return GuardResult()
+                return GuardResult(
+                    allowed=True,
+                    modified_body={
+                        **body,
+                        "messages": [{**messages[0], "content": desired_prompt}, *messages[1:]],
+                    },
+                )
         new_messages = [
-            {"role": "system", "content": self.system_prompt},
+            {"role": "system", "content": desired_prompt},
             *messages,
         ]
         return GuardResult(allowed=True, modified_body={**body, "messages": new_messages})

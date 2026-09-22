@@ -17,6 +17,7 @@ import pytest
 from tusker_gateway.guardrails import (
     GuardPipeline,
     HarnessSystemPromptGuard,
+    detect_message_language,
     init_guard_pipeline,
     run_guard_pipeline,
 )
@@ -37,6 +38,17 @@ class _FakeRequest:
 
 def _await(coro):
     return asyncio.get_event_loop().run_until_complete(coro) if False else asyncio.run(coro)
+
+
+def test_detect_message_language_uses_high_confidence_scripts_and_words():
+    assert detect_message_language("¿Puedes explicar este error, por favor?")[0] == "es"
+    assert detect_message_language("これは日本語の質問です")[0] == "ja"
+    assert detect_message_language("the quick brown fox") is None
+
+
+def test_detect_message_language_ignores_code_and_untrusted_data():
+    text = "```python\nprint('hello')\n``` <untrusted_data>これは日本語です</untrusted_data>"
+    assert detect_message_language(text) is None
 
 
 async def test_guard_injects_system_prompt_for_omp_harness_principal():
@@ -80,6 +92,29 @@ async def test_guard_is_idempotent_across_turns():
     result = await guard.check(pre_injected)
     # No new system prompt should be prepended.
     assert result.modified_body is None
+
+
+async def test_guard_injects_latest_user_language_and_updates_on_language_switch():
+    guard = HarnessSystemPromptGuard(target_principals=("omp-harness",))
+    guard._identity_marker = {"principal": "omp-harness"}
+    body = {
+        "messages": [{"role": "user", "content": "¿Puedes revisar este archivo, por favor?"}]
+    }
+    result = await guard.check(body)
+    assert result.modified_body is not None
+    assert "(es)" in result.modified_body["messages"][0]["content"]
+
+    switched = {
+        "messages": [
+            result.modified_body["messages"][0],
+            body["messages"][0],
+            {"role": "assistant", "content": "Claro."},
+            {"role": "user", "content": "これは日本語で答えてください。"},
+        ]
+    }
+    updated = await guard.check(switched)
+    assert updated.modified_body is not None
+    assert "(ja)" in updated.modified_body["messages"][0]["content"]
 
 
 async def test_init_guard_pipeline_omits_harness_guard_when_no_principals(monkeypatch):
