@@ -115,18 +115,22 @@ print(f"IMAGE DIGEST OK: {digest} ({verified} Ready pod(s))")
 # /health must report the revision baked into the verified image.
 echo "--- Commit verification ---"
 
-health_commit=$(curl --fail --retry 24 --retry-delay 5 --retry-all-errors \
-    --connect-timeout 5 --max-time 15 -sS \
-    "https://ai.tusker.net.au/health" \
-    | python3 -c "import json,sys; print(json.load(sys.stdin).get('commit',''))")
-
-if [ -z "${health_commit}" ]; then
-    echo "ERROR: could not read commit from /health"
-    exit 1
-fi
+health_commit=""
+for attempt in $(seq 1 30); do
+    health_commit=$(curl --fail --retry 2 --retry-delay 1 --retry-all-errors \
+        --connect-timeout 5 --max-time 15 -sS \
+        "https://ai.tusker.net.au/health" 2>/dev/null \
+        | python3 -c "import json,sys; print(json.load(sys.stdin).get('commit',''))" \
+        || true)
+    if [ "${health_commit}" = "${COMMIT}" ]; then
+        break
+    fi
+    echo "Waiting for /health commit propagation: live=${health_commit:-unavailable} intended=${COMMIT} (attempt ${attempt}/30)"
+    sleep 5
+done
 
 if [ "${health_commit}" != "${COMMIT}" ]; then
-    echo "ERROR: /health commit mismatch — live ${health_commit}, intended ${COMMIT}"
+    echo "ERROR: /health commit mismatch — live ${health_commit:-unavailable}, intended ${COMMIT}"
     exit 1
 fi
 echo "COMMIT OK (/health): ${health_commit}"
