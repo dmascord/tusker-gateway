@@ -72,6 +72,7 @@ from tusker_gateway.native_question import (
     question_response_for_content,
     replay_approved_tool_response,
 )
+from tusker_gateway.question_adapters import detect_adapter, set_current as set_question_adapter
 from tusker_gateway.pools import PoolManager
 from tusker_gateway.provider_usage import is_capacity_error
 from tusker_gateway.quality import QualityDB
@@ -5014,6 +5015,19 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                     body = guard_result.modified_body
 
             authorize_request_body(request, body)
+            # Select the client-facing approval envelope once the guard
+            # pipeline has produced the final request body. The provider
+            # protocol remains unchanged; this only affects synthetic native
+            # question responses returned to the connected harness.
+            question_adapter = detect_adapter(request.headers, body)
+            set_question_adapter(question_adapter)
+            logger.info(
+                "question adapter selected rid=%s adapter=%s tool=%s host_permission=%s",
+                request_id,
+                question_adapter.key,
+                question_adapter.tool_name,
+                question_adapter.host_permission,
+            )
 
             # Guards may normalize or remove request fields, so derive cache
             # eligibility and routing from the final body.

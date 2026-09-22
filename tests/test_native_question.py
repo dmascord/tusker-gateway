@@ -12,6 +12,7 @@ from tusker_gateway.endpoints import _validate_complete_tool_response
 from tusker_gateway.endpoints import _prepare_stream_result
 from tusker_gateway.sse import sse_frame
 from tusker_gateway.native_question import (
+    _content_approval_preview,
     question_authorized,
     question_authorized_for_content,
     question_response_for_calls,
@@ -119,6 +120,13 @@ def test_question_result_authorizes_exact_call():
         },
     ]
     assert question_authorized(messages, _trade_call()) is True
+
+
+def test_content_approval_preview_preserves_line_breaks():
+    preview = _content_approval_preview([
+        {"role": "user", "content": "submit_order\n\nprice: 123\nquantity: 4"},
+    ])
+    assert preview == "submit_order\n\nprice: 123\nquantity: 4"
 
 
 def test_question_user_answer_authorizes_exact_call():

@@ -16,7 +16,21 @@ import time
 import uuid
 from typing import Any
 
+from tusker_gateway.question_adapters import (
+    QuestionAdapter,
+    current as current_question_adapter,
+    render_question_arguments,
+)
+
 logger = logging.getLogger(__name__)
+
+_QUESTION_TOOL_NAMES = frozenset({
+    "ask",
+    "question",
+    "ask_question",
+    "AskQuestion",
+    "ask_followup_question",
+})
 
 _PENDING: dict[str, dict[str, Any]] = {}
 _TTL_SECS = 300
@@ -84,7 +98,14 @@ def _content_approval_preview(messages: Any, *, max_chars: int = 180) -> str:
             )
         if not isinstance(content, str) or not content.strip():
             continue
-        preview = re.sub(r"\s+", " ", content).strip()
+        # Preserve paragraph and line boundaries so approval prompts remain
+        # reviewable. Only normalize horizontal whitespace within each line;
+        # collapsing ``\s`` here turns scripts and structured instructions
+        # into an unreadable wall of text.
+        preview = "\n".join(
+            re.sub(r"[ \t]+", " ", line).rstrip()
+            for line in content.splitlines()
+        ).strip()
         # Keep credential-shaped values out of the prompt while retaining
         # enough context for the user to identify the request.
         preview = re.sub(
@@ -270,9 +291,11 @@ def question_response_for_calls(
     provider: str | None = None,
     request_id: str | None = None,
     audit: Any = None,
+    adapter: QuestionAdapter | None = None,
 ) -> dict[str, Any] | None:
     """Convert a risky provider response into an OMP-native ask call."""
     _prune()
+    adapter = adapter or current_question_adapter()
     action = _risky_action(calls)
     if action is None:
         return None
@@ -286,6 +309,7 @@ def question_response_for_calls(
         "provider": provider or "unknown",
         "model": model or "unknown",
         "action": action,
+        "adapter": adapter.key,
         "audit": audit,
     }
     _audit(audit, {
@@ -302,21 +326,21 @@ def question_response_for_calls(
         "call_signature": _calls_signature(calls),
         "decision": "pending",
     })
-    question = {
-        "questions": [{
-            "id": call_id,
-            "header": "Approval",
-            "question": (
-                f"Allow high-impact tool action '{action}'?\n"
-                f"Proposed action:\n{_call_approval_preview(calls)}\n"
-                "Review these arguments before approving."
-            ),
-            "options": [
-                {"label": "Allow once", "description": "Execute this exact tool call once."},
-                {"label": "Deny", "description": "Do not execute this tool call."},
-            ],
-        }],
-    }
+    question_prompt = (
+        f"Allow high-impact tool action '{action}'?\n"
+        f"Proposed action:\n{_call_approval_preview(calls)}\n"
+        "Review these arguments before approving."
+    )
+    question = render_question_arguments(
+        adapter,
+        question_id=call_id,
+        header="Approval",
+        prompt=question_prompt,
+        options=[
+            {"label": "Allow once", "description": "Execute this exact tool call once."},
+            {"label": "Deny", "description": "Do not execute this tool call."},
+        ],
+    )
     return {
         "id": "chatcmpl-" + secrets.token_hex(12),
         "object": "chat.completion",
@@ -329,9 +353,7 @@ def question_response_for_calls(
                 "tool_calls": [{
                     "id": call_id,
                     "type": "function",
-                    # OMP/OpenCode calls this built-in interactive tool
-                    # ``ask`` (not ``question``).
-                    "function": {"name": "ask", "arguments": _canonical(question)},
+                    "function": {"name": adapter.tool_name, "arguments": _canonical(question)},
                 }],
             },
             "finish_reason": "tool_calls",
@@ -367,7 +389,7 @@ def replay_approved_tool_response(
                 if not isinstance(call, dict):
                     continue
                 function = call.get("function") or {}
-                if function.get("name") in {"ask", "question"}:
+                if function.get("name") in _QUESTION_TOOL_NAMES:
                     call_id = call.get("id")
                     if isinstance(call_id, str) and call_id in _PENDING:
                         questions.add(call_id)
@@ -438,9 +460,11 @@ def question_response_for_content(
     provider: str | None = None,
     request_id: str | None = None,
     audit: Any = None,
+    adapter: QuestionAdapter | None = None,
 ) -> dict[str, Any]:
     """Convert a risky user-content request into an OMP-native ask call."""
     _prune()
+    adapter = adapter or current_question_adapter()
     signature = _content_signature(messages, action)
     # OMP can retry the original request while the interactive ask result is
     # being assembled. Reusing the pending response makes that retry
@@ -470,6 +494,7 @@ def question_response_for_content(
         "provider": provider or "unknown",
         "model": model or "unknown",
         "action": action,
+        "adapter": adapter.key,
         "audit": audit,
     }
     _audit(audit, {
@@ -483,28 +508,28 @@ def question_response_for_content(
         "call_signature": signature,
         "decision": "pending",
     })
-    question = {
-        "questions": [{
-            "id": call_id,
-            "header": "Approval",
-            "question": (
-                "The gateway detected this high-impact phrase in the user request: "
-                f"\u201c{matched_text or _content_approval_preview(messages)}\u201d\n"
-                "Allow the model to continue this request? Review the "
-                "instruction and any proposed tool action before approving."
-            ),
-            "options": [
-                {
-                    "label": "Allow once",
-                    "description": "Continue this request with this approval only.",
-                },
-                {
-                    "label": "Deny",
-                    "description": "Stop this request without allowing the action.",
-                },
-            ],
-        }],
-    }
+    question_prompt = (
+        "The gateway detected this high-impact phrase in the user request: "
+        f"\u201c{matched_text or _content_approval_preview(messages)}\u201d\n"
+        "Allow the model to continue this request? Review the "
+        "instruction and any proposed tool action before approving."
+    )
+    question = render_question_arguments(
+        adapter,
+        question_id=call_id,
+        header="Approval",
+        prompt=question_prompt,
+        options=[
+            {
+                "label": "Allow once",
+                "description": "Continue this request with this approval only.",
+            },
+            {
+                "label": "Deny",
+                "description": "Stop this request without allowing the action.",
+            },
+        ],
+    )
     response = {
         "id": "chatcmpl-" + secrets.token_hex(12),
         "object": "chat.completion",
@@ -517,7 +542,7 @@ def question_response_for_content(
                 "tool_calls": [{
                     "id": call_id,
                     "type": "function",
-                    "function": {"name": "ask", "arguments": _canonical(question)},
+                    "function": {"name": adapter.tool_name, "arguments": _canonical(question)},
                 }],
             },
             "finish_reason": "tool_calls",
@@ -550,7 +575,7 @@ def question_authorized(
                 if not isinstance(call, dict):
                     continue
                 function = call.get("function") or {}
-                if function.get("name") in {"ask", "question"} and call.get("id") in _PENDING:
+                if function.get("name") in _QUESTION_TOOL_NAMES and call.get("id") in _PENDING:
                     questions[str(call["id"])] = call
         if message.get("role") in {"tool", "function"} and message.get("tool_call_id"):
             results[str(message["tool_call_id"])] = _message_content(message)
