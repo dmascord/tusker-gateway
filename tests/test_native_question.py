@@ -10,6 +10,7 @@ import pytest
 from tusker_gateway.endpoints import _native_content_question_if_needed
 from tusker_gateway.endpoints import _validate_complete_tool_response
 from tusker_gateway.endpoints import _prepare_stream_result
+from tusker_gateway.question_adapters import adapter_for_name
 from tusker_gateway.sse import sse_frame
 from tusker_gateway.native_question import (
     _content_approval_preview,
@@ -127,6 +128,28 @@ def test_content_approval_preview_preserves_line_breaks():
         {"role": "user", "content": "submit_order\n\nprice: 123\nquantity: 4"},
     ])
     assert preview == "submit_order\n\nprice: 123\nquantity: 4"
+
+
+def test_pending_content_question_re_renders_for_a_different_harness():
+    messages = [{"role": "user", "content": "please submit_order"}]
+    first = question_response_for_content(
+        messages,
+        "user_content",
+        model="model",
+        adapter=adapter_for_name("opencode"),
+    )
+    second = question_response_for_content(
+        messages,
+        "user_content",
+        model="model",
+        adapter=adapter_for_name("cline"),
+    )
+    first_call = first["choices"][0]["message"]["tool_calls"][0]
+    second_call = second["choices"][0]["message"]["tool_calls"][0]
+    assert first_call["id"] == second_call["id"]
+    assert first_call["function"]["name"] == "question"
+    assert second_call["function"]["name"] == "ask_question"
+    assert json.loads(second_call["function"]["arguments"])["question_id"] == second_call["id"]
 
 
 def test_question_user_answer_authorizes_exact_call():

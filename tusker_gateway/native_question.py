@@ -476,12 +476,51 @@ def question_response_for_content(
             and pending.get("signature") == signature
             and isinstance(pending.get("response"), dict)
         ):
+            response = pending["response"]
+            if pending.get("adapter", "omp") != adapter.key:
+                # The approval is bound to the content/signature, not to the
+                # presentation client. Re-render the existing pending prompt
+                # for a harness that differs from the request which created
+                # it, while retaining the same approval ID and audit record.
+                old_call = (
+                    ((response.get("choices") or [{}])[0].get("message") or {})
+                    .get("tool_calls") or [{}]
+                )[0]
+                old_arguments = old_call.get("function", {}).get("arguments", "")
+                try:
+                    old_question = json.loads(old_arguments).get("questions", [{}])[0]
+                    prompt = str(old_question.get("question") or "")
+                except (TypeError, json.JSONDecodeError, AttributeError):
+                    prompt = "Allow the model to continue this request?"
+                rendered = render_question_arguments(
+                    adapter,
+                    question_id=str(old_call.get("id") or pending.get("approval_id")),
+                    header="Approval",
+                    prompt=prompt,
+                    options=[
+                        {
+                            "label": "Allow once",
+                            "description": "Continue this request with this approval only.",
+                        },
+                        {
+                            "label": "Deny",
+                            "description": "Stop this request without allowing the action.",
+                        },
+                    ],
+                )
+                response = json.loads(json.dumps(response, ensure_ascii=False))
+                response["choices"][0]["message"]["tool_calls"][0]["function"] = {
+                    "name": adapter.tool_name,
+                    "arguments": _canonical(rendered),
+                }
+                pending["response"] = response
+                pending["adapter"] = adapter.key
             logger.info(
                 "reusing pending content question approval_id=%s request_id=%s",
                 pending.get("approval_id", "unknown"),
                 request_id or "unknown",
             )
-            return pending["response"]
+            return response
 
     approval_id = str(uuid.uuid4())
     call_id = approval_id
