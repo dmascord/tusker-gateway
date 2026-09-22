@@ -277,18 +277,30 @@ mlx-mac model.
    raise). Regression tests in `tests/test_audit_concurrency.py`
    (concurrent chain integrity, transient retry, fail-closed
    exhaustion); full offline suite 1162 passed.
-2. ✅ **Disable or repair APIM** — DONE, commit `a0a4afa`.
-   `apim/gpt-5.6-luna` removed from `TUSKER_POOL_PRIVACY` static
-   models; `apim` removed from its `auto_catalog_providers`. Repair
-   requires a valid APIM subscription key (401 `invalid subscription
-   key` on every call — endpoint reachable, credentials rejected).
-3. **Prune dead providers** (open): `workers-ai`, `groq`,
-   `opencode-zen`, `github-copilot`, `github-copilot-enterprise`,
-   `openai` — add to `TUSKER_DISABLED_PROVIDERS` (or repair
-   keys/quotas). Unchanged since Sep-12. Note: quarantined candidates
-   are already skipped by the qualification prober, so the main
-   remaining cost is catalog/breaker noise and cold-pool failover
-   latency.
+2. ✅ **APIM** — root cause refined: **not a bad key, a bad auth header.**
+   Direct probing shows the gateway's `Authorization: Bearer <key>`
+   yields 401 `A valid API subscription key is required`, while the same
+   key in the `api-key` header yields **400 `max_tokens` is not
+   supported** — i.e. APIM authenticated the request and only rejected a
+   parameter. The gateway's auth strategies are exactly
+   `{bearer, oauth, codex}` (`auth_strategies.py`), with no
+   subscription-key strategy, so `apim` (`kind: bearer`) can never
+   authenticate. `apim/gpt-5.6-luna` was already removed from
+   `TUSKER_POOL_PRIVACY` (commit `a0a4afa`); re-enabling requires
+   adding an `api-key`-header authenticator and switching apim's `kind`.
+3. **Do NOT blanket-disable the "dead" providers** — the direct-probe
+   verdict (below) shows none of them is a dead upstream:
+   - **Dead credentials, needs repair**: `openai-codex` (all 3 OAuth
+     refresh tokens report `refresh_token_reused`), `openai` (no key
+     configured).
+   - **Cloudflare WAF-blocked egress**: `groq`, `opencode-zen` (403
+     `error code: 1010` at the edge — the API key is never evaluated).
+     Fix is egress/IP or user-agent related, not a key rotation.
+   - **Alive, model-catalog staleness only**: `workers-ai`,
+     `github-copilot`, `github-copilot-enterprise`, `google`.
+   Treating these as dead (as the Sep-12 review recommended) hides real
+   provenance errors and blocks recovery when quota/WAF conditions
+   clear.
 4. ✅ **Tool-qualification pipeline** — CORRECTED, not broken: the
    prober runs and persists to the NFS-backed SQLite store the gateway
    reads live. A targeted privacy-pool run completed 2026-09-22
@@ -300,17 +312,53 @@ mlx-mac model.
    `<upstream_error_page>`. Breaker behavior needed no change (upstream
    5xx already trips breakers; Cloudflare-edge pages never reach the
    gateway).
-6. **voyage/jina** (open): add model catalogs or bypass validation for
-   `embed_path`/`rerank_path`-only providers. Cause of the "No healthy
-   upstream" rejections remains undiagnosed — the original report's
-   "no `models_path`" explanation was not confirmed; the handlers are
-   constructed from `embed_path`/`rerank_path` + keys, both present.
-   Needs a runtime trace of the embed/rerank model-selection path.
+6. ✅ **voyage/jina** — **not broken; the original finding was a false
+   positive.** Live probes on 2026-09-22 all return 200 with correct
+   payloads: `voyage/voyage-3` (embed), `jina/jina-embeddings-v3`
+   (embed), `voyage/rerank-2.5` (correct ranking, Paris doc top-1),
+   `jina/jina-reranker-v2-base-multilingual` (rerank), and the virtual
+   `hermes-embed`. The handlers resolve backends from
+   `embed_path`/`rerank_path` + `provider_api_keys` (`embed.py`
+   `_backend_for`), all of which are configured. The earlier
+   "No healthy upstream" readings came from the audit's own probe path
+   (restricted key / transient cooldown), not from the embed/rerank
+   code. No code change needed; the report's "no `models_path`"
+   explanation was wrong.
 7. **Keep** minimax, xiaomi, zai, ollama-cloud, alibaba, opencode-go as
    the healthy core; mlx-mac as a hardware fallback. For local-llm,
    clear the stale breakers (`qwen2.5:3b`, `qwen2.5:7b`, `qwen3-vl:8b`)
    once the prober refreshes their rows (stale >24 h rows no longer
    count as qualified).
+
+## Dead vs. cooldown classification (verified 2026-09-22)
+
+Method: direct upstream calls issued from inside the gateway pod, built
+from the gateway's own provider registry (`base_url` + `chat_path`) and
+`provider_api_keys`, **bypassing gateway gating** (no pool selection, no
+breaker, no cooldown). The upstream — not the gateway — produced each
+verdict. This separates "provider unreachable/broken" from "gateway
+declines to call it right now".
+
+| Provider | Direct upstream response | Classification | Root cause |
+|---|---|---|---|
+| apim | 401 with `Bearer`; 400 `max_tokens unsupported` with `api-key` | **Misconfigured auth header** | Credentials valid; wrong header name. |
+| groq | 403 `error code: 1010` | **WAF-blocked** | Cloudflare edge rejection; key never evaluated. Not quota. |
+| opencode-zen | 403 `error code: 1010` | **WAF-blocked** | Same as groq. |
+| workers-ai | 400 `No such model: ping` | **Alive** | Authenticated and evaluated; only the probe model was unknown. |
+| github-copilot | 400 `model_not_supported` | **Alive** | Authenticated; per-model failures only. |
+| github-copilot-enterprise | 400 `model_not_supported` | **Alive** | Same as github-copilot. |
+| openai-codex | 401 `refresh_token_reused` (3/3 creds) | **Dead credentials** | Refresh tokens already redeemed; needs reauthorization. |
+| openai | 401 `You didn't provide an API key` | **Dead credentials** | No key configured for this provider. |
+| google | 404 `models/ping is not found` | **Alive** | Authenticated; model-name resolution only. |
+| voyage | 404 on chat path | **Alive** | Chat path not exposed; embed+rerank verified working. |
+| jina | 422 validation error | **Alive** | Authenticated; synthetic-probe schema mismatch. |
+
+**Verdict: no provider in this audit is a dead upstream.** Observed
+failure modes are misconfigured auth (apim), Cloudflare WAF blocking the
+cluster's egress (groq, opencode-zen), dead credentials (openai-codex,
+openai), and model-catalog staleness. Pool breakers/cooldowns therefore
+encode gateway-side symptoms, which is why several providers show
+long-lived "open" breakers while answering direct requests normally.
 
 ## Appendix
 
