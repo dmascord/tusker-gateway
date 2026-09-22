@@ -44,24 +44,35 @@ def store(monkeypatch: pytest.MonkeyPatch) -> ConfigStore:
 def _credential(
     *,
     account_id: str = "acct-1",
-    email: str = "user@example.com",
+    account_user_id: str | None = None,
+    email: str = "[REDACTED-EMAIL]",
     refresh_token: str = "rt-1",
     label: str | None = None,
     priority: int = 0,
     cred_id: str = "cred-1",
+    access_token: str = "at-1",
 ) -> dict[str, Any]:
-    return {
+    """Test credential.  ``account_user_id`` defaults to a per-login derivation
+    of ``account_id`` so most tests express login identity with one field."""
+    credential = {
         "id": cred_id,
         "label": label or email or account_id,
         "auth_type": "oauth",
-        "provider": "openai-codex",
+        "provider": PROVIDER,
         "priority": priority,
-        "access_token": "at-1",
+        "access_token": access_token,
         "refresh_token": refresh_token,
         "account_id": account_id,
         "email": email,
         "expires_at_ms": 0,
     }
+    # Omit account_user_id when deliberately empty so the "missing field"
+    # code path is exercised in _account_user_id / duplicate_account_indices.
+    if account_user_id is None:
+        account_user_id = f"user-{account_id}" if account_id else ""
+    if account_user_id:
+        credential["account_user_id"] = account_user_id
+    return credential
 
 
 def _stored(store: ConfigStore) -> list[dict[str, Any]]:
@@ -87,14 +98,14 @@ def _stub_flow(monkeypatch: pytest.MonkeyPatch, credential: dict[str, Any]) -> N
 # ---------------------------------------------------------------------------
 
 
-def test_duplicate_indices_detects_matching_account() -> None:
+def test_duplicate_indices_detects_matching_login() -> None:
     pool = [_credential(account_id="acct-A"), _credential(account_id="acct-B")]
     incoming = _credential(account_id="acct-B", refresh_token="rt-NEW", email="x@y")
     assert duplicate_account_indices(pool, incoming) == [1]
 
 
-def test_duplicate_indices_reports_every_entry_on_the_account() -> None:
-    # The incident shape: three enrollments of one ChatGPT account.
+def test_duplicate_indices_reports_every_entry_sharing_a_login() -> None:
+    # The 2026-09-22 incident: three re-enrollments of one ChatGPT login.
     pool = [
         _credential(account_id="acct-A", email="a@b.c"),
         _credential(account_id="acct-A", email="d@e.f", cred_id="cred-2"),
@@ -104,7 +115,23 @@ def test_duplicate_indices_reports_every_entry_on_the_account() -> None:
     assert duplicate_account_indices(pool, incoming) == [0, 1, 2]
 
 
-def _legacy_jwt(account_id: str = "acct-A", email: str = "legacy@x.y") -> str:
+def test_duplicate_indices_allows_distinct_logins_on_one_team_account() -> None:
+    """The 2026-09-22 finding: ChatGPT Team members share an account_id
+    but carry distinct account_user_ids and may co-enroll without conflict."""
+    pool = [
+        _credential(account_id="acct-A", account_user_id="user-damien"),
+        _credential(account_id="acct-A", account_user_id="user-bob"),
+    ]
+    incoming = _credential(account_id="acct-A", account_user_id="user-alice")
+    assert duplicate_account_indices(pool, incoming) == []
+
+
+def _legacy_jwt(
+    account_id: str = "acct-A",
+    email: str = "legacy@x.y",
+    *,
+    account_user_id: str | None = None,
+) -> str:
     """Minimal unsigned JWT carrying the ChatGPT account claim."""
     import base64
 
@@ -112,16 +139,20 @@ def _legacy_jwt(account_id: str = "acct-A", email: str = "legacy@x.y") -> str:
         raw = json.dumps(segment).encode()
         return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
 
+    auth: dict[str, str] = {"chatgpt_account_id": account_id}
+    if account_user_id:
+        auth["chatgpt_account_user_id"] = account_user_id
     payload = {
-        "https://api.openai.com/auth": {"chatgpt_account_id": account_id},
+        "https://api.openai.com/auth": auth,
         "email": email,
     }
     return f"{b64({'alg': 'none'})}.{b64(payload)}.sig"
 
 
-def test_duplicate_indices_resolves_legacy_account_via_jwt() -> None:
-    """The 2026-09-22 incident shape: legacy entries carry tokens but no
-    account_id field.  Their JWT identity must still collide."""
+def test_duplicate_indices_ignores_legacy_entry_without_user_identity() -> None:
+    """Truly ancient entries that carry only a chatgpt_account_id (no
+    chatgpt_account_user_id or user_id) are treated as distinct.  The
+    circuit breaker handles their dead refresh tokens gracefully."""
     legacy = {
         "id": "legacy-1",
         "label": "legacy",
@@ -132,9 +163,17 @@ def test_duplicate_indices_resolves_legacy_account_via_jwt() -> None:
         "id_token": _legacy_jwt(account_id="acct-A"),
         "expires_at_ms": 0,
     }
-    pool = [legacy]
     incoming = _credential(account_id="acct-A", refresh_token="rt-NEW")
-    assert duplicate_account_indices(pool, incoming) == [0]
+    # No match: the legacy entry has no resolvable account_user_id
+    assert duplicate_account_indices([legacy], incoming) == []
+
+
+def test_duplicate_indices_ignores_entries_without_login_identity() -> None:
+    """Entries lacking account_user_id (and no resolvable JWT) are never
+    treated as duplicates — they may be legacy or from another provider."""
+    pool = [_credential(account_user_id="", access_token="opaque-tok")]
+    assert duplicate_account_indices(pool, _credential(account_id="acct-A")) == []
+    assert duplicate_account_indices([], _credential(account_id="acct-A")) == []
 
 
 def test_duplicate_indices_ignores_non_jwt_legacy_tokens() -> None:
@@ -143,10 +182,22 @@ def test_duplicate_indices_ignores_non_jwt_legacy_tokens() -> None:
     assert duplicate_account_indices(pool, _credential(account_id="acct-A")) == []
 
 
-def test_duplicate_indices_ignores_missing_account_id() -> None:
-    pool = [_credential(account_id="acct-A")]
-    assert duplicate_account_indices(pool, _credential(account_id="")) == []
-    assert duplicate_account_indices([], _credential(account_id="acct-A")) == []
+def test_account_user_id_resolves_from_stored_field() -> None:
+    cred = _credential(account_user_id="user-XYZ")
+    assert module._account_user_id(cred) == "user-XYZ"
+
+
+def test_account_user_id_resolves_from_jwt_fallback() -> None:
+    jwt = _legacy_jwt(account_id="acct-A", account_user_id="user-damien")
+    cred = {"access_token": jwt, "id_token": jwt}
+    assert module._account_user_id(cred) == "user-damien"
+
+
+def test_account_user_id_omitted_when_empty() -> None:
+    """Credentials with account_id but no resolvable user identity should
+    omit the account_user_id field (safe default for legacy tokens)."""
+    cred = _credential(account_user_id="")
+    assert "account_user_id" not in cred
 
 
 def test_email_falls_back_to_jwt_profile() -> None:
@@ -272,13 +323,43 @@ def test_main_appends_distinct_account(
     assert [c["email"] for c in _stored(store)] == ["a@b.c", "b@c.d"]
 
 
-def test_main_refuses_second_entry_for_same_account(
+def test_main_appends_distinct_logins_on_same_team_account(
     store: ConfigStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Regression: the misconfiguration that killed the whole codex pool."""
-    write_credentials(store, PROVIDER, [_credential(email="a@b.c", account_id="acct-A")])
-    # A different login email on the SAME ChatGPT account.
-    _stub_flow(monkeypatch, _credential(account_id="acct-A", email="other@e.f"))
+    """The 2026-09-22 feature: ChatGPT Team members share an account_id but
+    carry distinct account_user_ids, so they must co-enroll by default."""
+    write_credentials(
+        store,
+        PROVIDER,
+        [_credential(email="a@b.c", account_id="acct-A", account_user_id="user-damien")],
+    )
+    _stub_flow(
+        monkeypatch,
+        _credential(account_id="acct-A", account_user_id="user-teammate", email="b@c.d"),
+    )
+
+    assert module.main(argv=[]) == 0
+    stored = _stored(store)
+    assert len(stored) == 2
+    assert [c["email"] for c in stored] == ["a@b.c", "b@c.d"]
+    assert [c["account_user_id"] for c in stored] == ["user-damien", "user-teammate"]
+
+
+def test_main_refuses_second_entry_for_same_login(
+    store: ConfigStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: the misconfiguration that killed the whole codex pool.
+    One ChatGPT login must never appear twice in the pool."""
+    write_credentials(
+        store,
+        PROVIDER,
+        [_credential(email="a@b.c", account_id="acct-A", account_user_id="user-1")],
+    )
+    # The SAME login re-enrolling under a new label/email.
+    _stub_flow(
+        monkeypatch,
+        _credential(account_id="acct-A", account_user_id="user-1", email="other@e.f"),
+    )
 
     assert module.main(argv=[]) == 1
     assert [c["email"] for c in _stored(store)] == ["a@b.c"]

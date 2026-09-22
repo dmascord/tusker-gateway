@@ -68,24 +68,60 @@ def _email(credential: dict[str, Any]) -> str:
     return ""
 
 
+def _account_user_id(credential: dict[str, Any]) -> str:
+    """Extract the per-user ChatGPT identity used as the pool dedup key.
+
+    On ChatGPT Team / Business plans several logins share one workspace
+    ``account_id``; only the composite ``chatgpt_account_user_id`` (or, when
+    missing, ``chatgpt_user_id``) tells two logins apart.  Pool duplicate
+    detection keys on this so team members can co-enroll without colliding.
+    """
+    value = credential.get("account_user_id")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    id_token = credential.get("id_token") or ""
+    access_token = credential.get("access_token") or ""
+    if id_token or access_token:
+        profile = codex_token_profile(access_token, id_token)
+        return profile.get("account_user_id") or profile.get("user_id", "")
+    return ""
+
+
+def _user_id(credential: dict[str, Any]) -> str:
+    """Extract the per-user ChatGPT login id (without the account prefix)."""
+    value = credential.get("user_id")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    id_token = credential.get("id_token") or ""
+    access_token = credential.get("access_token") or ""
+    if id_token or access_token:
+        return codex_token_profile(access_token, id_token).get("user_id", "")
+    return ""
+
+
+    return ""
+
+
 def duplicate_account_indices(
     credentials: list[dict[str, Any]],
     credential: dict[str, Any],
 ) -> list[int]:
-    """Indices in ``credentials`` sharing ``credential``'s ChatGPT account.
+    """Indices in ``credentials`` sharing ``credential``'s ChatGPT user identity.
 
-    Two pool entries for one account cannot both stay usable: a refresh by
-    either rotates the account's token and invalidates the other.  Entries
-    without a stored ``account_id`` are still compared via their JWT
-    identity, so legacy enrollments are recognised as duplicates too.
+    Two pool entries for one *login* cannot both stay usable: a refresh by
+    either rotates that login's tokens and OpenAI invalidates the other.
+    Different team members on the same workspace (``account_id``) carry
+    different ``account_user_id``s and are intentionally allowed to coexist.
+    Entries without an extractable ``account_user_id`` are treated as
+    distinct, which is the safe default.
     """
-    account = _account_id(credential)
-    if not account:
+    user = _account_user_id(credential)
+    if not user:
         return []
     return [
         index
         for index, existing in enumerate(credentials)
-        if _account_id(existing) == account
+        if _account_user_id(existing) == user
     ]
 
 
@@ -198,10 +234,14 @@ def write_credentials(
 def _summarise(credentials: list[dict[str, Any]]) -> str:
     lines = []
     for index, cred in enumerate(credentials):
+        user_key = _account_user_id(cred) or "(legacy)"
         account = _account_id(cred) or "?"
         label = cred.get("label") or "?"
         email = _email(cred) or "?"
-        lines.append(f"    [{index}] label={label} email={email} account_id={account[:18]}")
+        lines.append(
+            f"    [{index}] label={label} email={email} "
+            f"account_user_id={user_key[:20]}  account_id={account[:18]}"
+        )
     return "\n".join(lines) if lines else "    (empty)"
 
 
@@ -313,14 +353,18 @@ def main(argv: list[str] | None = None) -> int:
 
     email = _email(credential) or "?"
     account = _account_id(credential) or "?"
-    print(f"\nAuthorization received: email={email} account_id={account[:18]}")
+    user_key = _account_user_id(credential) or "?"
+    print(
+        f"\nAuthorization received: email={email} account_id={account[:18]} "
+        f"account_user_id={user_key[:20]}"
+    )
 
     if args.collapse_account:
         updated, removed = collapse_duplicates(existing, credential)
         noun = "entry" if len(removed) == 1 else "entries"
         action = (
-            f"collapsed {len(removed)} duplicate {noun} for account "
-            f"{account[:18] or '?'}"
+            f"collapsed {len(removed)} duplicate {noun} for account user "
+            f"{user_key[:20] or '?'}"
         )
     else:
         try:
@@ -339,11 +383,11 @@ def main(argv: list[str] | None = None) -> int:
         ]
         if duplicates and not args.allow_duplicate_account:
             logger.error(
-                "account_id %s is already enrolled at slot(s) %s; refreshing either "
-                "entry invalidates the other. Pass --collapse-account to merge them, "
-                "--allow-duplicate-account to override, or enroll a different ChatGPT "
-                "account.",
-                account[:18] or "?",
+                "this ChatGPT login (account_user_id %s) is already enrolled at "
+                "slot(s) %s; refreshing either entry invalidates the other. Pass "
+                "--collapse-account to merge them, --allow-duplicate-account to "
+                "override, or enroll a different ChatGPT login.",
+                user_key[:20] or "?",
                 duplicates,
             )
             return 1

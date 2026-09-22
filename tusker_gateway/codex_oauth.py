@@ -122,6 +122,16 @@ def codex_token_profile(
             if isinstance(value, str) and value.strip():
                 profile.setdefault("account_id", value.strip())
                 break
+        for key in ("chatgpt_account_user_id", "account_user_id"):
+            value = payload.get(key) or auth.get(key)
+            if isinstance(value, str) and value.strip():
+                profile.setdefault("account_user_id", value.strip())
+                break
+        for key in ("chatgpt_user_id", "user_id"):
+            value = payload.get(key) or auth.get(key)
+            if isinstance(value, str) and value.strip():
+                profile.setdefault("user_id", value.strip())
+                break
         for key in ("email", "preferred_username"):
             value = payload.get(key) or token_profile.get(key)
             if isinstance(value, str) and value.strip():
@@ -303,6 +313,10 @@ def _credential_from_token_response(
         credential["account_id"] = profile["account_id"]
     if profile.get("email"):
         credential["email"] = profile["email"]
+    if profile.get("account_user_id"):
+        credential["account_user_id"] = profile["account_user_id"]
+    if profile.get("user_id"):
+        credential["user_id"] = profile["user_id"]
     return credential
 
 
