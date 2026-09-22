@@ -330,6 +330,7 @@ async def admin_providers(request: web.Request) -> web.Response:
             "models_path": getattr(prov, "models_path", None),
             "rerank_path": getattr(prov, "rerank_path", None),
             "model_header": getattr(prov, "model_header", None),
+            "api_key_header": getattr(prov, "api_key_header", None),
             "zdr_ok": getattr(prov, "zdr_ok", False),
             "heavyweight": getattr(prov, "heavyweight", False),
             "excluded": name_lower in excluded,
@@ -1071,7 +1072,7 @@ def attach_admin_access_middleware(app: web.Application) -> None:
 
 _PROVIDER_DEF_FIELDS = frozenset({
     "name", "kind", "auth_type", "base_url", "chat_path",
-    "auth_env", "pool_env", "model_header", "models_path",
+    "auth_env", "pool_env", "model_header", "api_key_header", "models_path",
     "rerank_path", "model_aliases", "zdr_ok", "heavyweight",
 })
 _PROVIDER_SETTINGS_FIELDS = frozenset({

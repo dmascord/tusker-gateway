@@ -57,6 +57,34 @@ class BearerAuthenticator(Authenticator):
         return headers
 
 
+class ApiKeyHeaderAuthenticator(Authenticator):
+    """Send the API key in a named request header instead of ``Authorization``.
+
+    Used by providers like Azure API Management where the subscription key
+    is expected in a custom header (``api-key`` by default). The header
+    name is read from ``endpoint.api_key_header`` so each provider can
+    pick its own convention.
+    """
+
+    DEFAULT_HEADER = "api-key"
+
+    async def headers(
+        self,
+        config: dict[str, Any],
+        provider: str,
+        model: str,
+        api_key: str | None,
+        endpoint: ProviderConfig,
+    ) -> dict[str, str]:
+        headers: dict[str, str] = {}
+        provider_key = config.get("provider_api_keys", {}).get(provider.lower())
+        token = api_key or provider_key
+        if token:
+            header_name = (endpoint.api_key_header or self.DEFAULT_HEADER).strip() or self.DEFAULT_HEADER
+            headers[header_name] = token
+        return headers
+
+
 class OAuthAuthenticator(Authenticator):
     """Copilot/Enterprise OAuth exchange using CodexTokenRotator."""
 
@@ -219,6 +247,7 @@ AUTH_STRATEGIES: dict[str, type[Authenticator]] = {
     "bearer": BearerAuthenticator,
     "oauth": OAuthAuthenticator,
     "codex": CodexAuthenticator,
+    "api_key": ApiKeyHeaderAuthenticator,
 }
 
 
@@ -232,4 +261,6 @@ def get_auth_strategy(auth_type: str, rotator: CodexTokenRotator | None = None) 
         if rotator is None:
             raise RuntimeError("Codex provider requires CodexTokenRotator")
         return CodexAuthenticator(rotator)
+    if auth_type == "api_key":
+        return ApiKeyHeaderAuthenticator()
     return BearerAuthenticator()

@@ -53,6 +53,7 @@ def _section_counts(store: ConfigStore, config: dict, *, dry_run: bool, update: 
                     "auth_env": provider.auth_env,
                     "pool_env": provider.pool_env,
                     "model_header": provider.model_header,
+                    "api_key_header": provider.api_key_header,
                     "models_path": provider.models_path,
                     "rerank_path": provider.rerank_path,
                     "model_aliases": dict(provider.model_aliases) if provider.model_aliases else None,

@@ -594,6 +594,8 @@ def _init_provider_endpoints() -> dict[str, dict[str, Any]]:
             }
             if pc.model_header:
                 entry["model_header"] = pc.model_header
+            if pc.api_key_header:
+                entry["api_key_header"] = pc.api_key_header
             out[name] = entry
         if out:
             return out
@@ -662,6 +664,7 @@ def _configured_endpoint(config: dict[str, Any], provider: str) -> dict[str, Any
         chat_path = provider_config.get("chat_path")
         auth_type = provider_config.get("auth_type", provider_config.get("kind", "bearer"))
         model_header = provider_config.get("model_header")
+        api_key_header = provider_config.get("api_key_header")
     else:
         base_url = getattr(provider_config, "base_url", None)
         chat_path = getattr(provider_config, "chat_path", None)
@@ -671,6 +674,7 @@ def _configured_endpoint(config: dict[str, Any], provider: str) -> dict[str, Any
             getattr(provider_config, "kind", "bearer"),
         )
         model_header = getattr(provider_config, "model_header", None)
+        api_key_header = getattr(provider_config, "api_key_header", None)
     if not base_url or not chat_path:
         return None
     endpoint: dict[str, Any] = {
@@ -680,6 +684,8 @@ def _configured_endpoint(config: dict[str, Any], provider: str) -> dict[str, Any
     }
     if model_header:
         endpoint["model_header"] = str(model_header)
+    if api_key_header:
+        endpoint["api_key_header"] = str(api_key_header)
     return endpoint
 
 
@@ -2155,6 +2161,8 @@ class PassthroughClient:
             strategy = get_auth_strategy("codex", rotator)
         elif auth_type == "oauth":
             strategy = get_auth_strategy("oauth", rotator)
+        elif auth_type == "api_key":
+            strategy = get_auth_strategy("api_key", getattr(self, "_codex_rotator", None))
         else:
             strategy = get_auth_strategy("bearer", getattr(self, "_codex_rotator", None))
         # headers are built inside the retry loop below so each attempt can

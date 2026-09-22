@@ -88,12 +88,15 @@ class ProviderConfig:
     """Normalized provider configuration."""
 
     name: str
-    kind: Literal["bearer", "oauth", "local", "upstream"]
+    kind: Literal["bearer", "oauth", "local", "upstream", "api_key"]
     base_url: str
     chat_path: str
     auth_env: str | None = None
     pool_env: str | None = None
     model_header: str | None = None
+    # When set, the provider's API key is sent in this request header
+    # instead of ``Authorization: Bearer`` (e.g. Azure APIM's ``api-key``).
+    api_key_header: str | None = None
     auth_type: str = "bearer"
     zdr_ok: bool = False
     heavyweight: bool = False
@@ -864,6 +867,7 @@ def _provider_registry_from_env() -> dict[str, ProviderConfig]:
                     "auth_env": value.get("auth_env"),
                     "pool_env": value.get("pool_env"),
                     "model_header": value.get("model_header"),
+                    "api_key_header": value.get("api_key_header"),
                     "auth_type": value.get("auth_type", value.get("kind", "bearer")),
                     "zdr_ok": bool(value.get("zdr_ok", False)),
                     "heavyweight": bool(value.get("heavyweight", False)),

@@ -12,6 +12,9 @@ class ProviderEndpoint:
     chat_path: str
     auth_type: str = "bearer"
     model_header: str | None = None
+    # When set, the provider's API key is sent in this request header
+    # instead of ``Authorization: Bearer`` (e.g. Azure APIM's ``api-key``).
+    api_key_header: str | None = None
 
     @classmethod
     def from_registry(cls, registry: Mapping[str, Any] | None, name: str) -> "ProviderEndpoint":
@@ -20,8 +23,14 @@ class ProviderEndpoint:
         pc = reg.get(name.lower())
         if pc is None:
             raise KeyError(f"Unknown provider: {name}")
-        auth = pc.auth_type if pc.auth_type in {"bearer", "oauth", "local", "upstream"} else pc.kind
-        return cls(base_url=pc.base_url, chat_path=pc.chat_path, auth_type=auth, model_header=pc.model_header)
+        auth = pc.auth_type if pc.auth_type in {"bearer", "oauth", "local", "upstream", "api_key"} else pc.kind
+        return cls(
+            base_url=pc.base_url,
+            chat_path=pc.chat_path,
+            auth_type=auth,
+            model_header=pc.model_header,
+            api_key_header=pc.api_key_header,
+        )
 
     @classmethod
     def from_raw(cls, raw: Mapping[str, Any]) -> "ProviderEndpoint":
@@ -30,6 +39,7 @@ class ProviderEndpoint:
             chat_path=str(raw["chat_path"]),
             auth_type=str(raw.get("auth_type", "bearer")),
             model_header=raw.get("model_header"),
+            api_key_header=raw.get("api_key_header"),
         )
 
     def to_raw(self) -> dict[str, Any]:
@@ -40,6 +50,8 @@ class ProviderEndpoint:
         }
         if self.model_header:
             out["model_header"] = self.model_header
+        if self.api_key_header:
+            out["api_key_header"] = self.api_key_header
         return out
 
 
