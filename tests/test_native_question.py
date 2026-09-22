@@ -214,6 +214,40 @@ def test_namespaced_omp_question_id_is_replayed_without_provider_round_trip():
     assert replay["choices"][0]["message"]["tool_calls"] == original
 
 
+def test_namespaced_question_uses_embedded_approval_id_when_multiple_are_pending():
+    first = question_response_for_calls(_trade_call(qty=1), model="model")
+    second = question_response_for_calls(_trade_call(qty=2), model="model")
+    first_call = first["choices"][0]["message"]["tool_calls"][0]
+    second_call = second["choices"][0]["message"]["tool_calls"][0]
+    second_args = json.loads(second_call["function"]["arguments"])
+
+    ask_message = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [{
+            "id": "default_api:ask",
+            "type": "function",
+            "function": {
+                "name": "default_api:ask",
+                "arguments": json.dumps(second_args),
+            },
+        }],
+    }
+    replay = replay_approved_tool_response([
+        ask_message,
+        {
+            "role": "tool",
+            "tool_call_id": "default_api:ask",
+            "content": json.dumps({"selectedOptions": ["Allow once"]}),
+        },
+    ])
+
+    assert replay is not None
+    assert replay["choices"][0]["message"]["tool_calls"] == _trade_call(qty=2)
+    # The unrelated pending approval must remain available for its own answer.
+    assert first_call["id"] != second_call["id"]
+
+
 def test_question_deny_and_unrecognized_answer_do_not_authorize():
     question = question_response_for_calls(_trade_call(), model="model")
     call = question["choices"][0]["message"]["tool_calls"][0]

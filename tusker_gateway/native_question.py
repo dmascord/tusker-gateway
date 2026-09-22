@@ -264,6 +264,40 @@ def _embedded_ids(value: Any) -> set[str]:
     return found
 
 
+def _question_ids_from_call(function: Any) -> set[str]:
+    """Extract approval IDs from an ask call's arguments.
+
+    OMP/provider bridges can replace the tool-call ID with a namespaced value
+    such as ``default_api:ask``.  The stable UUID is also present in the
+    question payload, so prefer that identity when several approvals are
+    pending rather than guessing based on insertion order.
+    """
+    if not isinstance(function, dict):
+        return set()
+    arguments = function.get("arguments")
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments or "{}")
+        except (TypeError, json.JSONDecodeError):
+            return set()
+    found: set[str] = set()
+    if isinstance(arguments, dict):
+        questions = arguments.get("questions")
+        if isinstance(questions, list):
+            for question in questions:
+                if not isinstance(question, dict):
+                    continue
+                for key in ("id", "question_id", "questionId"):
+                    candidate = question.get(key)
+                    if isinstance(candidate, str) and candidate:
+                        found.add(candidate)
+        for key in ("id", "question_id", "questionId"):
+            candidate = arguments.get(key)
+            if isinstance(candidate, str) and candidate:
+                found.add(candidate)
+    return found
+
+
 def _prune() -> None:
     now = time.time()
     for call_id, pending in list(_PENDING.items()):
@@ -412,11 +446,26 @@ def replay_approved_tool_response(
                     call_id = call.get("id")
                     if isinstance(call_id, str) and call_id in _PENDING:
                         questions.add(call_id)
-                    elif len(pending_call_ids) == 1:
-                        # OMP/provider bridges may replace the opaque ID
-                        # with a namespaced value such as default_api:ask.
-                        # Bind only when exactly one pending approval exists.
-                        questions.add(pending_call_ids[0])
+                    else:
+                        embedded_pending = _question_ids_from_call(function) & set(
+                            pending_call_ids
+                        )
+                        if embedded_pending:
+                            questions.update(embedded_pending)
+                        elif len(pending_call_ids) == 1:
+                            # OMP/provider bridges may replace the opaque ID
+                            # with a namespaced value such as default_api:ask.
+                            # Bind only when exactly one pending approval exists.
+                            questions.add(pending_call_ids[0])
+                    logger.info(
+                        "approval replay question request_id=%s tool_id=%s "
+                        "embedded_ids=%s bound_ids=%s pending=%d",
+                        request_id or "unknown",
+                        call_id or "none",
+                        sorted(_question_ids_from_call(function)),
+                        sorted(questions),
+                        len(pending_call_ids),
+                    )
         if message.get("role") in {"tool", "function"}:
             content = _message_content(message)
             tool_call_id = message.get("tool_call_id")
