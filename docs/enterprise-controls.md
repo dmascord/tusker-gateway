@@ -88,6 +88,16 @@ behavior into automatic authorization. Keep the audit file on immutable or
 access-controlled storage and apply the same retention policy as other
 security records.
 
+For temporary investigation, set `TUSKER_HIGH_IMPACT_MODE=audit`. This keeps
+the classifier active but records `high_impact.audit` events and allows the
+request to continue without emitting an interactive OMP question. Events
+record the trigger category, provider/model, request ID, source role and
+message index, a hash of source user content, the matched policy phrase when
+available, tool names, and a hash/signature of the normalized tool call. Raw
+prompts, tool arguments, and secrets are not recorded. The default is
+`approval`; return to that mode after the investigation. Audit persistence
+continues to follow `TUSKER_AUDIT_FAIL_CLOSED`.
+
 Operational knobs:
 
 - `TUSKER_AUDIT_FAIL_CLOSED=true` rejects unprepared responses if audit

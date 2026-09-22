@@ -408,6 +408,9 @@ def status_handler(request: web.Request) -> web.Response:
             else "sha256" if getattr(audit_config, "enabled", False) else "disabled"
         ),
         "audit_fail_closed": bool(getattr(audit_config, "fail_closed", False)),
+        "high_impact_mode": (request.app.get("config") or {}).get(
+            "high_impact_mode", "approval"
+        ),
         "request_timeout_ms": getattr(deadline_config, "default_timeout_ms", 0),
         "max_request_timeout_ms": getattr(deadline_config, "max_timeout_ms", 0),
         "idempotency_enabled": bool(getattr(idempotency_config, "enabled", False)),

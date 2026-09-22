@@ -22,6 +22,7 @@ from tusker_gateway.cooldown import is_account_quota_exhausted
 from tusker_gateway.config import (
     build_high_impact_argument_regex,
     build_high_impact_content_regex,
+    high_impact_mode,
     high_impact_greylist_force_deny,
     model_is_blacklisted,
     model_is_greylisted,
@@ -1804,6 +1805,8 @@ def _native_content_question_if_needed(
     out of the approval protocol and guarantees a single OMP ask call.
     """
     action = _high_impact_content_kind(messages, content_regex=content_regex)
+    if high_impact_mode() == "audit":
+        return None
     if not action or question_authorized_for_content(
         messages, action, request_id=request_id, audit=audit
     ):
@@ -1832,6 +1835,7 @@ def _enforce_high_impact_approval(
     messages: Any = None,
     force_deny: bool = False,
     native_authorized: bool = False,
+    audit: Any = None,
 ) -> None:
     risky = next(
         (
@@ -1844,6 +1848,89 @@ def _enforce_high_impact_approval(
     if risky is None and messages is not None:
         risky = _high_impact_content_kind(messages, content_regex=content_regex)
     if risky is None:
+        return
+    if high_impact_mode() == "audit":
+        source_role = None
+        source_message_index = None
+        source_content_sha256 = None
+        matched_text = None
+        trigger_kind = "tool_call"
+        if calls:
+            tool_names = [
+                str((call.get("function") or {}).get("name") or "unknown")[:80]
+                for call in calls[:8]
+            ]
+            call_signature = _tool_call_signature(calls)
+            call_signature_sha256 = hashlib.sha256(
+                json.dumps(calls, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
+            ).hexdigest()
+            first_name = str(
+                (calls[0].get("function") or {}).get("name") or ""
+            ).strip().lower()
+            if first_name in {"place_trade", "submit_order", "send_message"}:
+                trigger_rule = "high_impact_tool_name"
+            elif first_name in _SHELL_TOOL_NAMES:
+                trigger_rule = "shell_high_impact_pattern"
+            else:
+                trigger_rule = "high_impact_argument_pattern"
+        else:
+            tool_names = []
+            call_signature = "none"
+            call_signature_sha256 = None
+            trigger_rule = "high_impact_content_pattern"
+        for index, message in enumerate(messages if isinstance(messages, list) else []):
+            if not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            content = message.get("content")
+            if isinstance(content, list):
+                content = " ".join(
+                    str(item.get("text", ""))
+                    for item in content
+                    if isinstance(item, dict) and item.get("type") == "text"
+                )
+            if not isinstance(content, str):
+                continue
+            source_role = "user"
+            source_message_index = index
+            source_content_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            if not calls:
+                trigger_kind = "user_content_pattern"
+                matched = content_regex.search(content) if content_regex else None
+                if matched:
+                    matched_text = re.sub(r"\s+", " ", matched.group(0)).strip()[:160]
+            break
+        event = {
+            "event_type": "high_impact.audit",
+            "decision": "allowed_audit_mode",
+            "mode": "audit",
+            "request_id": request_id or "unknown",
+            "provider": provider,
+            "model": model,
+            "action": risky,
+            "trigger_kind": trigger_kind,
+            "trigger_rule": trigger_rule,
+            "goal_source": "user_message_history" if source_role == "user" else "provider_tool_call",
+            "source_role": source_role,
+            "source_message_index": source_message_index,
+            "source_content_sha256": source_content_sha256,
+            "matched_text": matched_text,
+            "tool_names": tool_names,
+            "tool_call_signature": call_signature,
+            "tool_call_signature_sha256": call_signature_sha256,
+            "greylisted": greylisted,
+            "explicitly_authorized": explicitly_authorized,
+            "native_authorized": native_authorized,
+            "force_deny_configured": force_deny,
+        }
+        writer = getattr(audit, "write_sync", None)
+        if callable(writer):
+            writer(event)
+        logger.warning(
+            "high-impact action allowed in audit mode provider=%s model=%s request_id=%s "
+            "action=%s trigger=%s source_message_index=%s call_signature=%s",
+            provider, model, request_id or "unknown", risky, trigger_kind,
+            source_message_index, call_signature,
+        )
         return
     # A greylisted model never gets the "explicitly authorized" shortcut when
     # the operator hasn't opted out. This is the safe default: a goal-injected
@@ -2141,7 +2228,7 @@ def _validate_complete_tool_response(
         if content_action
         else False
     )
-    if calls and native_questions and not native_authorized:
+    if calls and native_questions and high_impact_mode() != "audit" and not native_authorized:
         question_response = question_response_for_calls(
             calls,
             model=model,
@@ -2151,7 +2238,7 @@ def _validate_complete_tool_response(
         )
         if question_response is not None:
             return question_response
-    if content_action and native_questions and not native_authorized:
+    if content_action and high_impact_mode() != "audit" and not native_authorized:
         return question_response_for_content(
             messages,
             content_action,
@@ -2173,6 +2260,7 @@ def _validate_complete_tool_response(
         messages=messages,
         force_deny=force_deny,
         native_authorized=native_authorized,
+        audit=audit,
     )
     if reject_empty and not calls and not _response_has_visible_content(response):
         raise UnusableToolResponseError(
@@ -2341,7 +2429,12 @@ async def _prepare_stream_result(
                 if content_action
                 else False
             )
-            if content_action and not native_content_authorized and not assembled_calls:
+            if (
+                content_action
+                and high_impact_mode() != "audit"
+                and not native_content_authorized
+                and not assembled_calls
+            ):
                 question_response = question_response_for_content(
                     messages,
                     content_action,
@@ -2377,7 +2470,7 @@ async def _prepare_stream_result(
                     request_id=request_id,
                     audit=audit,
                 )
-                if not native_authorized:
+                if high_impact_mode() != "audit" and not native_authorized:
                     question_response = question_response_for_calls(
                         assembled_calls,
                         model=model,
@@ -2398,7 +2491,7 @@ async def _prepare_stream_result(
                             request_id or "unknown",
                         )
                         return
-                if content_action and not native_content_authorized:
+                if content_action and high_impact_mode() != "audit" and not native_content_authorized:
                     question_response = question_response_for_content(
                         messages,
                         content_action,
@@ -2430,8 +2523,9 @@ async def _prepare_stream_result(
                     messages=[] if native_content_authorized else messages,
                     force_deny=force_deny,
                     native_authorized=native_authorized,
+                    audit=audit,
                 )
-            if content_action and not native_content_authorized:
+            if content_action and high_impact_mode() != "audit" and not native_content_authorized:
                 question_response = question_response_for_content(
                     messages,
                     content_action,

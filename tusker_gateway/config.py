@@ -81,6 +81,13 @@ DEFAULT_HIGH_IMPACT_CONTENT_PATTERNS = (
 # ``TUSKER_HIGH_IMPACT_GREYLIST_FORCE_DENY`` (default "true": greylist forces
 # the gate to require explicit approval regardless of authorization text).
 HIGH_IMPACT_GREYLIST_FORCE_DENY = True
+HIGH_IMPACT_MODES = frozenset({"approval", "audit"})
+
+
+def high_impact_mode() -> str:
+    """Return the request-time high-impact control mode."""
+    value = os.environ.get("TUSKER_HIGH_IMPACT_MODE", "approval").strip().lower()
+    return value if value in HIGH_IMPACT_MODES else "approval"
 
 
 @dataclass
@@ -301,6 +308,7 @@ def load_config() -> dict[str, Any]:
         os.environ.get("TUSKER_HIGH_IMPACT_GREYLIST_FORCE_DENY", ""),
         default=HIGH_IMPACT_GREYLIST_FORCE_DENY,
     )
+    config["high_impact_mode"] = high_impact_mode()
     # Providers whose catalog is considered a complete authoritative list for
     # negative discovery (route exclusion when absent from catalog). Default
     # empty: catalog presence/absence is never a selection gate without this.

@@ -12,6 +12,7 @@ from tusker_gateway.config import (
     build_high_impact_argument_regex,
     build_high_impact_content_regex,
     high_impact_greylist_force_deny,
+    high_impact_mode,
     load_config,
     model_is_blacklisted,
     tools_include_high_impact,
@@ -189,6 +190,81 @@ def test_approved_high_impact_call_is_allowed():
         request_id="req-test",
         explicitly_authorized=True,
     )
+
+
+def test_high_impact_audit_mode_allows_and_records_tool_trigger(monkeypatch):
+    class Audit:
+        def __init__(self):
+            self.events = []
+
+        def write_sync(self, event):
+            self.events.append(event)
+
+    monkeypatch.setenv("TUSKER_HIGH_IMPACT_MODE", "audit")
+    audit = Audit()
+    call = {"function": {"name": "bash", "arguments": '{"command":"kubectl delete pod x"}'}}
+    _enforce_high_impact_approval(
+        [call],
+        provider="provider-a",
+        model="model-a",
+        request_id="req-audit-tool",
+        explicitly_authorized=False,
+        messages=[{"role": "user", "content": "Please investigate this deployment."}],
+        audit=audit,
+    )
+    assert high_impact_mode() == "audit"
+    assert audit.events[0]["event_type"] == "high_impact.audit"
+    assert audit.events[0]["decision"] == "allowed_audit_mode"
+    assert audit.events[0]["trigger_kind"] == "tool_call"
+    assert audit.events[0]["trigger_rule"] == "shell_high_impact_pattern"
+    assert audit.events[0]["goal_source"] == "user_message_history"
+    assert audit.events[0]["source_message_index"] == 0
+    assert audit.events[0]["tool_names"] == ["bash"]
+    assert "kubectl delete" not in str(audit.events[0])
+
+
+def test_high_impact_audit_mode_records_user_content_trigger(monkeypatch):
+    class Audit:
+        def __init__(self):
+            self.events = []
+
+        def write_sync(self, event):
+            self.events.append(event)
+
+    monkeypatch.setenv("TUSKER_HIGH_IMPACT_MODE", "audit")
+    audit = Audit()
+    messages = [{"role": "user", "content": "Please submit the order now."}]
+    regex = build_high_impact_content_regex(load_config())
+    _enforce_high_impact_approval(
+        [],
+        provider="provider-b",
+        model="model-b",
+        request_id="req-audit-content",
+        explicitly_authorized=False,
+        content_regex=regex,
+        messages=messages,
+        audit=audit,
+    )
+    event = audit.events[0]
+    assert event["trigger_kind"] == "user_content_pattern"
+    assert event["trigger_rule"] == "high_impact_content_pattern"
+    assert event["source_role"] == "user"
+    assert event["source_message_index"] == 0
+    assert event["matched_text"] == "submit the order"
+    assert "Please submit the order now" not in str(event)
+
+
+def test_invalid_high_impact_mode_falls_back_to_approval(monkeypatch):
+    monkeypatch.setenv("TUSKER_HIGH_IMPACT_MODE", "unexpected")
+    assert high_impact_mode() == "approval"
+    with pytest.raises(HighImpactApprovalRequiredError):
+        _enforce_high_impact_approval(
+            [{"function": {"name": "place_trade", "arguments": "{}"}}],
+            provider="provider-c",
+            model="model-c",
+            request_id="req-default-mode",
+            explicitly_authorized=False,
+        )
 
 
 def test_repeated_suspicious_behavior_promotes_model_to_runtime_blacklist(monkeypatch):
