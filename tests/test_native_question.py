@@ -7,6 +7,8 @@ import uuid
 
 import pytest
 
+import tusker_gateway.native_question as native_question
+from tusker_gateway.approval_store import ApprovalStore
 from tusker_gateway.endpoints import _native_content_question_if_needed
 from tusker_gateway.endpoints import _validate_complete_tool_response
 from tusker_gateway.endpoints import _prepare_stream_result
@@ -25,8 +27,10 @@ from tusker_gateway.native_question import (
 
 @pytest.fixture(autouse=True)
 def clear_pending_questions():
+    native_question._approval_store = native_question._APPROVAL_STORE_UNSET
     reset_pending()
     yield
+    native_question._approval_store = native_question._APPROVAL_STORE_UNSET
     reset_pending()
 
 
@@ -228,6 +232,29 @@ def test_omp_human_readable_ask_result_replays_without_provider_round_trip():
 
     assert replay is not None
     assert replay["choices"][0]["message"]["tool_calls"] == original
+
+
+def test_approved_call_replays_after_process_local_state_is_lost(tmp_path):
+    """A rollout or another pod must retain the UUID-to-call binding."""
+    native_question._approval_store = ApprovalStore(tmp_path / "approvals.db")
+    original = _trade_call(qty=9)
+    response = question_response_for_calls(original, model="model", request_id="req-1")
+    approval_id = response["choices"][0]["message"]["tool_calls"][0]["id"]
+
+    # Simulate a process restart while the client still holds the ask result.
+    native_question._PENDING.clear()
+    replay = replay_approved_tool_response([
+        {"role": "assistant", "tool_calls": response["choices"][0]["message"]["tool_calls"]},
+        {
+            "role": "tool",
+            "tool_call_id": approval_id,
+            "content": "User selected: Allow once",
+        },
+    ])
+
+    assert replay is not None
+    assert replay["choices"][0]["message"]["tool_calls"] == original
+    assert native_question._approval_store.load_active() == {}
 
 
 def test_namespaced_omp_question_id_is_replayed_without_provider_round_trip():

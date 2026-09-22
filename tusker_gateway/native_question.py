@@ -41,6 +41,53 @@ def _is_question_tool_name(value: Any) -> bool:
 
 _PENDING: dict[str, dict[str, Any]] = {}
 _TTL_SECS = 300
+_APPROVAL_STORE_UNSET = object()
+_approval_store: Any = _APPROVAL_STORE_UNSET
+
+
+def _store() -> Any:
+    """Return the optional shared approval store without breaking local mode."""
+    global _approval_store
+    if _approval_store is _APPROVAL_STORE_UNSET:
+        try:
+            from tusker_gateway.approval_store import configured_approval_store
+
+            _approval_store = configured_approval_store()
+        except Exception:
+            logger.warning("native approval durable store unavailable", exc_info=True)
+            _approval_store = None
+    return _approval_store
+
+
+def _hydrate_pending() -> None:
+    store = _store()
+    if store is None:
+        return
+    try:
+        for approval_id, pending in store.load_active().items():
+            _PENDING.setdefault(approval_id, pending)
+    except Exception:
+        logger.warning("native approval durable state could not be loaded", exc_info=True)
+
+
+def _persist_pending(approval_id: str, pending: dict[str, Any]) -> None:
+    store = _store()
+    if store is None:
+        return
+    try:
+        store.put(approval_id, pending)
+    except Exception:
+        logger.warning("native approval durable state could not be written", exc_info=True)
+
+
+def _delete_persisted(approval_id: str) -> None:
+    store = _store()
+    if store is None:
+        return
+    try:
+        store.delete(approval_id)
+    except Exception:
+        logger.warning("native approval durable state could not be deleted", exc_info=True)
 
 
 def _audit(audit: Any, event: dict[str, Any]) -> None:
@@ -305,6 +352,7 @@ def _question_ids_from_call(function: Any) -> set[str]:
 
 
 def _prune() -> None:
+    _hydrate_pending()
     now = time.time()
     for call_id, pending in list(_PENDING.items()):
         if float(pending.get("expires_at", 0)) <= now:
@@ -319,6 +367,7 @@ def _prune() -> None:
                 "decision": "expired",
             })
             _PENDING.pop(call_id, None)
+            _delete_persisted(call_id)
 
 
 def _risky_action(calls: list[dict[str, Any]]) -> str | None:
@@ -370,6 +419,7 @@ def question_response_for_calls(
             "adapter": adapter.key,
             "audit": audit,
         }
+        _persist_pending(call_id, _PENDING[call_id])
         _audit(audit, {
             "event_type": "tool.approval.proposed",
             "approval_id": call_id,
@@ -397,6 +447,7 @@ def question_response_for_calls(
     else:
         pending = _PENDING[call_id]
         pending["expires_at"] = time.time() + _TTL_SECS
+        _persist_pending(call_id, pending)
         logger.info(
             "native approval reused request_id=%s approval_id=%s action=%s "
             "signature=%s",
@@ -534,6 +585,7 @@ def replay_approved_tool_response(
             continue
 
         _PENDING.pop(call_id, None)
+        _delete_persisted(call_id)
         _audit(pending.get("audit") or audit, {
             "event_type": "tool.approval.decision",
             "approval_id": call_id,
@@ -750,6 +802,7 @@ def question_authorized(
         if not found:
             continue
         _PENDING.pop(call_id, None)
+        _delete_persisted(call_id)
         _audit(pending.get("audit") or audit, {
             "event_type": "tool.approval.decision",
             "approval_id": call_id,
@@ -890,5 +943,11 @@ def question_authorized_for_content(
 
 
 def reset_pending() -> None:
-    """Test helper; pending approvals are process-local and short-lived."""
+    """Test helper; clear local and durable pending approvals."""
     _PENDING.clear()
+    store = _store()
+    if store is not None:
+        try:
+            store.clear()
+        except Exception:
+            logger.warning("native approval durable state could not be cleared", exc_info=True)
