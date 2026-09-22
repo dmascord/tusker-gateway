@@ -260,25 +260,22 @@ the privacy pool unless an explicit deployment policy enables them.
 | Provider prefix | Backend | Catalog |
 |---|---|---|
 | `local-llm/` | Jetson Orin Nano Ollama, `http://10.0.0.212:11434` | `/api/tags` |
-| `mlx-mac/` | Mac M4 Max MLX, `http://10.0.0.141:11435` | `/v1/models` |
+| `mlx-mac/` | Mac M4 Max (Ollama + MLX Metal backend), `http://10.0.0.141:11434` | `/api/tags` |
 
-Both use `/v1/chat/completions` and never substitute a gateway pool. Mac port
-11434 is a separate Ollama service, not MLX. Use these client-facing names:
+Both use `/v1/chat/completions` and never substitute a gateway pool. The MLX
+host runs Ollama with Apple MLX (Metal GPU) as its inference backend; there
+are no separate `mlx_lm`/`mlx_vlm` servers. Use these client-facing names:
 
 ```text
 local-llm/qwopus-9b-coder-mtp:latest
-mlx-mac/qwen3-coder-30b-a3b-instruct-4bit
+mlx-mac/qwen3.8-27b
 ```
 
-The MLX provider's `model_aliases` in `PROVIDER_REGISTRY_JSON` maps the friendly
-name to `/Users/tusker/models/Qwen3-Coder-30B-A3B-Instruct-4bit` only on the
-outbound chat request. Successful JSON and SSE model fields retain the friendly
-name; generated content is untouched. `mlx-mac::qwen3-coder-30b-a3b-instruct-4bit`
-is equivalent. `/v1/models` advertises configured provider aliases alongside
-the gateway's virtual models. Unmapped model IDs still pass through unchanged.
-The privacy pool includes both routes as eligible candidates. Their actual
-selection order is still controlled by the pool's quality and rotation logic;
-they are not guaranteed to run before cloud privacy candidates.
+Both `local-llm` and `mlx-mac` advertise their catalog via the gateway's
+`/v1/models`. Unmapped model IDs pass through unchanged. The privacy pool
+includes both routes as eligible candidates; their actual selection order
+is still controlled by the pool's quality and rotation logic — they are
+not guaranteed to run before cloud privacy candidates.
 
 #### Single-concurrency capacity gate
 
