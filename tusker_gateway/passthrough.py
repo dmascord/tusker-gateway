@@ -44,6 +44,13 @@ logger = logging.getLogger(__name__)
 _SENSITIVE_ERROR_VALUE_RE = re.compile(
     r"(?i)(\b(?:authorization|api[_ -]?key|access[_ -]?token|refresh[_ -]?token|token)\b\s*[:=]\s*)([\"']?)[^\s,\"'}]+",
 )
+# Cloudflare and similar WAF/CDN error pages don't belong in structured
+# error messages; detect HTML-ish bodies or ``error code: 5xx`` markers
+# so the safe-body helper can collapse them to a stable phrase.
+_CLOUDFLARE_OR_HTML_ERROR_RE = re.compile(
+    r"(?i)<!doctype html|<html[ >]|error code\s*:\s*5\d\d|cloudflare",
+)
+
 
 _OPENCODE_GO_PROVIDER = "opencode-go"
 _OPENCODE_SESSION_PROVIDERS = frozenset({_OPENCODE_GO_PROVIDER, "opencode-zen"})
@@ -153,10 +160,17 @@ def _stable_opencode_session_id(
 
 
 def _safe_upstream_body(body: str | None, *, limit: int = 500) -> str:
-    """Return a bounded provider error body without echoing credentials."""
+    """Return a bounded provider error body without echoing credentials.
+
+    Cloudflare error pages (``<!DOCTYPE html>…``, ``error code: 502``)
+    and similar WAF/CDN bodies are collapsed into a stable signal
+    instead of being relayed into structured error messages.
+    """
     if not body:
         return "<empty>"
     compact = " ".join(body.split())
+    if _CLOUDFLARE_OR_HTML_ERROR_RE.search(compact):
+        return "<upstream_error_page>"
     redacted = _SENSITIVE_ERROR_VALUE_RE.sub(r"\1<redacted>", compact)
     return redacted[:limit]
 

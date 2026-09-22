@@ -24,6 +24,11 @@ _MAX_AUDIT_TEXT_CHARS = 2_048
 _MAX_AUDIT_COLLECTION_ITEMS = 32
 _MAX_AUDIT_RECORD_BYTES = 64 * 1024
 _MAX_LEGACY_RECORD_BYTES = 1024 * 1024
+# A shared (NFS/RWX) audit volume can transiently reject an append while
+# another writer's advisory lock is reaped; bounded retry keeps the
+# fail-closed contract from turning that into a client-visible 503.
+_APPEND_RETRY_ATTEMPTS = 4
+_APPEND_RETRY_BACKOFF_SECS = 0.02
 
 try:  # pragma: no cover - Linux in production; fallback keeps local portability.
     import fcntl
@@ -75,6 +80,11 @@ class AuditLogger:
 
     def __init__(self, config: AuditConfig):
         self.config = config
+        # Serialize appends inside this process. ``flock`` still guards
+        # cross-process writers, but on the RWX/NFS audit volume a burst of
+        # concurrent requests otherwise piles up in ``to_thread`` workers
+        # where a transient NFS error surfaces as a client-visible 503.
+        self._write_lock = asyncio.Lock()
 
     def _digest(self, previous_hash: str, canonical_event: bytes) -> str:
         message = previous_hash.encode("ascii") + b"." + canonical_event
@@ -183,13 +193,36 @@ class AuditLogger:
     async def write(self, event: Mapping[str, Any]) -> dict[str, Any] | None:
         if not self.config.enabled:
             return None
-        try:
-            return await asyncio.to_thread(self._append, event)
-        except Exception as exc:
-            logger.error("audit write failed: %s", exc.__class__.__name__)
-            if self.config.fail_closed:
-                raise AuditWriteError("required audit persistence failed") from exc
-            return None
+        last_error: BaseException | None = None
+        for attempt in range(_APPEND_RETRY_ATTEMPTS):
+            try:
+                async with self._write_lock:
+                    return await asyncio.to_thread(self._append, event)
+            except OSError as exc:
+                # A shared/NFS-backed audit volume can reject an append while
+                # another writer's lock is being reaped. Retry with backoff
+                # instead of failing the caller closed.
+                last_error = exc
+                logger.warning(
+                    "audit append retry %d/%d after %s",
+                    attempt + 1,
+                    _APPEND_RETRY_ATTEMPTS,
+                    exc.__class__.__name__,
+                )
+                if attempt + 1 < _APPEND_RETRY_ATTEMPTS:
+                    await asyncio.sleep(_APPEND_RETRY_BACKOFF_SECS * (2**attempt))
+            except Exception as exc:
+                logger.error("audit write failed: %s", exc.__class__.__name__)
+                if self.config.fail_closed:
+                    raise AuditWriteError("required audit persistence failed") from exc
+                return None
+        logger.error(
+            "audit write exhausted retries: %s",
+            last_error.__class__.__name__ if last_error else "unknown",
+        )
+        if self.config.fail_closed and last_error is not None:
+            raise AuditWriteError("required audit persistence failed") from last_error
+        return None
 
     def write_sync(self, event: Mapping[str, Any]) -> dict[str, Any] | None:
         """Synchronously append a non-request audit event.
