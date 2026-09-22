@@ -32,23 +32,34 @@ tests; treat those two with that caveat).
   provider-free endpoint `GET /v1/models`: 0% failures at concurrency 1–4,
   **45.8% at concurrency 8, 75.0% at concurrency 16**. This is production
   impact today (23 OSErrors observed in logs during one probe burst).
-- **APIM is completely dead upstream** (0/162 7-day, 0/102 today, all
-  probes fail with upstream 502 `error code: 502`). Its structured-output
-  probe fails with `ClientConnectorError` — the APIM endpoint is
-  unreachable from the cluster. The privacy pool lists
-  `apim/gpt-5.6-luna` as its first static model; every pool miss pays a
-  dead-upstream penalty before failover.
+  **Post-deploy verification (2026-09-22)**: fix deployed (commit
+  `a0a4afac`), DB config propagated (generation 306 → 361). Live
+  re-test of `GET /v1/models` at concurrency 1/8/16/32 (24 requests
+  each): **0 audit 503s at every level** (was 45.8% at c=8, 75.0% at
+  c=16); pod logs show zero `audit write failed` and zero retries —
+  the in-process lock removes the contention before the retry path is
+  needed.
+- **APIM is completely dead upstream** (0/162 7-day, 0/102 today).
+  Every probe returns HTTP 401 `invalid subscription key` — the
+  endpoint is reachable but rejects the gateway's API key.
+  Removed `apim/gpt-5.6-luna` from `TUSKER_POOL_PRIVACY` in commit
+  `a0a4afa` (2026-09-22); each privacy request no longer pays a
+  dead-upstream failover penalty.
 - **github-copilot (both), groq, workers-ai, openai-codex, opencode-zen
   are 0% in live probes** and remain heavily breaker-open (113 open
   breakers of 680 tracked). opencode-zen regressed badly vs. its 97.9%
   7-day figure from the Sep-12 review — it is now 41% 7-day error and 0/10
   in probes.
-- **Tool qualification has never completed for any candidate**: all 697
-  pool candidates (privacy 423, code 234, premium 38, swarm 2) have
-  `tool_capability: null` (unprobed). `require_tool_qualification: true`
-  on the privacy pool therefore has nothing to work with; the
-  qualification probe pipeline is not running (or its results are not
-  persisted).
+- **Tool qualification IS running**: the live NFS-backed SQLite DB
+  (`model_tool_capability.db`) has 191 rows — 102 passed under probe
+  version `stream-tool-contract-v1`. The audit initially reported
+  `tool_capability: null` because it read from a stale Postgres
+  snapshot (`migrate_state.py`) rather than the live runtime store.
+  Privacy pool coverage is thin because 407/429 candidates are
+  quarantined (dead-provider cooldowns); `require_tool_qualification`
+  is effective for the ~22 non-quarantined candidates. A targeted
+  qualification run on 2026-09-22 confirmed: `mlx-mac/ornith-1.5:35b`
+  passed, `mlx-mac/qwen3.8-27b` failed (no tool call support).
 - **voyage + jina are configured for embed/rerank but unusable**: both
   have `embed_path`/`rerank_path` set but **no model catalog**
   (`models_path` unset), so the gateway rejects every model with
@@ -131,13 +142,25 @@ rejections (probes hit already-open breakers), 9 audit-503, plus timeouts.
 
 29 text + 11 vision + 9 tools failures returned **raw upstream HTML/plain
 error pages** (Cloudflare-style `<!DOCTYPE html>… no-js ie6 oldie …` and
-bare `error code: 502`) with upstream status codes relayed verbatim. The
-gateway does not classify non-JSON upstream responses as provider failures
-— clients receive garbage bodies. Recommendation: detect non-JSON chat
-responses at the relay layer, wrap as a structured 502 with provider/model
-attribution, and count them as breaker-worthy failures (today they pass
-through without tripping the breaker — see workers-ai: 95% failure for
-days, breakers "open" only because of separate failures).
+bare `error code: 502`). **Corrected after deeper inspection** — two
+distinct cases, only one a gateway concern:
+
+- **Cloudflare edge substitution** (`server: cloudflare`, `cf-ray`
+  present, ~0.3 s latency): the CDN in front of the upstream answered
+  with its own error page because the origin was down. The gateway never
+  received a body; the HTML came from Cloudflare, not through the
+  gateway. No gateway classification is possible or needed.
+- **Upstream 5xx HTML bodies**: these DO trip breakers —
+  `_check_response` raises on the upstream status code, and the observed
+  breaker state (e.g. 24 open workers-ai keys) is consistent with that.
+  The only genuine defect was that relayed bodies landed verbatim in the
+  structured error message. **Fixed in commit `a0a4afa`**:
+  `_safe_upstream_body` (`passthrough.py`) now collapses HTML/WAF error
+  pages to a stable `<upstream_error_page>` signal.
+
+An audit of the gateway's own structured error envelopes found 0 HTML
+payloads in gateway-generated messages — its JSON errors were already
+clean.
 
 ## Embeddings & rerank
 
@@ -193,15 +216,29 @@ Fix options (pick one):
 3. Set `TUSKER_AUDIT_FAIL_CLOSED=false` as an interim mitigation — loses
    fail-closed guarantees but stops the 503 storm.
 
-### 2. Tool qualification never ran (regression risk)
+### 2. Tool qualification — initial finding corrected: it IS running
 
-All 697 candidates across the 4 pools carry `tool_capability: null` and
-`model_capabilities` entries mostly `unavailable`/`ClientConnectorError`.
-`privacy` has `require_tool_qualification: true`, so per-candidate gating
-is effectively inert; routing currently works because the gate is open.
-When the catalog probe pipeline is fixed, expect a one-time reshuffle of
-selectable models (privacy pool has 10 vision-capable entries; only
-`local-llm/qwen3:4b`, `mlx-mac/qwen3.8-27b` were qualified historically).
+**Correction (2026-09-22, verified against the pod):** the original claim
+("never completed for any candidate") was wrong — the audit had read the
+stale Postgres `model_tool_capability` table (a `migrate_state.py`
+snapshot) instead of the runtime store. The gateway reads
+`/home/tusker/.hermes/model_tool_capability.db` — a SQLite file on the
+RWX/NFS PVC — live, per call. That DB holds 191 rows; 102 passed under
+probe version `stream-tool-contract-v1`.
+
+The maintenance loop is enabled and persists
+(`TUSKER_QUALIFICATION_MAINTENANCE_ENABLED=true`, interval 6 h, limit
+12, pod age > 1 cycle). Actual coverage is thinner than it looks:
+407 of 429 privacy-pool candidates are skipped as quarantined (dead
+providers in cooldown), so qualification refresh is concentrated on the
+~22 live candidates. A targeted run on 2026-09-22
+(`python -m tusker_gateway.tool_qualification --pool privacy`) probed 5
+candidates: `mlx-mac/ornith-1.5:35b` passed; `mlx-mac/qwen3.8-27b`,
+`qwen3.8-27b:latest`, `qwen38-vtest2`, and
+`shirdel-coder-9b-claude-fable-5` all failed `no_tool_call`.
+
+`require_tool_qualification: true` is therefore effective, with static
+unqualified models admitted as fallback for non-tool requests.
 
 ### 3. Circuit breakers healthy but slow to recover
 
@@ -226,49 +263,70 @@ auto-cataloged local providers: models without a persisted capability
 probe are treated as unknown/unhealthy. Same root cause as finding 2.
 
 Note: `mlx-mac/qwen3.8-27b` tools route fails the same way ("No healthy
-upstream") while text/vision pass — it was added to the pool this week
-and has never been tool-probed. `ornith-1.5:35b` remains the only
-tool-qualified mlx-mac model.
+upstream") while text/vision pass. **Update:** the 2026-09-22 targeted
+qualification run settled it — the model genuinely does not support the
+stream-tool contract (`no_tool_call`, HTTP 200 in ~66 ms), so its tools
+route stays excluded. `ornith-1.5:35b` remains the only tool-qualified
+mlx-mac model.
 
 ## Recommendations (priority order)
 
-1. **Fix the audit concurrency bug** (option 1 or 2 above + regression
-   test that fires N concurrent audited requests). This is client-visible
-   today under normal burst traffic.
-2. **Disable or repair APIM** — it is the first privacy-pool static model
-   and 0% for its entire 162-request history. Remove
-   `apim/gpt-5.6-luna` from `TUSKER_POOL_PRIVACY` or fix the APIM
-   endpoint/credentials. Each privacy request currently pays a
-   dead-upstream attempt before failover.
-3. **Prune dead providers**: `workers-ai`, `groq`, `opencode-zen`,
-   `github-copilot`, `github-copilot-enterprise`, `openai` — add to
-   `TUSKER_DISABLED_PROVIDERS` (or repair keys/quotas) to stop
-   breaker-thrash and catalog noise. This matches the Sep-12
-   recommendation, still unactioned.
-4. **Fix tool-qualification pipeline** — determine why the capability
-   prober has not persisted any `tool_capability` result, and re-run it.
-   This also clears finding 4 (local-llm explicit routes) and unlocks
-   tool calling for `mlx-mac/qwen3.8-27b`.
-5. **Catch non-JSON upstream responses** in the chat relay and convert
-   to structured 502 + breaker-worthy failure.
-6. **voyage/jina**: either add model catalogs or document/bypass
-   validation for `rerank_path`-only providers.
+1. ✅ **Fix the audit concurrency bug** — DONE, commit `a0a4afa`.
+   In-process `asyncio.Lock` serialization + bounded retry with
+   exponential backoff; fail-closed preserved (exhausted retries still
+   raise). Regression tests in `tests/test_audit_concurrency.py`
+   (concurrent chain integrity, transient retry, fail-closed
+   exhaustion); full offline suite 1162 passed.
+2. ✅ **Disable or repair APIM** — DONE, commit `a0a4afa`.
+   `apim/gpt-5.6-luna` removed from `TUSKER_POOL_PRIVACY` static
+   models; `apim` removed from its `auto_catalog_providers`. Repair
+   requires a valid APIM subscription key (401 `invalid subscription
+   key` on every call — endpoint reachable, credentials rejected).
+3. **Prune dead providers** (open): `workers-ai`, `groq`,
+   `opencode-zen`, `github-copilot`, `github-copilot-enterprise`,
+   `openai` — add to `TUSKER_DISABLED_PROVIDERS` (or repair
+   keys/quotas). Unchanged since Sep-12. Note: quarantined candidates
+   are already skipped by the qualification prober, so the main
+   remaining cost is catalog/breaker noise and cold-pool failover
+   latency.
+4. ✅ **Tool-qualification pipeline** — CORRECTED, not broken: the
+   prober runs and persists to the NFS-backed SQLite store the gateway
+   reads live. A targeted privacy-pool run completed 2026-09-22
+   (see finding 2). Remaining gap: coverage of quarantined candidates
+   (by design) and stale rows >24 h; widen `--limit` or run the CLI
+   periodically for deeper coverage.
+5. ✅ **HTML error bodies in structured messages** — DONE, commit
+   `a0a4afa`: `_safe_upstream_body` collapses WAF/CDN error pages to
+   `<upstream_error_page>`. Breaker behavior needed no change (upstream
+   5xx already trips breakers; Cloudflare-edge pages never reach the
+   gateway).
+6. **voyage/jina** (open): add model catalogs or bypass validation for
+   `embed_path`/`rerank_path`-only providers. Cause of the "No healthy
+   upstream" rejections remains undiagnosed — the original report's
+   "no `models_path`" explanation was not confirmed; the handlers are
+   constructed from `embed_path`/`rerank_path` + keys, both present.
+   Needs a runtime trace of the embed/rerank model-selection path.
 7. **Keep** minimax, xiaomi, zai, ollama-cloud, alibaba, opencode-go as
    the healthy core; mlx-mac as a hardware fallback. For local-llm,
    clear the stale breakers (`qwen2.5:3b`, `qwen2.5:7b`, `qwen3-vl:8b`)
-   once the prober is fixed.
+   once the prober refreshes their rows (stale >24 h rows no longer
+   count as qualified).
 
 ## Appendix
 
-Raw artifacts (local): `/tmp/audit/`
-- `probe.py` — audit probe implementation
-- `results.json` — 217 probe results
-- `audit_isolation.py` / `audit_isolation.json` — audit-layer concurrency
-  isolation test
-- `concurrency_test.py` / `concurrency_test.json` — local-route capacity
-  gate behavior
-- `pools.json`, `providers.json`, `catalog.json`, `breakers.json`,
-  `cooldowns.json`, `usage.json`, `diagnostics.json` — gateway state
-  snapshots at audit time
-- `inventory.json`, `sample.json` — 626-model inventory and 82-model probe
-  sample
+Durable artifacts from this audit:
+
+- Commit `a0a4afa` — audit append hardening (asyncio serialization +
+  bounded retry), `apim` removal from the privacy pool, and cloudflare/
+  HTML error-body sanitization.
+- `tests/test_audit_concurrency.py` — concurrency, transient-retry, and
+  fail-closed regression coverage for the audit logger.
+- Commit `cbce50d`..`a0a4afa` on `main` — the source of truth for every
+  code claim above; `git show --stat a0a4afa` lists the full diff.
+
+The probe sweep (217 results), 626-model inventory, 82-model sample, and
+the audit-isolation/concurrency scratch harnesses were temporary audit
+tooling and are not retained. The 7-day table is reproducible from
+`provider_usage_daily` in the state DB; live figures from the `/admin/*`
+endpoints on the running gateway (generation 306, commit `cbce50d` at
+audit time).
