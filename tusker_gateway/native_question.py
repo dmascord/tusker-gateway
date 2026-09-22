@@ -194,6 +194,12 @@ def _extract_answer(value: Any) -> tuple[bool, bool]:
         return True, value
     if isinstance(value, str):
         normalized = value.strip().lower()
+        # OMP's native ask tool returns human-readable tool text rather than
+        # the bare option label, e.g. ``User selected: Allow once``. Keep the
+        # accepted vocabulary exact after removing that protocol prefix so
+        # ordinary model prose cannot accidentally authorize an action.
+        if normalized.startswith("user selected:"):
+            normalized = normalized.removeprefix("user selected:").strip()
         if normalized in {"allow", "allow once", "approve", "approved", "yes", "proceed"}:
             return True, True
         if normalized in {"deny", "denied", "no", "cancel", "reject", "拒否"}:
