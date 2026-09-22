@@ -13,6 +13,7 @@ import tusker_gateway.sse
 from tusker_gateway.errors import (
     HighImpactApprovalRequiredError,
     InvalidToolCallArgumentsError,
+    ProviderEmptyStreamError,
     ProviderError,
     ProviderRouteDisabledError,
     RateLimitError,
@@ -81,6 +82,21 @@ def test_public_stream_error_contains_correlation_and_redacts_upstream_body():
     assert "req-stream-1" in message
     assert "Upstream provider error" in message
     assert "abc123" not in message
+
+
+def test_public_stream_error_explains_empty_provider_response():
+    exc = ProviderEmptyStreamError(provider="provider-a", model="model-a")
+    message, code = _public_stream_error(
+        exc,
+        request_id="req-empty-1",
+        provider="provider-a",
+        model="model-a",
+    )
+
+    assert code == "provider_empty_stream"
+    assert "empty assistant response" in message
+    assert "req-empty-1" in message
+    assert "Retry" in message
 
 
 def test_approval_stream_message_is_actionable_for_omp_clients():
@@ -1951,6 +1967,35 @@ async def test_chat_stream_provider_setup_error_is_actionable_text_not_in_band_e
 
     assert response.status == 200
     assert b"Upstream provider error" in body
+    assert b'"error"' not in body
+    assert b"data: [DONE]" in body
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal", [b"", b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'])
+async def test_chat_stream_empty_provider_response_is_not_empty_stop(client, terminal):
+    """A provider empty EOF/stop must become visible guidance for OMP."""
+    async def empty_stream(*args, **kwargs):
+        if terminal:
+            yield terminal
+        if terminal:
+            yield b"data: [DONE]\n\n"
+
+    with patch("tusker_gateway.endpoints.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
+        mock_chat.return_value = empty_stream()
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-code",
+                "messages": [{"role": "user", "content": "run the background job"}],
+                "stream": True,
+            },
+            headers=HEADERS_AUTH,
+        )
+        body = await response.read()
+
+    assert response.status == 200
+    assert b"empty assistant response" in body
     assert b'"error"' not in body
     assert b"data: [DONE]" in body
 

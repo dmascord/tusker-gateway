@@ -38,6 +38,7 @@ from tusker_gateway.errors import (
     MalformedToolCallError,
     NoHealthyModelsError,
     ProviderCapacityError,
+    ProviderEmptyStreamError,
     ProviderError,
     ProviderRouteDisabledError,
     ProviderStreamLoopError,
@@ -1016,6 +1017,20 @@ async def _normalize_stream(
     def finish_frame(reason: str) -> bytes:
         return sse_frame(format_openai_chunk(finish_reason=reason, model=model))
 
+    def empty_stream_error() -> ProviderEmptyStreamError:
+        logger.warning(
+            "empty provider stream provider=%s model=%s request_id=%s saw_finish=%s saw_done=%s",
+            provider or "unknown",
+            model or "unknown",
+            request_id or "unknown",
+            saw_finish_reason,
+            saw_done,
+        )
+        return ProviderEmptyStreamError(
+            provider=provider or "unknown",
+            model=model or "unknown",
+        )
+
     def tool_calls_frame(
         parsed_calls: list[dict[str, Any]],
         template_obj: dict[str, Any],
@@ -1087,6 +1102,8 @@ async def _normalize_stream(
                 if tools_requested and not saw_tool_call and not saw_visible_content:
                     if not saw_tool_markup or saw_tool_markup_opening:
                         raise unusable_tool_error("reasoning_only_or_empty")
+                if not tools_requested and not saw_tool_call and not saw_visible_content:
+                    raise empty_stream_error()
                 if emitted_finish_reason is None:
                     emitted_finish_reason = "tool_calls" if saw_tool_call else "stop"
                     yield finish_frame(emitted_finish_reason)
@@ -1395,6 +1412,8 @@ async def _normalize_stream(
                     and saw_tool_markup_opening
                 ):
                     raise unusable_tool_error("reasoning_only_or_empty")
+                if not tools_requested and not saw_tool_call and not saw_visible_content and not has_delta_text:
+                    raise empty_stream_error()
                 if has_delta_text:
                     content_delta = {
                         key: value
@@ -1455,6 +1474,8 @@ async def _normalize_stream(
     if tools_requested and not saw_tool_call and not saw_visible_content:
         if not saw_tool_markup or saw_tool_markup_opening:
             raise unusable_tool_error("reasoning_only_or_empty")
+    if not tools_requested and not saw_tool_call and not saw_visible_content:
+        raise empty_stream_error()
     if emitted_finish_reason is None:
         emitted_finish_reason = "tool_calls" if saw_tool_call else "stop"
         yield finish_frame(emitted_finish_reason)
@@ -3044,6 +3065,12 @@ def _public_stream_error(
     if _is_capacity_failure(exc):
         message = "Upstream provider capacity is unavailable; retry shortly."
         code = "service_unavailable"
+    elif isinstance(exc, ProviderEmptyStreamError):
+        message = (
+            "The upstream provider returned an empty assistant response. "
+            f"Retry the request or choose another model. Request ID: {request_id}."
+        )
+        code = "provider_empty_stream"
     elif isinstance(
         exc,
         (
@@ -4097,6 +4124,7 @@ async def _complete_chat_result_stream(result: dict[str, Any]) -> AsyncIterator[
     raw_choices = result.get("choices")
     choices = raw_choices if isinstance(raw_choices, list) else []
     emitted_choice = False
+    saw_useful_output = False
 
     for position, raw_choice in enumerate(choices):
         if not isinstance(raw_choice, dict):
@@ -4105,7 +4133,15 @@ async def _complete_chat_result_stream(result: dict[str, Any]) -> AsyncIterator[
         message = raw_choice.get("message") or {}
         if not isinstance(message, dict):
             message = {}
-        for text in _chat_content_to_stream_text_parts(message.get("content")):
+        text_parts = _chat_content_to_stream_text_parts(message.get("content"))
+        calls = _normalized_choice_tool_calls(message)
+        if not text_parts and not calls:
+            # Do not manufacture an empty assistant turn. OMP interprets a
+            # role/stop-only response as an "empty stop" and retries it.
+            continue
+        if text_parts or calls:
+            saw_useful_output = True
+        for text in text_parts:
             yield sse_frame(
                 {
                     "id": response_id,
@@ -4121,7 +4157,6 @@ async def _complete_chat_result_stream(result: dict[str, Any]) -> AsyncIterator[
                 }
             )
 
-        calls = _normalized_choice_tool_calls(message)
         if calls:
             tool_deltas: list[dict[str, Any]] = []
             for call_position, call in enumerate(calls):
@@ -4173,6 +4208,8 @@ async def _complete_chat_result_stream(result: dict[str, Any]) -> AsyncIterator[
         )
         emitted_choice = True
 
+    if not saw_useful_output:
+        raise ProviderEmptyStreamError(provider="complete-response", model=response_model)
     if not emitted_choice:
         yield sse_frame(
             {

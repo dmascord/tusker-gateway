@@ -275,7 +275,7 @@ async def test_streaming_dict_response_missing_required_tool_args_reaches_omp(ap
 
 @pytest.mark.asyncio
 async def test_streaming_dict_response_empty_content(client):
-    """Dict with empty content should not emit a content chunk but should emit finish_reason."""
+    """Dict with empty content must not become an OMP empty-stop turn."""
     dict_response = {
         "id": "chatcmpl-codex-789",
         "object": "chat.completion",
@@ -289,8 +289,8 @@ async def test_streaming_dict_response_empty_content(client):
         assert resp.status == 200
         content = await resp.read()
 
-    # No content chunk (empty content skipped), but finish_reason and [DONE] present.
-    assert b'"finish_reason": "stop"' in content
+    assert b"empty assistant response" in content
+    assert b'"error"' not in content
     assert b"data: [DONE]" in content
 
 

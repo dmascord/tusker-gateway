@@ -128,6 +128,18 @@ class ProviderStreamLoopError(ProviderError):
         )
 
 
+class ProviderEmptyStreamError(ProviderError):
+    """An upstream completed without content, a tool call, or useful output."""
+
+    def __init__(self, *, provider: str, model: str) -> None:
+        self.provider = provider
+        self.model = model
+        super().__init__(
+            "upstream provider returned an empty assistant stream",
+            code="provider_empty_stream",
+        )
+
+
 class ProviderCapacityError(ProviderError):
     """A provider worker-pool capacity failure handled by pool fallback."""
 
