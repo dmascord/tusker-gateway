@@ -7,13 +7,20 @@ corresponding ConfigStore table. By default rows that already exist
 ``--update`` existing rows are instead upserted, which propagates
 env/yaml changes into the DB-backed runtime config store.
 
+EXCEPTION — ``credential_pools``: OAuth pools are rotating runtime
+state owned by the gateway (rotator CAS writes, enrollment tool), not
+static config. They are INSERT-only here: a provider already present in
+the store is never overwritten, even with ``--update``. Pass
+``--allow-credential-overwrite`` to lift that guard deliberately.
+
     python -m tusker_gateway.tools.migrate_config_to_db [--dry-run] [--update]
 
 Sections migrated:
     providers          -> tusker_config_providers
     provider_api_keys  -> tusker_config_provider_api_keys (encrypted)
     pools              -> tusker_config_pools
-    credential_pools   -> tusker_config_oauth_credentials (encrypted)
+    credential_pools   -> tusker_config_oauth_credentials (encrypted,
+                          insert-only; see EXCEPTION above)
     api_keys           -> skipped (legacy env keys stay in env; managed
                           keys are created via POST /admin/keys)
 
@@ -32,7 +39,15 @@ from tusker_gateway.config import load_config
 from tusker_gateway.config_store import ConfigStore
 
 logger = logging.getLogger("tusker_gateway.migrate_config_to_db")
-def _section_counts(store: ConfigStore, config: dict, *, dry_run: bool, update: bool = False) -> list[tuple[str, int, int, int, int]]:
+
+def _section_counts(
+    store: ConfigStore,
+    config: dict,
+    *,
+    dry_run: bool,
+    update: bool = False,
+    allow_credential_overwrite: bool = False,
+) -> list[tuple[str, int, int, int, int]]:
     """Migrate each section; returns (section, inserted, updated, skipped, errors)."""
     results: list[tuple[str, int, int, int, int]] = []
 
@@ -126,6 +141,11 @@ def _section_counts(store: ConfigStore, config: dict, *, dry_run: bool, update: 
     for name, creds in (config.get("credential_pools") or {}).items():
         try:
             is_new = name.lower() not in existing
+            if not is_new and not allow_credential_overwrite:
+                # Rotating state (rotator CAS writes, enrollment tool) —
+                # never clobber an existing pool from env/yaml.
+                skipped += 1
+                continue
             if not is_new and not update:
                 skipped += 1
                 continue
@@ -133,12 +153,13 @@ def _section_counts(store: ConfigStore, config: dict, *, dry_run: bool, update: 
                 skipped += 1
                 continue
             if not dry_run:
+                overwrite = is_new is False and allow_credential_overwrite and update
                 with store._conn as conn:
                     if store._db_connect().is_postgres:
                         conflict = (
                             "ON CONFLICT (provider) DO UPDATE SET "
                             "credentials=excluded.credentials, updated_at=CURRENT_TIMESTAMP"
-                            if update else
+                            if overwrite else
                             "ON CONFLICT (provider) DO NOTHING"
                         )
                         conn.execute(
@@ -148,7 +169,7 @@ def _section_counts(store: ConfigStore, config: dict, *, dry_run: bool, update: 
                             (name.lower(), store._encrypt(conn, json.dumps(list(creds)))),
                         )
                     else:
-                        if update:
+                        if overwrite:
                             conn.execute(
                                 "INSERT INTO tusker_config_oauth_credentials "
                                 "(provider, credentials) VALUES (?, ?) "
@@ -187,7 +208,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--update", action="store_true",
-        help="Update existing rows (propagate env/yaml changes to the DB)",
+        help="Update existing rows (propagate env/yaml changes to the DB). "
+        "credential_pools remain insert-only regardless — see "
+        "--allow-credential-overwrite.",
+    )
+    parser.add_argument(
+        "--allow-credential-overwrite", action="store_true",
+        help="Also overwrite existing oauth credential_pool rows with the "
+        "env/yaml-derived values. Requires --update. Off by default: "
+        "credential pools are rotating state owned by the gateway, not "
+        "static config.",
     )
     args = parser.parse_args(argv)
 
@@ -205,7 +235,13 @@ def main(argv: list[str] | None = None) -> int:
     store = ConfigStore(fallback_config=config)
     store.reload_now()
 
-    counts = _section_counts(store, config, dry_run=args.dry_run, update=args.update)
+    counts = _section_counts(
+        store,
+        config,
+        dry_run=args.dry_run,
+        update=args.update,
+        allow_credential_overwrite=args.allow_credential_overwrite,
+    )
 
     print("section,inserted,updated,skipped,errors")
     total_inserted = total_updated = 0
