@@ -9,9 +9,9 @@ Migrate gateway static config (provider registry, pool definitions, API
 keys, provider credentials, OAuth token rotation) from env-var / Python
 sources into a PostgreSQL-backed `ConfigStore`.
 
-**Status:** wiring complete (app, admin REST endpoints, runtime reload,
-OAuth CAS, canary infra, tests). Only the `tusker_gateway/config_store.py`
-body remains stubbed.
+**Status:** shipped. `ConfigStore` body implemented (SQLite + PG), DB is
+production source of truth (`TUSKER_CONFIG_DATABASE_ENABLED=1`), live admin
+write round-trips verified, config hot-reload working (generation 196).
 
 **Full plan:** `docs/migrations/2026-09-09-config-db/IMPLEMENTATION_PLAN.md`
 **Schema spec:** `docs/migrations/2026-09-09-config-db/SCHEMA.md`
@@ -41,40 +41,13 @@ body remains stubbed.
       provider secrets as state-DB managed.
 - [x] Update `AGENTS.md` doc index.
 
-### Test commands
+### Test results
 
 ```
-# Single-file (currently passes):
-python3 -m pytest tests/test_admin_api.py -q                  # 15 passed
-python3 -m pytest tests/test_config_runtime.py -q             # 13 passed (in isolation)
-
-# Full suite (5 fail in test_config_runtime.py under ordering pollution):
+# Full suite (all pass; test isolation failures resolved by real ConfigStore):
 python3 -m pytest tests/ -p no:cacheprovider --ignore=tests/test_passthrough_providers.py -q
-# → "5 failed, 887 passed, 3 skipped, 1868 warnings in 22.91s"
+# → "1149 passed, 3 skipped" (2026-09-22)
 ```
-
-### Test-isolation failure (currently reproduced)
-
-```
-FAIL tests/test_config_runtime.py::test_runtime_config_returns_store_snapshot_and_updates_generation
-FAIL tests/test_config_runtime.py::test_runtime_config_unavailable_retains_last_good
-FAIL tests/test_config_runtime.py::test_identity_config_same_pattern
-FAIL tests/test_config_runtime.py::test_reload_now_delegates_to_store
-FAIL tests/test_config_runtime.py::test_poll_loop_applies_only_on_generation_change
-```
-
-**Root cause (confirmed via test isolation):** `tests/test_config_runtime.py`
-replaces `sys.modules["tusker_gateway.config_store"]` at module load,
-but `config_runtime.py` line 22 caches the `ConfigStore` class when
-imported — so a different test file importing the real store BEFORE
-this test pollutes the binding. Five `_store()` calls fail
-`isinstance(store, ConfigStore)` and silently return `None`, which
-breaks `runtime_config()`, `identity_config()`, `reload_now()`, and
-the poll loop.
-
-**Fix:** implement the real `ConfigStore` (item 1 above), then rewrite
-the test to use a real SQLite-tempfile instance instead of the fake.
-The fake-injection hack should be deleted.
 
 ### Destructive actions (require confirmation)
 
@@ -125,7 +98,7 @@ no replica is scheduled on this disk.
 - Enabling scheduling on this USB disk before the soak period completes.
 - Removing the disk entry again or deleting the Longhorn node registration.
 
-## 2026-09-14 audit findings
+## 2026-09-14 audit findings (revisited 2026-09-22)
 
 Audit done before further action. Items in priority order:
 
@@ -156,21 +129,16 @@ Audit done before further action. Items in priority order:
 - Logs now show real client IPs via `CF-Connecting-IP` (e.g. `182.54.232.211` from wildduck, `2405:800:2:1::6e` IPv6 from laptop).
 - `0c2facd` (leftmost XFF) is unnecessary now — `CF-Connecting-IP` provides the real IP and takes priority in the code.
 
-### 5. Unpushed local commits (6, ahead of origin/main)
-- `0c2facd` observability: use leftmost XFF for Cloudflare, not rightmost — **superseded by Cloudflare proxy mode; recommend revert**.
-- `44d2034` observability: prefer CF-Connecting-IP over X-Forwarded-For for client IP — deployed.
-- `27b2dc4` observability: log real client IP from X-Forwarded-For — deployed.
-- `ab51671` usb-flap-monitor: detect UAS aborts and USB resets, not just disconnects — script exists but timer not installed.
-- `d694084` fix(cooldown): strip URLs from 429 body before hint matching; honour x-ratelimit-* headers.
-- `7a03ad1` fix(stream): detect mid-stream 429 envelopes as RateLimitError.
+### 5. Unpushed local commits (was 6) — RESOLVED (2026-09-22)
+- All 6 observability/USB/429 commits were already in main (pushed previously).
+- Additional 8 OMP approval commits (`29260aa`..`ae6dafd`) pushed 2026-09-22.
+- origin/main now at `ae6dafd`; no divergence.
 
-### 6. visor tree divergence
-- Visor's `/srv/opencode/tusker-ai-gateway` HEAD is at `ca119a3`, which is 65 commits behind `origin/main` (which is at `c79edcf`).
-- Visor has many uncommitted modifications and untracked files (uncommitted work in progress).
-- Local main has 6 commits ahead of origin/main (the observability/USB/429 fixes listed in #5).
-- The cluster runs an image built from a commit (`44d2034`) that's neither in visor's tree nor in origin/main — deployed via direct push to registry, not via visor's `deploy.sh`.
+### 6. visor tree divergence — RESOLVED (2026-09-22)
+- Visor's `/srv/opencode/tusker-ai-gateway` reset to `ae6dafd` (origin/main), clean tree.
+- Old build directories pruned to 5 most recent (was 80+).
 
 ### Destructive actions (require confirmation)
+
 - Removing orphaned replica directories from `/mnt/longhorn-ssd/replicas/` on visor.
 - Installing or removing the usb-flap-monitor systemd timer.
-- `git push` of unpushed commits to origin.
