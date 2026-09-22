@@ -5769,58 +5769,39 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                 except asyncio.TimeoutError:
                     stream_hb_task.cancel()
                 try:
+                    # The response is already committed. An OpenAI error
+                    # event is rendered by OMP as an opaque in-band banner,
+                    # so return the sanitized details as assistant text.
                     if isinstance(exc, HighImpactApprovalRequiredError):
-                        await stream_resp.write(
-                            sse_frame(
-                                format_openai_chunk(
-                                    _approval_stream_message(exc, request_id),
-                                    model="tusker-gateway",
-                                )
-                            )
-                        )
-                        await stream_resp.write(
-                            sse_frame(
-                                format_openai_chunk(
-                                    finish_reason="stop",
-                                    model="tusker-gateway",
-                                )
-                            )
-                        )
+                        client_message = _approval_stream_message(exc, request_id)
                     elif isinstance(exc, (ProviderStreamLoopError, InvalidToolCallArgumentsError,
                                           MalformedToolCallError, RequiredToolCallError,
                                           ToolCallContractError, UnusableToolResponseError)):
-                        await stream_resp.write(
-                            sse_frame(
-                                format_openai_chunk(
-                                    _validation_stream_message(
-                                        request_id,
-                                        loop_failure=isinstance(exc, ProviderStreamLoopError),
-                                        error=exc,
-                                        provider=provider,
-                                        model=target_model,
-                                    ),
-                                    model="tusker-gateway",
-                                )
-                            )
-                        )
-                        await stream_resp.write(
-                            sse_frame(
-                                format_openai_chunk(
-                                    finish_reason="stop",
-                                    model="tusker-gateway",
-                                )
-                            )
+                        client_message = _validation_stream_message(
+                            request_id,
+                            loop_failure=isinstance(exc, ProviderStreamLoopError),
+                            error=exc,
+                            provider=provider,
+                            model=target_model,
                         )
                     else:
-                        await stream_resp.write(
-                            sse_frame({
-                                "error": openai_error(
-                                    stream_error_message,
-                                    code=stream_error_code,
-                                    error_type="provider_error",
-                                )
-                            })
+                        client_message = stream_error_message
+                    await stream_resp.write(
+                        sse_frame(
+                            format_openai_chunk(
+                                client_message,
+                                model="tusker-gateway",
+                            )
                         )
+                    )
+                    await stream_resp.write(
+                        sse_frame(
+                            format_openai_chunk(
+                                finish_reason="stop",
+                                model="tusker-gateway",
+                            )
+                        )
+                    )
                     await stream_resp.write(sse_done())
                 except (ConnectionResetError, ConnectionError, BrokenPipeError):
                     pass

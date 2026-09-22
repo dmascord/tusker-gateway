@@ -1920,6 +1920,42 @@ async def test_chat_stream_provider_error_is_actionable_text_not_in_band_error(c
 
 
 @pytest.mark.asyncio
+async def test_chat_stream_provider_setup_error_is_actionable_text_not_in_band_error(
+    app, client,
+):
+    """Setup/fallback failures after SSE commit use the same OMP-safe path."""
+    pool_manager = MagicMock()
+    pool_manager.select.side_effect = [
+        ("openrouter", "provider-that-times-out"),
+        None,
+    ]
+    app["pool_manager"] = pool_manager
+    failure = ProviderError("socket timed out", code="upstream_error")
+    failure.upstream_status = 502
+
+    with patch(
+        "tusker_gateway.endpoints.PassthroughClient.chat",
+        new_callable=AsyncMock,
+        side_effect=failure,
+    ):
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-code",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+            },
+            headers=HEADERS_AUTH,
+        )
+        body = await response.read()
+
+    assert response.status == 200
+    assert b"Upstream provider error" in body
+    assert b'"error"' not in body
+    assert b"data: [DONE]" in body
+
+
+@pytest.mark.asyncio
 async def test_chat_stream_sends_first_event_before_provider_dispatch(client):
     """The first SSE data event must not wait for provider connection/prefetch."""
     provider_started = asyncio.Event()
