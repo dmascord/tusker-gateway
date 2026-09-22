@@ -39,12 +39,17 @@ tests; treat those two with that caveat).
   c=16); pod logs show zero `audit write failed` and zero retries —
   the in-process lock removes the contention before the retry path is
   needed.
-- **APIM is completely dead upstream** (0/162 7-day, 0/102 today).
-  Every probe returns HTTP 401 `invalid subscription key` — the
-  endpoint is reachable but rejects the gateway's API key.
-  Removed `apim/gpt-5.6-luna` from `TUSKER_POOL_PRIVACY` in commit
-  `a0a4afa` (2026-09-22); each privacy request no longer pays a
-  dead-upstream failover penalty.
+- **APIM: fully resolved 2026-09-22.** The 0/162 audit figures were a
+  gateway-side auth bug, not a dead upstream: the gateway sent
+  `Authorization: Bearer` where APIM requires the `api-key` header
+  (fixed in commit `d862656`, `ApiKeyHeaderAuthenticator`), then
+  rejected APIM's `max_tokens unsupported_parameter` (fixed in commit
+  `25a43fb`, request-time rename to `max_completion_tokens` for apim).
+  Deployed image `swarm-alpine-20260922191253` (TUSKER_COMMIT
+  `25a43fbb`); E2E chat through the gateway now returns 200 in ~1.8 s
+  (`apim/gpt-5.6-luna` → `gpt-5.6-luna-2026-07-09`). APIM remains out
+  of `TUSKER_POOL_PRIVACY` (commit `a0a4afa`); pool re-entry is an
+  operator decision, not a blocker.
 - **github-copilot (both), groq, workers-ai, openai-codex, opencode-zen
   are 0% in live probes** and remain heavily breaker-open (113 open
   breakers of 680 tracked). opencode-zen regressed badly vs. its 97.9%
@@ -102,7 +107,7 @@ Source: `provider_usage_daily` (state DB), all models.
 | Broken | synthetic | 5,705 | 985 | 82.7% | 0/5, 4/5, 4/5 | text failures are HTML pages on `hf:` routes (1 is a deliberate Kimi-K3 blacklist rejection); vision/tools work |
 | Broken | groq | 273 | 42 | 84.6% | 0/1, —, 0/1 | circuit-open on gpt-oss-20b; unchanged since Sep-12 |
 | Broken | workers-ai | 2,499 | 115 | 95.4% | 0/5, 0/5, — | free tier still exhausted; 24 open breakers |
-| Dead | apim | 162 | 0 | 100% | 0/5, —, 0/5 | upstream 502 `error code: 502`; ClientConnectorError on probes |
+| Dead | apim | 162 | 0 | 100% | 0/5, —, 0/5 | upstream 502 `error code: 502`; ClientConnectorError on probes — **resolved 2026-09-22**: gateway-side auth (`d862656`) + `max_tokens` rename (`25a43fb`) verified E2E |
 | Dead | github-copilot-enterprise | 23 | 0 | 100% | 0/5, 0/5, 0/5 | 12 open breakers |
 | Dead | github-copilot | 13 | 0 | 100% | 0/5, 0/5, 0/5 | 3 open breakers |
 | Dead | openai | 1 | 0 | 100% | — | single failed call; no traffic otherwise |
@@ -277,17 +282,20 @@ mlx-mac model.
    raise). Regression tests in `tests/test_audit_concurrency.py`
    (concurrent chain integrity, transient retry, fail-closed
    exhaustion); full offline suite 1162 passed.
-2. ✅ **APIM** — root cause refined: **not a bad key, a bad auth header.**
-   Direct probing shows the gateway's `Authorization: Bearer <key>`
-   yields 401 `A valid API subscription key is required`, while the same
-   key in the `api-key` header yields **400 `max_tokens` is not
-   supported** — i.e. APIM authenticated the request and only rejected a
-   parameter. The gateway's auth strategies are exactly
-   `{bearer, oauth, codex}` (`auth_strategies.py`), with no
-   subscription-key strategy, so `apim` (`kind: bearer`) can never
-   authenticate. `apim/gpt-5.6-luna` was already removed from
-   `TUSKER_POOL_PRIVACY` (commit `a0a4afa`); re-enabling requires
-   adding an `api-key`-header authenticator and switching apim's `kind`.
+2. ✅ **APIM — fully resolved 2026-09-22.** The audit verdict (misconfigured
+   auth header + `max_tokens` rejection) was correct; both gateway bugs
+   are now fixed and verified end-to-end:
+     - `d862656` — added `ApiKeyHeaderAuthenticator`; apim switched to
+       `kind: api_key` with `api_key_header: api-key`.
+     - `25a43fb` — at request-build time, rename `max_tokens` →
+       `max_completion_tokens` for providers in
+       `_COMPLETION_TOKENS_PROVIDERS` (currently `{"apim"}`); covers both
+       direct passthrough and pool paths.
+   Deployed image `swarm-alpine-20260922191253` (TUSKER_COMMIT
+   `25a43fbb`); E2E chat `apim/gpt-5.6-luna` returns 200 in ~1.8 s via
+   the gateway and ~1.4 s directly against APIM with the `api-key`
+   header. Pool re-entry for `TUSKER_POOL_PRIVACY` is an operator
+   decision — the gateway-side bugs are no longer a blocker.
 3. **Do NOT blanket-disable the "dead" providers** — the direct-probe
    verdict (below) shows none of them is a dead upstream:
    - **Dead credentials, needs repair**: `openai-codex` (all 3 OAuth
@@ -341,7 +349,7 @@ declines to call it right now".
 
 | Provider | Direct upstream response | Classification | Root cause |
 |---|---|---|---|
-| apim | 401 with `Bearer`; 400 `max_tokens unsupported` with `api-key` | **Misconfigured auth header** | Credentials valid; wrong header name. |
+| apim | 401 with `Bearer`; 400 `max_tokens unsupported` with `api-key` | **Misconfigured auth header — RESOLVED** | Credentials valid; wrong header name. Fixed in `d862656` (`api_key_header`) + `25a43fb` (`max_tokens` rename). |
 | groq | 403 `error code: 1010` | **WAF-blocked** | Cloudflare edge rejection; key never evaluated. Not quota. |
 | opencode-zen | 403 `error code: 1010` | **WAF-blocked** | Same as groq. |
 | workers-ai | 400 `No such model: ping` | **Alive** | Authenticated and evaluated; only the probe model was unknown. |
@@ -354,11 +362,12 @@ declines to call it right now".
 | jina | 422 validation error | **Alive** | Authenticated; synthetic-probe schema mismatch. |
 
 **Verdict: no provider in this audit is a dead upstream.** Observed
-failure modes are misconfigured auth (apim), Cloudflare WAF blocking the
-cluster's egress (groq, opencode-zen), dead credentials (openai-codex,
-openai), and model-catalog staleness. Pool breakers/cooldowns therefore
-encode gateway-side symptoms, which is why several providers show
-long-lived "open" breakers while answering direct requests normally.
+failure modes were misconfigured auth (apim — fixed `d862656`+`25a43fb`),
+Cloudflare WAF blocking the cluster's egress (groq, opencode-zen), dead
+credentials (openai-codex, openai), and model-catalog staleness. Pool
+breakers/cooldowns therefore encode gateway-side symptoms, which is why
+several providers show long-lived "open" breakers while answering direct
+requests normally.
 
 ## Appendix
 
@@ -371,6 +380,16 @@ Durable artifacts from this audit:
   fail-closed regression coverage for the audit logger.
 - Commit `cbce50d`..`a0a4afa` on `main` — the source of truth for every
   code claim above; `git show --stat a0a4afa` lists the full diff.
+- Commit `d862656` — `ApiKeyHeaderAuthenticator` (header-name auth for
+  APIM-style providers) + apim `kind: api_key` switch.
+- Commit `25a43fb` — `_rename_max_tokens_for_provider` request-time
+  translation (`max_tokens` → `max_completion_tokens` for apim);
+  regression tests in `tests/test_passthrough_providers.py::TestCompletionTokensParam`.
+- E2E proof (2026-09-22): gateway chat `apim/gpt-5.6-luna` → 200 in
+  1.92 s (`max_completion_tokens` path) and 1.74 s (`max_tokens`
+  client path); direct upstream probe → 200 in 1.43 s. Deployed image
+  `swarm-alpine-20260922191253`, TUSKER_COMMIT `25a43fbb`; config
+  store synced to generation 468.
 
 The probe sweep (217 results), 626-model inventory, 82-model sample, and
 the audit-isolation/concurrency scratch harnesses were temporary audit
