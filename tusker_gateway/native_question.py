@@ -32,6 +32,13 @@ _QUESTION_TOOL_NAMES = frozenset({
     "ask_followup_question",
 })
 
+
+def _is_question_tool_name(value: Any) -> bool:
+    """Recognize native question names with client/provider namespaces."""
+    if not isinstance(value, str):
+        return False
+    return value.rsplit(":", 1)[-1].strip() in _QUESTION_TOOL_NAMES
+
 _PENDING: dict[str, dict[str, Any]] = {}
 _TTL_SECS = 300
 
@@ -381,23 +388,47 @@ def replay_approved_tool_response(
     results: dict[str, Any] = {}
     unbound_results: list[Any] = []
     answer_found, answer_approved, _ = _latest_user_answer(messages)
+    pending_call_ids = [
+        call_id
+        for call_id, pending in _PENDING.items()
+        if pending.get("scope", "calls") == "calls"
+    ]
     for message in messages:
         if not isinstance(message, dict):
             continue
         if message.get("role") == "assistant":
-            for call in message.get("tool_calls") or []:
+            calls = list(message.get("tool_calls") or [])
+            # Some OpenAI-compatible clients downgrade a single tool call to
+            # the legacy function_call field when replaying a transcript.
+            if isinstance(message.get("function_call"), dict):
+                calls.append(message["function_call"])
+            for call in calls:
                 if not isinstance(call, dict):
                     continue
                 function = call.get("function") or {}
-                if function.get("name") in _QUESTION_TOOL_NAMES:
+                if not function and call.get("name"):
+                    function = call
+                if _is_question_tool_name(function.get("name")):
                     call_id = call.get("id")
                     if isinstance(call_id, str) and call_id in _PENDING:
                         questions.add(call_id)
+                    elif len(pending_call_ids) == 1:
+                        # OMP/provider bridges may replace the opaque ID
+                        # with a namespaced value such as default_api:ask.
+                        # Bind only when exactly one pending approval exists.
+                        questions.add(pending_call_ids[0])
         if message.get("role") in {"tool", "function"}:
             content = _message_content(message)
             tool_call_id = message.get("tool_call_id")
             if tool_call_id:
-                results[str(tool_call_id)] = content
+                result_id = str(tool_call_id)
+                results[result_id] = content
+                for embedded_id in _embedded_ids(content):
+                    results[embedded_id] = content
+                if result_id not in questions:
+                    # A namespaced/default tool ID is still an answer, but
+                    # cannot be used as the approval record key directly.
+                    unbound_results.append(content)
             else:
                 unbound_results.append(content)
 
@@ -614,7 +645,7 @@ def question_authorized(
                 if not isinstance(call, dict):
                     continue
                 function = call.get("function") or {}
-                if function.get("name") in _QUESTION_TOOL_NAMES and call.get("id") in _PENDING:
+                if _is_question_tool_name(function.get("name")) and call.get("id") in _PENDING:
                     questions[str(call["id"])] = call
         if message.get("role") in {"tool", "function"} and message.get("tool_call_id"):
             results[str(message["tool_call_id"])] = _message_content(message)

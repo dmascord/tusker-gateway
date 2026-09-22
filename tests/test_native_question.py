@@ -196,6 +196,24 @@ def test_approved_call_is_replayed_without_model_round_trip():
     ]) is None
 
 
+def test_namespaced_omp_question_id_is_replayed_without_provider_round_trip():
+    original = _trade_call(qty=9)
+    question = question_response_for_calls(original, model="model")
+    ask_message = json.loads(json.dumps(question["choices"][0]["message"]))
+    ask_message["tool_calls"][0]["id"] = "default_api:ask"
+    ask_message["tool_calls"][0]["function"]["name"] = "default_api:ask"
+    replay = replay_approved_tool_response([
+        ask_message,
+        {
+            "role": "tool",
+            "tool_call_id": "default_api:ask",
+            "content": json.dumps({"selectedOptions": ["Allow once"]}),
+        },
+    ])
+    assert replay is not None
+    assert replay["choices"][0]["message"]["tool_calls"] == original
+
+
 def test_question_deny_and_unrecognized_answer_do_not_authorize():
     question = question_response_for_calls(_trade_call(), model="model")
     call = question["choices"][0]["message"]["tool_calls"][0]
