@@ -168,6 +168,34 @@ class ConfigRuntime:
         # it on the next tick. An eager _apply here would break tests that
         # monkeypatch it (and fails on mock stores with minimal config).
         self._task = asyncio.create_task(self._poll(stop_event, interval), name="config-runtime-reload")
+
+    async def initialize(self) -> bool:
+        """Load and apply the current DB snapshot before provider startup probes.
+
+        Startup otherwise begins catalog/capability refreshes with the
+        environment fallback, which may contain credentials intentionally
+        replaced in the database. A store outage remains fail-soft: the
+        caller continues with the existing environment configuration.
+        """
+        store = self._store()
+        if store is None or not self._enabled:
+            return False
+        try:
+            await asyncio.to_thread(store.reload_now)
+            generation = store.generation
+            self._generation = generation
+            self._error = None
+            self._apply(generation)
+            self._app["config_runtime_status"] = self.status()
+            logger.info("initial config generation %s applied", generation)
+            return True
+        except ConfigUnavailableError as exc:
+            self._error = self._redact(str(exc))
+            logger.warning("initial config load unavailable; using environment fallback: %s", self._error)
+            return False
+        except Exception:
+            logger.exception("initial config apply failed; using existing configuration")
+            return False
     async def stop(self) -> None:
         """Stop the poll loop and join the task."""
         if self._stop_event is not None:

@@ -276,6 +276,13 @@ def create_app() -> web.Application:
             # shared session before catalog/capability refresh begins.
             rotator._http = app["http_session"]
         startup_log.info("HTTP session created")
+        # Apply database-backed credentials before catalog and capability
+        # refreshes. Otherwise startup can probe stale environment credentials
+        # before the background config poller gets its first turn.
+        config_runtime = app.get("config_runtime")
+        if config_runtime is not None and config_runtime.enabled():
+            await config_runtime.initialize()
+            config = app["config"]
         # One stop signal controls every refresh loop using the shared session.
         stop_event = asyncio.Event()
         app["refresh_stop_event"] = stop_event

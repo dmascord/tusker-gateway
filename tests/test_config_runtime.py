@@ -182,6 +182,44 @@ def test_runtime_config_returns_store_snapshot_and_updates_generation(
     assert rt._last_good_runtime is snap
 
 
+def test_initialize_applies_db_generation_before_startup_consumers(monkeypatch) -> None:
+    """Startup can eagerly publish the DB generation before provider probes."""
+    _env_state("1")
+    store = _make_store()
+    store.upsert_client_key({"principal": "startup", "tenant": "gateway"})
+    app = _make_app()
+    app["config_store"] = store
+    runtime = ConfigRuntime(app)
+    applied: list[int] = []
+    monkeypatch.setattr(runtime, "_apply", applied.append)
+
+    assert asyncio.run(runtime.initialize()) is True
+    assert applied == [store.generation]
+    assert runtime.status()["generation"] == store.generation
+    assert runtime.status()["error"] is None
+
+
+def test_initialize_keeps_environment_fallback_if_db_is_unavailable(monkeypatch) -> None:
+    _env_state("1")
+    store = _make_store()
+
+    def unavailable() -> None:
+        raise ConfigUnavailableError("database unavailable")
+
+    monkeypatch.setattr(store, "reload_now", unavailable)
+    fallback = {"providers": {"environment-provider": {}}}
+    app = _make_app(fallback)
+    app["config_store"] = store
+    runtime = ConfigRuntime(app)
+    applied: list[int] = []
+    monkeypatch.setattr(runtime, "_apply", applied.append)
+
+    assert asyncio.run(runtime.initialize()) is False
+    assert app["config"] is fallback
+    assert applied == []
+    assert runtime.status()["error"] == "ConfigUnavailableError"
+
+
 # ===========================================================================
 # 4. ConfigUnavailableError: retains last-good, error redacted
 # ===========================================================================
