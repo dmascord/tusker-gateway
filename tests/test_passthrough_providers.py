@@ -527,6 +527,137 @@ async def test_codex_rotator_get_token_round_robin():
 
 
 @pytest.mark.asyncio
+async def test_codex_model_exclusion_is_account_and_model_scoped():
+    from tusker_gateway.passthrough import CodexTokenRotator
+
+    rotator = CodexTokenRotator([
+        {"access_token": "acct-a-token", "account_id": "acct-a"},
+        {"access_token": "acct-b-token", "account_id": "acct-b"},
+    ])
+    assert rotator.exclude_model_for_token("acct-a-token", "gpt-5.4-mini")
+    # Account B can still use that model; account A can still use other models.
+    assert await rotator.get_token(model="gpt-5.4-mini") == "acct-b-token"
+    assert await rotator.get_token(model="gpt-5.6-luna") == "acct-a-token"
+
+
+@pytest.mark.asyncio
+async def test_codex_model_exclusion_persists_by_hashed_account_identity(tmp_path):
+    from tusker_gateway.passthrough import CodexTokenRotator
+    from tusker_gateway.persistent_cooldown import PersistentCooldownStore
+
+    store = PersistentCooldownStore(tmp_path / "cooldowns.db")
+    credentials = [
+        {"access_token": "acct-a-token", "account_id": "private-account-id"},
+        {"access_token": "acct-b-token", "account_id": "account-b"},
+    ]
+    first = CodexTokenRotator(credentials, model_exclusion_store=store)
+    assert first.exclude_model_for_token("acct-a-token", "gpt-5.4-mini")
+    second = CodexTokenRotator(credentials, model_exclusion_store=store)
+
+    assert await second.get_token(model="gpt-5.4-mini") == "acct-b-token"
+    # Raw account identifiers are never written to the exclusion table.
+    rows = store.credential_model_exclusions("openai-codex")
+    assert len(rows) == 1
+    assert "private-account-id" not in repr(rows)
+
+
+@pytest.mark.asyncio
+async def test_codex_rotator_reports_when_all_accounts_exclude_model():
+    from tusker_gateway.passthrough import CodexTokenRotator
+
+    rotator = CodexTokenRotator([
+        {"access_token": "acct-a-token", "account_id": "acct-a"},
+        {"access_token": "acct-b-token", "account_id": "acct-b"},
+    ])
+    assert rotator.exclude_model_for_token("acct-a-token", "gpt-5.4-mini")
+    assert not rotator.model_excluded_for_all_credentials("gpt-5.4-mini")
+    assert rotator.exclude_model_for_token("acct-b-token", "gpt-5.4-mini")
+    assert rotator.model_excluded_for_all_credentials("gpt-5.4-mini")
+
+
+@pytest.mark.asyncio
+async def test_codex_unsupported_account_model_retries_next_credential(
+    mock_http, quality_db,
+):
+    credentials = [
+        {"access_token": "unsupported-account-token", "account_id": "acct-a"},
+        {"access_token": "supported-account-token", "account_id": "acct-b"},
+    ]
+    config = _base_config(codex_credentials=credentials)
+    client = PassthroughClient(config, quality_db, mock_http)
+
+    unsupported = MagicMock()
+    unsupported.status = 400
+    unsupported.headers = {}
+    unsupported.text = AsyncMock(return_value=(
+        '{"error":{"message":"The \'gpt-5.4-mini\' model is not supported '
+        'when using Codex with a ChatGPT account."}}'
+    ))
+    unsupported.release = MagicMock()
+    success = MagicMock()
+    success.status = 200
+    success.content = _AsyncChunks([
+        b'data: {"type":"response.completed","response":{"output":[{"type":"message",'
+        b'"content":[{"type":"output_text","text":"ok"}]}]}}\n\n'
+    ])
+    mock_http.request = AsyncMock(side_effect=[unsupported, success])
+
+    result = await client._chat_codex(
+        provider="openai-codex",
+        model="gpt-5.4-mini",
+        messages=[{"role": "user", "content": "hello"}],
+        stream=False,
+        api_key=None,
+    )
+
+    assert result["choices"][0]["message"]["content"] == "ok"
+    assert mock_http.request.await_count == 2
+    first_headers = mock_http.request.await_args_list[0].kwargs["headers"]
+    second_headers = mock_http.request.await_args_list[1].kwargs["headers"]
+    assert first_headers["Authorization"] == "Bearer unsupported-account-token"
+    assert second_headers["Authorization"] == "Bearer supported-account-token"
+
+
+@pytest.mark.asyncio
+async def test_codex_all_accounts_unsupported_stops_repeating_upstream_request(
+    mock_http, quality_db,
+):
+    config = _base_config(codex_credentials=[
+        {"access_token": "only-account-token", "account_id": "acct-a"},
+    ])
+    client = PassthroughClient(config, quality_db, mock_http)
+    response = MagicMock()
+    response.status = 400
+    response.headers = {}
+    response.text = AsyncMock(return_value=(
+        '{"error":{"message":"The \'gpt-5.4-mini\' model is not supported '
+        'when using Codex with a ChatGPT account."}}'
+    ))
+    response.release = MagicMock()
+    mock_http.request = AsyncMock(return_value=response)
+
+    with pytest.raises(ProviderError, match="Provider returned 400"):
+        await client._chat_codex(
+            provider="openai-codex",
+            model="gpt-5.4-mini",
+            messages=[{"role": "user", "content": "hello"}],
+            stream=False,
+            api_key=None,
+        )
+    assert mock_http.request.await_count == 1
+
+    with pytest.raises(ProviderError, match="unsupported by all configured OAuth accounts"):
+        await client._chat_codex(
+            provider="openai-codex",
+            model="gpt-5.4-mini",
+            messages=[{"role": "user", "content": "hello"}],
+            stream=False,
+            api_key=None,
+        )
+    assert mock_http.request.await_count == 1
+
+
+@pytest.mark.asyncio
 async def test_codex_rotator_logs_redacted_credential_slot(caplog):
     from tusker_gateway.passthrough import CodexTokenRotator
 

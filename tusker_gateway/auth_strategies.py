@@ -109,7 +109,7 @@ class OAuthAuthenticator(Authenticator):
             raw_token = provider_key
             token_source = "provider_api_key"
         elif self._rotator:
-            raw_token = await self._rotator.get_token()
+            raw_token = await self._rotator.get_token(model=model)
             if raw_token:
                 token_source = "credential_rotator"
 
@@ -204,7 +204,7 @@ class CodexAuthenticator(Authenticator):
             raw_token = provider_key
             token_source = "provider_api_key"
         elif self._rotator:
-            raw_token = await self._rotator.get_token()
+            raw_token = await self._rotator.get_token(model=model)
             if raw_token:
                 token_source = "credential_rotator"
 

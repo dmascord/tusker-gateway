@@ -773,6 +773,7 @@ class CodexTokenRotator:
         provider: str = "openai-codex",
         persist_credentials: Any | None = None,
         secrets_authoritative: bool = False,
+        model_exclusion_store: Any | None = None,
     ):
         self._creds: list[dict[str, Any]] = list(credentials)
         self._index = 0
@@ -786,6 +787,19 @@ class CodexTokenRotator:
         # other healthy credentials in the same pool — ``get_token``
         # skips fingerprints whose cooldown is still active.
         self._credential_cooldowns: dict[str, float] = {}
+        # Some OAuth providers expose models differently per account. Keep
+        # unsupported model decisions scoped to a stable credential identity,
+        # never to the provider/model route globally.
+        self._model_exclusion_store = model_exclusion_store
+        try:
+            self._unsupported_models: set[tuple[str, str]] = (
+                model_exclusion_store.credential_model_exclusions(self._provider)
+                if model_exclusion_store is not None
+                else set()
+            )
+        except Exception:
+            logger.warning("credential model exclusions could not be loaded provider=%s", self._provider)
+            self._unsupported_models = set()
 
         #   persist_credentials(provider, expected, replacement) -> bool CAS.
         # When set, refreshed credentials persist to the encrypted DB instead
@@ -809,6 +823,8 @@ class CodexTokenRotator:
         self._index = min(self._index, max(len(self._creds) - 1, 0))
         self._refresh_failed_until.clear()
         self._credential_cooldowns.clear()
+        # Keep exclusions across credential refresh/reload. Their identity is
+        # derived from stable account metadata, not the short-lived access token.
         self._initial_refresh_tokens = frozenset(
             str(c.get("refresh_token")) for c in self._creds if c.get("refresh_token")
         )
@@ -862,7 +878,60 @@ class CodexTokenRotator:
             return True
         return False
 
-    async def get_token(self) -> str | None:
+    @staticmethod
+    def _credential_identity(cred: dict[str, Any], token: str | None = None) -> str:
+        """Stable, non-secret identity for per-account model exclusions."""
+        for key in ("account_id", "user_id", "email", "label", "id"):
+            value = cred.get(key)
+            if value:
+                raw = f"{key}:{' '.join(str(value).split()).casefold()}"
+                return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+        # Refresh tokens are more stable than short-lived access tokens.
+        raw = str(cred.get("refresh_token") or token or _creds_access_token(cred) or "")
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24] if raw else ""
+
+    def exclude_model_for_token(self, token: str | None, model: str) -> bool:
+        """Exclude a model only for the credential that returned unsupported."""
+        if not token or not model:
+            return False
+        fp = self.fingerprint(token)
+        for cred in self._creds:
+            if self.fingerprint(_creds_access_token(cred)) == fp:
+                identity = self._credential_identity(cred, token)
+                if identity:
+                    self._unsupported_models.add((identity, str(model).casefold()))
+                    if self._model_exclusion_store is not None:
+                        try:
+                            self._model_exclusion_store.record_credential_model_exclusion(
+                                self._provider, identity, str(model).casefold()
+                            )
+                        except Exception:
+                            logger.warning(
+                                "credential model exclusion persistence failed provider=%s model=%s",
+                                self._provider,
+                                model,
+                            )
+                    logger.warning(
+                        "oauth model excluded for credential provider=%s model=%s fingerprint=%s",
+                        self._provider,
+                        model,
+                        fp,
+                    )
+                    return True
+        return False
+
+    def model_excluded_for_all_credentials(self, model: str) -> bool:
+        if not model or not self._creds:
+            return False
+        return all(
+            (
+                identity := self._credential_identity(cred, _creds_access_token(cred))
+            )
+            and (identity, str(model).casefold()) in self._unsupported_models
+            for cred in self._creds
+        )
+
+    async def get_token(self, model: str | None = None) -> str | None:
         """Return the next usable token in round-robin order.
 
         If the token is near expiry, attempts an automatic refresh.
@@ -891,6 +960,15 @@ class CodexTokenRotator:
                 # ``credential_available`` evicts expired entries so the
                 # dict does not grow unbounded over time.
                 fp = self.fingerprint(token)
+                identity = self._credential_identity(cred, token)
+                if model and (identity, str(model).casefold()) in self._unsupported_models:
+                    logger.info(
+                        "oauth credential skipped provider=%s model=%s fingerprint=%s reason=model_unsupported_for_account",
+                        self._provider,
+                        model,
+                        fp,
+                    )
+                    continue
                 if not self.credential_available(fp):
                     logger.debug(
                         "oauth rotator skip provider=%s credential_index=%d/%d "
@@ -2299,11 +2377,10 @@ class PassthroughClient:
                 if "effort" in reasoning:
                     reasoning["effort"] = _normalize_reasoning_effort(reasoning["effort"])
         url = f"{endpoint_raw['base_url']}{endpoint_raw['chat_path']}"
-        # Retry loop: on a per-credential quota 429 (e.g. codex team user
-        # exhausted their own quota), quarantine the credential and retry
-        # with the next one from the rotator. Non-quota 429s (generic
-        # throttling) and other errors re-raise immediately. At most
-        # ``rotator.size`` attempts to prevent infinite loops.
+        # Retry loop: per-credential quota exhaustion and account-specific
+        # model entitlement errors quarantine only that credential, then try
+        # the next account. Generic throttling and unrelated errors re-raise.
+        # At most ``rotator.size`` attempts prevents infinite loops.
         max_attempts = max(rotator.size, 1) if rotator else 1
         last_exc: RateLimitError | None = None
         for attempt in range(max_attempts):
@@ -2315,6 +2392,16 @@ class PassthroughClient:
                 **(extra_headers or {}),
                 **await strategy.headers(self._config, provider, model, api_key, endpoint_model),
             }
+            if rotator is not None and rotator.model_excluded_for_all_credentials(model):
+                unsupported = ProviderError(
+                    f"Codex model {model!r} is unsupported by all configured OAuth accounts",
+                    code="unsupported_model_for_credentials",
+                )
+                unsupported.upstream_status = 400
+                unsupported.upstream_body = (
+                    "model is not supported by any configured Codex ChatGPT account"
+                )
+                raise unsupported
             if provider.lower() in {
                 "github-copilot",
                 "github-copilot-enterprise",
@@ -2427,6 +2514,26 @@ class PassthroughClient:
                         body_text[:300],
                     )
                 resp.release()
+                # This Codex 400 is not a malformed request: ChatGPT OAuth
+                # accounts can have different model entitlements. Exclude
+                # the model only for the credential that produced this exact
+                # entitlement error, then retry another credential if present.
+                unsupported_codex_account_model = (
+                    provider.lower() == "openai-codex"
+                    and status == 400
+                    and "model is not supported when using codex with a chatgpt account"
+                    in body_text.lower()
+                )
+                if unsupported_codex_account_model and rotator is not None:
+                    auth_value = str(headers.get("Authorization") or "")
+                    used_token = (
+                        auth_value[7:]
+                        if auth_value.lower().startswith("bearer ")
+                        else None
+                    )
+                    excluded = rotator.exclude_model_for_token(used_token, model)
+                    if excluded and attempt + 1 < max_attempts:
+                        continue
                 # A revoked Codex access token can still carry a future local
                 # expiry. Force-refresh the credential that produced this
                 # 401 before trying the next account; otherwise rotation

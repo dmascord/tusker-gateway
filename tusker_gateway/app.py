@@ -214,7 +214,20 @@ def create_app() -> web.Application:
     # independent: a Copilot token must never be selected for chatgpt.com, and
     # a Codex credential must never be used to authenticate a Copilot catalog.
     from tusker_gateway.passthrough import CodexTokenRotator
+    from tusker_gateway.persistent_cooldown import PersistentCooldownStore
     config = app["config"]
+    from pathlib import Path
+
+    cooldown_db_path = (
+        Path(config.get("quality_db_path", "data/quality.db")).parent / "cooldowns.db"
+    )
+    try:
+        model_exclusion_store = PersistentCooldownStore(cooldown_db_path)
+    except Exception:
+        model_exclusion_store = None
+        logging.getLogger("tusker_gateway.startup").warning(
+            "credential model exclusion storage unavailable", exc_info=True
+        )
     credential_rotators: dict[str, CodexTokenRotator] = {}
     configured_pools = config.get("credential_pools")
     if isinstance(configured_pools, dict):
@@ -230,6 +243,7 @@ def create_app() -> web.Application:
                 [credential for credential in credentials if isinstance(credential, dict)],
                 auth_file=(config.get("auth_file") if provider == "openai-codex" else None),
                 provider=provider,
+                model_exclusion_store=model_exclusion_store,
             )
     codex_rotator = credential_rotators.get("openai-codex")
     if codex_rotator is None:
@@ -237,6 +251,7 @@ def create_app() -> web.Application:
             config.get("codex_credentials") or [],
             auth_file=config.get("auth_file"),
             provider="openai-codex",
+            model_exclusion_store=model_exclusion_store,
         )
         credential_rotators["openai-codex"] = codex_rotator
     app["credential_rotators"] = credential_rotators

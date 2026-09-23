@@ -73,6 +73,17 @@ class PersistentCooldownStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS credential_model_exclusions (
+                    provider TEXT NOT NULL,
+                    credential_id TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    failed_at REAL NOT NULL,
+                    PRIMARY KEY (provider, credential_id, model)
+                )
+                """
+            )
             conn.commit()
 
     def _connect(self):
@@ -292,6 +303,34 @@ class PersistentCooldownStore:
                 loaded += 1
         logger.info('hydrated %d permanent failure markers from store', loaded)
         return loaded
+
+    def record_credential_model_exclusion(
+        self, provider: str, credential_id: str, model: str
+    ) -> None:
+        """Persist an account-specific model entitlement failure."""
+        if not provider or not credential_id or not model:
+            return
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO credential_model_exclusions
+                    (provider, credential_id, model, failed_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(provider, credential_id, model) DO UPDATE SET
+                    failed_at = excluded.failed_at
+                """,
+                (provider, credential_id, model, time.time()),
+            )
+            conn.commit()
+
+    def credential_model_exclusions(self, provider: str) -> set[tuple[str, str]]:
+        """Return (credential identity, model) exclusions for one provider."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT credential_id, model FROM credential_model_exclusions WHERE provider = ?",
+                (provider,),
+            ).fetchall()
+        return {(str(credential_id), str(model)) for credential_id, model in rows}
 
     def status(self) -> dict[str, Any]:
         with self._connect() as conn:
