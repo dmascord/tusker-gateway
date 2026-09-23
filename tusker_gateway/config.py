@@ -608,6 +608,33 @@ def expand_env_placeholders(value: str | None) -> str | None:
 
 
 DEFAULT_PROVIDER_REGISTRY: dict[str, ProviderConfig] = {
+    # Native process-backed transport. The sentinel URL is never contacted;
+    # PassthroughClient dispatches this provider through its registered adapter.
+    # It is deliberately not ZDR eligible and is not included in any default pool.
+    "claude-code-cli": ProviderConfig(
+        "claude-code-cli",
+        "local",
+        "claude://local",
+        "/chat/completions",
+        auth_type="local",
+        zdr_ok=False,
+    ),
+    "opencode-cli": ProviderConfig(
+        "opencode-cli",
+        "local",
+        "opencode://local",
+        "/chat/completions",
+        auth_type="local",
+        zdr_ok=False,
+    ),
+    "kilo-cli": ProviderConfig(
+        "kilo-cli",
+        "local",
+        "kilo://local",
+        "/chat/completions",
+        auth_type="local",
+        zdr_ok=False,
+    ),
     "openai": ProviderConfig(
         "openai",
         "bearer",
@@ -1001,7 +1028,6 @@ def _load_pools() -> dict[str, PoolConfig]:
             zdr=True,
             auto_catalog=True,
             auto_catalog_providers=default_auto_catalog_providers or (
-                "local-llm",
                 "mlx-mac",
                 "openai-codex",
                 "github-copilot-enterprise",

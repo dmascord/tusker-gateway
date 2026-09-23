@@ -40,7 +40,6 @@ def test_default_privacy_pool_has_no_manual_routes_and_requires_qualification(mo
     assert pool.models == []
     assert pool.require_tool_qualification is True
     assert pool.auto_catalog_providers == (
-        "local-llm",
         "mlx-mac",
         "openai-codex",
         "github-copilot-enterprise",
@@ -105,11 +104,8 @@ def test_new_privacy_eligible_providers_load(monkeypatch):
     assert all(p != "alibaba" for p, _ in routes)
 
 
-def test_local_hardware_routes_in_privacy_pool(monkeypatch):
-    """local-llm (Jetson Ollama) and mlx-mac are privacy-eligible. Pool config
-    that lists their canonical models as static entries must include them as
-    candidate routes without triggering the heavyweight gate.
-    """
+def test_jetson_local_llm_is_not_a_privacy_chat_candidate(monkeypatch):
+    """Keep Jetson's provider definition, but exclude it from privacy chat."""
     for key in tuple(os.environ):
         if key.startswith("TUSKER_POOL_") or key == "TUSKER_AUTO_CATALOG_PROVIDERS":
             monkeypatch.delenv(key, raising=False)
@@ -121,11 +117,6 @@ def test_local_hardware_routes_in_privacy_pool(monkeypatch):
     )
     privacy_models = [
         {
-            "provider": "local-llm",
-            "model": "qwopus-9b-coder-mtp:latest",
-            "input_modalities": ["text"],
-        },
-        {
             "provider": "mlx-mac",
             "model": "qwen3-coder-30b-a3b-instruct-4bit",
             "input_modalities": ["text"],
@@ -133,7 +124,8 @@ def test_local_hardware_routes_in_privacy_pool(monkeypatch):
     ]
     monkeypatch.setenv(
         "TUSKER_POOL_PRIVACY",
-        '{"models":' + json.dumps(privacy_models) + ',"zdr":true,"auto_catalog":true}',
+        '{"models":' + json.dumps(privacy_models)
+        + ',"zdr":true,"auto_catalog":true,"auto_catalog_providers":["mlx-mac"]}',
     )
 
     from tusker_gateway.config import _provider_registry_from_env
@@ -143,16 +135,13 @@ def test_local_hardware_routes_in_privacy_pool(monkeypatch):
     assert registry["local-llm"].zdr_ok is True
     assert registry["mlx-mac"].zdr_ok is True
 
-    # Neither slug should trip the heavyweight gate (privacy drops heavies).
-    assert is_heavyweight_slug("qwopus-9b-coder-mtp:latest") is False
+    # The Jetson remains configured, but is not routed for privacy chat.
     assert is_heavyweight_slug("qwen3-coder-30b-a3b-instruct-4bit") is False
 
     pool = _load_pools()["privacy"]
     routes = {(model["provider"], model["model"]) for model in pool.models}
-    assert {
-        ("local-llm", "qwopus-9b-coder-mtp:latest"),
-        ("mlx-mac", "qwen3-coder-30b-a3b-instruct-4bit"),
-    } <= routes
+    assert routes == {("mlx-mac", "qwen3-coder-30b-a3b-instruct-4bit")}
+    assert "local-llm" not in pool.auto_catalog_providers
 
 
 def test_public_copilot_is_not_available_to_privacy_catalog(monkeypatch):

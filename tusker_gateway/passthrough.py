@@ -606,6 +606,10 @@ def _init_provider_endpoints() -> dict[str, dict[str, Any]]:
 
         out: dict[str, dict[str, Any]] = {}
         for name, pc in DEFAULT_PROVIDER_REGISTRY.items():
+            # Native transports are dispatched through provider_adapters and
+            # must not be exposed as HTTP endpoints in this legacy map.
+            if not str(pc.base_url).startswith(("http://", "https://")):
+                continue
             entry: dict[str, Any] = {
                 "base_url": expand_env_placeholders(pc.base_url) or pc.base_url,
                 "chat_path": pc.chat_path,
@@ -1797,6 +1801,22 @@ class PassthroughClient:
 
             if rtk_enabled():
                 messages = compress_tool_results(messages, metrics=metrics_registry)
+
+        # Process-backed providers use the same OpenAI response contract as
+        # HTTP transports. Keeping this dispatch at the client boundary means
+        # every result still passes through endpoint-level validation/audit.
+        from tusker_gateway.provider_adapters import provider_adapters
+
+        adapter = provider_adapters.get(provider)
+        if adapter is not None:
+            return await adapter.chat(
+                provider=provider,
+                model=model,
+                messages=messages,
+                stream=stream,
+                tools=tools,
+                tool_choice=tool_choice,
+            )
 
         # Resolve the endpoint up front so the dispatch can decide between
         # the standard chat-completions passthrough and the openai-codex

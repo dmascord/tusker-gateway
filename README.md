@@ -55,4 +55,5 @@ Capability discovery refreshes supported image/video models from provider catalo
 5. **Codex token rotation** — shared OAuth pools select credentials round-robin; failed requests continue with the next scheduled credential.
 6. **Virtual alias guard** — the advertised model name (e.g. `tusker-gateway`) is never persisted as a session's model or sent to a provider.
 7. **Semantic cache isolation** — approximate response reuse is restricted to deterministic text requests and scoped by caller, pool, and concrete route; tool calls and ZDR traffic are excluded. See `docs/semantic-cache.md`.
-8. **Enterprise controls** — optional tenant identities, least-privilege API scopes, tamper-evident request audit, and persistent idempotency are enforced before provider dispatch. Request deadlines are bounded globally. See `docs/enterprise-controls.md`.
+8. **Native provider adapters** — non-HTTP transports use the common OpenAI response contract and remain inside gateway validation/audit. See `docs/provider-adapters.md`.
+9. **Enterprise controls** — optional tenant identities, least-privilege API scopes, tamper-evident request audit, and persistent idempotency are enforced before provider dispatch. Request deadlines are bounded globally. See `docs/enterprise-controls.md`.
