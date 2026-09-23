@@ -28,6 +28,7 @@ from tusker_gateway.config import (
     PoolConfig,
     model_is_blacklisted,
 )
+from tusker_gateway.context_limits import declared_context_window
 from tusker_gateway.cooldown import CooldownTracker, global_tracker, is_permanently_failed
 from tusker_gateway.heavyweight import is_heavyweight
 from tusker_gateway.model_capability import (
@@ -1214,7 +1215,12 @@ class PoolManager:
                         if pool_config and pool_config.zdr and not s.zdr_ok:
                             self._drop_stickiness(key)
                             break
-                        if context_tokens > 0 and s.context_window < context_tokens:
+                        declared = (
+                            declared_context_window(s.provider, s.model)
+                            if context_tokens > 0
+                            else None
+                        )
+                        if declared is not None and declared < context_tokens:
                             # Context doesn't fit; clear stickiness
                             self._drop_stickiness(key)
                             break
@@ -1288,6 +1294,7 @@ class PoolManager:
             "zdr_policy": 0,
         }
         filtered_zdr_models: list[str] = []
+        filtered_context_models: list[str] = []
         for s in specs:
             if self._model_is_blacklisted(s.provider, s.model):
                 filter_counts["blacklisted_model"] += 1
@@ -1312,9 +1319,16 @@ class PoolManager:
                 if len(filtered_zdr_models) < 12:
                     filtered_zdr_models.append(f"{s.provider}/{s.model}")
                 continue
-            if context_tokens > 0 and s.context_window < context_tokens:
-                filter_counts["context_window"] += 1
-                continue
+            # Only operator-declared windows gate selection: the pool-wide
+            # ``context_window`` is a 128k guess that would wrongly exclude
+            # long-context routes.
+            if context_tokens > 0:
+                window = declared_context_window(s.provider, s.model)
+                if window is not None and window < context_tokens:
+                    filter_counts["context_window"] += 1
+                    if len(filtered_context_models) < 12:
+                        filtered_context_models.append(f"{s.provider}/{s.model}:{window}")
+                    continue
             if not heavyweight_ok and s.heavyweight:
                 filter_counts["heavyweight"] += 1
                 continue
@@ -1399,6 +1413,14 @@ class PoolManager:
                 pool_name,
                 len(filtered_special_models),
                 ",".join(filtered_special_models[:12]),
+            )
+        if filtered_context_models:
+            logger.info(
+                "pool '%s' context window filter context_tokens=%d filtered=%d models=%s",
+                pool_name,
+                context_tokens,
+                filter_counts["context_window"],
+                ",".join(filtered_context_models),
             )
         if filtered_zdr_models:
             logger.info(

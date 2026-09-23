@@ -5,7 +5,7 @@ import asyncio
 import json
 import os
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 
 import pytest
 from tusker_gateway.budget import BudgetDecision
@@ -350,11 +350,12 @@ async def test_pool_fallback_recovery_probe_without_http_server():
     assert (provider, model) == ("openai-codex", "recovery-model")
     assert result["choices"][0]["message"]["content"] == "ok"
     assert pool_manager.select.call_args_list == [
-        call("code", excluded=set(), required_input_modalities=None),
+        call("code", excluded=set(), required_input_modalities=None, context_tokens=ANY),
         call(
             "code",
             excluded=set(),
             required_input_modalities=None,
+            context_tokens=ANY,
             allow_cooldown_probe=True,
         ),
     ]
@@ -393,12 +394,14 @@ async def test_tool_pool_compatibility_probe_without_http_server():
             "code",
             excluded=set(),
             required_input_modalities=None,
+            context_tokens=ANY,
             requires_tools=True,
         ),
         call(
             "code",
             excluded=set(),
             required_input_modalities=None,
+            context_tokens=ANY,
             requires_tools=True,
             allow_cooldown_probe=True,
             allow_unqualified_static_tools=True,
@@ -408,6 +411,7 @@ async def test_tool_pool_compatibility_probe_without_http_server():
             "code",
             excluded=set(),
             required_input_modalities=None,
+            context_tokens=ANY,
             requires_tools=True,
             allow_cooldown_probe=True,
             allow_unqualified_static_tools=True,
@@ -938,11 +942,12 @@ async def test_empty_pool_enters_bounded_recovery_probe(app, client):
 
     assert resp.status == 200
     assert pool_manager.select.call_args_list == [
-        call("code", excluded=set(), required_input_modalities=None),
+        call("code", excluded=set(), required_input_modalities=None, context_tokens=ANY),
         call(
             "code",
             excluded=set(),
             required_input_modalities=None,
+            context_tokens=ANY,
             allow_cooldown_probe=True,
         ),
     ]
@@ -979,12 +984,14 @@ async def test_tool_pool_recovery_probe_enables_curated_fallback(app, client):
             "code",
             excluded=set(),
             required_input_modalities=None,
+            context_tokens=ANY,
             requires_tools=True,
         ),
         call(
             "code",
             excluded=set(),
             required_input_modalities=None,
+            context_tokens=ANY,
             requires_tools=True,
             allow_cooldown_probe=True,
             allow_unqualified_static_tools=True,
@@ -1015,8 +1022,8 @@ async def test_code_pool_uses_configured_fallback_pool_when_exhausted(app, clien
 
     assert resp.status == 200
     assert pool_manager.select.call_args_list == [
-        call("code", excluded=set(), required_input_modalities=None),
-        call("premium", excluded=set(), required_input_modalities=None),
+        call("code", excluded=set(), required_input_modalities=None, context_tokens=ANY),
+        call("premium", excluded=set(), required_input_modalities=None, context_tokens=ANY),
     ]
 
 
@@ -1057,6 +1064,7 @@ async def test_chat_pool_requires_tool_capability_and_forwards_tool_choice(app, 
         "code",
         excluded=set(),
         required_input_modalities=None,
+        context_tokens=ANY,
         requires_tools=True,
     )
     assert mock_chat.call_args.kwargs["tool_choice"] == "required"
@@ -1093,11 +1101,12 @@ async def test_chat_pool_image_requirement_is_preserved_across_fallbacks(app, cl
 
     assert resp.status == 200
     assert pool_manager.select.call_args_list == [
-        call("code", excluded=set(), required_input_modalities=frozenset({"image"})),
+        call("code", excluded=set(), required_input_modalities=frozenset({"image"}), context_tokens=ANY),
         call(
             "code",
             excluded={("xiaomi", "mimo-v2.5")},
             required_input_modalities=frozenset({"image"}),
+            context_tokens=ANY,
         ),
     ]
 
@@ -1138,11 +1147,12 @@ async def test_chat_stream_provider_502_falls_back_before_client_response(app, c
     assert resp.status == 200
     assert b"fallback" in content
     assert pool_manager.select.call_args_list == [
-        call("code", excluded=set(), required_input_modalities=None),
+        call("code", excluded=set(), required_input_modalities=None, context_tokens=ANY),
         call(
             "code",
             excluded={("openrouter", "nvidia/saturated-model")},
             required_input_modalities=None,
+            context_tokens=ANY,
         ),
     ]
 
@@ -1624,11 +1634,12 @@ async def test_chat_pool_input_image_requires_image_after_breaker_skip(app, clie
 
     assert resp.status == 200
     assert pool_manager.select.call_args_list == [
-        call("code", excluded=set(), required_input_modalities=frozenset({"image"})),
+        call("code", excluded=set(), required_input_modalities=frozenset({"image"}), context_tokens=ANY),
         call(
             "code",
             excluded={("xiaomi", "mimo-v2.5-pro")},
             required_input_modalities=frozenset({"image"}),
+            context_tokens=ANY,
         ),
     ]
 
@@ -1657,6 +1668,7 @@ async def test_chat_text_only_pool_request_has_no_modality_requirement(app, clie
         "code",
         excluded=set(),
         required_input_modalities=None,
+        context_tokens=ANY,
     )
 
 

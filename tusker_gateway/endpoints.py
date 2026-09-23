@@ -62,10 +62,16 @@ from tusker_gateway.observability import set_access_log_context
 from tusker_gateway.guardrails import run_guard_pipeline
 from tusker_gateway.passthrough import (
     PassthroughClient,
+    bind_upstream_progress,
     _persist_cooldown,
     _safe_upstream_body,
     _sanitize_opencode_session_id,
     _stable_opencode_session_id,
+)
+from tusker_gateway.context_limits import (
+    estimate_prompt_tokens,
+    fit_output_budget,
+    required_context_tokens,
 )
 from tusker_gateway.max_tokens import apply_max_tokens_floor
 from tusker_gateway.native_question import (
@@ -1075,6 +1081,11 @@ async def _normalize_stream(
         return RequiredToolCallError()
 
     def unusable_tool_error(reason: str) -> UnusableToolResponseError:
+        if reason == "reasoning_only_or_empty" and emitted_finish_reason == "length":
+            # The route ran out of room (prompt filled the window or
+            # max_tokens was tiny) before answering; that is a property of
+            # this request, not evidence the model breaks the tool contract.
+            reason = "output_budget_exhausted"
         logger.warning(
             "unusable tool response rejected provider=%s model=%s request_id=%s reason=%s "
             "reasoning_chars=%d content_chars=%d chunks=%d upstream_bytes=%d frames=%d "
@@ -3054,6 +3065,9 @@ def _select_cache_route_target(
             "excluded": set(excluded),
             "required_input_modalities": required_modalities,
             "high_impact_tools": tools_include_high_impact(body.get("tools")),
+            "context_tokens": required_context_tokens(
+                estimate_prompt_tokens(body.get("messages"), body.get("tools"))
+            ),
         }
         if requires_structured_output:
             select_kwargs["requires_structured_output"] = True
@@ -3097,6 +3111,32 @@ def _max_pool_provider_attempts() -> int:
         return max(1, int(os.environ.get("TUSKER_MAX_PROVIDER_ATTEMPTS", "6")))
     except ValueError:
         return 6
+
+
+def _candidate_extra_body(
+    extra_body: dict[str, Any],
+    provider: str,
+    model: str,
+    *,
+    prompt_estimate: int,
+    request_id: str | None,
+) -> dict[str, Any]:
+    """Apply the reasoning floor, then fit ``max_tokens`` to the route's window."""
+    floored = apply_max_tokens_floor(extra_body, provider, model)
+    fitted, budget = fit_output_budget(floored, provider, model, prompt_estimate)
+    logger.info(
+        "context budget rid=%s candidate=%s/%s window=%s prompt_estimate=%d "
+        "requested_max_tokens=%s effective_max_tokens=%s clamped=%s",
+        request_id or "unknown",
+        provider,
+        model,
+        budget.window or "undeclared",
+        budget.prompt_estimate,
+        budget.requested_max_tokens,
+        budget.effective_max_tokens,
+        budget.clamped,
+    )
+    return fitted
 
 
 def _provider_attempt_timeout_overrides() -> dict[str, float]:
@@ -3178,6 +3218,10 @@ class _AttemptActivity:
         self.started = asyncio.get_running_loop().time()
         self.last: float | None = None
 
+    def touch(self) -> None:
+        """Record upstream progress now."""
+        self.last = asyncio.get_running_loop().time()
+
 
 def _attempt_touch_iterator(
     stream: Any,
@@ -3187,7 +3231,7 @@ def _attempt_touch_iterator(
 
     async def _wrapped() -> AsyncIterator[Any]:
         async for chunk in stream:
-            activity.last = asyncio.get_running_loop().time()
+            activity.touch()
             yield chunk
 
     return _wrapped()
@@ -3261,6 +3305,13 @@ def _quarantine_tool_response_failure(
             UnusableToolResponseError,
         ),
     ):
+        return
+    if getattr(exc, "reason", None) == "output_budget_exhausted":
+        logger.warning(
+            "tool response not quarantined provider=%s model=%s reason=output_budget_exhausted",
+            provider,
+            model,
+        )
         return
     seconds = _tool_response_failure_cooldown_secs()
     from tusker_gateway.cooldown import global_tracker
@@ -3491,6 +3542,16 @@ def _validation_stream_message(
         else:
             problem = "the arguments did not satisfy the tool schema"
         detail = f"The provider{route} returned invalid arguments for tool '{error.tool_name}': {problem}."
+    elif (
+        isinstance(error, UnusableToolResponseError)
+        and error.reason == "output_budget_exhausted"
+    ):
+        route = f" {provider}/{model}" if provider and model else ""
+        return (
+            f"The provider{route} ran out of output room before answering; the prompt "
+            "nearly filled its context window. Retry, or compact the conversation. "
+            f"Request ID: {request_id}."
+        )
     else:
         detail = "The gateway could not use the provider's tool response."
     return f"{detail} The route was temporarily quarantined; Retry the request. Request ID: {request_id}."
@@ -3587,6 +3648,7 @@ async def _call_with_pool_fallback(
     than 429 rate-limit, which uses the cooldown path) record failure.
     """
     extra_body = _build_extra_body(body)
+    prompt_estimate = estimate_prompt_tokens(body.get("messages"), tools)
     required_input_modalities = _required_input_modalities(body.get("messages"))
     requires_tools = bool(tools)
     high_impact_tools = tools_include_high_impact(tools)
@@ -3624,6 +3686,8 @@ async def _call_with_pool_fallback(
 
             async def call_direct() -> Any:
                 nonlocal result
+                # Runs in its own task, so the binding is scoped to this attempt.
+                bind_upstream_progress(activity.touch)
                 result = await client.chat(
                     provider,
                     model,
@@ -3631,7 +3695,13 @@ async def _call_with_pool_fallback(
                     stream=bool(body.get("stream")),
                     tools=tools,
                     tool_choice=body.get("tool_choice"),
-                    extra_body=apply_max_tokens_floor(extra_body, provider, model),
+                    extra_body=_candidate_extra_body(
+                        extra_body,
+                        provider,
+                        model,
+                        prompt_estimate=prompt_estimate,
+                        request_id=request_id,
+                    ),
                     conversation_id=conversation_id,
                     metrics_registry=metrics_registry,
                 )
@@ -3805,6 +3875,7 @@ async def _call_with_pool_fallback(
             select_kwargs: dict[str, Any] = {
                 "excluded": set(excluded),
                 "required_input_modalities": required_input_modalities,
+                "context_tokens": required_context_tokens(prompt_estimate),
             }
             allowed_providers = provider_patterns_for_request(request)
             if allowed_providers is not None:
@@ -3942,6 +4013,8 @@ async def _call_with_pool_fallback(
 
             async def call_candidate() -> Any:
                 nonlocal result
+                # Runs in its own task, so the binding is scoped to this attempt.
+                bind_upstream_progress(activity.touch)
                 result = await client.chat(
                     provider,
                     model,
@@ -3949,7 +4022,13 @@ async def _call_with_pool_fallback(
                     stream=bool(body.get("stream")),
                     tools=tools,
                     tool_choice=body.get("tool_choice"),
-                    extra_body=apply_max_tokens_floor(extra_body, provider, model),
+                    extra_body=_candidate_extra_body(
+                        extra_body,
+                        provider,
+                        model,
+                        prompt_estimate=prompt_estimate,
+                        request_id=request_id,
+                    ),
                     conversation_id=conversation_id,
                     metrics_registry=metrics_registry,
                 )

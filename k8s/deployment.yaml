@@ -456,6 +456,16 @@ spec:
           value: '240000'
         - name: TUSKER_PROVIDER_ATTEMPT_TIMEOUT_OVERRIDES_JSON
           value: '{"local-llm": 240, "mlx-mac": 240, "zai": 90, "opencode-go": 90}'
+        # Real context windows of servers whose window differs from the pool
+        # default (keys: provider or provider/model; ":latest" optional).
+        # Ollama ignores num_ctx on /v1, so this must track the host config:
+        # MLX Mac sets OLLAMA_CONTEXT_LENGTH=131072 in
+        # /Library/LaunchDaemons/dev.tusker.ollama.plist (2026-09-24; all chat
+        # models fit in 23 GiB at 128k). Declared routes are skipped when
+        # prompt + TUSKER_MIN_OUTPUT_TOKENS won't fit and max_tokens is
+        # clamped to the remaining room.
+        - name: TUSKER_CONTEXT_WINDOW_OVERRIDES_JSON
+          value: '{"mlx-mac": 131072}'
         # Per-provider streaming per-chunk idle budget overrides (seconds).
         # xiaomi/mimo large contexts regularly exceed the default 120s wall
         # clock — extend the per-chunk budget so streaming generation completes

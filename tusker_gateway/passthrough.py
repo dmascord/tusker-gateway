@@ -7,6 +7,7 @@ for Codex OAuth and cooldown tracking on failures.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hashlib
 import inspect
 import json
@@ -14,7 +15,7 @@ import logging
 import os
 import re
 import time
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Callable
 
 import aiohttp
 
@@ -50,6 +51,28 @@ _SENSITIVE_ERROR_VALUE_RE = re.compile(
 _CLOUDFLARE_OR_HTML_ERROR_RE = re.compile(
     r"(?i)<!doctype html|<html[ >]|error code\s*:\s*5\d\d|cloudflare",
 )
+
+
+# Buffered upstream paths (Codex SSE is assembled into one dict before the
+# caller sees anything) never touch the endpoint's per-chunk activity
+# tracker, so the idle-based attempt budget degrades into a wall-clock cap.
+# The endpoint binds a progress callback per attempt task; buffered parsers
+# report each upstream event through it.
+_upstream_progress: contextvars.ContextVar[Callable[[], None] | None] = contextvars.ContextVar(
+    "tusker_upstream_progress", default=None
+)
+
+
+def bind_upstream_progress(callback: Callable[[], None] | None) -> None:
+    """Bind *callback* as the upstream-progress hook for the current task."""
+    _upstream_progress.set(callback)
+
+
+def _note_upstream_progress() -> None:
+    """Report upstream liveness to the attempt watchdog, if one is bound."""
+    callback = _upstream_progress.get()
+    if callback is not None:
+        callback()
 
 
 _OPENCODE_GO_PROVIDER = "opencode-go"
@@ -2637,6 +2660,7 @@ class PassthroughClient:
             return ensure_function_call({"id": item_id, "call_id": call_id})
 
         async for raw_line in resp.content:
+            _note_upstream_progress()
             line = raw_line.decode("utf-8", errors="replace").strip()
             if not line.startswith("data: "):
                 continue

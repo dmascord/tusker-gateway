@@ -297,6 +297,43 @@ route. After a capacity failure the route is in capacity cooldown
 (`TUSKER_PROVIDER_CAPACITY_COOLDOWN_SECS=300`) so a hot backend can finish
 its current request and the gateway stops hammering it.
 
+#### Declared context windows and max_tokens fitting
+
+Ollama sizes `num_ctx` from host memory unless `OLLAMA_CONTEXT_LENGTH` or a
+model's `PARAMETER num_ctx` says otherwise, and ignores `options.num_ctx` on
+`/v1/chat/completions`. The pool-wide `context_window` (128k) is only a
+guess, so `TUSKER_CONTEXT_WINDOW_OVERRIDES_JSON` declares real windows,
+keyed by `provider` or `provider/model` (model keys win; `:latest` is
+optional): `{"mlx-mac": 131072}`. Keep it in step with the host.
+
+The MLX Mac runs `OLLAMA_CONTEXT_LENGTH=131072` (set 2026-09-24 in
+`/Library/LaunchDaemons/dev.tusker.ollama.plist`; its default was 32k).
+Measured at 128k: ornith-1.5:35b 22.2 GiB, qwen3.8-27b 20.6 GiB,
+shirdel-coder-9b 9.5 GiB, all on the GPU. The duplicate
+`homebrew.mxcl.ollama` daemon is disabled; it was crash-looping on the
+port held by `dev.tusker.ollama`.
+
+For declared routes only:
+
+- Selection skips the route when the prompt estimate plus
+  `TUSKER_MIN_OUTPUT_TOKENS` (default 4096) plus a 256-token margin exceeds
+  the window. `pool '<name>' context window filter ...` logs what was dropped.
+- `max_tokens` / `max_completion_tokens` is clamped to
+  `window - prompt_estimate - 256`. An unset value stays unset.
+
+The prompt estimate (`context_limits.estimate_prompt_tokens`) counts message
+text, tool-call arguments and tool schemas at 3.2 chars/token (measured on
+the Qwen tokenizer: code ~3.3, schema JSON ~3.4, prose ~5.1), plus
+`TUSKER_IMAGE_TOKEN_ESTIMATE` (default 1600) per image. Every attempt logs
+`context budget rid=... window=... prompt_estimate=... requested_max_tokens=...
+effective_max_tokens=... clamped=...`.
+
+A tool turn that ends `finish_reason=length` with no answer or tool call is
+rejected as `output_budget_exhausted`. That depends on the request, not the
+model, so the route is not quarantined, and the client is told the prompt
+nearly filled the window. Incident: `req_7b0d460047e30296` (2026-09-23)
+sent a 32,669-token prompt to ornith's 32,768-token slot.
+
 Operators should expect:
 
 - First request after a cold start of a large model may take ~25s on
