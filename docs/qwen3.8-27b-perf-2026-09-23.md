@@ -81,11 +81,23 @@ against `ai.tusker.net.au` must set a recognised UA.
 
 ## MLX-VLM durability status
 
-The port-11435 server was started ad hoc (`nohup … &`) for this
-benchmark and is **not** supervised — it will not survive a reboot.
-The old `~/Library/LaunchAgents/net.tusker.mlx-27b.plist.bak` is
-misleading: it launches `mlx_lm.server`, which cannot serve this VLM.
-If MLX-VLM is promoted beyond benchmarking, write a fresh LaunchAgent
-that runs `mlx_vlm.server` with `KeepAlive` and register a distinct
-gateway provider entry (e.g. `mlx-vlm-mac`) rather than reusing
-`mlx-mac`. Ollama on 11434 stays the production path.
+**Decision (2026-09-23): Ollama is the production path; MLX-VLM is not
+deployed.** The 28.5 tok/s decode advantage does not justify a second
+17 GB copy of the same weights, a second provider entry, and a second
+supervised service — particularly given MLX-VLM's 3× slower prefill
+(126 vs 408 tok/s) on long prompts.
+
+Cleanup performed on the host:
+
+- stopped the ad-hoc `mlx_vlm.server` on port 11435 (freed ~17 GB;
+  system memory 94% free afterwards);
+- removed the duplicate Ollama tag `qwen38-vtest2` (same blob as
+  `qwen3.8-27b:latest`);
+- deleted the stale `~/Library/LaunchAgents/net.tusker.mlx-27b.plist.bak`,
+  which launched `mlx_lm.server` and could not have served this VLM.
+
+The weights remain on disk at
+`/Users/tusker/models/Qwen3.8-27B-MLX-4bit`, so later promotion is a
+service + provider-entry change, not a re-download. If promoted, use a
+fresh LaunchAgent running `mlx_vlm.server` with `KeepAlive` and register
+a distinct `mlx-vlm-mac` provider entry — do not repoint `mlx-mac`.
