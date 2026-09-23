@@ -989,6 +989,7 @@ async def _normalize_stream(
     reasoning_window = ""
     promoted_reasoning_window = ""
     reasoning_chars = 0
+    promoted_reasoning_chars = 0
     emitted_finish_reason: str | None = None
     native_call_indices: dict[tuple[int, str], int] = {}
     native_position_indices: dict[tuple[int, int], int] = {}
@@ -1240,6 +1241,8 @@ async def _normalize_stream(
             # and arrived as visible, unstructured text.
             if (raw_content is None or raw_content == "") and isinstance(reasoning_content, str):
                 raw_content = reasoning_content
+                promoted_reasoning_chars += len(reasoning_content)
+                stream_diag["content_chars"] += len(reasoning_content)
                 delta["content"] = reasoning_content
                 delta.pop("reasoning_content", None)
                 reasoning_content = None
@@ -1421,13 +1424,31 @@ async def _normalize_stream(
                 and not pending_tool_frames
             ):
                 cycle = _repeated_text_cycle(reasoning_window)
+                cycle_source = "reasoning_fields"
+                cycle_window = reasoning_window
                 if cycle is None and promoted_reasoning:
                     promoted_reasoning_window = (
                         promoted_reasoning_window + promoted_reasoning
                     )[-_REASONING_WINDOW_CHARS:]
                     cycle = _repeated_text_cycle(promoted_reasoning_window)
+                    cycle_source = "promoted_reasoning_content"
+                    cycle_window = promoted_reasoning_window
                 if cycle is not None:
                     cycle_chars, repeats = cycle
+                    from tusker_gateway.stream_diagnostics import (
+                        extract_cycle_text,
+                        store_reasoning_cycle,
+                    )
+
+                    capture = store_reasoning_cycle(
+                        extract_cycle_text(cycle_window, cycle_chars, repeats),
+                        request_id=request_id,
+                        provider=provider or "unknown",
+                        model=model or "unknown",
+                        source=cycle_source,
+                        cycle_chars=cycle_chars,
+                        repeats=repeats,
+                    )
                     if tools_requested and not saw_visible_content:
                         raise unusable_tool_error(
                             f"repeated_reasoning_cycle:{cycle_chars}x{repeats}"
@@ -1435,7 +1456,8 @@ async def _normalize_stream(
                     logger.warning(
                         "provider repeated stream cycle provider=%s model=%s request_id=%s "
                         "cycle_chars=%d repeats=%d chunks=%d upstream_bytes=%d frames=%d "
-                        "data_events=%d content_chars=%d reasoning_chars=%d delta_fields=%s "
+                        "data_events=%d content_chars=%d reasoning_chars=%d "
+                        "promoted_reasoning_chars=%d cycle_source=%s capture=%s delta_fields=%s "
                         "tool_call_deltas=%d finish_reason=%s saw_finish=%s saw_done=%s buffer_bytes=%d",
                         provider or "unknown",
                         model or "unknown",
@@ -1448,6 +1470,9 @@ async def _normalize_stream(
                         stream_diag["data_events"],
                         stream_diag["content_chars"],
                         reasoning_chars,
+                        promoted_reasoning_chars,
+                        cycle_source,
+                        capture or "unavailable_or_limit_reached",
                         ",".join(sorted(stream_diag["delta_fields"]))[:300] or "none",
                         stream_diag["tool_call_deltas"],
                         emitted_finish_reason or "none",
@@ -3318,7 +3343,10 @@ def _validation_stream_message(
 ) -> str:
     """Return actionable, safe text for gateway-generated stream stops."""
     if loop_failure:
-        detail = "The provider stream ended unexpectedly before it could be completed."
+        detail = (
+            "The gateway detected repeated reasoning text from the provider and stopped this stream. "
+            "It could not switch models after the SSE response had started; retry the request."
+        )
     elif isinstance(error, InvalidToolCallArgumentsError):
         route = f" from {provider}/{model}" if provider and model else ""
         if error.reason == "invalid_json":

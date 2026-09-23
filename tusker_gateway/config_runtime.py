@@ -334,7 +334,12 @@ class ConfigRuntime:
             return
         new_cfg = store.runtime_config(self._app.get("config", {}))
         old = self._app.get("capability_registry")
-        if old is not None and dict(old.provider_keys) == dict(new_cfg.get("provider_api_keys", {})):
+        current_codex_rotator = self._app.get("codex_rotator")
+        if (
+            old is not None
+            and dict(old.provider_keys) == dict(new_cfg.get("provider_api_keys", {}))
+            and self._app.get("_capability_codex_rotator") is current_codex_rotator
+        ):
             return  # keys unchanged
         session = self._app.get("http_session")
         if session is None:
@@ -346,6 +351,7 @@ class ConfigRuntime:
             model_capability_db=self._app.get("model_capabilities"),
         )
         self._app["capability_registry"] = new_reg
+        self._app["_capability_codex_rotator"] = current_codex_rotator
         stop_event = self._app.get("refresh_stop_event")
         if stop_event is not None:
             old_task = self._app.get("capabilities_task")
@@ -413,9 +419,17 @@ class ConfigRuntime:
                     rot._http = session
             result[provider] = rot
 
-        self._app["credential_rotators"] = result
+        # Keep the mapping object stable: PassthroughClient instances and
+        # catalog token-source closures retain this dict and resolve the
+        # current rotator through it for every request. Rebinding it leaves
+        # those consumers refreshing with stale credentials indefinitely.
+        live_rotators = self._app.setdefault("credential_rotators", {})
+        live_rotators.clear()
+        live_rotators.update(result)
         if "openai-codex" in result:
             self._app["codex_rotator"] = result["openai-codex"]
+        else:
+            self._app.pop("codex_rotator", None)
     def _rebuild_media_handlers(self, config: dict[str, Any]) -> None:
         """Rebuild media handlers when their relevant config changed.
 

@@ -84,6 +84,42 @@ def test_config_runtime_enabled_flag_via_env(monkeypatch) -> None:
         assert rt.enabled() is False, f"expected disabled for {falsy!r}"
 
 
+def test_rotator_reload_preserves_live_mapping_for_existing_consumers(monkeypatch):
+    """Catalog closures and clients retain the mapping across DB reloads."""
+    from tusker_gateway.passthrough import CodexTokenRotator
+
+    store = _make_store()
+    monkeypatch.setattr(
+        store,
+        "runtime_config",
+        lambda fallback: {
+            "credential_pools": {
+                "openai-codex": [{"access_token": "a", "refresh_token": "r"}],
+            },
+            "auth_file": "/tmp/auth.json",
+            "providers": {},
+        },
+    )
+
+    original_rotator = CodexTokenRotator(
+        [{"access_token": "a", "refresh_token": "r"}],
+        auth_file="/tmp/auth.json",
+    )
+    live_mapping = {"openai-codex": original_rotator, "removed-provider": object()}
+    app = _make_app({"providers": {}})
+    app["credential_rotators"] = live_mapping
+    app["codex_rotator"] = original_rotator
+    app["config_store"] = store
+    runtime = ConfigRuntime(app)
+    runtime._last_media_providers = frozenset()
+
+    runtime._rebuild_rotators()
+
+    assert app["credential_rotators"] is live_mapping
+    assert live_mapping == {"openai-codex": original_rotator}
+    assert app["codex_rotator"] is original_rotator
+
+
 # ===========================================================================
 # 2. legacy mode (env unset): app has no config_store, auth dev bypass works,
 #    runtime_config returns fallback

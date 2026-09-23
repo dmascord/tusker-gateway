@@ -117,11 +117,13 @@ def test_approval_stream_message_is_actionable_for_omp_clients():
 def test_validation_stream_message_is_actionable_for_omp_clients():
     message = _validation_stream_message("req-validation-1")
     loop_message = _validation_stream_message("req-loop-1", loop_failure=True)
+    assert "repeated reasoning text" in loop_message
+    assert "could not switch models after the SSE response had started" in loop_message
 
     assert "could not use the provider's tool response" in message
     assert "Retry the request" in message
     assert "req-validation-1" in message
-    assert "ended unexpectedly" in loop_message
+    assert "detected repeated reasoning text" in loop_message
 
 
 def test_validation_stream_message_explains_invalid_tool_arguments_safely():
