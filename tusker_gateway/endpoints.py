@@ -313,6 +313,28 @@ def _content_frame(content: str, template_obj: dict[str, Any]) -> bytes:
     return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode()
 
 
+def _stream_chunk_has_visible_output(chunk: bytes) -> bool:
+    """Whether a normalized SSE chunk exposes assistant text or an executable call."""
+    payload = sse_data_payload(chunk)
+    if payload is None:
+        return False
+    try:
+        obj = json.loads(payload)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return False
+    for choice in obj.get("choices", []) if isinstance(obj, dict) else []:
+        delta = choice.get("delta") if isinstance(choice, dict) else None
+        if not isinstance(delta, dict):
+            continue
+        for field in ("content", "reasoning", "reasoning_content", "thinking", "analysis", "refusal"):
+            value = delta.get(field)
+            if isinstance(value, str) and value.strip():
+                return True
+        if delta.get("tool_calls") or delta.get("function_call"):
+            return True
+    return False
+
+
 class _ToolCallStripper:
     """Stateful stripper that removes XML/Markdown tool_call markup from a
     streamed text sequence, tolerating block boundaries that split across
@@ -336,6 +358,11 @@ class _ToolCallStripper:
     stripped but the inner prose is emitted as ordinary text.
     """
 
+    # Avoid allowing an upstream to drip-feed an unclosed tool envelope for
+    # minutes while every chunk is withheld from the client.
+    _MAX_PENDING_CHARS = 64 * 1024
+    _MAX_PENDING_SECONDS = 30.0
+
     def __init__(self) -> None:
         self._carry = ""
         # When an unclosed bare <function=...> block is observed we buffer it
@@ -345,12 +372,30 @@ class _ToolCallStripper:
         self._pending_function_block: str | None = None
         self._pending_generic_block: tuple[str, str] | None = None
         self._pending_wrapper_block: tuple[str, str] | None = None
+        self._pending_started_at: float | None = None
         # Blocks that completed (or matched a single-chunk regex) get
         # stashed here so the caller can promote them into structured
         # ``delta.tool_calls`` frames. We track them as tuples of
         # ``(block, had_params)`` so the caller can decide whether each
         # block is well-formed.
         self._pending_blocks: list[tuple[str, bool]] = []
+
+    def _guard_pending(self, block: str) -> str:
+        if self._pending_started_at is None:
+            self._pending_started_at = time.monotonic()
+        age = time.monotonic() - self._pending_started_at
+        if len(block) > self._MAX_PENDING_CHARS or age > self._MAX_PENDING_SECONDS:
+            raise MalformedToolCallError(marker_types=("incomplete_tool_markup",))
+        return block
+
+    def _clear_pending_age(self) -> None:
+        if not (
+            self._pending_function_block is not None
+            or self._pending_generic_block is not None
+            or self._pending_wrapper_block is not None
+            or self._carry
+        ):
+            self._pending_started_at = None
 
     def _looks_like_opener(self, text: str) -> bool:
         """Return True if `text` is a prefix of a known tool-call opener."""
@@ -409,11 +454,12 @@ class _ToolCallStripper:
                 re.IGNORECASE,
             )
             if not closer:
-                self._pending_wrapper_block = (pending + text, tag)
+                self._pending_wrapper_block = (self._guard_pending(pending + text), tag)
                 return ""
             pending += text[: closer.end()]
             self._stash_block(pending, True)
             self._pending_wrapper_block = None
+            self._clear_pending_age()
             text = text[closer.end() :]
 
         # If we're mid-block (previously saw an unclosed <function=...>),
@@ -426,7 +472,7 @@ class _ToolCallStripper:
                 # Buffer the chunk. We re-check for parameters on the full
                 # assembled block when the closer arrives (in case the
                 # <parameter ...> tag was split across chunks).
-                self._pending_function_block += text
+                self._pending_function_block = self._guard_pending(self._pending_function_block + text)
                 return ""
             # Block closes within this chunk. Stash the complete block and
             # process the remaining text below. Check the *full* assembled
@@ -437,6 +483,7 @@ class _ToolCallStripper:
             had_params = bool(_PARAMETER_RE.search(self._pending_function_block))
             self._stash_block(self._pending_function_block, had_params)
             self._pending_function_block = None
+            self._clear_pending_age()
             text = tail
 
         if self._pending_generic_block is not None:
@@ -447,11 +494,12 @@ class _ToolCallStripper:
                 re.IGNORECASE,
             )
             if not closer:
-                self._pending_generic_block = (pending + text, tag)
+                self._pending_generic_block = (self._guard_pending(pending + text), tag)
                 return ""
             pending += text[: closer.end()]
             self._stash_block(pending, True)
             self._pending_generic_block = None
+            self._clear_pending_age()
             text = text[closer.end() :]
 
         wrapper_open = _WRAPPER_OPEN_RE.search(text)
@@ -468,7 +516,7 @@ class _ToolCallStripper:
                 self._stash_block(text[wrapper_open.start() : close_end], True)
                 text = text[close_end:]
             else:
-                self._pending_wrapper_block = (text[wrapper_open.start() :], tag)
+                self._pending_wrapper_block = (self._guard_pending(text[wrapper_open.start() :]), tag)
                 return "".join(out)
 
         # Repeatedly remove complete tool-call blocks. For bare <function=...>
@@ -510,7 +558,7 @@ class _ToolCallStripper:
         open_match = _FUNCTION_OPEN_RE.search(text)
         if open_match:
             out.append(text[: open_match.start()])
-            self._pending_function_block = text[open_match.start() :]
+            self._pending_function_block = self._guard_pending(text[open_match.start() :])
             # Parameter detection is done on the assembled block at close
             # time (see the close-detection code above), so we don't track
             # it per-chunk here.
@@ -526,7 +574,7 @@ class _ToolCallStripper:
             )
             if not closer:
                 out.append(text[: generic_open.start()])
-                self._pending_generic_block = (text[generic_open.start() :], tag)
+                self._pending_generic_block = (self._guard_pending(text[generic_open.start() :]), tag)
                 return "".join(out)
 
         # No unclosed opener. If `text` ends with an incomplete opener
@@ -548,6 +596,10 @@ class _ToolCallStripper:
             else:
                 out.append(text)
             self._carry = carry
+            if carry:
+                self._guard_pending(carry)
+            else:
+                self._clear_pending_age()
         return "".join(out)
 
     def flush(self) -> str:
@@ -559,6 +611,7 @@ class _ToolCallStripper:
         self._pending_function_block = None
         self._pending_generic_block = None
         self._pending_wrapper_block = None
+        self._pending_started_at = None
         return ""
 
     def drain_pending_blocks(self) -> list[tuple[str, bool]]:
@@ -5793,6 +5846,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                 stream_ok = True
                 stream_frame_count = 1
                 stream_bytes = len(role_frame)
+                stream_visible_output = False
                 try:
                     cycle_fallbacks = 0
                     while True:
@@ -5806,6 +5860,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                                     await resp.write(chunk)
                                     stream_frame_count += 1
                                     stream_bytes += len(chunk)
+                                    stream_visible_output |= _stream_chunk_has_visible_output(chunk)
                                     if not _first_token_recorded:
                                         _first_token_recorded = True
                                         if metrics is not None:
@@ -5832,6 +5887,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                                     await resp.write(chunk)
                                     stream_frame_count += 1
                                     stream_bytes += len(chunk)
+                                    stream_visible_output |= _stream_chunk_has_visible_output(chunk)
                                     if not _first_token_recorded:
                                         _first_token_recorded = True
                                         if metrics is not None:
@@ -5840,28 +5896,33 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                                                 {"pool": pool_name, "provider": provider, "model": target_model},
                                             )
                             break
-                        except ProviderStreamLoopError as cycle_exc:
+                        except (ProviderStreamLoopError, MalformedToolCallError) as stream_recovery_exc:
                             # The role event and SSE headers are already sent,
                             # but a model can still be changed safely until an
                             # assistant data frame has reached the client.
                             # Never splice providers after visible output.
                             if (
                                 cycle_fallbacks >= 1
-                                or stream_frame_count != 1
+                                or stream_visible_output
                                 or pool_name is None
                             ):
                                 raise
                             cycle_fallbacks += 1
                             failed_provider, failed_model = provider, target_model
-                            _quarantine_stream_loop(
-                                config, failed_provider, failed_model, cycle_exc
-                            )
+                            if isinstance(stream_recovery_exc, MalformedToolCallError):
+                                _quarantine_tool_response_failure(
+                                    config, failed_provider, failed_model, stream_recovery_exc
+                                )
+                            else:
+                                _quarantine_stream_loop(
+                                    config, failed_provider, failed_model, stream_recovery_exc
+                                )
                             if breaker is not None:
                                 await asyncio.to_thread(
                                     breaker.record_failure,
                                     failed_provider,
                                     failed_model,
-                                    cooldown_secs=_cooldown_for_exc(cycle_exc),
+                                    cooldown_secs=_cooldown_for_exc(stream_recovery_exc),
                                 )
                             failed_stream = (
                                 result.iterator
@@ -5870,13 +5931,14 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                             )
                             await _close_async_iterator(failed_stream)
                             await resp.write(
-                                b": gateway: repeated reasoning detected; trying another model\n\n"
+                                b": gateway: upstream output was unusable; trying another model\n\n"
                             )
                             logger.warning(
-                                "stream cycle fallback rid=%s from=%s/%s visible_frames=%d attempt=1",
+                                "stream pre-visible fallback rid=%s from=%s/%s reason=%s visible_frames=%d attempt=1",
                                 request_id,
                                 failed_provider,
                                 failed_model,
+                                getattr(stream_recovery_exc, "code", type(stream_recovery_exc).__name__),
                                 stream_frame_count - 1,
                             )
                             try:
@@ -5894,8 +5956,9 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                                     attempt_offset=1,
                                 )
                             except Exception as retry_exc:
-                                raise cycle_exc from retry_exc
+                                raise stream_recovery_exc from retry_exc
                             request["_stream_cycle_fallback_attempted"] = True
+                            request["_stream_previsible_fallback_attempted"] = True
                             set_access_log_context(
                                 request,
                                 provider=provider,
@@ -5973,7 +6036,8 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                             provider=provider,
                             model=target_model,
                             fallback_attempted=bool(
-                                request.get("_stream_cycle_fallback_attempted")
+                                request.get("_stream_previsible_fallback_attempted")
+                                or request.get("_stream_cycle_fallback_attempted")
                             ),
                         )
                     request["_stream_error_code"] = stream_error_code

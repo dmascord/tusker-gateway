@@ -2021,12 +2021,70 @@ async def test_chat_stream_retries_cycle_before_any_assistant_output(app, client
         body = await response.read()
 
     assert response.status == 200
-    assert b"gateway: repeated reasoning detected; trying another model" in body
+    assert b"gateway: upstream output was unusable; trying another model" in body
     assert b"alternative completed" in body
     assert b"data: [DONE]" in body
     assert pool_manager.select.call_count == 2
     assert pool_manager.select.call_args_list[1].kwargs["excluded"] == {
         ("alibaba", "looping-model")
+    }
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_malformed_tool_markup_retries_before_visible_output(app, client):
+    """Malformed markup can fail over while the client has seen only role/SSE metadata."""
+    pool_manager = MagicMock()
+    pool_manager.select.side_effect = [
+        ("alibaba", "malformed-model"),
+        ("openrouter", "healthy-model"),
+    ]
+    pool_manager.fallback_pools.return_value = ()
+    app["pool_manager"] = pool_manager
+
+    async def malformed_stream(*args, **kwargs):
+        # Expose only the assistant role before malformed markup arrives. The
+        # normalized stream must be allowed to recover because no answer/tool
+        # data has reached the client.
+        yield b'data: {"choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}\n\n'
+        yield (
+            b'data: {"choices":[{"delta":{"content":"<tool_call>not a valid call"},'
+            b'"finish_reason":null}]}\n\n'
+        )
+        yield (
+            b'data: {"choices":[{"delta":{"content":"</tool_call>"},'
+            b'"finish_reason":"stop"}]}\n\n'
+        )
+        yield b"data: [DONE]\n\n"
+
+    async def healthy_stream(*args, **kwargs):
+        yield b'data: {"choices":[{"delta":{"content":"fallback response"}}]}\n\n'
+        yield b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    with patch(
+        "tusker_gateway.endpoints.PassthroughClient.chat",
+        new_callable=AsyncMock,
+    ) as mock_chat:
+        mock_chat.side_effect = [malformed_stream(), healthy_stream()]
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-code",
+                "messages": [{"role": "user", "content": "run a tool"}],
+                "tools": [{"type": "function", "function": {"name": "bash"}}],
+                "stream": True,
+            },
+            headers=HEADERS_AUTH,
+        )
+        body = await response.read()
+
+    assert response.status == 200
+    assert b"gateway: upstream output was unusable; trying another model" in body
+    assert b"fallback response" in body
+    assert b"not a valid call" not in body
+    assert pool_manager.select.call_count == 2
+    assert pool_manager.select.call_args_list[1].kwargs["excluded"] == {
+        ("alibaba", "malformed-model")
     }
 
 

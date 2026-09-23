@@ -882,6 +882,29 @@ def test_stripper_drops_empty_args_block_as_malformed():
     asyncio.run(run())
 
 
+def test_stripper_bounds_unclosed_tool_markup_buffer():
+    from tusker_gateway.errors import MalformedToolCallError
+    from tusker_gateway.endpoints import _ToolCallStripper
+
+    stripper = _ToolCallStripper()
+    assert stripper.feed("<tool_call>") == ""
+    with pytest.raises(MalformedToolCallError):
+        stripper.feed("x" * stripper._MAX_PENDING_CHARS)
+
+
+def test_stripper_bounds_time_spent_buffering_tool_markup():
+    import time
+
+    from tusker_gateway.errors import MalformedToolCallError
+    from tusker_gateway.endpoints import _ToolCallStripper
+
+    stripper = _ToolCallStripper()
+    assert stripper.feed("<tool_call>") == ""
+    stripper._pending_started_at = time.monotonic() - stripper._MAX_PENDING_SECONDS - 1
+    with pytest.raises(MalformedToolCallError):
+        stripper.feed("still incomplete")
+
+
 @pytest.mark.asyncio
 async def test_stream_normalizer_deduplicates_native_call_and_finishes_as_tool_call():
     """A native call plus XML text in one event must be emitted once."""
