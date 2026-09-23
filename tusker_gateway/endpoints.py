@@ -967,6 +967,18 @@ async def _normalize_stream(
     )
 
     buffer = b""
+    stream_diag: dict[str, Any] = {
+        "chunks": 0,
+        "upstream_bytes": 0,
+        "frames": 0,
+        "data_events": 0,
+        "non_data_frames": 0,
+        "invalid_json_events": 0,
+        "empty_choice_events": 0,
+        "delta_fields": {},
+        "content_chars": 0,
+        "tool_call_deltas": 0,
+    }
     tool_stripper = _ToolCallStripper()
     saw_finish_reason = False
     saw_done = False
@@ -1008,12 +1020,30 @@ async def _normalize_stream(
 
     def unusable_tool_error(reason: str) -> UnusableToolResponseError:
         logger.warning(
-            "unusable tool response rejected provider=%s model=%s request_id=%s reason=%s reasoning_chars=%d",
+            "unusable tool response rejected provider=%s model=%s request_id=%s reason=%s "
+            "reasoning_chars=%d content_chars=%d chunks=%d upstream_bytes=%d frames=%d "
+            "data_events=%d non_data_frames=%d invalid_json_events=%d empty_choice_events=%d "
+            "delta_fields=%s tool_call_deltas=%d finish_reason=%s saw_finish=%s saw_done=%s "
+            "buffer_bytes=%d",
             provider or "unknown",
             model or "unknown",
             request_id or "unknown",
             reason,
             reasoning_chars,
+            stream_diag["content_chars"],
+            stream_diag["chunks"],
+            stream_diag["upstream_bytes"],
+            stream_diag["frames"],
+            stream_diag["data_events"],
+            stream_diag["non_data_frames"],
+            stream_diag["invalid_json_events"],
+            stream_diag["empty_choice_events"],
+            ",".join(sorted(stream_diag["delta_fields"]))[:300] or "none",
+            stream_diag["tool_call_deltas"],
+            emitted_finish_reason or "none",
+            saw_finish_reason,
+            saw_done,
+            len(buffer),
         )
         return UnusableToolResponseError(
             reason=reason,
@@ -1089,18 +1119,51 @@ async def _normalize_stream(
             }
         )
 
-    async for chunk in raw_stream:
+    async def diagnostic_raw_stream() -> AsyncIterator[bytes]:
+        try:
+            async for upstream_chunk in raw_stream:
+                stream_diag["chunks"] += 1
+                stream_diag["upstream_bytes"] += len(upstream_chunk)
+                yield upstream_chunk
+        except Exception as exc:
+            logger.warning(
+                "provider SSE source failed provider=%s model=%s request_id=%s "
+                "error_type=%s chunks=%d upstream_bytes=%d frames=%d data_events=%d "
+                "content_chars=%d reasoning_chars=%d tool_call_deltas=%d "
+                "finish_reason=%s saw_finish=%s saw_done=%s buffer_bytes=%d",
+                provider or "unknown",
+                model or "unknown",
+                request_id or "unknown",
+                type(exc).__name__,
+                stream_diag["chunks"],
+                stream_diag["upstream_bytes"],
+                stream_diag["frames"],
+                stream_diag["data_events"],
+                stream_diag["content_chars"],
+                reasoning_chars,
+                stream_diag["tool_call_deltas"],
+                emitted_finish_reason or "none",
+                saw_finish_reason,
+                saw_done,
+                len(buffer),
+            )
+            raise
+
+    async for chunk in diagnostic_raw_stream():
         buffer += chunk
         while True:
             frame, remainder = split_sse_frame(buffer)
             if frame is None:
                 break
             buffer = remainder
+            stream_diag["frames"] += 1
             framed = frame + b"\n\n"
             stripped = frame.strip()
             if not stripped.startswith(b"data: "):
+                stream_diag["non_data_frames"] += 1
                 yield framed
                 continue
+            stream_diag["data_events"] += 1
             if stripped == b"data: [DONE]":
                 tool_stripper.flush()
                 if require_tool_call and not saw_tool_call:
@@ -1124,6 +1187,7 @@ async def _normalize_stream(
                 payload = sse_data_payload(frame)
                 obj = json.loads(payload) if payload is not None else None
             except (json.JSONDecodeError, UnicodeDecodeError):
+                stream_diag["invalid_json_events"] += 1
                 # An invalid JSON event is not useful to an OpenAI client, but
                 # preserving it is still preferable to silently changing the
                 # provider stream.
@@ -1131,6 +1195,7 @@ async def _normalize_stream(
                 continue
             choices = obj.get("choices")
             if not isinstance(choices, list) or not choices:
+                stream_diag["empty_choice_events"] += 1
                 yield framed
                 continue
             if tools_requested and len(choices) != 1:
@@ -1148,6 +1213,13 @@ async def _normalize_stream(
             except (TypeError, ValueError):
                 choice_index = 0
             delta = dict(choice.get("delta") or {})
+            for field_name in delta:
+                if len(stream_diag["delta_fields"]) < 40 or field_name in stream_diag["delta_fields"]:
+                    stream_diag["delta_fields"][field_name] = True
+            if isinstance(delta.get("content"), str):
+                stream_diag["content_chars"] += len(delta["content"])
+            if isinstance(delta.get("tool_calls"), list):
+                stream_diag["tool_call_deltas"] += len(delta["tool_calls"])
             upstream_finish_reason = choice.get("finish_reason")
             if upstream_finish_reason:
                 saw_finish_reason = True
@@ -1360,6 +1432,29 @@ async def _normalize_stream(
                         raise unusable_tool_error(
                             f"repeated_reasoning_cycle:{cycle_chars}x{repeats}"
                         )
+                    logger.warning(
+                        "provider repeated stream cycle provider=%s model=%s request_id=%s "
+                        "cycle_chars=%d repeats=%d chunks=%d upstream_bytes=%d frames=%d "
+                        "data_events=%d content_chars=%d reasoning_chars=%d delta_fields=%s "
+                        "tool_call_deltas=%d finish_reason=%s saw_finish=%s saw_done=%s buffer_bytes=%d",
+                        provider or "unknown",
+                        model or "unknown",
+                        request_id or "unknown",
+                        cycle_chars,
+                        repeats,
+                        stream_diag["chunks"],
+                        stream_diag["upstream_bytes"],
+                        stream_diag["frames"],
+                        stream_diag["data_events"],
+                        stream_diag["content_chars"],
+                        reasoning_chars,
+                        ",".join(sorted(stream_diag["delta_fields"]))[:300] or "none",
+                        stream_diag["tool_call_deltas"],
+                        emitted_finish_reason or "none",
+                        saw_finish_reason,
+                        saw_done,
+                        len(buffer),
+                    )
                     raise ProviderStreamLoopError(
                         provider=provider or "unknown",
                         model=model or "unknown",
