@@ -32,6 +32,7 @@ Topic-specific:
 | `README_IMAGE_GENERATION.md` | Image gen architecture (OpenAI GPT Image + Codex pathway). |
 | `IMAGE_GENERATION_IMPLEMENTATION_PLAN.md` | Phased plan for image/video wiring. |
 | `IMPLEMENTATION_SUMMARY.md` / `IMPLEMENTATION_COMPLETE.md` | Milestones + acceptance evidence. |
+| `docs/qwen3.8-27b-perf-2026-09-23.md` | Qwen3.8-27B local and gateway benchmark, including vision verification. |
 
 Source of truth for runtime config: `tusker_gateway/config.py`
 (`DEFAULT_PROVIDER_REGISTRY`, `PoolConfig`). Manifest source: `k8s/`.
