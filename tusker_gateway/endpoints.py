@@ -990,6 +990,7 @@ async def _normalize_stream(
     promoted_reasoning_window = ""
     reasoning_chars = 0
     promoted_reasoning_chars = 0
+    pending_reasoning_cycle: tuple[int, int, str, str, str] | None = None
     emitted_finish_reason: str | None = None
     native_call_indices: dict[tuple[int, str], int] = {}
     native_position_indices: dict[tuple[int, int], int] = {}
@@ -1422,6 +1423,8 @@ async def _normalize_stream(
                 and not has_tools
                 and not saw_tool_call
                 and not pending_tool_frames
+                and not saw_finish_reason
+                and not saw_done
             ):
                 cycle = _repeated_text_cycle(reasoning_window)
                 cycle_source = "reasoning_fields"
@@ -1433,6 +1436,31 @@ async def _normalize_stream(
                     cycle = _repeated_text_cycle(promoted_reasoning_window)
                     cycle_source = "promoted_reasoning_content"
                     cycle_window = promoted_reasoning_window
+                if cycle is not None:
+                    cycle_chars, repeats = cycle
+                    cycle_pattern = cycle_window[-cycle_chars:]
+                    if (
+                        pending_reasoning_cycle is not None
+                        and pending_reasoning_cycle[0] == cycle_chars
+                        and pending_reasoning_cycle[2] == cycle_pattern
+                        and repeats > pending_reasoning_cycle[1]
+                        and repeats * cycle_chars >= _REASONING_WINDOW_CHARS
+                    ):
+                        # The first match is only a suspicion. Let a model
+                        # finish or break the pattern, but cap prolonged exact
+                        # repetition so an infinite reasoning loop is bounded.
+                        confirmed_cycle = True
+                    else:
+                        confirmed_cycle = False
+                        pending_reasoning_cycle = (
+                            cycle_chars,
+                            repeats,
+                            cycle_pattern,
+                            cycle_source,
+                            cycle_window,
+                        )
+                    if not confirmed_cycle:
+                        cycle = None
                 if cycle is not None:
                     cycle_chars, repeats = cycle
                     from tusker_gateway.stream_diagnostics import (
@@ -1449,10 +1477,6 @@ async def _normalize_stream(
                         cycle_chars=cycle_chars,
                         repeats=repeats,
                     )
-                    if tools_requested and not saw_visible_content:
-                        raise unusable_tool_error(
-                            f"repeated_reasoning_cycle:{cycle_chars}x{repeats}"
-                        )
                     logger.warning(
                         "provider repeated stream cycle provider=%s model=%s request_id=%s "
                         "cycle_chars=%d repeats=%d chunks=%d upstream_bytes=%d frames=%d "
@@ -1586,6 +1610,54 @@ async def _normalize_stream(
                     yield f"data: {json.dumps(new_obj, ensure_ascii=False)}\n\n".encode()
                 for prose_frame in pending_prose_frames:
                     yield prose_frame
+
+    eof_window = (
+        promoted_reasoning_window
+        if pending_reasoning_cycle is not None
+        and pending_reasoning_cycle[3] == "promoted_reasoning_content"
+        else reasoning_window
+    )
+    eof_cycle = _repeated_text_cycle(eof_window)
+    if (
+        pending_reasoning_cycle is not None
+        and eof_cycle is not None
+        and eof_cycle[0] == pending_reasoning_cycle[0]
+        and eof_window[-pending_reasoning_cycle[0]:] == pending_reasoning_cycle[2]
+        and not saw_finish_reason
+        and not saw_done
+        and not saw_tool_call
+    ):
+        cycle_chars, repeats, _, cycle_source, cycle_window = pending_reasoning_cycle
+        from tusker_gateway.stream_diagnostics import (
+            extract_cycle_text,
+            store_reasoning_cycle,
+        )
+
+        capture = store_reasoning_cycle(
+            extract_cycle_text(cycle_window, cycle_chars, repeats),
+            request_id=request_id,
+            provider=provider or "unknown",
+            model=model or "unknown",
+            source=cycle_source,
+            cycle_chars=cycle_chars,
+            repeats=repeats,
+        )
+        logger.warning(
+            "provider stream ended incomplete during repeated reasoning provider=%s model=%s "
+            "request_id=%s cycle_chars=%d repeats=%d capture=%s",
+            provider or "unknown",
+            model or "unknown",
+            request_id or "unknown",
+            cycle_chars,
+            repeats,
+            capture or "unavailable_or_limit_reached",
+        )
+        raise ProviderStreamLoopError(
+            provider=provider or "unknown",
+            model=model or "unknown",
+            cycle_chars=cycle_chars,
+            repeats=repeats,
+        )
 
     if buffer.strip():
         logger.warning(
@@ -3340,13 +3412,20 @@ def _validation_stream_message(
     error: BaseException | None = None,
     provider: str | None = None,
     model: str | None = None,
+    fallback_attempted: bool = False,
 ) -> str:
     """Return actionable, safe text for gateway-generated stream stops."""
     if loop_failure:
-        detail = (
-            "The gateway detected repeated reasoning text from the provider and stopped this stream. "
-            "It could not switch models after the SSE response had started; retry the request."
-        )
+        if fallback_attempted:
+            detail = (
+                "The gateway detected repeated reasoning text and tried one alternative model, "
+                "but could not continue this stream. Retry the request."
+            )
+        else:
+            detail = (
+                "The gateway detected repeated reasoning text from the provider and stopped this stream. "
+                "It could not safely switch models after assistant output began; retry the request."
+            )
     elif isinstance(error, InvalidToolCallArgumentsError):
         route = f" from {provider}/{model}" if provider and model else ""
         if error.reason == "invalid_json":
@@ -3444,6 +3523,8 @@ async def _call_with_pool_fallback(
     initial_selection: tuple[str, str] | None = None,
     request_id: str | None = None,
     conversation_id: str | None = None,
+    excluded_candidates: set[tuple[str, str]] | None = None,
+    attempt_offset: int = 0,
 ) -> tuple[str, str, Any]:
     """Call a pool candidate, trying the next candidate after provider failure.
 
@@ -3601,7 +3682,7 @@ async def _call_with_pool_fallback(
                 )
             raise
 
-    excluded: set[tuple[str, str]] = set()
+    excluded: set[tuple[str, str]] = set(excluded_candidates or ())
     last_error: Exception | None = None
     # Prefer the app-level PoolManager (so catalog refresh + session
     # stickiness are shared); fall back to a per-request instance.
@@ -3619,7 +3700,7 @@ async def _call_with_pool_fallback(
     pool_index = 0
     active_pool = pool_names[pool_index]
     pending_selection = initial_selection
-    attempts = 0
+    attempts = max(0, attempt_offset)
     max_attempts = _max_pool_provider_attempts()
     recovery_probe = False
     tool_compatibility_probe = False
@@ -5713,61 +5794,115 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                 stream_frame_count = 1
                 stream_bytes = len(role_frame)
                 try:
-                    if isinstance(result, dict):
-                        # Codex parses the full response from its SSE stream;
-                        # the gateway receives it as a single dict and must
-                        # emit proper OpenAI streaming chunks so clients such
-                        # as OMP can consume text, legacy calls, and all
-                        # returned choices.
-                        async for chunk in _complete_chat_result_stream(result):
-                            # The HTTP handler owns the client-facing [DONE]
-                            # sentinel, just as it does for native streams.
-                            if chunk == sse_done():
-                                continue
-                            await resp.write(chunk)
-                            stream_frame_count += 1
-                            stream_bytes += len(chunk)
-                            if not _first_token_recorded:
-                                _first_token_recorded = True
-                                if metrics is not None:
-                                    metrics.first_token_latency.observe(
-                                        time.monotonic() - stream_write_start,
-                                        {
-                                            "pool": pool_name,
-                                            "provider": provider,
-                                            "model": target_model,
-                                        },
+                    cycle_fallbacks = 0
+                    while True:
+                        try:
+                            if isinstance(result, dict):
+                                # Codex parses the full response from its SSE
+                                # stream; the gateway re-emits it as OpenAI SSE.
+                                async for chunk in _complete_chat_result_stream(result):
+                                    if chunk == sse_done():
+                                        continue
+                                    await resp.write(chunk)
+                                    stream_frame_count += 1
+                                    stream_bytes += len(chunk)
+                                    if not _first_token_recorded:
+                                        _first_token_recorded = True
+                                        if metrics is not None:
+                                            metrics.first_token_latency.observe(
+                                                time.monotonic() - stream_write_start,
+                                                {"pool": pool_name, "provider": provider, "model": target_model},
+                                            )
+                            else:
+                                stream_result = (
+                                    result.iterator
+                                    if isinstance(result, _PreparedStream)
+                                    else _normalize_stream(
+                                        result,
+                                        provider=provider,
+                                        model=target_model,
+                                        request_id=request_id,
+                                        tools_requested=bool(tools),
+                                        require_tool_call=_tool_choice_requires_call(
+                                            body.get("tool_choice")
+                                        ),
                                     )
-                    else:
-                        stream_result = (
-                            result.iterator
-                            if isinstance(result, _PreparedStream)
-                            else _normalize_stream(
-                                result,
+                                )
+                                async for chunk in stream_result:
+                                    await resp.write(chunk)
+                                    stream_frame_count += 1
+                                    stream_bytes += len(chunk)
+                                    if not _first_token_recorded:
+                                        _first_token_recorded = True
+                                        if metrics is not None:
+                                            metrics.first_token_latency.observe(
+                                                time.monotonic() - stream_write_start,
+                                                {"pool": pool_name, "provider": provider, "model": target_model},
+                                            )
+                            break
+                        except ProviderStreamLoopError as cycle_exc:
+                            # The role event and SSE headers are already sent,
+                            # but a model can still be changed safely until an
+                            # assistant data frame has reached the client.
+                            # Never splice providers after visible output.
+                            if (
+                                cycle_fallbacks >= 1
+                                or stream_frame_count != 1
+                                or pool_name is None
+                            ):
+                                raise
+                            cycle_fallbacks += 1
+                            failed_provider, failed_model = provider, target_model
+                            _quarantine_stream_loop(
+                                config, failed_provider, failed_model, cycle_exc
+                            )
+                            if breaker is not None:
+                                await asyncio.to_thread(
+                                    breaker.record_failure,
+                                    failed_provider,
+                                    failed_model,
+                                    cooldown_secs=_cooldown_for_exc(cycle_exc),
+                                )
+                            failed_stream = (
+                                result.iterator
+                                if isinstance(result, _PreparedStream)
+                                else locals().get("stream_result")
+                            )
+                            await _close_async_iterator(failed_stream)
+                            await resp.write(
+                                b": gateway: repeated reasoning detected; trying another model\n\n"
+                            )
+                            logger.warning(
+                                "stream cycle fallback rid=%s from=%s/%s visible_frames=%d attempt=1",
+                                request_id,
+                                failed_provider,
+                                failed_model,
+                                stream_frame_count - 1,
+                            )
+                            try:
+                                provider, target_model, result = await _call_with_pool_fallback(
+                                    config,
+                                    body,
+                                    client,
+                                    tools,
+                                    breaker=breaker,
+                                    request=request,
+                                    metrics_registry=request.app.get("metrics"),
+                                    request_id=request_id,
+                                    conversation_id=conversation_id,
+                                    excluded_candidates={(failed_provider, failed_model)},
+                                    attempt_offset=1,
+                                )
+                            except Exception as retry_exc:
+                                raise cycle_exc from retry_exc
+                            request["_stream_cycle_fallback_attempted"] = True
+                            set_access_log_context(
+                                request,
                                 provider=provider,
                                 model=target_model,
-                                request_id=request_id,
-                                tools_requested=bool(tools),
-                                require_tool_call=_tool_choice_requires_call(
-                                    body.get("tool_choice")
-                                ),
+                                pool=pool_name,
+                                candidate_attempts=2,
                             )
-                        )
-                        async for chunk in stream_result:
-                            await resp.write(chunk)
-                            stream_frame_count += 1
-                            stream_bytes += len(chunk)
-                            if not _first_token_recorded:
-                                _first_token_recorded = True
-                                if metrics is not None:
-                                    metrics.first_token_latency.observe(
-                                        time.monotonic() - stream_write_start,
-                                        {
-                                            "pool": pool_name,
-                                            "provider": provider,
-                                            "model": target_model,
-                                        },
-                                    )
                 except (ConnectionResetError, ConnectionError, BrokenPipeError) as exc:
                     stream_ok = False
                     status = "client_disconnected"
@@ -5837,6 +5972,9 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                             error=exc,
                             provider=provider,
                             model=target_model,
+                            fallback_attempted=bool(
+                                request.get("_stream_cycle_fallback_attempted")
+                            ),
                         )
                     request["_stream_error_code"] = stream_error_code
                     request["_stream_error_detail"] = stream_error_message

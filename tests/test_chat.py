@@ -118,7 +118,11 @@ def test_validation_stream_message_is_actionable_for_omp_clients():
     message = _validation_stream_message("req-validation-1")
     loop_message = _validation_stream_message("req-loop-1", loop_failure=True)
     assert "repeated reasoning text" in loop_message
-    assert "could not switch models after the SSE response had started" in loop_message
+    assert "could not safely switch models after assistant output began" in loop_message
+    retried_loop_message = _validation_stream_message(
+        "req-loop-retry", loop_failure=True, fallback_attempted=True
+    )
+    assert "tried one alternative model" in retried_loop_message
 
     assert "could not use the provider's tool response" in message
     assert "Retry the request" in message
@@ -1971,6 +1975,59 @@ async def test_chat_stream_provider_setup_error_is_actionable_text_not_in_band_e
     assert b"Upstream provider error" in body
     assert b'"error"' not in body
     assert b"data: [DONE]" in body
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_retries_cycle_before_any_assistant_output(app, client, tmp_path, monkeypatch):
+    """A preflighted loop can switch routes while only the role frame is sent."""
+    monkeypatch.setenv("TUSKER_STREAM_DIAGNOSTICS_DIR", str(tmp_path / "cycles"))
+    pool_manager = MagicMock()
+    pool_manager.select.side_effect = [
+        ("alibaba", "looping-model"),
+        ("openrouter", "healthy-model"),
+    ]
+    pool_manager.fallback_pools.return_value = ()
+    app["pool_manager"] = pool_manager
+    cycle = "I will inspect, reason, and continue with the task now. "
+
+    async def loop_stream(*args, **kwargs):
+        for _ in range(6):
+            payload = {"choices": [{"delta": {"reasoning_content": cycle}}]}
+            yield f"data: {json.dumps(payload)}\n\n".encode()
+
+    async def healthy_stream(*args, **kwargs):
+        yield b'data: {"choices":[{"delta":{"content":"alternative completed"}}]}\n\n'
+        yield b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    with patch(
+        "tusker_gateway.endpoints.PassthroughClient.chat",
+        new_callable=AsyncMock,
+    ) as mock_chat:
+        mock_chat.side_effect = [loop_stream(), healthy_stream()]
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-code",
+                "messages": [{"role": "user", "content": "hello"}],
+                "tools": [{
+                    "type": "function",
+                    "function": {"name": "bash", "parameters": {"type": "object"}},
+                }],
+                "stream": True,
+            },
+            headers=HEADERS_AUTH,
+        )
+        body = await response.read()
+
+    assert response.status == 200
+    assert b"gateway: repeated reasoning detected; trying another model" in body
+    assert b"alternative completed" in body
+    assert b"data: [DONE]" in body
+    assert pool_manager.select.call_count == 2
+    assert pool_manager.select.call_args_list[1].kwargs["excluded"] == {
+        ("alibaba", "looping-model")
+    }
 
 
 @pytest.mark.asyncio

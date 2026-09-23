@@ -517,17 +517,18 @@ async def test_stream_normalizer_rejects_repeated_reasoning_cycle():
 
 
 @pytest.mark.asyncio
-async def test_stream_normalizer_rejects_repeated_reasoning_cycle_without_tools():
+async def test_stream_normalizer_rejects_repeated_reasoning_cycle_without_tools(tmp_path, monkeypatch):
     """Ordinary OMP streams must also stop pathological reasoning loops."""
     import json as _json
 
     from tusker_gateway.errors import ProviderStreamLoopError
     from tusker_gateway.endpoints import _normalize_stream
+    monkeypatch.setenv("TUSKER_STREAM_DIAGNOSTICS_DIR", str(tmp_path / "cycles"))
 
     cycle = "Planning the next step: inspect the repository and continue. "
 
     async def repeated_stream():
-        for _ in range(5):
+        for _ in range(15):
             payload = {"choices": [{"delta": {"reasoning_content": cycle}}]}
             yield f"data: {_json.dumps(payload)}\n\n".encode()
 
@@ -542,6 +543,33 @@ async def test_stream_normalizer_rejects_repeated_reasoning_cycle_without_tools(
 
     assert error.value.provider == "test-provider"
     assert error.value.model == "looping-model"
+
+
+@pytest.mark.asyncio
+async def test_stream_normalizer_allows_repeated_reasoning_that_completes():
+    """A repeated phrase is only provisional if the model later finishes."""
+    import json as _json
+
+    from tusker_gateway.endpoints import _normalize_stream
+
+    cycle = "Planning the next step: inspect the repository and continue. "
+
+    async def completing_stream():
+        for _ in range(15):
+            yield f'data: {_json.dumps({"choices": [{"delta": {"reasoning_content": cycle}}]})}\n\n'.encode()
+        yield f'data: {_json.dumps({"choices": [{"delta": {"content": "The task is complete."}}]})}\n\n'.encode()
+        yield f'data: {_json.dumps({"choices": [{"delta": {}, "finish_reason": "stop"}]})}\n\n'.encode()
+        yield b"data: [DONE]\n\n"
+
+    output = b"".join([
+        frame async for frame in _normalize_stream(
+            completing_stream(),
+            provider="test-provider",
+            model="completing-model",
+            detect_repeated_reasoning=True,
+        )
+    ])
+    assert b"The task is complete." in output
 
 
 @pytest.mark.asyncio
