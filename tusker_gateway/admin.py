@@ -240,6 +240,14 @@ _login_limiter = _LoginRateLimiter()
 
 
 
+async def admin_claude_auth_status(request: web.Request) -> web.Response:
+    """GET /admin/claude/auth — safe, allowlisted Claude CLI login status."""
+    from tusker_gateway.provider_adapters.claude_code import claude_auth_status
+
+    status = await claude_auth_status()
+    return web.json_response({**status, "login_command": "k8s/claude-code-login.sh"})
+
+
 async def admin_diagnostics(request: web.Request) -> web.Response:
     """GET /admin/diagnostics — aggregated view of every subsystem.
 

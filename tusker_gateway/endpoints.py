@@ -33,6 +33,7 @@ from tusker_gateway.config import (
 )
 from tusker_gateway.errors import (
     BadRequestError,
+    ClaudeAuthRequiredError,
     GatewayError,
     HighImpactApprovalRequiredError,
     InvalidToolCallArgumentsError,
@@ -3711,6 +3712,16 @@ async def _call_with_pool_fallback(
                     error_detail=_pool_failure_summary(exc),
                 )
             raise
+        except ClaudeAuthRequiredError as exc:
+            # Local subscription auth is operator state, not provider health;
+            # do not quarantine or permanently disable the model for expiry.
+            if request is not None:
+                set_access_log_context(
+                    request,
+                    failure_class=exc.code or "claude_auth_required",
+                    error_detail="Claude Code runtime login required",
+                )
+            raise
         except HighImpactApprovalRequiredError:
             # Never retry a consequential action with another model.
             raise
@@ -4046,6 +4057,25 @@ async def _call_with_pool_fallback(
                 max_attempts,
                 getattr(exc, "upstream_status", None),
                 _pool_failure_summary(exc),
+            )
+        except ClaudeAuthRequiredError as exc:
+            # Try another pool candidate if one exists, but keep this local
+            # credential problem out of breaker/quarantine health signals.
+            last_error = exc
+            excluded.add(selected)
+            if request is not None:
+                set_access_log_context(
+                    request,
+                    failure_class=exc.code or "claude_auth_required",
+                    error_detail="Claude Code runtime login required",
+                    candidate_attempts=attempts,
+                )
+            logger.warning(
+                "pool candidate requires operator login rid=%s pool=%s candidate=%s/%s",
+                request_id or "unknown",
+                active_pool,
+                provider,
+                model,
             )
         except HighImpactApprovalRequiredError:
             # Never retry a consequential action with another model.

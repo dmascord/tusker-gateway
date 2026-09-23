@@ -18,7 +18,12 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from tusker_gateway.errors import BadRequestError, ProviderError, ProviderRouteDisabledError
+from tusker_gateway.errors import (
+    BadRequestError,
+    ClaudeAuthRequiredError,
+    ProviderError,
+    ProviderRouteDisabledError,
+)
 from tusker_gateway.sse import format_openai_chunk, sse_done, sse_frame
 
 logger = logging.getLogger(__name__)
@@ -28,6 +33,65 @@ _MODEL_ALIASES = {
     "opus": "opus",
     "haiku": "haiku",
 }
+
+
+def _cli_env() -> dict[str, str]:
+    """Build the intentionally small environment shared by Claude CLI calls."""
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+        "HOME": os.environ.get("HOME", "/home/tusker"),
+        "LANG": os.environ.get("LANG", "C.UTF-8"),
+        "LC_ALL": os.environ.get("LC_ALL", "C.UTF-8"),
+        "USER": os.environ.get("USER", ""),
+        "LOGNAME": os.environ.get("LOGNAME", os.environ.get("USER", "")),
+        "TMPDIR": os.environ.get("TMPDIR", "/tmp"),
+        "DISABLE_AUTOUPDATER": "1",
+    }
+    if os.environ.get("CLAUDE_CONFIG_DIR"):
+        env["CLAUDE_CONFIG_DIR"] = os.environ["CLAUDE_CONFIG_DIR"]
+    return env
+
+
+async def claude_auth_status(*, executable: str | None = None) -> dict[str, str]:
+    """Return a sanitized status; never expose or log Claude's raw auth JSON."""
+    path = executable or os.environ.get("TUSKER_CLAUDE_CODE_PATH") or "claude"
+    resolved = shutil.which(path)
+    if not resolved:
+        return {"status": "unknown"}
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            resolved, "auth", "status", "--json",
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            env=_cli_env(),
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+        if proc.returncode != 0:
+            return {"status": "unknown"}
+        value = json.loads(stdout)
+        if not isinstance(value, dict) or not isinstance(value.get("loggedIn"), bool):
+            return {"status": "unknown"}
+        if not value["loggedIn"]:
+            return {"status": "login_required"}
+        status = {"status": "authenticated"}
+        method = value.get("authMethod")
+        if isinstance(method, str) and method in {"claude.ai", "console", "third-party"}:
+            status["auth_method"] = method
+        return status
+    except (asyncio.TimeoutError, OSError, ValueError, TypeError):
+        return {"status": "unknown"}
+
+
+def _auth_error_indicated(*parts: bytes | str) -> bool:
+    text = " ".join(
+        part.decode("utf-8", errors="ignore") if isinstance(part, bytes) else part
+        for part in parts
+    ).lower()
+    return any(phrase in text for phrase in (
+        "login expired", "please run /login", "not logged in",
+        "authentication required", "oauth token expired", "token has expired",
+    ))
 
 
 def _enabled() -> bool:
@@ -200,20 +264,8 @@ class ClaudeCodeCLIAdapter:
 
         tool_manifest = _normalise_tools(tools, tool_choice)
         prompt = _prompt(messages, has_tools=bool(tool_manifest), tool_choice=tool_choice)
-        env = {
-            "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
-            "HOME": os.environ.get("HOME", "/home/tusker"),
-            "LANG": os.environ.get("LANG", "C.UTF-8"),
-            "LC_ALL": os.environ.get("LC_ALL", "C.UTF-8"),
-            # Claude Code's local credential integration also consults the
-            # invoking OS user's identity and temp directory. Keep the child
-            # environment otherwise allowlisted (no gateway/provider secrets).
-            "USER": os.environ.get("USER", ""),
-            "LOGNAME": os.environ.get("LOGNAME", os.environ.get("USER", "")),
-            "TMPDIR": os.environ.get("TMPDIR", "/tmp"),
-        }
-        if os.environ.get("CLAUDE_CONFIG_DIR"):
-            env["CLAUDE_CONFIG_DIR"] = os.environ["CLAUDE_CONFIG_DIR"]
+        # Keep the child environment allowlisted (no gateway/provider secrets).
+        env = _cli_env()
         with tempfile.TemporaryDirectory(prefix="tusker-claude-") as temp_name:
             temp_dir = Path(temp_name)
             command = [
@@ -331,6 +383,11 @@ class ClaudeCodeCLIAdapter:
                 proc.returncode,
                 len(stderr),
             )
+            if _auth_error_indicated(stdout, stderr):
+                raise ClaudeAuthRequiredError()
+            auth_status = await claude_auth_status(executable=resolved)
+            if auth_status["status"] == "login_required":
+                raise ClaudeAuthRequiredError()
             raise ProviderError("Claude Code CLI request failed", code="claude_code_cli_failed")
         try:
             result = json.loads(stdout)
@@ -345,11 +402,17 @@ class ClaudeCodeCLIAdapter:
                 code="invalid_upstream_response",
             )
         if result.get("is_error"):
+            api_status = result.get("api_error_status")
             logger.warning(
                 "claude-code-cli reported an error subtype=%s api_status=%s",
                 result.get("subtype"),
-                result.get("api_error_status"),
+                api_status,
             )
+            if api_status == 401 or _auth_error_indicated(result.get("result", "")):
+                raise ClaudeAuthRequiredError()
+            auth_status = await claude_auth_status(executable=resolved)
+            if auth_status["status"] == "login_required":
+                raise ClaudeAuthRequiredError()
             raise ProviderError(
                 "Claude Code CLI could not complete the request; check its local login and account status",
                 code="claude_code_cli_failed",

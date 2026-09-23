@@ -106,6 +106,21 @@ class ProviderError(GatewayError):
     error_type = "provider_error"
 
 
+class ClaudeAuthRequiredError(ProviderError):
+    """Claude Code needs an operator-managed login in the gateway runtime."""
+
+    status = 503
+    error_type = "server_error"
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Claude Code is not authenticated in the gateway runtime. Ask a gateway "
+            "administrator to run `k8s/claude-code-login.sh`, then retry. Do not send "
+            "tokens or login codes in chat.",
+            code="claude_auth_required",
+        )
+
+
 class ProviderStreamLoopError(ProviderError):
     """An upstream stream repeated reasoning/content and was terminated."""
 

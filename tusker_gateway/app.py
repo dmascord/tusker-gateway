@@ -44,6 +44,7 @@ from tusker_gateway.health import health_handler, ready_handler, status_handler
 from tusker_gateway.admin import (
     admin_breakers,
     admin_catalog,
+    admin_claude_auth_status,
     admin_cooldowns,
     admin_diagnostics,
     admin_keys,
@@ -570,6 +571,7 @@ def create_app() -> web.Application:
     app.router.add_post("/admin/logout", admin_logout)
     app.router.add_get("/admin/session", admin_session)
     app.router.add_get("/admin/diagnostics", admin_diagnostics)
+    app.router.add_get("/admin/claude/auth", admin_claude_auth_status)
     app.router.add_get("/admin/providers", admin_providers)
     app.router.add_get("/admin/pools", admin_pools)
     app.router.add_get("/admin/catalog", admin_catalog)

@@ -35,11 +35,45 @@ OpenAI SSE after the CLI has completed; gateway heartbeat behavior remains
 available while the process runs. CLI token deltas are not yet streamed
 incrementally.
 
-The CLI is not bundled in the gateway container and this change does not
-install it, provision a subscription, or deploy the adapter. Operators must
-assess Anthropic account/CLI terms and runtime credential handling before
-enabling it. Without the environment opt-in, requests to this provider are
-rejected as disabled.
+The gateway image includes a pinned Claude Code CLI executable (currently
+2.1.281). The image does not include or provision credentials. In production,
+the CLI reads its own runtime login from `CLAUDE_CONFIG_DIR` or
+`$HOME/.claude`; do not copy a developer's macOS Keychain into the image.
+Claude Code's self-updater is disabled in the image so the pinned version is
+stable. Operators must assess Anthropic account/CLI terms and runtime
+credential handling before enabling it. Without the environment opt-in,
+requests to this provider are rejected as disabled.
+
+OAuth lifecycle belongs to Claude Code, not the gateway adapter. On Linux,
+Claude Code keeps its login under `$HOME/.claude/.credentials.json`; that
+runtime directory must be mounted with private permissions and writable by
+the gateway user. Anthropic documents `CLAUDE_CODE_OAUTH_REFRESH_TOKEN` plus
+`CLAUDE_CODE_OAUTH_SCOPES` as inputs to `claude auth login` for automated
+credential provisioning. `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`
+is a separate long-lived access token and must be replaced when it expires.
+The adapter intentionally does not read Keychain data, exchange refresh
+tokens itself, or log/store OAuth credentials.
+
+### Login, renewal, and user notification
+
+An operator can start the standard interactive Claude subscription login from
+an operator-controlled terminal with `k8s/claude-code-login.sh`. It runs
+`claude auth login --claudeai` in the gateway container, where the mounted
+Claude runtime home persists the credential. Complete any browser or one-time
+code step only in that terminal; never put credentials or login codes in a
+chat request. The helper prints only an allowlisted status after login.
+
+`GET /admin/claude/auth` reports only `authenticated`, `login_required`, or
+`unknown` (and a small allowlist of auth-method labels), protected by the
+existing admin access controls. Claude Code remains responsible for refresh
+where supported and may request a fresh login when the current credential
+cannot be renewed. The gateway does not promise unattended refresh for every
+account type. If an actual request receives an explicit auth-expiry failure,
+the gateway returns an OpenAI-compatible HTTP 503 error with code
+`claude_auth_required` and directs the client to ask an administrator to run
+the login helper. CLI output is buffered until completion, so this error is
+sent before the response stream starts; no separate push channel is needed.
+Auth expiry is not recorded as provider/model health failure or quarantine.
 
 ## OpenCode CLI
 
@@ -63,16 +97,13 @@ rules here: testing showed that they make OpenCode Zen return HTTP 403
 ("free tier can only be used from within OpenCode"). The CLI's own
 non-interactive permission handling remains in effect for other tools, so
 operators should also review any global CLI configuration used by the gateway.
-Follow-up tool calls and results are replayed as transcript history. The CLI
-is not bundled in the gateway container; this adapter is disabled by default
-and excluded from default pools.
+Follow-up tool calls and results are replayed as transcript history. The
+gateway image includes the pinned OpenCode v2 CLI executable (currently
+2.0.15); this adapter is disabled by default and excluded from default pools.
 
-Set `TUSKER_OPENCODE_CLI_PATH` when multiple OpenCode installations exist; the
-gateway does not install or upgrade the CLI. The local request probe used
-`/Users/tusker/.opencode/bin/opencode`, which reports `v2.0.15`; a separate
-Homebrew install reports `1.18.32` and was not used. OpenCode Zen may still
-reject CLI/API use based on account or service policy; the adapter does not
-bypass those restrictions.
+Set `TUSKER_OPENCODE_CLI_PATH` when an operator-managed installation should
+be used instead. OpenCode Zen may still reject CLI/API use based on account or
+service policy; the adapter does not bypass those restrictions.
 
 ## Kilo Code CLI
 
@@ -88,6 +119,7 @@ Each request receives high-priority inline `KILO_CONFIG_CONTENT`, disables
 project config, denies tools by default, and exposes only request-scoped MCP
 proxies for client-declared tools. The proxy returns an OpenAI tool call to
 the connected harness; it never executes that call. Like the other CLI
-adapters, Kilo is local/non-ZDR, excluded from default pools, not bundled in
-the gateway image, and streaming is returned after the CLI completes rather
-than as incremental token deltas.
+adapters, Kilo is local/non-ZDR, excluded from default pools, and streaming
+is returned after the CLI completes rather than as incremental token deltas.
+The gateway image includes the pinned Kilo CLI (currently 7.7.9); set
+`TUSKER_KILO_CLI_PATH` to use an operator-managed installation instead.

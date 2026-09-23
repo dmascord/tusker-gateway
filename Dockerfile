@@ -1,3 +1,26 @@
+# CLI adapters invoke the provider CLIs as subprocesses. Install pinned npm
+# packages in a Node stage, then copy the runtime and packages into the
+# Python-based gateway image.
+FROM node:22-bookworm-slim AS cli-tools
+
+ARG CLAUDE_CODE_CLI_VERSION=2.1.281
+ARG OPENCODE_CLI_VERSION=2.0.15
+ARG KILO_CLI_VERSION=7.7.9
+
+RUN npm install --global --no-audit --no-fund \
+      "@anthropic-ai/claude-code@${CLAUDE_CODE_CLI_VERSION}" \
+      "@opencode/cli@${OPENCODE_CLI_VERSION}" \
+      "@kilocode/cli@${KILO_CLI_VERSION}" \
+ && cli_arch="$(node -p 'process.arch')" \
+ && mkdir -p /opt/provider-cli \
+ && cp "/usr/local/lib/node_modules/@anthropic-ai/claude-code/node_modules/@anthropic-ai/claude-code-linux-${cli_arch}/claude" /opt/provider-cli/claude \
+ && cp "/usr/local/lib/node_modules/@opencode/cli/node_modules/@opencode/cli-linux-${cli_arch}/bin/opencode" /opt/provider-cli/opencode \
+ && cp "/usr/local/lib/node_modules/@kilocode/cli/node_modules/@kilocode/cli-linux-${cli_arch}/bin/kilo" /opt/provider-cli/kilo \
+ && chmod 0755 /opt/provider-cli/* \
+ && /opt/provider-cli/claude --version \
+ && /opt/provider-cli/opencode --version \
+ && /opt/provider-cli/kilo --version
+
 FROM python:3.11-slim
 
 LABEL org.opencontainers.image.title="tusker-gateway" \
@@ -6,6 +29,7 @@ LABEL org.opencontainers.image.title="tusker-gateway" \
 
 ARG TUSKER_COMMIT=unknown
 ARG TUSKER_SEMANTIC_CACHE_MODEL_REVISION=1110a243fdf4706b3f48f1d95db1a4f5529b4d41
+COPY --from=cli-tools /opt/provider-cli/ /usr/local/bin/
 # Keep build-time Python imports from filling image layers with bytecode. The
 # runtime sets this too, but the model prewarm below imports a large package
 # tree before the final runtime environment is declared.
@@ -52,7 +76,8 @@ RUN find /opt/tusker-gateway /usr/local/lib/python3.11 \
 RUN mkdir -p /home/tusker/.hermes && chown -R nobody:nogroup /home/tusker
 ENV HOME=/home/tusker \
     PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    DISABLE_AUTOUPDATER=1
 
 USER nobody
 

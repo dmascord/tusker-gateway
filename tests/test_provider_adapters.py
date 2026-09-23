@@ -10,7 +10,12 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from tusker_gateway.config import DEFAULT_PROVIDER_REGISTRY
-from tusker_gateway.errors import BadRequestError, ProviderError, ProviderRouteDisabledError
+from tusker_gateway.errors import (
+    BadRequestError,
+    ClaudeAuthRequiredError,
+    ProviderError,
+    ProviderRouteDisabledError,
+)
 from tusker_gateway.provider_adapters import ProviderAdapterRegistry, provider_adapters
 from tusker_gateway.provider_adapters.claude_code import ClaudeCodeCLIAdapter
 from tusker_gateway.passthrough import _configured_endpoint
@@ -24,7 +29,7 @@ class _FakeProcess:
         self.returncode = returncode
         self.pid = 23456
 
-    async def communicate(self, _input: bytes):
+    async def communicate(self, _input: bytes | None = None):
         return self.stdout, self.stderr
 
     async def wait(self):
@@ -166,6 +171,7 @@ async def test_cli_invokes_allowlisted_model_and_converts_result(monkeypatch):
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in spawn.await_args.kwargs["env"]
     assert "USER" in spawn.await_args.kwargs["env"]
     assert "TMPDIR" in spawn.await_args.kwargs["env"]
+    assert spawn.await_args.kwargs["env"]["DISABLE_AUTOUPDATER"] == "1"
 
 
 @pytest.mark.asyncio
@@ -322,3 +328,57 @@ async def test_cli_reports_nonzero_exit_without_exposing_stderr_to_client(monkey
             )
     assert "private account" not in exc.value.message
     assert exc.value.code == "claude_code_cli_failed"
+
+
+@pytest.mark.asyncio
+async def test_claude_auth_status_allowlists_fields_and_hides_identity(monkeypatch):
+    from tusker_gateway.provider_adapters.claude_code import claude_auth_status
+
+    monkeypatch.setenv("HOME", "/home/tusker")
+    raw = json.dumps({
+        "loggedIn": True,
+        "authMethod": "claude.ai",
+        "email": "private@example.test",
+        "organization": "private-org",
+        "accessToken": "secret-token",
+    }).encode()
+    with patch("tusker_gateway.provider_adapters.claude_code.shutil.which", return_value="/bin/claude"), \
+         patch("tusker_gateway.provider_adapters.claude_code.asyncio.create_subprocess_exec",
+               new=AsyncMock(return_value=_FakeProcess(raw))) as spawn:
+        status = await claude_auth_status()
+    assert status == {"status": "authenticated", "auth_method": "claude.ai"}
+    assert "secret-token" not in json.dumps(status)
+    assert spawn.await_args.args == ("/bin/claude", "auth", "status", "--json")
+    assert spawn.await_args.kwargs["env"]["HOME"] == "/home/tusker"
+
+
+@pytest.mark.asyncio
+async def test_claude_auth_status_unknown_for_bad_or_unavailable_cli():
+    from tusker_gateway.provider_adapters.claude_code import claude_auth_status
+
+    with patch("tusker_gateway.provider_adapters.claude_code.shutil.which", return_value=None):
+        assert await claude_auth_status() == {"status": "unknown"}
+    with patch("tusker_gateway.provider_adapters.claude_code.shutil.which", return_value="claude"), \
+         patch("tusker_gateway.provider_adapters.claude_code.asyncio.create_subprocess_exec",
+               new=AsyncMock(return_value=_FakeProcess(b'{"loggedIn":false}'))):
+        assert await claude_auth_status() == {"status": "login_required"}
+
+
+@pytest.mark.asyncio
+async def test_cli_returns_specific_auth_error_on_expired_session(monkeypatch):
+    monkeypatch.setenv("TUSKER_CLAUDE_CODE_ENABLED", "true")
+    result = {
+        "result": "Login expired. Please run /login.",
+        "is_error": True,
+        "api_error_status": 401,
+    }
+    with patch("tusker_gateway.provider_adapters.claude_code.shutil.which", return_value="claude"), \
+         patch("tusker_gateway.provider_adapters.claude_code.asyncio.create_subprocess_exec",
+               new=AsyncMock(return_value=_FakeProcess(json.dumps(result).encode()))):
+        with pytest.raises(ClaudeAuthRequiredError) as exc:
+            await ClaudeCodeCLIAdapter().chat(
+                provider="claude-code-cli", model="opus", messages=[], stream=False,
+            )
+    assert exc.value.code == "claude_auth_required"
+    assert "login code" in exc.value.message
+    assert "accessToken" not in exc.value.message

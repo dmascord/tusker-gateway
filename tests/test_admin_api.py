@@ -10,6 +10,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from tusker_gateway.admin import (
     admin_breakers,
     admin_catalog,
+    admin_claude_auth_status,
     admin_cooldowns,
     admin_diagnostics,
     admin_keys,
@@ -117,6 +118,7 @@ def _admin_app(api_key: str, identities=None):
     app.router.add_post("/admin/logout", admin_logout)
     app.router.add_get("/admin/session", admin_session)
     app.router.add_get("/admin/diagnostics", admin_diagnostics)
+    app.router.add_get("/admin/claude/auth", admin_claude_auth_status)
     app.router.add_get("/admin/providers", admin_providers)
     app.router.add_get("/admin/pools", admin_pools)
     app.router.add_get("/admin/catalog", admin_catalog)
@@ -129,6 +131,7 @@ def _admin_app(api_key: str, identities=None):
 
 ADMIN_PATHS = [
     "/admin/diagnostics",
+    "/admin/claude/auth",
     "/admin/providers",
     "/admin/pools",
     "/admin/catalog",
@@ -318,6 +321,30 @@ async def test_admin_diagnostics_aggregates_subsystems():
             "state_store",
         ):
             assert section in data, section
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_claude_auth_admin_route_returns_only_sanitized_status(monkeypatch):
+    from tusker_gateway.provider_adapters import claude_code
+
+    async def fake_status():
+        return {"status": "authenticated", "auth_method": "claude.ai"}
+
+    monkeypatch.setattr(claude_code, "claude_auth_status", fake_status)
+    app = _admin_app("sk-admin-test", identities=_admin_identities())
+    client = await _client(app)
+    try:
+        resp = await client.get(
+            "/admin/claude/auth", headers={"Authorization": "Bearer sk-admin-test"}
+        )
+        assert resp.status == 200
+        assert await resp.json() == {
+            "status": "authenticated",
+            "auth_method": "claude.ai",
+            "login_command": "k8s/claude-code-login.sh",
+        }
     finally:
         await client.close()
 
