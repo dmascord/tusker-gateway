@@ -137,6 +137,12 @@ class EmbedHandler:
         )
 
     @staticmethod
+    def _routing_strategy() -> str:
+        """Choose priority order or legacy round-robin across embed backends."""
+        value = os.environ.get("TUSKER_EMBED_STRATEGY", "round-robin").strip().lower()
+        return value if value in {"priority", "round-robin"} else "round-robin"
+
+    @staticmethod
     def _default_model(provider: str) -> str:
         suffix = provider.upper().replace("-", "_")
         return (
@@ -252,8 +258,11 @@ class EmbedHandler:
             return "voyage", value
         if lower.startswith("jina") and "jina" in known:
             return "jina", value
-        if lower.startswith("nomic") and "ollama-cloud" in known:
-            return "ollama-cloud", value
+        if lower.startswith("nomic"):
+            if "local-llm" in known:
+                return "local-llm", value
+            if "ollama-cloud" in known:
+                return "ollama-cloud", value
 
         return None, value
 
@@ -590,9 +599,14 @@ class EmbedHandler:
                 code="no_embed_providers",
             )
 
-        with self._lock:
-            start = self._cursor % len(backends)
-        ordered = backends[start:] + backends[:start]
+        strategy = self._routing_strategy()
+        if strategy == "priority":
+            start = 0
+            ordered = backends
+        else:
+            with self._lock:
+                start = self._cursor % len(backends)
+            ordered = backends[start:] + backends[:start]
         last_error: GatewayError | None = None
         attempted = False
 
@@ -612,8 +626,9 @@ class EmbedHandler:
                 if breaker is not None:
                     breaker.record_success(backend.provider, backend.model)
                 global_tracker().clear_failures(backend.provider)
-                with self._lock:
-                    self._cursor = (start + position + 1) % len(backends)
+                if strategy == "round-robin":
+                    with self._lock:
+                        self._cursor = (start + position + 1) % len(backends)
                 logger.info(
                     "embed completed provider=%s model=%s inputs=%d",
                     backend.provider,

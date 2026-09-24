@@ -205,6 +205,17 @@ spec:
           value: 'true'
         # /v1/rerank is a dedicated native-provider route and is not disabled
         # by the chat-pool list above. It uses rerank_path + provider keys.
+        # Keep embeddings on the Jetson by default (small Nomic model); use
+        # configured remote providers only as ordered fallback. This is
+        # separate from chat routing and does not put local-llm in a chat pool.
+        - name: TUSKER_EMBED_STRATEGY
+          value: priority
+        - name: TUSKER_EMBED_PROVIDERS
+          value: local-llm,synthetic,voyage,jina,openrouter
+        - name: TUSKER_EMBED_LOCAL_LLM_MODEL
+          value: nomic-embed-text
+        - name: TUSKER_EMBED_LOCAL_LLM_DIMENSIONS
+          value: '768'
         - name: TUSKER_POOL_CODE
           value: '{"models":[{"provider":"minimax","model":"MiniMax-M3","input_modalities":["text","image"]},{"provider":"minimax","model":"MiniMax-M2.7","input_modalities":["text"]},{"provider":"minimax","model":"MiniMax-M2.7-highspeed","input_modalities":["text"]},{"provider":"minimax","model":"MiniMax-M2.5","input_modalities":["text"]},{"provider":"minimax","model":"MiniMax-M2.5-highspeed","input_modalities":["text"]},{"provider":"minimax","model":"MiniMax-M2.1","input_modalities":["text"]},{"provider":"minimax","model":"MiniMax-M2.1-highspeed","input_modalities":["text"]},{"provider":"minimax","model":"MiniMax-M2","input_modalities":["text"]},{"provider":"synthetic","model":"syn:large:text","input_modalities":["text"]},{"provider":"synthetic","model":"syn:small:text","input_modalities":["text"]},{"provider":"synthetic","model":"syn:small:vision","input_modalities":["text","image"]},{"provider":"groq","model":"openai/gpt-oss-20b","input_modalities":["text"]},{"provider":"groq","model":"qwen/qwen3.6-27b","input_modalities":["text"]},{"provider":"zai","model":"glm-4.7"},{"provider":"openai-codex","model":"gpt-5.6-luna"},{"provider":"openai-codex","model":"gpt-5.4-mini"},{"provider":"github-copilot","model":"gpt-5.6-luna"},{"provider":"github-copilot-enterprise","model":"gpt-5.6-luna"},{"provider":"google","model":"gemini-3.5-flash","input_modalities":["text","image"]},{"provider":"google","model":"gemini-3.1-flash-lite","input_modalities":["text","image"]},{"provider":"google","model":"gemini-3.1-flash-lite-preview","input_modalities":["text","image"]},{"provider":"alibaba","model":"deepseek-v4-flash-0731","input_modalities":["text","image"]},{"provider":"opencode-go","model":"qwen3.6-plus"},{"provider":"zai","model":"glm-5.3-flash"},{"provider":"alibaba","model":"deepseek-v4-pro","input_modalities":["text","image"]},{"provider":"alibaba","model":"deepseek-v4.1-flash","input_modalities":["text","image"]},{"provider":"alibaba","model":"qwen3.6-flash","input_modalities":["text","image"]},{"provider":"alibaba","model":"qwen3.7-plus","input_modalities":["text","image"]},{"provider":"alibaba","model":"qwen3.8-flash","input_modalities":["text","image"]}],"fallback_pools":["premium","swarm"],"auto_catalog":true,"auto_catalog_providers":["minimax","synthetic","zai","openai-codex","github-copilot","github-copilot-enterprise","alibaba","opencode-go","workers-ai","ollama-cloud","groq","google","cerebras"]}'
         - name: TUSKER_POOL_PRIVACY
@@ -459,13 +470,15 @@ spec:
         # Real context windows of servers whose window differs from the pool
         # default (keys: provider or provider/model; ":latest" optional).
         # Ollama ignores num_ctx on /v1, so this must track the host config:
-        # MLX Mac sets OLLAMA_CONTEXT_LENGTH=131072 in
-        # /Library/LaunchDaemons/dev.tusker.ollama.plist (2026-09-24; all chat
-        # models fit in 23 GiB at 128k). Declared routes are skipped when
-        # prompt + TUSKER_MIN_OUTPUT_TOKENS won't fit and max_tokens is
-        # clamped to the remaining room.
+        # MLX Mac sets OLLAMA_CONTEXT_LENGTH=262144 in
+        # /Library/LaunchDaemons/dev.tusker.ollama.plist (2026-09-24). These
+        # three model tags report native 262144 context; keep the gateway
+        # declaration model-specific so newly catalogued models are not
+        # silently assumed to support it. Jetson has only 8 GiB RAM, so do
+        # not declare a blanket context override there; the coder model's
+        # Modelfile explicitly sets 8192.
         - name: TUSKER_CONTEXT_WINDOW_OVERRIDES_JSON
-          value: '{"mlx-mac": 131072}'
+          value: '{"mlx-mac/ornith-1.5:35b": 262144, "mlx-mac/qwen3.8-27b": 262144, "mlx-mac/shirdel-coder-9b-claude-fable-5": 262144, "local-llm/qwopus-9b-coder-mtp": 8192}'
         # Per-provider streaming per-chunk idle budget overrides (seconds).
         # xiaomi/mimo large contexts regularly exceed the default 120s wall
         # clock — extend the per-chunk budget so streaming generation completes

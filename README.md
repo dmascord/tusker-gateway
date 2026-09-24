@@ -34,6 +34,7 @@ __main__.py    — python -m tusker_gateway
 | Image edits/variations | `/v1/images/edits`, `/v1/images/variations` | OpenAI-compatible image providers; unsupported provider surfaces fail explicitly. |
 | Video generation | `/v1/videos` | OpenAI Sora, OpenRouter video models, Google Veo, Z.AI CogVideoX/Vidu. `wait=false` returns the upstream job; waited Z.AI results retain the signed result URL. |
 | Reranking | `/v1/rerank` | Cohere v2, Voyage, and Jina native rerank APIs with provider fallback. `hermes-reranker` is the virtual model alias. |
+| Embeddings | `/v1/embeddings` | Jetson Ollama `nomic-embed-text` first, then configured remote providers on failure; independent of chat pools. |
 
 Capability discovery refreshes supported image/video models from provider catalogs. Anthropic supports image input for understanding, not image generation. Media and rerank routes use the same authenticated per-key rate limit, budget, and guardrail preflight as chat.
 

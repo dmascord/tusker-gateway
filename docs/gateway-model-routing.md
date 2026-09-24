@@ -272,10 +272,23 @@ mlx-mac/qwen3.8-27b
 ```
 
 Both `local-llm` and `mlx-mac` advertise their catalog via the gateway's
-`/v1/models`. Unmapped model IDs pass through unchanged. The privacy pool
-includes both routes as eligible candidates; their actual selection order
-is still controlled by the pool's quality and rotation logic — they are
-not guaranteed to run before cloud privacy candidates.
+`/v1/models`. Unmapped model IDs pass through unchanged. Jetson's chat models
+are deliberately not in the normal chat pools; its role is local embeddings.
+The MLX route remains governed by the configured chat pool and its quality
+and rotation logic.
+
+#### Jetson embedding service
+
+`POST /v1/embeddings` tries `local-llm/nomic-embed-text` first (768 dimensions)
+using Ollama's `/v1/embeddings` API. It is a small 137M-parameter model and
+is kept separate from chat-pool routing. If the Jetson is unavailable, the
+priority-ordered fallback is Synthetic, Voyage, Jina, then OpenRouter, subject
+to each provider having an API key and being healthy. The fallback behavior
+preserves availability but sends embedding input to the selected remote
+provider; callers requiring local-only processing can pin
+`model: "local-llm/nomic-embed-text"`, which does not fall through to remote
+providers. `TUSKER_EMBED_STRATEGY=priority` makes configured order deterministic;
+the default for other deployments remains round-robin.
 
 #### Single-concurrency capacity gate
 
@@ -304,12 +317,19 @@ model's `PARAMETER num_ctx` says otherwise, and ignores `options.num_ctx` on
 `/v1/chat/completions`. The pool-wide `context_window` (128k) is only a
 guess, so `TUSKER_CONTEXT_WINDOW_OVERRIDES_JSON` declares real windows,
 keyed by `provider` or `provider/model` (model keys win; `:latest` is
-optional): `{"mlx-mac": 131072}`. Keep it in step with the host.
+optional). Prefer model-specific values when only some models on a provider
+have been verified.
 
-The MLX Mac runs `OLLAMA_CONTEXT_LENGTH=131072` (set 2026-09-24 in
+The MLX Mac runs `OLLAMA_CONTEXT_LENGTH=262144` (set 2026-09-24 in
 `/Library/LaunchDaemons/dev.tusker.ollama.plist`; its default was 32k).
-Measured at 128k: ornith-1.5:35b 22.2 GiB, qwen3.8-27b 20.6 GiB,
-shirdel-coder-9b 9.5 GiB, all on the GPU. The duplicate
+The three configured MLX models report native 262144 context. At 128k,
+ornith-1.5:35b used 22.2 GiB, qwen3.8-27b 20.6 GiB, and shirdel-coder-9b
+9.5 GiB, all on the GPU; 256k is enabled on the 48-GiB M4 Max, but should be
+watched for peak memory under concurrent load. Jetson Orin Nano has 8 GiB
+total RAM, so the gateway deliberately makes no blanket 128k claim for it.
+Only `qwopus-9b-coder-mtp` has a declared 8192 context, matching its
+Modelfile; verify actual `ollama ps` allocation before raising other Jetson
+models. The duplicate
 `homebrew.mxcl.ollama` daemon is disabled; it was crash-looping on the
 port held by `dev.tusker.ollama`.
 
