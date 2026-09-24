@@ -154,7 +154,15 @@ bounded CPU/memory, receives only the Groq key, and currently allows
 `groq/openai/gpt-oss-20b`, `groq/qwen/qwen3.8-27b`, and
 `kilo/kilo-auto/free`. The free auto-router passed a live tool-call probe
 through the worker HTTP endpoint with a clean home directory and no API keys.
-Other environments can run the adapter
+Request-shaped worker failures (for example a 400 *unsupported_message_content*
+for an image payload) are relayed with their original status and OpenAI error
+code, so the modality probe records an authoritative `unsupported` verdict and
+clients see a clean 400 rather than a misleading 502. Worker-side outages and
+unparseable bodies still surface as 502 `kilo_worker_failed`. Streaming
+requests that reject before the first SSE byte get the same code/message via
+the SSE error frame. Kilo has no catalog advertisement for image input, so
+re-probing it requires `python -m tusker_gateway.modality_qualification
+--include-unadvertised`. Other environments can run the adapter
 locally by leaving `TUSKER_KILO_WORKER_URL` unset. The gateway image includes
 the pinned Kilo CLI (currently 7.7.9); set `TUSKER_KILO_CLI_PATH` to use an
 operator-managed installation instead.
