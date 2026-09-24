@@ -123,6 +123,7 @@ def create_app() -> web.Application:
             app["config_runtime_status"] = {}
             app["config_generation"] = 0
             app["config"]["_persist_credentials"] = getattr(store, "persist_credentials", None)
+            app["config"]["_load_oauth_credentials"] = getattr(store, "load_oauth_credentials", None)
             app["config_runtime"] = ConfigRuntime(app)
         except Exception as exc:
             log.warning("config store init failed (legacy config will be used): %s", exc)
@@ -244,6 +245,8 @@ def create_app() -> web.Application:
                 [credential for credential in credentials if isinstance(credential, dict)],
                 auth_file=(config.get("auth_file") if provider == "openai-codex" else None),
                 provider=provider,
+                persist_credentials=config.get("_persist_credentials"),
+                load_credentials=config.get("_load_oauth_credentials"),
                 model_exclusion_store=model_exclusion_store,
             )
     codex_rotator = credential_rotators.get("openai-codex")
@@ -252,9 +255,11 @@ def create_app() -> web.Application:
             config.get("codex_credentials") or [],
             auth_file=config.get("auth_file"),
             provider="openai-codex",
+            persist_credentials=config.get("_persist_credentials"),
+            load_credentials=config.get("_load_oauth_credentials"),
             model_exclusion_store=model_exclusion_store,
         )
-        credential_rotators["openai-codex"] = codex_rotator
+    credential_rotators["openai-codex"] = codex_rotator
     app["credential_rotators"] = credential_rotators
     app["codex_rotator"] = codex_rotator
     capability_registry = CapabilitiesRegistry(

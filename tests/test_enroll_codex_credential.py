@@ -489,3 +489,32 @@ def test_main_ignores_pool_without_account_ids(
 
 def test_module_exposes_main() -> None:
     assert callable(sys.modules[module.__name__].main)
+
+
+def test_main_mirrors_credential_to_explicit_auth_file(
+    store: ConfigStore, monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """With TUSKER_AUTH_FILE set, enrollment also updates the Hermes auth.json."""
+    auth_file = tmp_path / "auth.json"
+    auth_file.write_text(json.dumps({"version": 1, "credential_pool": {}}))
+    monkeypatch.setenv("TUSKER_AUTH_FILE", str(auth_file))
+    _stub_flow(monkeypatch, _credential(account_id="acct-A", email="a@b.c"))
+
+    assert module.main(argv=["--label", "mirrored"]) == 0
+
+    doc = json.loads(auth_file.read_text())
+    assert [c["account_id"] for c in doc["credential_pool"][PROVIDER]] == ["acct-A"]
+
+
+def test_main_skips_auth_file_mirror_without_explicit_path(
+    store: ConfigStore, monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """No TUSKER_AUTH_FILE means no file mirror: the DB is the only target."""
+    monkeypatch.delenv("TUSKER_AUTH_FILE", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _stub_flow(monkeypatch, _credential(account_id="acct-A", email="a@b.c"))
+
+    assert module.main(argv=["--label", "db-only"]) == 0
+
+    assert not (tmp_path / ".hermes" / "auth.json").exists()
+    assert [c["account_id"] for c in _stored(store)] == ["acct-A"]

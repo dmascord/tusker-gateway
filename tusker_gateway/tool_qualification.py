@@ -95,7 +95,10 @@ def _catalog_registry(
 
     # Codex and Copilot model catalogs use short-lived OAuth credentials. The
     # gateway process wires full rotators; the standalone qualification job
-    # only needs a read-only token source for catalog enumeration.
+    # only needs a read-only token source for catalog enumeration. Refresh is
+    # disabled: refreshing here would consume the shared single-use refresh
+    # token and the rotated result could not be persisted (no auth_file, no
+    # DB callback), permanently killing the credential for the gateway.
     credential_pools = config.get("credential_pools", {})
     if isinstance(credential_pools, dict):
         from tusker_gateway.passthrough import CodexTokenRotator
@@ -115,6 +118,7 @@ def _catalog_registry(
                 credentials,
                 http_client=http_client,
                 provider=provider,
+                refresh_enabled=False,
             )
             client.set_token_source(rotator.get_token)
     return registry

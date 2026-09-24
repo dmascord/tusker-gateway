@@ -817,6 +817,8 @@ class CodexTokenRotator:
         http_client: Any | None = None,
         provider: str = "openai-codex",
         persist_credentials: Any | None = None,
+        load_credentials: Any | None = None,
+        refresh_enabled: bool = True,
         secrets_authoritative: bool = False,
         model_exclusion_store: Any | None = None,
     ):
@@ -827,6 +829,16 @@ class CodexTokenRotator:
         self._http = http_client  # aiohttp.ClientSession for OAuth calls
         self._provider = str(provider or "openai-codex").lower()
         self._refresh_failed_until: dict[int, float] = {}
+        # ``load_credentials(provider) -> list[dict] | None`` reads the stored
+        # credential pool. With it, a rotator about to refresh first adopts a
+        # credential another process already rotated, instead of replaying a
+        # refresh token that was consumed upstream (refresh_token_reused).
+        self._load_credentials = load_credentials
+        # ``refresh_enabled=False`` marks a read-only rotator (standalone
+        # qualification jobs): never call the OAuth token endpoint, so the
+        # shared refresh tokens cannot be consumed by a process that cannot
+        # persist the rotated result.
+        self._refresh_enabled = bool(refresh_enabled)
         # Per-credential cooldowns keyed by token fingerprint. A single
         # exhausted-quota 429 on one credential must not lock out the
         # other healthy credentials in the same pool — ``get_token``
@@ -847,8 +859,9 @@ class CodexTokenRotator:
             self._unsupported_models = set()
 
         #   persist_credentials(provider, expected, replacement) -> bool CAS.
-        # When set, refreshed credentials persist to the encrypted DB instead
-        # of the legacy auth.json file (auth_file is ignored).
+        #   Encrypted-DB persistence. auth.json is additionally kept in sync
+        #   when ``auth_file`` is set (dual-write), so file-based consumers
+        #   and operators always see the live tokens.
         self._persist_credentials = persist_credentials
         self._secrets_authoritative = bool(secrets_authoritative)
         self._canary_mode = bool(
@@ -857,6 +870,122 @@ class CodexTokenRotator:
         self._initial_refresh_tokens: frozenset[str] = frozenset(
             str(c.get("refresh_token")) for c in self._creds if c.get("refresh_token")
         )
+        self._log_pool_initialized()
+
+    @staticmethod
+    def _process_identity() -> str:
+        """Return a stable identity for the current process (pod name preferred)."""
+        for env_var in ("POD_NAME", "HOSTNAME"):
+            value = os.environ.get(env_var, "").strip()
+            if value:
+                return value
+        try:
+            import socket as _socket
+            return _socket.gethostname()
+        except Exception:
+            return "unknown"
+
+    @staticmethod
+    def _matches_identity(a: dict[str, Any], b: dict[str, Any]) -> bool:
+        """Return whether two credential dicts describe the same account.
+
+        Stable identity fields first; fall back to refresh-token equality
+        when no shared account metadata is present.
+        """
+        for key in ("account_id", "email", "label"):
+            av = a.get(key)
+            bv = b.get(key)
+            if av and bv:
+                return str(av) == str(bv)
+        return str(a.get("refresh_token") or "") == str(b.get("refresh_token") or "")
+
+    def _log_pool_initialized(self) -> None:
+        """Log the rotator's initial state on construction."""
+        refresh_fps = [
+            self.fingerprint(c.get("refresh_token")) or "-"
+            for c in self._creds
+        ]
+        access_fps = [
+            self.fingerprint(_creds_access_token(c) or None) or "-"
+            for c in self._creds
+        ]
+        targets: list[str] = []
+        if self._persist_credentials is not None:
+            targets.append("db")
+        if self._auth_file:
+            targets.append("file")
+        logger.info(
+            "oauth rotator initialized provider=%s credentials=%d refresh_enabled=%s "
+            "persist=%s auth_file=%s pod=%s refresh_fps=%s access_fps=%s",
+            self._provider,
+            len(self._creds),
+            self._refresh_enabled,
+            "+".join(targets) or "none",
+            "set" if self._auth_file else "unset",
+            self._process_identity(),
+            ",".join(refresh_fps),
+            ",".join(access_fps),
+        )
+
+    async def _maybe_adopt_from_store(self, idx: int) -> bool:
+        """Adopt a credential rotated by another process, return True on adopt.
+
+        Only meaningful for providers whose refresh tokens rotate (Codex).
+        Copilot's GitHub exchange uses long-lived PATs that are renewed
+        out-of-band and rebuilt on the next config reload, so adopting
+        would only paper over real config drift.
+        """
+        if self._load_credentials is None:
+            return False
+        if self._provider != "openai-codex":
+            return False
+        cred = self._creds[idx]
+        try:
+            stored_list = await asyncio.to_thread(self._load_credentials, self._provider)
+        except Exception as exc:
+            logger.warning(
+                "oauth credential store reload failed provider=%s credential_index=%d error=%s",
+                self._provider,
+                idx + 1,
+                type(exc).__name__,
+            )
+            return False
+        if not stored_list:
+            return False
+        # Find the stored credential that describes the same account but
+        # has been rotated past this in-memory copy.
+        match: dict[str, Any] | None = None
+        for stored in stored_list:
+            if not isinstance(stored, dict):
+                continue
+            if not self._matches_identity(cred, stored):
+                continue
+            if str(stored.get("refresh_token") or "") == str(cred.get("refresh_token") or ""):
+                return False
+            if float(stored.get("expires_at_ms") or 0) <= float(cred.get("expires_at_ms") or 0):
+                return False
+            match = stored
+            break
+        if match is None:
+            return False
+        adopted = dict(match)
+        # Preserve stable identity fields we already know about locally.
+        for key in ("label", "account_id", "email"):
+            if cred.get(key) and not adopted.get(key):
+                adopted[key] = cred[key]
+        self._creds[idx] = adopted
+        logger.info(
+            "oauth credential adopted from store provider=%s credential_index=%d/%d "
+            "old_refresh_fp=%s new_refresh_fp=%s expires_in_s=%.0f pod=%s",
+            self._provider,
+            idx + 1,
+            len(self._creds),
+            self.fingerprint(cred.get("refresh_token")),
+            self.fingerprint(adopted.get("refresh_token")),
+            max(0.0, _creds_expires_at(adopted) - time.time()),
+            self._process_identity(),
+        )
+        return True
 
     @property
     def size(self) -> int:
@@ -1041,35 +1170,87 @@ class CodexTokenRotator:
                         continue
                 else:
                     retry_at = self._refresh_failed_until.get(idx, 0.0)
+                    if not self._refresh_enabled and self._is_expired(cred):
+                        logger.warning(
+                            "oauth refresh disabled and access token expired "
+                            "provider=%s credential_index=%d/%d fingerprint=%s pod=%s",
+                            self._provider,
+                            idx + 1,
+                            count,
+                            self.fingerprint(cred.get("refresh_token")),
+                            self._process_identity(),
+                        )
+                        continue
                     if retry_at <= now and self._is_near_expiry(cred):
-                        pre_refresh = dict(cred)
-                        try:
-                            refreshed = await self._refresh_one(cred)
-                        except Exception as exc:
-                            self._refresh_failed_until[idx] = time.time() + (
-                                self._permanent_refresh_cooldown_seconds()
-                                if self._is_permanent_refresh_error(exc)
-                                else self._refresh_failure_cooldown_seconds()
-                            )
-                            self._log_refresh_failure(idx, exc)
-                            if self._is_expired(cred):
-                                continue
-                        else:
-                            self._creds[idx] = refreshed
-                            self._refresh_failed_until.pop(idx, None)
-                            persisted = await self._persist(pre_refresh, refreshed)
-                            token = _creds_access_token(refreshed)
+                        adopted_fresh = False
+                        adopted = await self._maybe_adopt_from_store(idx)
+                        if adopted:
+                            cred = self._creds[idx]
+                            token = _creds_access_token(cred)
+                            if token and not self._is_expired(cred):
+                                # Store already holds a newer credential — use
+                                # it directly instead of the OAuth round-trip.
+                                # Falling through to the refresh block below
+                                # would burn the shared single-use refresh token
+                                # even though the adopted access token is valid
+                                # (refresh_token_reused).
+                                self._refresh_failed_until.pop(idx, None)
+                                adopted_fresh = True
+                            else:
+                                # Adoption gave us a row but its access token
+                                # is already past expiry; fall through and let
+                                # the refresh attempt below re-rotate it.
+                                token = None
+                        if self._refresh_enabled and not adopted_fresh:
+                            # Refresh under our own authority: this process
+                            # owns the rotated result and persists it.
+                            pre_refresh = dict(cred)
                             logger.info(
-                                "oauth refresh succeeded provider=%s credential_index=%d/%d "
-                                "expires_in_s=%.0f refresh_token_rotated=%s persistence=%s",
+                                "oauth refresh starting provider=%s credential_index=%d/%d "
+                                "refresh_fp=%s access_expires_in_s=%.0f pod=%s",
                                 self._provider,
                                 idx + 1,
                                 count,
-                                max(0.0, _creds_expires_at(refreshed) - time.time()),
-                                _creds_refresh_token(pre_refresh)
-                                != _creds_refresh_token(refreshed),
-                                "committed" if persisted else "not_committed",
+                                self.fingerprint(pre_refresh.get("refresh_token")),
+                                _creds_expires_at(pre_refresh) - time.time(),
+                                self._process_identity(),
                             )
+                            try:
+                                refreshed = await self._refresh_one(cred)
+                            except Exception as exc:
+                                self._refresh_failed_until[idx] = time.time() + (
+                                    self._permanent_refresh_cooldown_seconds()
+                                    if self._is_permanent_refresh_error(exc)
+                                    else self._refresh_failure_cooldown_seconds()
+                                )
+                                self._log_refresh_failure(idx, exc)
+                                if self._is_expired(cred):
+                                    continue
+                            else:
+                                self._creds[idx] = refreshed
+                                self._refresh_failed_until.pop(idx, None)
+                                targets_label = await self._persist(pre_refresh, refreshed)
+                                token = _creds_access_token(refreshed)
+                                committed = any(
+                                    part.endswith("committed")
+                                    for part in targets_label.split("+")
+                                )
+                                logger.info(
+                                    "oauth refresh succeeded provider=%s credential_index=%d/%d "
+                                    "expires_in_s=%.0f refresh_token_rotated=%s persistence=%s "
+                                    "targets=%s refresh_fp=%s->%s pod=%s",
+                                    self._provider,
+                                    idx + 1,
+                                    count,
+                                    max(0.0, _creds_expires_at(refreshed) - time.time()),
+                                    _creds_refresh_token(pre_refresh)
+                                    != _creds_refresh_token(refreshed),
+                                    "committed" if committed else "not_committed",
+                                    targets_label,
+                                    self.fingerprint(_creds_refresh_token(pre_refresh)),
+                                    self.fingerprint(_creds_refresh_token(refreshed)),
+                                    self._process_identity(),
+                                )
                     elif self._is_expired(cred):
                         # Do not retry a known-bad refresh on every request
                         # and do not forward an access token that is dead.
@@ -1226,14 +1407,23 @@ class CodexTokenRotator:
 
     def _log_refresh_failure(self, index: int, exc: BaseException) -> None:
         """Log OAuth failure metadata without logging token-bearing details."""
+        cred = self._creds[index] if 0 <= index < len(self._creds) else None
+        access_age_s = (
+            time.time() - _creds_expires_at(cred) if cred and _creds_expires_at(cred) else None
+        )
         logger.warning(
-            "oauth refresh failed provider=%s credential_index=%s status=%s code=%s retryable=%s",
+            "oauth refresh failed provider=%s credential_index=%s status=%s code=%s "
+            "retryable=%s refresh_fp=%s access_age_s=%s pod=%s",
             self._provider,
             index + 1 if index >= 0 else index,
             getattr(exc, "status", None),
             getattr(exc, "code", None),
             getattr(exc, "retryable", None),
+            self.fingerprint(_creds_refresh_token(cred) if cred else None),
+            f"{access_age_s:.0f}" if access_age_s is not None else "-",
+            self._process_identity(),
         )
+
 
     @classmethod
     def _is_near_expiry(cls, cred: dict[str, Any]) -> bool:
@@ -1245,58 +1435,65 @@ class CodexTokenRotator:
         expires_at = _creds_expires_at(cred)
         return bool(expires_at and time.time() >= expires_at)
 
-    async def _persist(self, expected: dict[str, Any], replacement: dict[str, Any]) -> bool:
-        """Persist a refreshed credential.
+    async def _persist(self, expected: dict[str, Any], replacement: dict[str, Any]) -> str:
+        """Persist a refreshed credential to every configured target.
 
-        DB-authoritative mode (``persist_credentials`` callback set):
-        compare-and-swap write of the refreshed credential into the
-        encrypted store, offloaded to a worker thread. Await completion so a
-        successful refresh is not reported before its rotated token is
-        durably written. A CAS miss means another writer replaced the row;
-        keep this process's in-memory token but report the conflict.
+        Dual-write: the encrypted DB (CAS) and the legacy auth.json file are
+        independent targets. Each outcome is logged and reported; a failure
+        on one target never blocks the other. In DB-authoritative mode
+        ``auth_file`` is None, so only the DB target applies.
 
-        Legacy mode: write the pool back to the Hermes auth file.
+        Returns a "+-joined" outcome label, for example
+        ``db_committed+file_committed``.
         """
+        outcomes: list[str] = []
         persist = self._persist_credentials
         if persist is not None:
             expected_snap = dict(expected)
             replacement_snap = dict(replacement)
             provider = self._provider
-
             try:
                 committed = await asyncio.to_thread(
                     persist, provider, expected_snap, replacement_snap
                 )
             except Exception:
                 logger.exception(
-                    "oauth credential DB persistence failed provider=%s outcome=exception",
+                    "oauth credential DB persistence failed provider=%s outcome=exception pod=%s",
                     provider,
+                    self._process_identity(),
                 )
-                return False
-            if not committed:
-                logger.error(
-                    "oauth credential CAS did not commit provider=%s outcome=conflict_or_missing",
-                    provider,
-                )
-            return bool(committed)
-        if not self._auth_file:
-            return True
-        try:
-            from tusker_gateway.copilot_enroll import save_provider_auth_pool
+                outcomes.append("db_error")
+            else:
+                outcomes.append("db_committed" if committed else "db_conflict_or_missing")
+                if not committed:
+                    logger.error(
+                        "oauth credential CAS did not commit provider=%s "
+                        "outcome=conflict_or_missing refresh_fp=%s pod=%s",
+                        provider,
+                        self.fingerprint(_creds_refresh_token(expected)),
+                        self._process_identity(),
+                    )
+        if self._auth_file:
+            try:
+                from tusker_gateway.copilot_enroll import save_provider_auth_pool
 
-            await asyncio.to_thread(
-                save_provider_auth_pool,
-                self._provider,
-                self._creds,
-                self._auth_file,
-            )
-        except Exception:
-            logger.exception(
-                "oauth credential persistence failed provider=%s",
-                self._provider,
-            )
-            return False
-        return True
+                await asyncio.to_thread(
+                    save_provider_auth_pool,
+                    self._provider,
+                    self._creds,
+                    self._auth_file,
+                )
+                outcomes.append("file_committed")
+            except Exception:
+                logger.exception(
+                    "oauth credential auth.json persistence failed provider=%s pod=%s",
+                    self._provider,
+                    self._process_identity(),
+                )
+                outcomes.append("file_error")
+        if not outcomes:
+            outcomes.append("memory_only")
+        return "+".join(outcomes)
 
     def _canary_skip_rotation(self, cred: dict[str, Any]) -> bool:
         """Return True when canary policy forbids rotating this credential.
@@ -1574,7 +1771,9 @@ class PassthroughClient:
         persist_callback = config.get("_persist_credentials")
         if persist_callback is not None and not callable(persist_callback):
             persist_callback = None
-        # Request handlers are short-lived, but credential cursors must be
+        load_callback = config.get("_load_oauth_credentials")
+        if load_callback is not None and not callable(load_callback):
+            load_callback = None
         # process-wide. Reuse the rotators assembled during app startup when
         # available; otherwise retain the standalone/test fallback below.
         self._credential_rotators: dict[str, CodexTokenRotator] = {}
@@ -1582,7 +1781,6 @@ class PassthroughClient:
         self._credential_pools_configured = isinstance(configured_pools, dict)
         if isinstance(credential_rotators, dict):
             self._credential_rotators = credential_rotators
-            self._credential_pools_configured = True
             self._codex_rotator = self._credential_rotators.get("openai-codex")
             if self._codex_rotator is None:
                 self._codex_rotator = CodexTokenRotator(
@@ -1591,6 +1789,7 @@ class PassthroughClient:
                     http_client=http_client,
                     provider="openai-codex",
                     persist_credentials=persist_callback,
+                    load_credentials=load_callback,
                     secrets_authoritative=secrets_authoritative,
                 )
                 self._credential_rotators["openai-codex"] = self._codex_rotator
@@ -1612,6 +1811,7 @@ class PassthroughClient:
                     http_client=http_client,
                     provider=provider_key,
                     persist_credentials=persist_callback,
+                    load_credentials=load_callback,
                     secrets_authoritative=secrets_authoritative,
                 )
 
@@ -1623,6 +1823,7 @@ class PassthroughClient:
                 http_client=http_client,
                 provider="openai-codex",
                 persist_credentials=persist_callback,
+                load_credentials=load_callback,
                 secrets_authoritative=secrets_authoritative,
             )
 

@@ -685,3 +685,202 @@ def test_rotator_classifies_invalid_grant_as_permanent():
         code="server_error",
     )
     assert CodexTokenRotator._is_permanent_refresh_error(server_err) is False
+
+@pytest.mark.asyncio
+async def test_rotator_with_refresh_disabled_never_calls_oauth_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Read-only rotators must not consume shared single-use refresh tokens.
+
+    Standalone qualification jobs build rotators with ``refresh_enabled=False``
+    so they cannot kill the credential pool even when no persistence target
+    is wired.
+    """
+    import tusker_gateway.codex_oauth as codex_oauth
+    from tusker_gateway.passthrough import CodexTokenRotator
+
+    refresh = AsyncMock(
+        side_effect=AssertionError("refresh must not be called for a read-only rotator")
+    )
+    monkeypatch.setattr(codex_oauth, "refresh_codex_token", refresh)
+
+    rotator = CodexTokenRotator(
+        [{
+            "access_token": "valid-access",
+            "refresh_token": "shared-refresh",
+            "expires_at_ms": int((time.time() + 3600) * 1000),
+        }],
+        http_client=object(),
+        provider="openai-codex",
+        refresh_enabled=False,
+    )
+
+    token = await rotator.get_token()
+    assert token == "valid-access"
+    refresh.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_rotator_persists_to_both_db_callback_and_auth_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A successful refresh writes to the DB AND to the Hermes auth.json.
+
+    The DB persist is CAS; the file persist is merge-preserving so other
+    providers keep their existing entries.
+    """
+    import logging
+
+    import tusker_gateway.codex_oauth as codex_oauth
+    from tusker_gateway.passthrough import CodexTokenRotator
+
+    refresh = AsyncMock(
+        return_value=(
+            {"access_token": "new-access", "refresh_token": "new-refresh"},
+            time.time() + 3600,
+        )
+    )
+    monkeypatch.setattr(codex_oauth, "refresh_codex_token", refresh)
+
+    auth_file = tmp_path / "auth.json"
+    auth_file.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "credential_pool": {
+                    "openai-codex": [],
+                    "copilot": [{"id": "copilot-keep"}],
+                },
+            }
+        )
+    )
+    db_writes: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
+
+    def persist(provider: str, expected: dict[str, Any], replacement: dict[str, Any]) -> bool:
+        db_writes.append((provider, expected, replacement))
+        return True
+
+    rotator = CodexTokenRotator(
+        [{
+            "label": "dual-account",
+            "access_token": "old-access",
+            "refresh_token": "old-refresh",
+            "expires_at_ms": int((time.time() - 60) * 1000),
+        }],
+        auth_file=str(auth_file),
+        http_client=object(),
+        provider="openai-codex",
+        persist_credentials=persist,
+    )
+
+    with caplog.at_level(logging.INFO, logger="tusker_gateway.passthrough"):
+        token = await rotator.get_token()
+
+    assert token == "new-access"
+    assert len(db_writes) == 1
+    saved = json.loads(auth_file.read_text())
+    assert saved["credential_pool"]["copilot"] == [{"id": "copilot-keep"}]
+    assert saved["credential_pool"]["openai-codex"][0]["refresh_token"] == "new-refresh"
+    assert "targets=" in caplog.text
+    assert "refresh_token_rotated=True" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_rotator_adopts_fresher_credential_from_store_before_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Adopt a credential another pod already rotated instead of refreshing.
+
+    Without adoption, two pods rolling through OAuth refresh would each
+    consume the shared refresh token, leaving the second with a 401 and
+    ``refresh_token_reused``.
+    """
+    import logging
+
+    import tusker_gateway.codex_oauth as codex_oauth
+    from tusker_gateway.passthrough import CodexTokenRotator
+
+    refresh = AsyncMock(
+        side_effect=AssertionError(
+            "refresh must not run when store already holds a newer credential"
+        )
+    )
+    monkeypatch.setattr(codex_oauth, "refresh_codex_token", refresh)
+
+    in_memory_cred = {
+        "account_id": "acct-A",
+        "access_token": "expired-access",
+        "refresh_token": "old-refresh",
+        "expires_at_ms": int((time.time() - 60) * 1000),
+    }
+    stored_pool = [
+        {
+            "account_id": "acct-A",
+            "access_token": "fresh-access",
+            "refresh_token": "rotated-refresh",
+            "expires_at_ms": int((time.time() + 3600) * 1000),
+        }
+    ]
+
+    def load(_provider: str) -> list[dict[str, Any]]:
+        return stored_pool
+
+    rotator = CodexTokenRotator(
+        [in_memory_cred],
+        http_client=object(),
+        provider="openai-codex",
+        load_credentials=load,
+    )
+
+    with caplog.at_level(logging.INFO, logger="tusker_gateway.passthrough"):
+        token = await rotator.get_token()
+
+    assert token == "fresh-access"
+    refresh.assert_not_awaited()
+    assert "oauth credential adopted from store" in caplog.text
+    assert rotator._creds[0]["refresh_token"] == "rotated-refresh"
+
+
+@pytest.mark.asyncio
+async def test_rotator_initialised_log_redacts_tokens(caplog: pytest.LogCaptureFixture) -> None:
+    """Initial rotator state must show fingerprints, never raw tokens."""
+    import logging
+
+    from tusker_gateway.passthrough import CodexTokenRotator
+
+    # Construction is inside the capture scope: the initialised log line is
+    # emitted from __init__, before any request touches the rotator.
+    with caplog.at_level(logging.INFO, logger="tusker_gateway.passthrough"):
+        rotator = CodexTokenRotator(
+            [
+                {
+                    "access_token": "sensitive-access",
+                    "refresh_token": "sensitive-refresh",
+                    "expires_at_ms": int((time.time() + 3600) * 1000),
+                },
+                {
+                    "access_token": "other-access",
+                    "refresh_token": "other-refresh",
+                    "expires_at_ms": int((time.time() + 3600) * 1000),
+                },
+            ],
+            http_client=object(),
+            provider="openai-codex",
+        )
+        await rotator.get_token()
+
+    init_log = [
+        record.message
+        for record in caplog.records
+        if "oauth rotator initialized" in record.message
+    ]
+    assert init_log, "expected an initialised log line"
+    line = init_log[0]
+    assert "sensitive-access" not in line
+    assert "sensitive-refresh" not in line
+    assert "other-access" not in line
+    assert "refresh_fps=" in line
+    assert "access_fps=" in line

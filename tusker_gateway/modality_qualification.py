@@ -246,10 +246,15 @@ def _catalog_registry(
             credentials = credential_pools.get(provider)
             if client is None or not isinstance(credentials, list) or not credentials:
                 continue
+            # Read-only token source: a standalone qualification job must
+            # never consume the shared single-use Codex refresh token —
+            # the rotated result could not be persisted here and would
+            # kill the credential for the gateway (refresh_token_reused).
             rotator = CodexTokenRotator(
                 credentials,
                 http_client=session,
                 provider=provider,
+                refresh_enabled=False,
             )
             client.set_token_source(rotator.get_token)
     return registry

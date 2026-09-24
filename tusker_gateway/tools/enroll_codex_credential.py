@@ -1,10 +1,9 @@
 """Enroll a Codex OAuth credential directly into the gateway's config store.
 
-Runs OpenAI's device-code flow from inside the gateway process and writes the
-resulting credential straight into ``tusker_config_oauth_credentials`` — the
-database is the only place the credential lands.  Nothing is written to
-``auth.json`` or any other file, so a credential enrolled here is owned solely
-by the gateway.
+Runs OpenAI's device-code flow and writes the resulting credential into
+``tusker_config_oauth_credentials`` (the primary store) and, best-effort, to
+the Hermes ``auth.json`` so file-based consumers stay in sync. The DB write
+is authoritative; an auth.json failure only logs a warning.
 
 Usage (inside the gateway pod, where the config DB and encryption key exist)::
 
@@ -23,8 +22,10 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import sys
 import time
+from pathlib import Path
 from typing import Any
 
 from tusker_gateway.codex_oauth import CodexOAuthError, codex_token_profile, issue_codex_device_token
@@ -424,6 +425,29 @@ def main(argv: list[str] | None = None) -> int:
         f"\nPersisted to the config store (generation {store.generation}); "
         "the gateway hot-reloads it without a restart."
     )
+
+    # Best-effort dual-write to the Hermes auth.json so file-based consumers
+    # (and the next gateway restart) see the freshly enrolled credential even
+    # if the DB store is unavailable or not yet authoritative. Errors are
+    # logged but never fail the enrollment: the DB is the primary store.
+    #
+    # Only fires when TUSKER_AUTH_FILE points at an explicit path. Without an
+    # explicit value the operator has not opted into a file-based mirror, so
+    # we skip — otherwise we'd silently write to ~/.hermes/auth.json on the
+    # test workstation or any non-managed deployment, creating drift the
+    # operator never asked for.
+    auth_file = os.environ.get("TUSKER_AUTH_FILE")
+    if auth_file:
+        try:
+            from tusker_gateway.copilot_enroll import save_provider_auth_pool
+
+            save_provider_auth_pool(PROVIDER, updated, auth_file)
+            logger.info("enrolled credential mirrored to auth.json path=%s", auth_file)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "auth.json mirror after enrollment failed path=%s error=%s",
+                auth_file, exc,
+            )
     return 0
 
 

@@ -1225,6 +1225,35 @@ class ConfigStore:
             return None
         return self._cas_persist_credentials
 
+    def load_oauth_credentials(self, provider: str) -> list[dict[str, Any]] | None:
+        """Return the stored credential list for ``provider``, or None.
+
+        None means "no row / unreadable" — distinct from an empty list.
+        The token rotator uses this to adopt a credential another process
+        already rotated instead of refreshing the same refresh token twice
+        (a second refresh would fail with ``refresh_token_reused``).
+        """
+        if not self._managed:
+            return None
+        name = str(provider).strip().lower()
+        try:
+            with self._conn as conn:
+                cur = conn.execute(
+                    "SELECT credentials FROM tusker_config_oauth_credentials "
+                    "WHERE provider = ?",
+                    (name,),
+                )
+                row = cur.fetchone()
+                if row is None or not row[0]:
+                    return None
+                decoded = json.loads(self._decrypt(conn, row[0]))
+                return decoded if isinstance(decoded, list) else None
+        except Exception:
+            logger.debug(
+                "oauth credential store read failed provider=%s", name, exc_info=True
+            )
+            return None
+
     def _cas_persist_credentials(
         self, provider: str, expected: dict[str, Any], replacement: dict[str, Any]
     ) -> bool:
@@ -1236,6 +1265,11 @@ class ConfigStore:
         caller can distinguish them from a genuine compare-and-swap conflict.
         """
         name = str(provider).strip().lower()
+        # Match every other writer: guarantee the schema is present before
+        # we touch the table. A pod that never ran a config reload before
+        # its first refresh (no load path has fired yet) would otherwise
+        # fail with ``no such table`` and drop the rotated token silently.
+        self._ensure_db()
         with self._conn as conn:
             # Read current row
             cur = conn.execute(
@@ -1245,7 +1279,19 @@ class ConfigStore:
             )
             row = cur.fetchone()
             if row is None:
-                return False
+                # First persist for this provider: seed the row instead of
+                # dropping the rotated token. Without this, a pool that has
+                # never been written through the admin API silently loses
+                # every rotation ("CAS miss") and auth.json/DB stay stale.
+                encrypted = self._encrypt(conn, json.dumps([replacement]))
+                conn.execute(
+                    "INSERT INTO tusker_config_oauth_credentials "
+                    "(provider, credentials) VALUES (?, ?)",
+                    (name, encrypted),
+                )
+                self._bump_generation(conn)
+                self._refresh_after_write()
+                return True
             current = json.loads(self._decrypt(conn, row[0]))
             if not isinstance(current, list):
                 current = []

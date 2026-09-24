@@ -234,10 +234,13 @@ class ConfigRuntime:
             return
         old_cfg = self._app.get("config", {})
         new_cfg = store.runtime_config(old_cfg)
-        # Expose the store's CAS persistence callback so PassthroughClient
-        # (which reads request.app["config"]) can wire rotators to persist
-        # refreshed credentials back to the DB without importing the store.
+        # Expose the store's CAS persistence and credential-read callbacks so
+        # PassthroughClient (which reads request.app["config"]) can wire
+        # rotators to persist refreshed credentials back to the DB — and to
+        # adopt a credential another pod already rotated — without importing
+        # the store.
         new_cfg["_persist_credentials"] = getattr(store, "persist_credentials", None)
+        new_cfg["_load_oauth_credentials"] = getattr(store, "load_oauth_credentials", None)
         # Validate: build the new pool manager off-loop visible state first.
         # A failure here aborts the apply before anything is published.
         from tusker_gateway.pools import PoolManager
@@ -408,6 +411,7 @@ class ConfigRuntime:
         existing: dict[str, Any] = dict(self._app.get("credential_rotators", {}))
         new_providers = set(configured.keys())
         old_providers = set(existing.keys())
+        load_cb = getattr(store, "load_oauth_credentials", None)
         auth_file = new_cfg.get("auth_file")
         persist_cb = getattr(store, "persist_credentials", None)
         creds_authoritative = bool(new_cfg.get("config_db_credentials_authoritative"))
@@ -434,12 +438,12 @@ class ConfigRuntime:
                     continue
             if rot is None:
                 from tusker_gateway.passthrough import CodexTokenRotator
-                provider_auth = auth_file if provider == "openai-codex" else None
                 rot = CodexTokenRotator(
                     clean,
                     auth_file=provider_auth,
                     provider=provider,
                     persist_credentials=persist_cb,
+                    load_credentials=load_cb,
                     secrets_authoritative=creds_authoritative,
                 )
                 session = self._app.get("http_session")
