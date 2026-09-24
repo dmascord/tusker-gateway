@@ -94,6 +94,32 @@ async def test_text_result_parses_opencode_json_event_stream(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_opencode_stream_uses_incremental_json_event_reader(monkeypatch):
+    from tusker_gateway.provider_adapters import cli_streaming
+
+    monkeypatch.setenv("TUSKER_OPENCODE_CLI_ENABLED", "true")
+    marker = object()
+    captured = {}
+
+    def stream(command, **kwargs):
+        captured.update(command=command, **kwargs)
+        return marker
+
+    monkeypatch.setattr(cli_streaming, "stream_cli_jsonl", stream)
+    with patch("tusker_gateway.provider_adapters.opencode_cli.shutil.which", return_value="/opt/opencode"):
+        result = await OpenCodeCLIAdapter().chat(
+            provider="opencode-cli", model="big-pickle",
+            messages=[{"role": "user", "content": "hello"}], stream=True,
+        )
+    assert result is marker
+    assert captured["command"] == [
+        "/opt/opencode", "run", "--standalone", "--format", "json",
+        "--model", "opencode/big-pickle",
+    ]
+    assert captured["text_extractor"].__name__ == "text_from_event"
+
+
+@pytest.mark.asyncio
 async def test_explicit_opencode_api_key_is_forwarded_without_aliasing_zen_key(monkeypatch):
     monkeypatch.setenv("TUSKER_OPENCODE_CLI_ENABLED", "true")
     monkeypatch.setenv("OPENCODE_API_KEY", "explicit-cli-key")

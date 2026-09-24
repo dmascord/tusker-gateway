@@ -32,10 +32,12 @@ approve, and execute. On the next turn, the assistant call and client tool
 result are replayed as history. Tool-bearing runs use `dontAsk` with a strict
 MCP config and allow only this gateway MCP server; text-only runs use plan
 mode. Images and other multimodal message content remain unsupported and are
-rejected rather than silently dropped. Streaming requests currently receive
-OpenAI SSE after the CLI has completed; gateway heartbeat behavior remains
-available while the process runs. CLI token deltas are not yet streamed
-incrementally.
+rejected rather than silently dropped. Streaming requests use Claude Code's
+`stream-json` partial-message output and forward assistant text deltas as
+OpenAI SSE while the CLI is still running. Lifecycle and diagnostic events
+are not exposed as assistant text; CLI errors after a stream starts are sent
+in-band. Gateway heartbeat behavior keeps the client connection active while
+the CLI is waiting for its first text delta.
 
 The gateway image includes a pinned Claude Code CLI executable (currently
 2.1.281). The image does not include or provision credentials. In production,
@@ -73,8 +75,9 @@ cannot be renewed. The gateway does not promise unattended refresh for every
 account type. If an actual request receives an explicit auth-expiry failure,
 the gateway returns an OpenAI-compatible HTTP 503 error with code
 `claude_auth_required` and directs the client to ask an administrator to run
-the login helper. CLI output is buffered until completion, so this error is
-sent before the response stream starts; no separate push channel is needed.
+the login helper. Non-streaming requests receive this as an HTTP error;
+streaming requests receive it in-band if Claude reports it after the SSE
+response has started.
 Auth expiry is not recorded as provider/model health failure or quarantine.
 
 ## OpenCode CLI
@@ -108,6 +111,9 @@ gateway image includes the pinned OpenCode v2 CLI executable (currently
 Set `TUSKER_OPENCODE_CLI_PATH` when an operator-managed installation should
 be used instead. OpenCode Zen may still reject CLI/API use based on account or
 service policy; the adapter does not bypass those restrictions.
+For streaming requests, JSON text events are forwarded incrementally as
+OpenAI SSE; other CLI lifecycle/diagnostic events are not presented as model
+content, and the gateway heartbeat remains active while awaiting output.
 
 ## Kilo Code CLI
 
@@ -128,8 +134,11 @@ project config, denies tools by default, and exposes only request-scoped MCP
 proxies for client-declared tools. The proxy returns an OpenAI tool call to
 the connected harness; it never executes that call. Like the other CLI
 adapters, Kilo is local/non-ZDR. Production explicitly includes
-`kilo-cli/kilo/kilo-auto/free` in the code pool; streaming is returned after
-the CLI completes rather than as incremental token deltas.
+`kilo-cli/kilo/kilo-auto/free` in the code pool. For streaming requests, the
+adapter reads JSON events as they arrive and forwards assistant text deltas
+as OpenAI SSE; lifecycle and diagnostic events are filtered out. Tool calls
+continue to be returned as normal OpenAI tool-call deltas. The gateway
+heartbeat stays active while waiting for the first CLI text event.
 In Kubernetes, the gateway forwards Kilo requests to the dedicated
 `tusker-kilo-worker` service, pinned to node `visor` and isolated by a
 NetworkPolicy that permits ingress only from the gateway pod. The worker has

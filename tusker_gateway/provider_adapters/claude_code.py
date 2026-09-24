@@ -266,6 +266,63 @@ class ClaudeCodeCLIAdapter:
         prompt = _prompt(messages, has_tools=bool(tool_manifest), tool_choice=tool_choice)
         # Keep the child environment allowlisted (no gateway/provider secrets).
         env = _cli_env()
+        if stream:
+            from tusker_gateway.provider_adapters.cli_streaming import (
+                claude_text_from_event,
+                stream_cli_jsonl,
+            )
+
+            def stream_error(event: dict[str, Any]) -> Exception | None:
+                if event.get("type") != "result" or not event.get("is_error"):
+                    return None
+                message = event.get("result") if isinstance(event.get("result"), str) else ""
+                if event.get("api_error_status") == 401 or _auth_error_indicated(message):
+                    return ClaudeAuthRequiredError()
+                return ProviderError(
+                    "Claude Code CLI could not complete the request; check its local login and account status",
+                    code="claude_code_cli_failed",
+                )
+
+            temp_dir = Path(tempfile.mkdtemp(prefix="tusker-claude-stream-"))
+            command = [
+                resolved, "-p", "--output-format", "stream-json", "--verbose",
+                "--include-partial-messages", "--model", cli_model,
+                "--tools", "", "--permission-mode",
+                "dontAsk" if tool_manifest else "plan",
+                "--permission-prompts", "none", "--no-session-persistence",
+            ]
+            call_file: Path | None = None
+            if tool_manifest:
+                manifest_file = temp_dir / "tools.json"
+                call_file = temp_dir / "tool-call.json"
+                mcp_config = temp_dir / "mcp.json"
+                manifest_file.write_text(json.dumps(tool_manifest), encoding="utf-8")
+                mcp_env = {
+                    "TUSKER_MCP_MANIFEST": str(manifest_file),
+                    "TUSKER_MCP_CALL_FILE": str(call_file),
+                }
+                mcp_config.write_text(json.dumps({
+                    "mcpServers": {
+                        "gateway": {
+                            "command": sys.executable,
+                            "args": ["-m", "tusker_gateway.provider_adapters.mcp_stdio"],
+                            "env": mcp_env,
+                        },
+                    },
+                }), encoding="utf-8")
+                command.extend([
+                    "--mcp-config", str(mcp_config), "--strict-mcp-config",
+                    "--allowedTools", "mcp__gateway__*",
+                ])
+            timeout = max(10.0, float(os.environ.get("TUSKER_CLAUDE_CODE_TIMEOUT_SECS", "600")))
+            return stream_cli_jsonl(
+                command, env=env, prompt=prompt.encode(), model=model, timeout=timeout,
+                text_extractor=claude_text_from_event, event_error_extractor=stream_error,
+                call_file=call_file,
+                cleanup_dir=temp_dir, error_code="claude_code_cli_failed",
+                timeout_message="Claude Code CLI request timed out",
+            )
+
         with tempfile.TemporaryDirectory(prefix="tusker-claude-") as temp_name:
             temp_dir = Path(temp_name)
             command = [

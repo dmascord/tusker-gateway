@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from typing import Any
@@ -45,11 +46,14 @@ async def chat(request: web.Request) -> web.Response:
     adapter = KiloCLIAdapter()
     async with _CONCURRENCY:
         try:
+            response_model = body.get("public_model")
+            if not isinstance(response_model, str) or not response_model.startswith("kilo-cli/"):
+                response_model = model
             result: Any = await adapter.chat(
                 provider="kilo-cli",
-                model=model,
+                model=response_model,
                 messages=messages,
-                stream=False,
+                stream=body.get("stream") is True,
                 tools=body.get("tools"),
                 tool_choice=body.get("tool_choice"),
             )
@@ -65,6 +69,28 @@ async def chat(request: web.Request) -> web.Response:
                 {"error": {"code": "kilo_worker_failed", "message": "Kilo worker request failed"}},
                 status=502,
             )
+        if hasattr(result, "__aiter__"):
+            response = web.StreamResponse(
+                status=200,
+                headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"},
+            )
+            await response.prepare(request)
+            try:
+                async for frame in result:
+                    await response.write(frame)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("Kilo stream failed: %s", getattr(exc, "code", type(exc).__name__))
+                error = {
+                    "error": {
+                        "message": str(exc) or "Kilo stream failed",
+                        "type": "provider_error",
+                        "code": getattr(exc, "code", "kilo_worker_failed"),
+                    },
+                }
+                await response.write(f"data: {json.dumps(error)}\n\ndata: [DONE]\n\n".encode())
+            return response
     return web.json_response(result)
 
 

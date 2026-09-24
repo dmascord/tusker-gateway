@@ -95,6 +95,11 @@ class KiloCLIAdapter:
         cli_model = _model_for_cli(model)
         worker_url = os.environ.get("TUSKER_KILO_WORKER_URL", "").strip()
         if worker_url:
+            if stream:
+                return self._worker_stream_chat(
+                    worker_url=worker_url, model=model, cli_model=cli_model,
+                    messages=messages, tools=tools, tool_choice=tool_choice,
+                )
             return await self._worker_chat(
                 worker_url=worker_url,
                 model=model,
@@ -134,6 +139,38 @@ class KiloCLIAdapter:
             value = os.environ.get(name)
             if value:
                 env[name] = value
+
+        if stream:
+            from tusker_gateway.provider_adapters.cli_streaming import stream_cli_jsonl, text_from_event
+
+            temp_dir = Path(tempfile.mkdtemp(prefix="tusker-kilo-stream-"))
+            call_file: Path | None = None
+            config: dict[str, Any] = {"permission": {"*": "deny"}, "plugin": []}
+            if tool_manifest:
+                manifest_file = temp_dir / "tools.json"
+                call_file = temp_dir / "tool-call.json"
+                manifest_file.write_text(json.dumps(tool_manifest), encoding="utf-8")
+                config["mcp"] = {
+                    "gateway": {
+                        "type": "local",
+                        "command": [sys.executable, "-m", "tusker_gateway.provider_adapters.mcp_stdio"],
+                        "environment": {
+                            "TUSKER_MCP_MANIFEST": str(manifest_file),
+                            "TUSKER_MCP_CALL_FILE": str(call_file),
+                        },
+                        "timeout": 120000,
+                    },
+                }
+                for item in tool_manifest:
+                    config["permission"][f"gateway_{item['mcp_name']}"] = "allow"
+            env["KILO_CONFIG_CONTENT"] = json.dumps(config, separators=(",", ":"))
+            command = [resolved, "run", "--pure", "--format", "json", "--model", cli_model]
+            timeout = max(10.0, float(os.environ.get("TUSKER_KILO_CLI_TIMEOUT_SECS", "600")))
+            return stream_cli_jsonl(
+                command, env=env, prompt=prompt.encode(), model=model, timeout=timeout,
+                text_extractor=text_from_event, call_file=call_file, cleanup_dir=temp_dir,
+                error_code="kilo_cli_failed", timeout_message="Kilo CLI request timed out",
+            )
 
         with tempfile.TemporaryDirectory(prefix="tusker-kilo-") as temp_name:
             temp_dir = Path(temp_name)
@@ -291,6 +328,52 @@ class KiloCLIAdapter:
             raise ProviderError("Kilo worker returned an invalid completion", code="invalid_upstream_response")
         payload["model"] = model
         return ClaudeCodeCLIAdapter._stream_completion(payload, stream) if stream else payload
+
+    @staticmethod
+    def _worker_stream_chat(
+        *, worker_url: str, model: str, cli_model: str,
+        messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None,
+        tool_choice: Any,
+    ):
+        """Keep the worker HTTP stream open and relay its OpenAI SSE bytes."""
+        import aiohttp
+
+        async def events():
+            timeout = max(10.0, float(os.environ.get("TUSKER_KILO_CLI_TIMEOUT_SECS", "600")))
+            request = {
+                "model": cli_model, "messages": messages, "tools": tools,
+                "tool_choice": tool_choice, "stream": True, "public_model": model,
+            }
+            try:
+                async with aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=timeout),
+                ) as session:
+                    async with session.post(
+                        urljoin(worker_url.rstrip("/") + "/", "v1/chat/completions"),
+                        json=request,
+                    ) as response:
+                        if response.status >= 400:
+                            try:
+                                payload = await response.json()
+                            except (ValueError, aiohttp.ContentTypeError):
+                                payload = {}
+                            error = payload.get("error", {}) if isinstance(payload, dict) else {}
+                            raise ProviderError(
+                                error.get("message", "Kilo worker request failed")
+                                if isinstance(error, dict) else "Kilo worker request failed",
+                                code=error.get("code", "kilo_worker_failed")
+                                if isinstance(error, dict) else "kilo_worker_failed",
+                            )
+                        async for chunk in response.content.iter_any():
+                            if chunk:
+                                yield chunk
+            except asyncio.TimeoutError as exc:
+                raise ProviderError("Kilo worker request timed out", code="upstream_timeout") from exc
+            except aiohttp.ClientError as exc:
+                logger.warning("kilo worker stream unavailable: %s", type(exc).__name__)
+                raise ProviderError("Kilo worker is unavailable", code="kilo_worker_unavailable") from exc
+
+        return events()
 
     @staticmethod
     def _extract_text(stdout: bytes) -> str | None:

@@ -98,6 +98,29 @@ async def test_kilo_text_request_uses_headless_json_cli(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_kilo_stream_uses_incremental_json_event_reader(monkeypatch):
+    from tusker_gateway.provider_adapters import cli_streaming
+
+    monkeypatch.setenv("TUSKER_KILO_CLI_ENABLED", "true")
+    marker = object()
+    captured = {}
+
+    def stream(command, **kwargs):
+        captured.update(command=command, **kwargs)
+        return marker
+
+    monkeypatch.setattr(cli_streaming, "stream_cli_jsonl", stream)
+    with patch("tusker_gateway.provider_adapters.kilo_cli.shutil.which", return_value="/opt/kilo"):
+        result = await KiloCLIAdapter().chat(
+            provider="kilo-cli", model="kilo/kilo-auto/free",
+            messages=[{"role": "user", "content": "hello"}], stream=True,
+        )
+    assert result is marker
+    assert captured["command"][:5] == ["/opt/kilo", "run", "--pure", "--format", "json"]
+    assert captured["text_extractor"].__name__ == "text_from_event"
+
+
+@pytest.mark.asyncio
 async def test_kilo_client_tools_are_only_exposed_as_request_scoped_mcp(monkeypatch):
     monkeypatch.setenv("TUSKER_KILO_CLI_ENABLED", "1")
 

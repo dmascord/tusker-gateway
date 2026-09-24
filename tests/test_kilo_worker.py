@@ -72,6 +72,33 @@ async def test_worker_forwards_allowed_tool_requests_without_execution(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_worker_relays_incremental_cli_sse(monkeypatch):
+    async def chunks():
+        yield b'data: {"choices":[{"delta":{"content":"first"}}]}\n\n'
+        yield b'data: [DONE]\n\n'
+
+    run = AsyncMock(return_value=chunks())
+    monkeypatch.setattr(kilo_worker.KiloCLIAdapter, "chat", run)
+    client = TestClient(TestServer(kilo_worker.create_app()))
+    await client.start_server()
+    try:
+        response = await client.post("/v1/chat/completions", json={
+            "model": "kilo/kilo-auto/free",
+            "public_model": "kilo-cli/kilo/kilo-auto/free",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": True,
+        })
+        assert response.status == 200
+        assert response.headers["Content-Type"].startswith("text/event-stream")
+        assert b'"content":"first"' in await response.read()
+        run.assert_awaited_once()
+        assert run.await_args.kwargs["model"] == "kilo-cli/kilo/kilo-auto/free"
+        assert run.await_args.kwargs["stream"] is True
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
 async def test_gateway_kilo_adapter_proxies_to_worker_and_restores_public_model(monkeypatch):
     seen = {}
 

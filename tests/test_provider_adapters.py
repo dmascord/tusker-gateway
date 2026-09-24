@@ -38,6 +38,36 @@ class _FakeProcess:
         return self.returncode
 
 
+class _FakeWriter:
+    def write(self, _data):
+        pass
+
+    async def drain(self):
+        pass
+
+    def close(self):
+        pass
+
+
+class _FakeReader:
+    def __init__(self, data: bytes):
+        self._lines = list(data.splitlines(keepends=True)) + [b""]
+
+    async def readline(self):
+        return self._lines.pop(0) if self._lines else b""
+
+    async def read(self):
+        return b"".join(self._lines)
+
+
+class _FakeStreamingProcess(_FakeProcess):
+    def __init__(self, stdout: bytes, stderr: bytes = b"", returncode: int = 0):
+        super().__init__(stdout, stderr, returncode)
+        self.stdin = _FakeWriter()
+        self.stdout = _FakeReader(stdout)
+        self.stderr = _FakeReader(stderr)
+
+
 @pytest.mark.asyncio
 async def test_claude_cli_is_registered_as_local_provider():
     assert provider_adapters.get("claude-code-cli") is not None
@@ -179,41 +209,58 @@ async def test_cli_invokes_allowlisted_model_and_converts_result(monkeypatch):
 @pytest.mark.asyncio
 async def test_cli_stream_result_uses_openai_sse_and_done(monkeypatch):
     monkeypatch.setenv("TUSKER_CLAUDE_CODE_ENABLED", "true")
-    proc = _FakeProcess(b'{"result":"streamed","usage":{}}')
+    proc = _FakeStreamingProcess(b'{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"streamed"}}}\n')
     with patch("tusker_gateway.provider_adapters.claude_code.shutil.which", return_value="claude"), \
          patch("tusker_gateway.provider_adapters.claude_code.asyncio.create_subprocess_exec",
                new=AsyncMock(return_value=proc)):
         result = await ClaudeCodeCLIAdapter().chat(
             provider="claude-code-cli", model="haiku", messages=[], stream=True,
         )
-    frames = [frame async for frame in result]
+        frames = [frame async for frame in result]
     assert json.loads(sse_data_payload(frames[0]))["choices"][0]["delta"]["content"] == "streamed"
     assert json.loads(sse_data_payload(frames[1]))["choices"][0]["finish_reason"] == "stop"
     assert frames[2] == b"data: [DONE]\n\n"
 
 
 @pytest.mark.asyncio
+async def test_cli_stream_surfaces_auth_expiry_as_specific_error(monkeypatch):
+    monkeypatch.setenv("TUSKER_CLAUDE_CODE_ENABLED", "true")
+    error_event = {
+        "type": "result", "is_error": True, "api_error_status": 401,
+        "result": "OAuth token expired",
+    }
+    process = _FakeStreamingProcess(json.dumps(error_event).encode() + b"\n")
+    with patch("tusker_gateway.provider_adapters.claude_code.shutil.which", return_value="claude"), \
+         patch("tusker_gateway.provider_adapters.claude_code.asyncio.create_subprocess_exec",
+               new=AsyncMock(return_value=process)):
+        result = await ClaudeCodeCLIAdapter().chat(
+            provider="claude-code-cli", model="sonnet", messages=[], stream=True,
+        )
+        with pytest.raises(ClaudeAuthRequiredError):
+            _ = [frame async for frame in result]
+
+
+@pytest.mark.asyncio
 async def test_cli_stream_tool_call_preserves_openai_tool_delta(monkeypatch):
     monkeypatch.setenv("TUSKER_CLAUDE_CODE_ENABLED", "true")
 
-    class ToolCallProcess(_FakeProcess):
-        async def communicate(self, _input: bytes):
-            config_path = spawn.await_args.args[spawn.await_args.args.index("--mcp-config") + 1]
-            config = json.loads(Path(config_path).read_text(encoding="utf-8"))
-            bridge_env = config["mcpServers"]["gateway"]["env"]
-            Path(bridge_env["TUSKER_MCP_CALL_FILE"]).write_text(json.dumps({
-                "id": "call_stream", "name": "ask", "arguments": {"q": "ok"},
-            }))
-            return b"", b""
+    async def start(*args, **_kwargs):
+        config_path = args[args.index("--mcp-config") + 1]
+        config = json.loads(Path(config_path).read_text(encoding="utf-8"))
+        bridge_env = config["mcpServers"]["gateway"]["env"]
+        Path(bridge_env["TUSKER_MCP_CALL_FILE"]).write_text(json.dumps({
+            "id": "call_stream", "name": "ask", "arguments": {"q": "ok"},
+        }))
+        return _FakeStreamingProcess(b"")
 
     with patch("tusker_gateway.provider_adapters.claude_code.shutil.which", return_value="claude"), \
          patch("tusker_gateway.provider_adapters.claude_code.asyncio.create_subprocess_exec",
-               new=AsyncMock(return_value=ToolCallProcess(b""))) as spawn:
+               new=AsyncMock(side_effect=start)) as spawn:
         result = await ClaudeCodeCLIAdapter().chat(
             provider="claude-code-cli", model="sonnet", messages=[], stream=True,
             tools=[{"type": "function", "function": {"name": "ask"}}],
         )
-    frames = [frame async for frame in result]
+        frames = [frame async for frame in result]
     delta = json.loads(sse_data_payload(frames[0]))["choices"][0]["delta"]["tool_calls"][0]
     assert delta["id"] == "call_stream"
     assert delta["function"]["name"] == "ask"

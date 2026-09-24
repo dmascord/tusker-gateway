@@ -99,6 +99,40 @@ class OpenCodeCLIAdapter:
             if value:
                 env[name] = value
 
+        if stream:
+            from tusker_gateway.provider_adapters.cli_streaming import stream_cli_jsonl, text_from_event
+
+            temp_dir = Path(tempfile.mkdtemp(prefix="tusker-opencode-stream-"))
+            call_file: Path | None = None
+            config: dict[str, Any] = {}
+            if tool_manifest:
+                manifest_file = temp_dir / "tools.json"
+                call_file = temp_dir / "tool-call.json"
+                manifest_file.write_text(json.dumps(tool_manifest), encoding="utf-8")
+                config["mcp"] = {
+                    "gateway": {
+                        "type": "local",
+                        "command": [sys.executable, "-m", "tusker_gateway.provider_adapters.mcp_stdio"],
+                        "environment": {
+                            "TUSKER_MCP_MANIFEST": str(manifest_file),
+                            "TUSKER_MCP_CALL_FILE": str(call_file),
+                        },
+                        "timeout": 120000,
+                    },
+                }
+                env["OPENCODE_CONFIG_CONTENT"] = json.dumps(config, separators=(",", ":"))
+            package_root = str(Path(__file__).resolve().parents[2])
+            env["PYTHONPATH"] = os.pathsep.join(
+                part for part in (package_root, os.environ.get("PYTHONPATH", "")) if part
+            )
+            command = [resolved, "run", "--standalone", "--format", "json", "--model", cli_model]
+            timeout = max(10.0, float(os.environ.get("TUSKER_OPENCODE_CLI_TIMEOUT_SECS", "600")))
+            return stream_cli_jsonl(
+                command, env=env, prompt=prompt.encode(), model=model, timeout=timeout,
+                text_extractor=text_from_event, call_file=call_file, cleanup_dir=temp_dir,
+                error_code="opencode_cli_failed", timeout_message="OpenCode CLI request timed out",
+            )
+
         with tempfile.TemporaryDirectory(prefix="tusker-opencode-") as temp_name:
             temp_dir = Path(temp_name)
             call_file: Path | None = None
