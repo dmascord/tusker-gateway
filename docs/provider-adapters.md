@@ -39,6 +39,11 @@ are not exposed as assistant text; CLI errors after a stream starts are sent
 in-band. Gateway heartbeat behavior keeps the client connection active while
 the CLI is waiting for its first text delta.
 
+Because the CLI is one-shot, a model that repeats a tool call whose result is
+already present in the replayed history is not handed back to the harness a
+second time: the adapter re-runs the CLI without tools and answers in prose
+instead, and raises `tool_call_loop` when that produces no assistant text.
+
 The gateway image includes a pinned Claude Code CLI executable (currently
 2.1.281). The image does not include or provision credentials. In production,
 the CLI reads its own runtime login from `CLAUDE_CONFIG_DIR` or
