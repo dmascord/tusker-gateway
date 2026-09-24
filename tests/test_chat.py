@@ -2294,7 +2294,7 @@ async def test_provider_attempt_timeout_helper_uses_per_provider_override():
 
     os.environ["TUSKER_PROVIDER_ATTEMPT_TIMEOUT_SECS"] = "30"
     os.environ["TUSKER_PROVIDER_ATTEMPT_TIMEOUT_OVERRIDES_JSON"] = (
-        '{"local-llm": 120, "mlx-mac": 120}'
+        '{"local-llm": 120, "mlx-mac": 120, "kilo-cli": 120}'
     )
     try:
         request = SimpleNamespace(
@@ -2305,6 +2305,7 @@ async def test_provider_attempt_timeout_helper_uses_per_provider_override():
         # Override raises the budget for local backends.
         assert _provider_attempt_timeout_secs(request, provider="local-llm") == 120.0
         assert _provider_attempt_timeout_secs(request, provider="mlx-mac") == 120.0
+        assert _provider_attempt_timeout_secs(request, provider="kilo-cli") == 120.0
         # Case-insensitive.
         assert _provider_attempt_timeout_secs(request, provider="Local-LLM") == 120.0
         # No provider -> falls back to global.

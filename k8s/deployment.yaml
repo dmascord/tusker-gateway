@@ -474,12 +474,14 @@ spec:
         - name: TUSKER_UPSTREAM_SOCK_READ_SECS
           value: '90'
         # Local Ollama/MLX Mac cold model loads need up to 240s before the
-        # first byte. The request deadline must cover the per-provider budget;
-        # remote candidates still return immediately and are not delayed.
+        # first byte. Kilo Auto Free runs behind a CLI worker and buffers its
+        # response until the CLI exits, so it needs a longer idle window too.
+        # The request deadline caps every provider budget; other remote
+        # candidates still return immediately and are not delayed.
         - name: TUSKER_REQUEST_TIMEOUT_MS
           value: '240000'
         - name: TUSKER_PROVIDER_ATTEMPT_TIMEOUT_OVERRIDES_JSON
-          value: '{"local-llm": 240, "mlx-mac": 240, "zai": 90, "opencode-go": 90}'
+          value: '{"local-llm": 240, "mlx-mac": 240, "zai": 90, "opencode-go": 90, "kilo-cli": 120}'
         # Real context windows of servers whose window differs from the pool
         # default (keys: provider or provider/model; ":latest" optional).
         # Ollama ignores num_ctx on /v1, so this must track the host config:

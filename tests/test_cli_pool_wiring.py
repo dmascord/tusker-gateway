@@ -32,3 +32,7 @@ def test_opencode_and_kilo_routes_are_code_only_and_explicitly_enabled():
     assert env["TUSKER_OPENCODE_CLI_API_KEY"]["valueFrom"]["secretKeyRef"]["key"] == (
         "OPENCODE_ZEN_API_KEY"
     )
+    attempt_timeouts = json.loads(
+        env["TUSKER_PROVIDER_ATTEMPT_TIMEOUT_OVERRIDES_JSON"]["value"]
+    )
+    assert attempt_timeouts["kilo-cli"] == 120
