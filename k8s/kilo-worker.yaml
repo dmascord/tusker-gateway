@@ -1,0 +1,114 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tusker-kilo-worker
+  namespace: hermes
+  labels:
+    app: tusker-kilo-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tusker-kilo-worker
+  template:
+    metadata:
+      labels:
+        app: tusker-kilo-worker
+    spec:
+      automountServiceAccountToken: false
+      nodeSelector:
+        kubernetes.io/hostname: wynk
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: kilo-worker
+        image: registry.tusker.net.au:5000/tusker-gateway:latest
+        imagePullPolicy: Always
+        command: ["python", "-m", "tusker_gateway.kilo_worker"]
+        env:
+        - name: HOME
+          value: /tmp
+        - name: TUSKER_KILO_CLI_ENABLED
+          value: "true"
+        - name: TUSKER_KILO_CLI_TIMEOUT_SECS
+          value: "120"
+        - name: GROQ_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: tusker-env-vault
+              key: GROQ_API_KEY
+        ports:
+        - name: http
+          containerPort: 8643
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: http
+          initialDelaySeconds: 2
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 30
+        resources:
+          requests:
+            cpu: 250m
+            memory: 1Gi
+            ephemeral-storage: 512Mi
+          limits:
+            cpu: "1"
+            memory: 2Gi
+            ephemeral-storage: 2Gi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+          seccompProfile:
+            type: RuntimeDefault
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: tmp
+        emptyDir:
+          sizeLimit: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tusker-kilo-worker
+  namespace: hermes
+spec:
+  type: ClusterIP
+  selector:
+    app: tusker-kilo-worker
+  ports:
+  - name: http
+    port: 8643
+    targetPort: http
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-tusker-gateway-to-kilo-worker
+  namespace: hermes
+spec:
+  podSelector:
+    matchLabels:
+      app: tusker-kilo-worker
+  policyTypes: [Ingress]
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: tusker-gateway
+    ports:
+    - protocol: TCP
+      port: 8643

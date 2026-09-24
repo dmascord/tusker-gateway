@@ -45,13 +45,14 @@ def test_kilo_cli_registered_local_and_non_zdr():
     ("anthropic/claude-sonnet-4.6", "anthropic/claude-sonnet-4.6"),
     ("kilo-cli/anthropic/claude-sonnet-4.6", "anthropic/claude-sonnet-4.6"),
     ("openai/gpt-6-luna", "openai/gpt-6-luna"),
+    ("groq/openai/gpt-oss-20b", "groq/openai/gpt-oss-20b"),
 ])
 def test_kilo_model_identifier(value, expected):
     assert _model_for_cli(value) == expected
 
 
 @pytest.mark.parametrize("value", [
-    "", "anthropic", "a/b/c", "../model", "anthropic/../model",
+    "", "anthropic", "a//c", "../model", "anthropic/../model",
     "anthropic/-flag", "other provider/model",
 ])
 def test_kilo_model_rejects_invalid_ids(value):

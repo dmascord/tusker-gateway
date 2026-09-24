@@ -18,6 +18,8 @@ from tusker_gateway.errors import (
 )
 from tusker_gateway.provider_adapters import ProviderAdapterRegistry, provider_adapters
 from tusker_gateway.provider_adapters.claude_code import ClaudeCodeCLIAdapter
+from tusker_gateway.provider_adapters.kilo_cli import KiloCLIAdapter
+from tusker_gateway.provider_adapters.opencode_cli import OpenCodeCLIAdapter
 from tusker_gateway.passthrough import _configured_endpoint
 from tusker_gateway.sse import sse_data_payload
 
@@ -362,6 +364,100 @@ async def test_claude_auth_status_unknown_for_bad_or_unavailable_cli():
          patch("tusker_gateway.provider_adapters.claude_code.asyncio.create_subprocess_exec",
                new=AsyncMock(return_value=_FakeProcess(b'{"loggedIn":false}'))):
         assert await claude_auth_status() == {"status": "login_required"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("adapter_type", "provider", "model", "enable_var", "module", "config_var"),
+    [
+        (OpenCodeCLIAdapter, "opencode-cli", "big-pickle", "TUSKER_OPENCODE_CLI_ENABLED",
+         "tusker_gateway.provider_adapters.opencode_cli", "OPENCODE_CONFIG_CONTENT"),
+        (KiloCLIAdapter, "kilo-cli", "groq/openai/gpt-oss-20b", "TUSKER_KILO_CLI_ENABLED",
+         "tusker_gateway.provider_adapters.kilo_cli", "KILO_CONFIG_CONTENT"),
+    ],
+)
+async def test_non_anthropic_cli_adapters_return_declared_tool_call(
+    monkeypatch, adapter_type, provider, model, enable_var, module, config_var,
+):
+    """OpenCode and Kilo surface MCP calls as OpenAI calls; neither executes them."""
+    monkeypatch.setenv(enable_var, "true")
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setenv("PROVIDER_GROQ_API_KEY", "test-groq-key")
+    monkeypatch.setenv("PROVIDER_OPENROUTER_API_KEY", "unrelated-key-must-not-leak")
+    tool_call = {
+        "id": "call_cli_smoke",
+        "name": "report_value",
+        "arguments": {"value": "gateway-cli-smoke"},
+    }
+
+    class ToolCallProcess(_FakeProcess):
+        async def communicate(self, _input: bytes):
+            env = spawn.await_args.kwargs["env"]
+            config = json.loads(env[config_var])
+            bridge = config["mcp"]["gateway"]
+            bridge_env = bridge.get("environment", {})
+            call_file = Path(bridge_env["TUSKER_MCP_CALL_FILE"])
+            call_file.write_text(json.dumps(tool_call), encoding="utf-8")
+            return b"", b""
+
+    process = ToolCallProcess(b"")
+    with patch(f"{module}.shutil.which", return_value="cli"), \
+         patch(f"{module}.asyncio.create_subprocess_exec",
+               new=AsyncMock(return_value=process)) as spawn:
+        result = await adapter_type().chat(
+            provider=provider,
+            model=model,
+            messages=[{"role": "user", "content": "Call report_value once."}],
+            stream=False,
+            tools=[{"type": "function", "function": {
+                "name": "report_value",
+                "description": "Return a value to the connected client; do not execute anything.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}},
+                    "required": ["value"],
+                    "additionalProperties": False,
+                },
+            }}],
+            tool_choice="required",
+        )
+
+    choice = result["choices"][0]
+    call = choice["message"]["tool_calls"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    assert call["id"] == "call_cli_smoke"
+    assert call["function"]["name"] == "report_value"
+    assert json.loads(call["function"]["arguments"]) == {"value": "gateway-cli-smoke"}
+    args = spawn.await_args.args
+    if provider == "opencode-cli":
+        assert args[1:4] == ("run", "--standalone", "--format")
+        assert "GROQ_API_KEY" not in spawn.await_args.kwargs["env"]
+    else:
+        assert args[1:4] == ("run", "--pure", "--format")
+        child_env = spawn.await_args.kwargs["env"]
+        assert child_env["GROQ_API_KEY"] == "test-groq-key"
+        assert "OPENROUTER_API_KEY" not in child_env
+
+
+def test_kilo_model_id_accepts_nested_upstream_model_paths():
+    from tusker_gateway.provider_adapters.kilo_cli import _model_for_cli
+
+    assert _model_for_cli("kilo-cli/groq/openai/gpt-oss-20b") == "groq/openai/gpt-oss-20b"
+    assert _model_for_cli("kilo-cli/kilo/~anthropic/claude-sonnet-latest") == (
+        "kilo/~anthropic/claude-sonnet-latest"
+    )
+    with pytest.raises(BadRequestError):
+        _model_for_cli("kilo-cli/groq/--help")
+
+
+def test_kilo_forwards_only_the_selected_provider_key(monkeypatch):
+    from tusker_gateway.provider_adapters.kilo_cli import _provider_api_key
+
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.setenv("PROVIDER_GEMINI_API_KEY", "selected-key")
+    monkeypatch.setenv("PROVIDER_OPENROUTER_API_KEY", "unrelated-key")
+    assert _provider_api_key("google/gemini-flash") == ("GEMINI_API_KEY", "selected-key")
 
 
 @pytest.mark.asyncio

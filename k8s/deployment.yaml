@@ -42,6 +42,10 @@ spec:
           value: '1'
         - name: PYTHONDONTWRITEBYTECODE
           value: '1'
+        - name: TUSKER_KILO_CLI_ENABLED
+          value: 'true'
+        - name: TUSKER_KILO_WORKER_URL
+          value: http://tusker-kilo-worker.hermes.svc.cluster.local:8643
         # Shared mutable gateway state lives in the dedicated PostgreSQL
         # service. SQLite paths remain as local/test fallbacks only.
         - name: TUSKER_STATE_DATABASE_URL

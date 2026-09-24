@@ -90,6 +90,15 @@ The gateway reads provider keys for every provider named in those pools:
   catalog discovery is disabled while its upstream capacity is saturated)
 - `SYNTHETIC_API_KEY`
 
+Kilo Code CLI runs in a dedicated worker deployment pinned to `wynk`, not
+inside the gateway pod. `k8s/kilo-worker.yaml` gives it bounded resources and
+allows ingress only from the gateway pod; it receives only `GROQ_API_KEY`.
+The `kilo/kilo-auto/free` route itself ran without API credentials in a clean
+worker-like environment. The normal deploy script builds one image and deploys the worker before
+rolling the gateway, which uses the internal ClusterIP service. The initial
+worker allowlist contains only routes that passed an actual MCP tool-call
+probe. Kilo routes are non-ZDR and are therefore never privacy-pool candidates.
+
 `POST /v1/rerank` is independent of chat-pool disablement. For example,
 Cohere may remain excluded from chat pool/catalog construction while its
 native rerank endpoint is still available when `COHERE_API_KEY` is present.

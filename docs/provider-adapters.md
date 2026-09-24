@@ -108,12 +108,16 @@ service policy; the adapter does not bypass those restrictions.
 ## Kilo Code CLI
 
 The `kilo-cli` adapter runs `kilo run --format json --model provider/model`.
-It accepts explicit `provider/model` IDs (for example,
-`kilo-cli/anthropic/claude-sonnet-4.6`) and is opt-in with
+It accepts explicit Kilo model IDs, including nested upstream names (for
+example, `kilo-cli/anthropic/claude-sonnet-4.6` or
+`kilo-cli/groq/openai/gpt-oss-20b`), and is opt-in with
 `TUSKER_KILO_CLI_ENABLED=true`. `TUSKER_KILO_CLI_PATH` chooses the executable
 and `TUSKER_KILO_CLI_TIMEOUT_SECS` sets the request timeout (default 600
 seconds). The adapter uses Kilo's existing runtime auth; if `KILO_API_KEY` is
-set, it is passed only to the child process.
+set, it is passed only to the child process. For a direct provider/model ID,
+the gateway passes only that provider's configured API key under the provider's
+standard CLI variable (for example, the Groq key for `groq/...` models), never
+the full gateway key set.
 
 Each request receives high-priority inline `KILO_CONFIG_CONTENT`, disables
 project config, denies tools by default, and exposes only request-scoped MCP
@@ -121,5 +125,18 @@ proxies for client-declared tools. The proxy returns an OpenAI tool call to
 the connected harness; it never executes that call. Like the other CLI
 adapters, Kilo is local/non-ZDR, excluded from default pools, and streaming
 is returned after the CLI completes rather than as incremental token deltas.
-The gateway image includes the pinned Kilo CLI (currently 7.7.9); set
-`TUSKER_KILO_CLI_PATH` to use an operator-managed installation instead.
+In Kubernetes, the gateway forwards Kilo requests to the dedicated
+`tusker-kilo-worker` service, pinned to node `wynk` and isolated by a
+NetworkPolicy that permits ingress only from the gateway pod. The worker has
+bounded CPU/memory, receives only the Groq key, and currently allows
+`groq/openai/gpt-oss-20b`, `groq/qwen/qwen3.8-27b`, and
+`kilo/kilo-auto/free`. The free auto-router passed a live tool-call probe
+through the worker HTTP endpoint with a clean home directory and no API keys.
+Other environments can run the adapter
+locally by leaving `TUSKER_KILO_WORKER_URL` unset. The gateway image includes
+the pinned Kilo CLI (currently 7.7.9); set `TUSKER_KILO_CLI_PATH` to use an
+operator-managed installation instead.
+
+Kilo routes remain non-ZDR and must not be added to the privacy pool. The
+worker is deliberately not a general-purpose proxy: its model allowlist is
+separate from the main gateway's pool configuration.

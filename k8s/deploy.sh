@@ -64,7 +64,15 @@ kubectl set image -f k8s/deployment.yaml \
     "${DEPLOY}=${IMAGE}" \
     --local -o json > "${RENDERED}"
 
+# The Kilo CLI runs in a separate, resource-limited pod on wynk. Render the
+# exact same immutable-by-tag build into its manifest before applying it.
+KILO_WORKER_RENDERED="${WORK_DIR}/kilo-worker.yaml"
+sed "s|${REGISTRY}/tusker-gateway:latest|${IMAGE}|g" \
+    k8s/kilo-worker.yaml > "${KILO_WORKER_RENDERED}"
+
 echo "--- Apply manifests ---"
+kubectl -n "${NAMESPACE}" apply -f "${KILO_WORKER_RENDERED}"
+kubectl -n "${NAMESPACE}" rollout status deployment/tusker-kilo-worker --timeout=300s
 kubectl -n "${NAMESPACE}" apply -f k8s/pvc-rwx.yaml
 kubectl -n "${NAMESPACE}" apply -f k8s/pvc.yaml
 kubectl -n "${NAMESPACE}" apply -f k8s/config.yaml
