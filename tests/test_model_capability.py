@@ -1,8 +1,11 @@
 """Tests for persisted model capability evidence and input probes."""
 from __future__ import annotations
 
+import base64
 import json
+import struct
 import time
+import zlib
 from typing import Any
 
 import pytest
@@ -191,6 +194,46 @@ def test_probe_payloads_cover_supported_input_shapes():
     assert _messages_for_modality("audio")[0]["content"][1]["type"] == "input_audio"
     assert _messages_for_modality("video")[0]["content"][1]["type"] == "video_url"
     assert MODEL_CAPABILITY_PROBE_VERSION == "model-capability-v2"
+
+
+def test_probe_image_data_url_is_a_decodable_png():
+    """A truncated probe image makes strict decoders reject every image probe.
+
+    Ollama's OpenAI shim returns 400 "Failed to load image or audio file" for
+    a PNG whose IDAT chunk is cut short, which records a false capability
+    negative for a vision-capable model. The probe's exact image is the one
+    embedded in ``_messages_for_modality("image")``; this guards that
+    artifact rather than the source string, so it catches any future
+    regeneration that breaks it.
+    """
+    payload = _messages_for_modality("image")[0]["content"][1]["image_url"]["url"]
+    prefix = "data:image/png;base64,"
+    assert payload.startswith(prefix)
+    raw = base64.b64decode(payload[len(prefix):], validate=True)
+    assert raw[:8] == b"\x89PNG\r\n\x1a\n"
+
+    offset = 8
+    kinds: list[bytes] = []
+    idat = b""
+    while offset + 12 <= len(raw):
+        (length,) = struct.unpack(">I", raw[offset : offset + 4])
+        kind = raw[offset + 4 : offset + 8]
+        body = raw[offset + 8 : offset + 8 + length]
+        crc = raw[offset + 8 + length : offset + 12 + length]
+        assert len(crc) == 4, f"{kind!r} chunk truncated"
+        assert crc == struct.pack(
+            ">I", zlib.crc32(kind + body) & 0xFFFFFFFF
+        ), f"{kind!r} chunk CRC mismatch"
+        kinds.append(kind)
+        if kind == b"IDAT":
+            idat += body
+        offset += 12 + length
+
+    assert offset == len(raw), "trailing bytes after declared chunks"
+    assert kinds and kinds[0] == b"IHDR" and kinds[-1] == b"IEND"
+    width, height, depth, color_type = struct.unpack(">IIBB", raw[16:26])
+    assert (width, height, depth, color_type) == (128, 128, 8, 2)
+    assert len(zlib.decompress(idat)) == height * (1 + width * 3)
 
 
 def test_successful_media_capability_records_are_provider_model_scoped(tmp_path):

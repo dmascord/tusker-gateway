@@ -47,16 +47,20 @@ logger = logging.getLogger(__name__)
 
 # 128x128 PNG: providers like DashScope reject 1x1 probes with an
 # "image length and width" 400, which would falsely mark vision-capable
-# models as unsupported. Keep it small (306 bytes) but above minimum-size
-# checks.
+# models as unsupported. Keep it small (318 bytes) but above minimum-size
+# checks, and keep it a *decodable* PNG: strict decoders (the Go image/png
+# behind Ollama's OpenAI shim) reject a truncated file with "Failed to load
+# image or audio file", which records a false capability negative.
+# test_probe_image_data_url_is_a_decodable_png guards this constant.
 _TINY_IMAGE_DATA_URL = (
     "data:image/png;base64,"
-    "iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAIAAABMXPacAAAA+ElEQVR4nO3RMQ0A"
-    "MAzAsEIp/3sAB6NHLAVAJM/b1WFzfhAPAIB2AAC0AwCgHQAA7QAAaAcAQDsAANoB"
-    "ANAOAIB2AAC0AwCgHQAA7QAAaAcAQDsAANoBANAOAIB2AAC0AwCgHQAA7QAAaAcA"
-    "QDsAANoBANAOAIB2AAC0AwCgHQAA7QAAaAcAQDsAANoBANAOAIB2AAC0AwCgHQAA"
-    "7QAAaAcAQDsAANoBANAOAIB2AAC0AwCgHQAA7QAAaAcAQDsAANp925MD"
-    "lLkrqhMAAAAASUVORK5CYII="
+    "iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAIAAABMXPacAAABBUlEQVR42u3RMQ0A"
+    "IAwAMJTsRgmaEIYIREwEEpiNJU3qoCMjWoudrQ0BAgQIECBAgAABAgQIECBAgAAB"
+    "AgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQI"
+    "ECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECCgAuKs1t6drQkQ"
+    "IECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECA"
+    "AAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAEC"
+    "BAgQIECAAAHlAxK4JSlML2M2AAAAAElFTkSuQmCC"
 )
 _TINY_WAV_BASE64 = "UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAAA"
 _MODALITY_TO_CAPABILITY = {
