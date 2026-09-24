@@ -158,16 +158,101 @@ def _normalise_tools(tools: list[dict[str, Any]] | None, tool_choice: Any) -> li
     return result
 
 
+def _canonical_arguments(raw: Any) -> str:
+    """Canonical JSON text so logically identical tool arguments compare equal."""
+    value = raw
+    if isinstance(raw, str):
+        try:
+            value = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return raw.strip()
+    try:
+        return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _answered_tool_calls(messages: list[dict[str, Any]]) -> set[tuple[str, str]]:
+    """Return (name, canonical arguments) for every call that already has a result.
+
+    Claude Code is invoked one-shot over a rendered text transcript, so a call
+    whose result is already present is a repeat, not progress.
+    """
+    from tusker_gateway.tool_formats import normalize_tool_calls
+
+    result_ids = {
+        str(message.get("tool_call_id") or "")
+        for message in messages
+        if str(message.get("role", "")) == "tool"
+    }
+    result_ids.discard("")
+    if not result_ids:
+        return set()
+    answered: set[tuple[str, str]] = set()
+    for message in messages:
+        if str(message.get("role", "")) != "assistant":
+            continue
+        calls = message.get("tool_calls")
+        if calls is None and message.get("function_call") is not None:
+            calls = [message["function_call"]]
+        for call in normalize_tool_calls(calls):
+            if str(call.get("id")) not in result_ids:
+                continue
+            function = call.get("function") or {}
+            answered.add((
+                str(function.get("name")),
+                _canonical_arguments(function.get("arguments")),
+            ))
+    return answered
+
+
+def _repeats_answered_call(tool_call: Any, answered: set[tuple[str, str]]) -> bool:
+    """True when ``tool_call`` duplicates a call that already returned a result."""
+    if not answered or not isinstance(tool_call, dict):
+        return False
+    name = tool_call.get("name")
+    if not isinstance(name, str) or not name:
+        return False
+    return (name, _canonical_arguments(tool_call.get("arguments"))) in answered
+
+
+def _frame_tool_call(frame: bytes) -> dict[str, Any] | None:
+    """Extract a tool call from an OpenAI SSE data frame, if it carries one."""
+    from tusker_gateway.sse import sse_data_payload
+
+    if not frame.startswith(b"data:"):
+        return None
+    payload = sse_data_payload(frame)
+    if not payload or payload == b"[DONE]":
+        return None
+    try:
+        event = json.loads(payload)
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        return None
+    for choice in event.get("choices") or []:
+        delta = choice.get("delta") or {}
+        for call in delta.get("tool_calls") or []:
+            function = call.get("function") or {}
+            name = function.get("name")
+            if isinstance(name, str) and name:
+                return {"name": name, "arguments": function.get("arguments")}
+    return None
+
+
 def _prompt(messages: list[dict[str, Any]], *, has_tools: bool, tool_choice: Any) -> str:
     from tusker_gateway.tool_formats import normalize_tool_calls
 
     supported = {"system", "developer", "user", "assistant"}
     transcript: list[str] = []
+    call_ids: list[str] = []
+    result_ids: set[str] = set()
     for message in messages:
         role = str(message.get("role", ""))
         if role == "tool":
             call_id = str(message.get("tool_call_id") or "")
             content = _as_text(message.get("content", ""))
+            if call_id:
+                result_ids.add(call_id)
             transcript.append(f"<gateway_tool_result call_id={json.dumps(call_id)}>\n{content}\n</gateway_tool_result>")
             continue
         if role not in supported:
@@ -182,22 +267,32 @@ def _prompt(messages: list[dict[str, Any]], *, has_tools: bool, tool_choice: Any
         if calls is None and message.get("function_call") is not None:
             calls = [message["function_call"]]
         for call in normalize_tool_calls(calls):
+            call_ids.append(str(call.get("id")))
             transcript.append(
                 "<gateway_tool_call>\n"
                 + json.dumps(call, ensure_ascii=False, separators=(",", ":"))
                 + "\n</gateway_tool_call>"
             )
+    policy_appended = False
     if has_tools:
         if tool_choice == "required":
             transcript.append(
                 "<gateway_tool_policy>Call one of the supplied gateway tools now. "
                 "Return a tool call instead of answering in prose.</gateway_tool_policy>"
             )
+            policy_appended = True
         elif isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
             name = tool_choice.get("function", {}).get("name")
             transcript.append(
                 f"<gateway_tool_policy>Call the required tool {name!r}.</gateway_tool_policy>"
             )
+            policy_appended = True
+    if call_ids and not policy_appended and set(call_ids) <= result_ids:
+        transcript.append(
+            "<gateway_tool_state>Every gateway_tool_call above is already complete and its "
+            "gateway_tool_result holds the authoritative output. Do not repeat an identical "
+            "tool call. Use those results and answer the user in prose.</gateway_tool_state>"
+        )
     return "\n\n".join(transcript)
 
 
@@ -264,6 +359,8 @@ class ClaudeCodeCLIAdapter:
 
         tool_manifest = _normalise_tools(tools, tool_choice)
         prompt = _prompt(messages, has_tools=bool(tool_manifest), tool_choice=tool_choice)
+
+        answered_calls = _answered_tool_calls(messages)
         # Keep the child environment allowlisted (no gateway/provider secrets).
         env = _cli_env()
         if stream:
@@ -315,12 +412,15 @@ class ClaudeCodeCLIAdapter:
                     "--allowedTools", "mcp__gateway__*",
                 ])
             timeout = max(10.0, float(os.environ.get("TUSKER_CLAUDE_CODE_TIMEOUT_SECS", "600")))
-            return stream_cli_jsonl(
-                command, env=env, prompt=prompt.encode(), model=model, timeout=timeout,
-                text_extractor=claude_text_from_event, event_error_extractor=stream_error,
-                call_file=call_file,
-                cleanup_dir=temp_dir, error_code="claude_code_cli_failed",
-                timeout_message="Claude Code CLI request timed out",
+            return self._guarded_stream(
+                stream_cli_jsonl(
+                    command, env=env, prompt=prompt.encode(), model=model, timeout=timeout,
+                    text_extractor=claude_text_from_event, event_error_extractor=stream_error,
+                    call_file=call_file,
+                    cleanup_dir=temp_dir, error_code="claude_code_cli_failed",
+                    timeout_message="Claude Code CLI request timed out",
+                ),
+                provider=provider, model=model, messages=messages, answered=answered_calls,
             )
 
         with tempfile.TemporaryDirectory(prefix="tusker-claude-") as temp_name:
@@ -415,6 +515,14 @@ class ClaudeCodeCLIAdapter:
                             "Claude Code CLI returned an invalid tool request",
                             code="invalid_upstream_response",
                         )
+                    if _repeats_answered_call(tool_call, answered_calls):
+                        logger.warning(
+                            "claude-code-cli repeated an answered tool call name=%s; answering in prose",
+                            tool_call.get("name"),
+                        )
+                        return await self._prose_completion(
+                            provider=provider, model=model, messages=messages,
+                        )
                     completion = self._tool_completion(model, tool_call)
                     return self._stream_completion(completion, stream) if stream else completion
                 stdout, stderr = await communicate_task
@@ -435,10 +543,12 @@ class ClaudeCodeCLIAdapter:
                 ) from exc
 
         if proc.returncode != 0:
+            stderr_preview = stderr.decode("utf-8", errors="replace")[:512]
             logger.warning(
-                "claude-code-cli exited rc=%s stderr_bytes=%d",
+                "claude-code-cli exited rc=%s stderr_bytes=%d stderr=%r",
                 proc.returncode,
                 len(stderr),
+                stderr_preview,
             )
             if _auth_error_indicated(stdout, stderr):
                 raise ClaudeAuthRequiredError()
@@ -496,6 +606,57 @@ class ClaudeCodeCLIAdapter:
         }
         return self._stream_completion(completion, stream) if stream else completion
 
+    async def _prose_completion(
+        self, *, provider: str, model: str, messages: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Re-run the CLI without tools so the model answers from existing results.
+
+        Claude Code runs one-shot over a rendered transcript. Once a tool result
+        is present a model can otherwise repeat the same call indefinitely, so
+        the gateway asks for a prose answer instead of handing the client a
+        duplicate call it would execute again.
+        """
+        completion = await self.chat(
+            provider=provider, model=model, messages=messages, stream=False,
+        )
+        message = (completion.get("choices") or [{}])[0].get("message") or {}
+        text = message.get("content")
+        if not isinstance(text, str) or not text.strip():
+            raise ProviderError(
+                "Claude Code CLI repeated an already-answered tool call without producing an answer",
+                code="tool_call_loop",
+            )
+        return completion
+
+    async def _guarded_stream(
+        self,
+        frame_source: Any,
+        *,
+        provider: str,
+        model: str,
+        messages: list[dict[str, Any]],
+        answered: set[tuple[str, str]],
+    ):
+        """Forward CLI frames, replacing a repeated tool call with a prose answer."""
+        repeated = False
+        try:
+            async for frame in frame_source:
+                if answered:
+                    tool_call = _frame_tool_call(frame)
+                    if tool_call is not None and _repeats_answered_call(tool_call, answered):
+                        repeated = True
+                        break
+                yield frame
+        finally:
+            await frame_source.aclose()
+        if not repeated:
+            return
+        logger.warning("claude-code-cli repeated an answered tool call; answering in prose")
+        completion = await self._prose_completion(
+            provider=provider, model=model, messages=messages,
+        )
+        async for frame in self._stream_completion(completion, True):
+            yield frame
     @staticmethod
     def _tool_completion(model: str, tool_call: dict[str, Any]) -> dict[str, Any]:
         return {

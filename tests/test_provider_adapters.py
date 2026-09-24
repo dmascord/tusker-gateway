@@ -525,3 +525,238 @@ async def test_cli_returns_specific_auth_error_on_expired_session(monkeypatch):
     assert exc.value.code == "claude_auth_required"
     assert "login code" in exc.value.message
     assert "accessToken" not in exc.value.message
+
+
+def test_prompt_marks_completed_tool_calls_and_skips_repeats():
+    from tusker_gateway.provider_adapters.claude_code import _prompt
+
+    messages = [
+        {"role": "user", "content": "What time is it?"},
+        {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function",
+          "function": {"name": "bash", "arguments": json.dumps({"command": "date"})}}],
+         "content": None},
+        {"role": "tool", "tool_call_id": "c1", "content": "Wed Sep 24 07:41 UTC"},
+    ]
+    prompt = _prompt(messages, has_tools=True, tool_choice="auto")
+    assert "<gateway_tool_state>" in prompt
+    assert "Do not repeat an identical tool call" in prompt
+
+    # Missing result keeps the model in tool-call mode.
+    pending = messages[:-1]
+    assert "<gateway_tool_state>" not in _prompt(pending, has_tools=True, tool_choice="auto")
+
+    # tool_choice=required always wins: no state directive, the policy text stays.
+    required = _prompt(messages, has_tools=True, tool_choice="required")
+    assert "<gateway_tool_state>" not in required
+    assert "<gateway_tool_policy>" in required
+
+
+@pytest.mark.asyncio
+async def test_cli_repeated_tool_call_becomes_prose_answer(monkeypatch):
+    """An already-answered tool call must not loop: fall back to a prose run."""
+    monkeypatch.setenv("TUSKER_CLAUDE_CODE_ENABLED", "true")
+    duplicate_call = {"id": "c1", "name": "bash", "arguments": {"command": "echo hi"}}
+
+    class DuplicateCallProcess(_FakeProcess):
+        async def communicate(self, _input: bytes = b""):
+            config_path = spawn.await_args.args[spawn.await_args.args.index("--mcp-config") + 1]
+            config = json.loads(Path(config_path).read_text(encoding="utf-8"))
+            bridge_env = config["mcpServers"]["gateway"]["env"]
+            Path(bridge_env["TUSKER_MCP_CALL_FILE"]).write_text(json.dumps(duplicate_call))
+            return b"", b""
+
+    prose_payload = json.dumps({"result": "already ran", "session_id": "s2"}).encode()
+    with patch("tusker_gateway.provider_adapters.claude_code.shutil.which", return_value="claude"), \
+         patch("tusker_gateway.provider_adapters.claude_code.asyncio.create_subprocess_exec",
+               new=AsyncMock(side_effect=[DuplicateCallProcess(b""), _FakeProcess(prose_payload)])) as spawn:
+        result = await ClaudeCodeCLIAdapter().chat(
+            provider="claude-code-cli",
+            model="sonnet",
+            messages=[
+                {"role": "user", "content": "Run echo hi and tell me what it printed."},
+                {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function",
+                  "function": {"name": "bash", "arguments": json.dumps({"command": "echo hi"})}}],
+                 "content": None},
+                {"role": "tool", "tool_call_id": "c1", "content": "hi\n"},
+            ],
+            stream=False,
+            tools=[{"type": "function", "function": {
+                "name": "bash", "description": "Shell",
+                "parameters": {"type": "object",
+                               "properties": {"command": {"type": "string"}},
+                               "required": ["command"], "additionalProperties": False},
+            }}],
+        )
+
+    choice = result["choices"][0]
+    assert choice["finish_reason"] == "stop"
+    assert choice["message"]["content"] == "already ran"
+    assert choice["message"].get("tool_calls") is None
+    assert spawn.call_count == 2
+    # Second invocation is the prose fallback: no --mcp-config (tools dropped).
+    assert "--mcp-config" not in spawn.call_args_list[1].args
+
+
+@pytest.mark.asyncio
+async def test_cli_distinct_tool_call_is_still_returned(monkeypatch):
+    """A new tool call (different arguments) still surfaces to the client."""
+    monkeypatch.setenv("TUSKER_CLAUDE_CODE_ENABLED", "true")
+    new_call = {"id": "c2", "name": "bash", "arguments": {"command": "ls"}}
+
+    class NewCallProcess(_FakeProcess):
+        async def communicate(self, _input: bytes = b""):
+            config_path = spawn.await_args.args[spawn.await_args.args.index("--mcp-config") + 1]
+            config = json.loads(Path(config_path).read_text(encoding="utf-8"))
+            bridge_env = config["mcpServers"]["gateway"]["env"]
+            Path(bridge_env["TUSKER_MCP_CALL_FILE"]).write_text(json.dumps(new_call))
+            return b"", b""
+
+    with patch("tusker_gateway.provider_adapters.claude_code.shutil.which", return_value="claude"), \
+         patch("tusker_gateway.provider_adapters.claude_code.asyncio.create_subprocess_exec",
+               new=AsyncMock(return_value=NewCallProcess(b""))) as spawn:
+        result = await ClaudeCodeCLIAdapter().chat(
+            provider="claude-code-cli",
+            model="sonnet",
+            messages=[
+                {"role": "user", "content": "Look around."},
+                {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function",
+                  "function": {"name": "bash", "arguments": json.dumps({"command": "echo hi"})}}],
+                 "content": None},
+                {"role": "tool", "tool_call_id": "c1", "content": "hi\n"},
+            ],
+            stream=False,
+            tools=[{"type": "function", "function": {
+                "name": "bash", "description": "Shell",
+                "parameters": {"type": "object",
+                               "properties": {"command": {"type": "string"}},
+                               "required": ["command"], "additionalProperties": False},
+            }}],
+        )
+
+    choice = result["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    assert choice["message"]["tool_calls"][0]["id"] == "c2"
+    assert json.loads(choice["message"]["tool_calls"][0]["function"]["arguments"]) == {"command": "ls"}
+    assert spawn.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_cli_tool_loop_without_prose_reports_bounded_error(monkeypatch):
+    """When even the fallback returns no prose, surface a tool_call_loop error."""
+    monkeypatch.setenv("TUSKER_CLAUDE_CODE_ENABLED", "true")
+    duplicate_call = {"id": "c1", "name": "bash", "arguments": {"command": "echo hi"}}
+
+    class DuplicateCallProcess(_FakeProcess):
+        async def communicate(self, _input: bytes = b""):
+            config_path = spawn.await_args.args[spawn.await_args.args.index("--mcp-config") + 1]
+            config = json.loads(Path(config_path).read_text(encoding="utf-8"))
+            bridge_env = config["mcpServers"]["gateway"]["env"]
+            Path(bridge_env["TUSKER_MCP_CALL_FILE"]).write_text(json.dumps(duplicate_call))
+            return b"", b""
+
+    empty_prose = json.dumps({"result": "  ", "session_id": "s3"}).encode()
+    with patch("tusker_gateway.provider_adapters.claude_code.shutil.which", return_value="claude"), \
+         patch("tusker_gateway.provider_adapters.claude_code.asyncio.create_subprocess_exec",
+               new=AsyncMock(side_effect=[DuplicateCallProcess(b""), _FakeProcess(empty_prose)])) as spawn:
+        with pytest.raises(ProviderError) as exc:
+            await ClaudeCodeCLIAdapter().chat(
+                provider="claude-code-cli",
+                model="sonnet",
+                messages=[
+                    {"role": "user", "content": "Run echo hi and tell me what it printed."},
+                    {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function",
+                      "function": {"name": "bash", "arguments": json.dumps({"command": "echo hi"})}}],
+                     "content": None},
+                    {"role": "tool", "tool_call_id": "c1", "content": "hi\n"},
+                ],
+                stream=False,
+                tools=[{"type": "function", "function": {
+                    "name": "bash", "description": "Shell",
+                    "parameters": {"type": "object",
+                                   "properties": {"command": {"type": "string"}},
+                                   "required": ["command"], "additionalProperties": False},
+                }}],
+            )
+    assert exc.value.code == "tool_call_loop"
+    assert "already-answered" in exc.value.message
+
+
+@pytest.mark.asyncio
+async def test_cli_stream_repeated_tool_call_becomes_prose(monkeypatch):
+    """Streaming duplicate calls switch mid-stream to a prose fallback."""
+    monkeypatch.setenv("TUSKER_CLAUDE_CODE_ENABLED", "true")
+    duplicate_call = {"id": "c1", "name": "bash", "arguments": {"command": "echo hi"}}
+
+    prose_payload = json.dumps({"result": "already ran", "session_id": "s2"}).encode()
+    spawns = {"count": 0}
+
+    async def start(*args, **_kwargs):
+        spawns["count"] += 1
+        if spawns["count"] > 1:
+            # Prose fallback runs non-streaming with tools dropped.
+            return _FakeProcess(prose_payload)
+        config_path = args[args.index("--mcp-config") + 1]
+        config = json.loads(Path(config_path).read_text(encoding="utf-8"))
+        bridge_env = config["mcpServers"]["gateway"]["env"]
+        Path(bridge_env["TUSKER_MCP_CALL_FILE"]).write_text(json.dumps(duplicate_call))
+        return _FakeStreamingProcess(b"")
+
+    with patch("tusker_gateway.provider_adapters.claude_code.shutil.which", return_value="claude"), \
+         patch("tusker_gateway.provider_adapters.claude_code.asyncio.create_subprocess_exec",
+               new=AsyncMock(side_effect=start)):
+        result = await ClaudeCodeCLIAdapter().chat(
+            provider="claude-code-cli",
+            model="sonnet",
+            messages=[
+                {"role": "user", "content": "Run echo hi and tell me what it printed."},
+                {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function",
+                  "function": {"name": "bash", "arguments": json.dumps({"command": "echo hi"})}}],
+                 "content": None},
+                {"role": "tool", "tool_call_id": "c1", "content": "hi\n"},
+            ],
+            stream=True,
+            tools=[{"type": "function", "function": {
+                "name": "bash", "description": "Shell",
+                "parameters": {"type": "object",
+                               "properties": {"command": {"type": "string"}},
+                               "required": ["command"], "additionalProperties": False},
+            }}],
+        )
+        frames = [frame async for frame in result]
+
+    deltas = []
+    finish_reasons = []
+    for frame in frames:
+        if frame == b"data: [DONE]\n\n":
+            deltas.append("DONE")
+            continue
+        payload = json.loads(sse_data_payload(frame))
+        delta = payload["choices"][0].get("delta", {})
+        if delta.get("content"):
+            deltas.append(delta["content"])
+        finish = payload["choices"][0].get("finish_reason")
+        if finish:
+            finish_reasons.append(finish)
+    assert deltas == ["already ran", "DONE"]
+    assert finish_reasons == ["stop"]
+
+
+@pytest.mark.asyncio
+async def test_claude_nonzero_exit_logs_bounded_stderr_preview(monkeypatch, caplog):
+    """Non-zero exit logs a bounded stderr preview instead of dropping it entirely."""
+    monkeypatch.setenv("TUSKER_CLAUDE_CODE_ENABLED", "true")
+    secret = "super-secret-account-detail-" + "x" * 600
+    proc = _FakeProcess(b"", b"login error: " + secret.encode(), returncode=1)
+    with patch("tusker_gateway.provider_adapters.claude_code.shutil.which", return_value="claude"), \
+         patch("tusker_gateway.provider_adapters.claude_code.asyncio.create_subprocess_exec",
+               new=AsyncMock(return_value=proc)):
+        with caplog.at_level("WARNING", logger="tusker_gateway.provider_adapters.claude_code"):
+            with pytest.raises(ProviderError) as exc:
+                await ClaudeCodeCLIAdapter().chat(
+                    provider="claude-code-cli", model="sonnet", messages=[], stream=False,
+                )
+    assert exc.value.code == "claude_code_cli_failed"
+    assert secret not in exc.value.message
+    assert "login error:" in caplog.text
+    # Preview is bounded so a runaway stack trace can't blow up the log.
+    assert caplog.text.count("x") <= 513
