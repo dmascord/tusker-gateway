@@ -126,7 +126,7 @@ the connected harness; it never executes that call. Like the other CLI
 adapters, Kilo is local/non-ZDR, excluded from default pools, and streaming
 is returned after the CLI completes rather than as incremental token deltas.
 In Kubernetes, the gateway forwards Kilo requests to the dedicated
-`tusker-kilo-worker` service, pinned to node `wynk` and isolated by a
+`tusker-kilo-worker` service, pinned to node `visor` and isolated by a
 NetworkPolicy that permits ingress only from the gateway pod. The worker has
 bounded CPU/memory, receives only the Groq key, and currently allows
 `groq/openai/gpt-oss-20b`, `groq/qwen/qwen3.8-27b`, and

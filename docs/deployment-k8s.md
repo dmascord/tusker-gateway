@@ -90,7 +90,7 @@ The gateway reads provider keys for every provider named in those pools:
   catalog discovery is disabled while its upstream capacity is saturated)
 - `SYNTHETIC_API_KEY`
 
-Kilo Code CLI runs in a dedicated worker deployment pinned to `wynk`, not
+Kilo Code CLI runs in a dedicated worker deployment pinned to `visor`, not
 inside the gateway pod. `k8s/kilo-worker.yaml` gives it bounded resources and
 allows ingress only from the gateway pod; it receives only `GROQ_API_KEY`.
 The `kilo/kilo-auto/free` route itself ran without API credentials in a clean
