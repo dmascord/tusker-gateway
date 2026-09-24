@@ -1232,50 +1232,48 @@ class ConfigStore:
 
         Returns False when ``expected`` is no longer in the stored credential set
         (concurrent admin replacement). The caller keeps its in-memory refreshed
-        credential in that case.
+        credential in that case. Database/serialization errors propagate so the
+        caller can distinguish them from a genuine compare-and-swap conflict.
         """
         name = str(provider).strip().lower()
-        try:
-            with self._conn as conn:
-                # Read current row
-                cur = conn.execute(
-                    "SELECT credentials FROM tusker_config_oauth_credentials "
-                    "WHERE provider = ?",
-                    (name,),
-                )
-                row = cur.fetchone()
-                if row is None:
-                    return False
-                current = json.loads(self._decrypt(conn, row[0]))
-                if not isinstance(current, list):
-                    current = []
+        with self._conn as conn:
+            # Read current row
+            cur = conn.execute(
+                "SELECT credentials FROM tusker_config_oauth_credentials "
+                "WHERE provider = ?",
+                (name,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return False
+            current = json.loads(self._decrypt(conn, row[0]))
+            if not isinstance(current, list):
+                current = []
 
-                # Find and replace the expected entry
-                found = False
-                new_list = []
-                for cred in current:
-                    if _cred_equal(cred, expected):
-                        new_list.append(replacement)
-                        found = True
-                    else:
-                        new_list.append(cred)
+            # Find and replace the expected entry
+            found = False
+            new_list = []
+            for cred in current:
+                if _cred_equal(cred, expected):
+                    new_list.append(replacement)
+                    found = True
+                else:
+                    new_list.append(cred)
 
-                if not found:
-                    return False
+            if not found:
+                return False
 
-                # Write back
-                encrypted = self._encrypt(conn, json.dumps(new_list))
-                conn.execute(
-                    "UPDATE tusker_config_oauth_credentials SET "
-                    "credentials = ?, updated_at = CURRENT_TIMESTAMP "
-                    "WHERE provider = ?",
-                    (encrypted, name),
-                )
-                self._bump_generation(conn)
-                self._refresh_after_write()
-                return True
-        except Exception:
-            return False
+            # Write back
+            encrypted = self._encrypt(conn, json.dumps(new_list))
+            conn.execute(
+                "UPDATE tusker_config_oauth_credentials SET "
+                "credentials = ?, updated_at = CURRENT_TIMESTAMP "
+                "WHERE provider = ?",
+                (encrypted, name),
+            )
+            self._bump_generation(conn)
+            self._refresh_after_write()
+            return True
 
     # ─── Maintenance ───────────────────────────────────────────────────────────
 

@@ -267,6 +267,120 @@ async def test_codex_rotator_uses_codex_authority_and_persists_rotation(
 
 
 @pytest.mark.asyncio
+async def test_rotator_waits_for_database_persistence_and_logs_rotation_state(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    import logging
+
+    import tusker_gateway.codex_oauth as codex_oauth
+    from tusker_gateway.passthrough import CodexTokenRotator
+
+    refresh = AsyncMock(
+        return_value=(
+            {"access_token": "new-access", "refresh_token": "new-refresh"},
+            time.time() + 3600,
+        )
+    )
+    monkeypatch.setattr(codex_oauth, "refresh_codex_token", refresh)
+    writes: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
+
+    def persist(provider: str, expected: dict[str, Any], replacement: dict[str, Any]) -> bool:
+        writes.append((provider, expected, replacement))
+        return True
+
+    rotator = CodexTokenRotator(
+        [{
+            "label": "test-account",
+            "access_token": "old-access",
+            "refresh_token": "old-refresh",
+            "expires_at_ms": int((time.time() - 60) * 1000),
+        }],
+        http_client=object(),
+        provider="openai-codex",
+        persist_credentials=persist,
+    )
+
+    with caplog.at_level(logging.INFO, logger="tusker_gateway.passthrough"):
+        assert await rotator.get_token() == "new-access"
+
+    assert len(writes) == 1
+    assert writes[0][0] == "openai-codex"
+    assert writes[0][1]["refresh_token"] == "old-refresh"
+    assert writes[0][2]["refresh_token"] == "new-refresh"
+    assert "refresh_token_rotated=True persistence=committed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_rotator_reports_missing_rotated_refresh_token(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    import logging
+
+    import tusker_gateway.codex_oauth as codex_oauth
+    from tusker_gateway.passthrough import CodexTokenRotator
+
+    refresh = AsyncMock(
+        return_value=({"access_token": "new-access"}, time.time() + 3600)
+    )
+    monkeypatch.setattr(codex_oauth, "refresh_codex_token", refresh)
+    writes: list[dict[str, Any]] = []
+
+    def persist(_provider: str, _expected: dict[str, Any], replacement: dict[str, Any]) -> bool:
+        writes.append(replacement)
+        return True
+
+    rotator = CodexTokenRotator(
+        [{
+            "access_token": "old-access",
+            "refresh_token": "old-refresh",
+            "expires_at_ms": int((time.time() - 60) * 1000),
+        }],
+        http_client=object(),
+        provider="openai-codex",
+        persist_credentials=persist,
+    )
+
+    with caplog.at_level(logging.INFO, logger="tusker_gateway.passthrough"):
+        assert await rotator.get_token() == "new-access"
+
+    assert writes[0]["refresh_token"] == "old-refresh"
+    assert "refresh_token_rotated=False persistence=committed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_rotator_logs_database_persistence_conflict_without_losing_live_token(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    import logging
+
+    import tusker_gateway.codex_oauth as codex_oauth
+    from tusker_gateway.passthrough import CodexTokenRotator
+
+    refresh = AsyncMock(
+        return_value=(
+            {"access_token": "new-access", "refresh_token": "new-refresh"},
+            time.time() + 3600,
+        )
+    )
+    monkeypatch.setattr(codex_oauth, "refresh_codex_token", refresh)
+    rotator = CodexTokenRotator(
+        [{
+            "access_token": "old-access",
+            "refresh_token": "old-refresh",
+            "expires_at_ms": int((time.time() - 60) * 1000),
+        }],
+        http_client=object(),
+        provider="openai-codex",
+        persist_credentials=lambda *_args: False,
+    )
+
+    with caplog.at_level(logging.ERROR, logger="tusker_gateway.passthrough"):
+        assert await rotator.get_token() == "new-access"
+
+    assert "outcome=conflict_or_missing" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_rotator_refreshes_access_token_rejected_before_local_expiry(
     monkeypatch: pytest.MonkeyPatch,
 ):

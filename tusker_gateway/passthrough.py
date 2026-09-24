@@ -1057,15 +1057,18 @@ class CodexTokenRotator:
                         else:
                             self._creds[idx] = refreshed
                             self._refresh_failed_until.pop(idx, None)
-                            self._persist(pre_refresh, refreshed)
+                            persisted = await self._persist(pre_refresh, refreshed)
                             token = _creds_access_token(refreshed)
                             logger.info(
                                 "oauth refresh succeeded provider=%s credential_index=%d/%d "
-                                "expires_in_s=%.0f",
+                                "expires_in_s=%.0f refresh_token_rotated=%s persistence=%s",
                                 self._provider,
                                 idx + 1,
                                 count,
                                 max(0.0, _creds_expires_at(refreshed) - time.time()),
+                                _creds_refresh_token(pre_refresh)
+                                != _creds_refresh_token(refreshed),
+                                "committed" if persisted else "not_committed",
                             )
                     elif self._is_expired(cred):
                         # Do not retry a known-bad refresh on every request
@@ -1242,15 +1245,15 @@ class CodexTokenRotator:
         expires_at = _creds_expires_at(cred)
         return bool(expires_at and time.time() >= expires_at)
 
-    def _persist(self, expected: dict[str, Any], replacement: dict[str, Any]) -> None:
+    async def _persist(self, expected: dict[str, Any], replacement: dict[str, Any]) -> bool:
         """Persist a refreshed credential.
 
         DB-authoritative mode (``persist_credentials`` callback set):
         compare-and-swap write of the refreshed credential into the
-        encrypted store, offloaded to a worker thread so the request path
-        never blocks on DB I/O. A CAS failure means an admin replaced the
-        row concurrently — the in-memory refreshed credential is kept for
-        this process, but the admin replacement is NOT overwritten.
+        encrypted store, offloaded to a worker thread. Await completion so a
+        successful refresh is not reported before its rotated token is
+        durably written. A CAS miss means another writer replaced the row;
+        keep this process's in-memory token but report the conflict.
 
         Legacy mode: write the pool back to the Hermes auth file.
         """
@@ -1260,35 +1263,29 @@ class CodexTokenRotator:
             replacement_snap = dict(replacement)
             provider = self._provider
 
-            def _cas() -> None:
-                try:
-                    # CAS contract: persist_credentials(provider, expected,
-                    # replacement) -> bool, single credential dicts. False
-                    # means an admin replaced the row concurrently — keep
-                    # the in-memory refreshed credential but do NOT
-                    # overwrite the admin replacement.
-                    if not persist(provider, expected_snap, replacement_snap):
-                        logger.info(
-                            "oauth credential CAS skipped (row replaced concurrently) provider=%s",
-                            provider,
-                        )
-                except Exception:
-                    logger.exception(
-                        "oauth credential DB persistence failed provider=%s",
-                        provider,
-                    )
-
-            # DB I/O must never block the request path: offload to a worker
-            # thread. to_thread returns a future we do not await (fire-and-
-            # forget) which is safe: _cas swallows all exceptions.
-            asyncio.get_running_loop().run_in_executor(None, _cas)
-            return
+            try:
+                committed = await asyncio.to_thread(
+                    persist, provider, expected_snap, replacement_snap
+                )
+            except Exception:
+                logger.exception(
+                    "oauth credential DB persistence failed provider=%s outcome=exception",
+                    provider,
+                )
+                return False
+            if not committed:
+                logger.error(
+                    "oauth credential CAS did not commit provider=%s outcome=conflict_or_missing",
+                    provider,
+                )
+            return bool(committed)
         if not self._auth_file:
-            return
+            return True
         try:
             from tusker_gateway.copilot_enroll import save_provider_auth_pool
 
-            save_provider_auth_pool(
+            await asyncio.to_thread(
+                save_provider_auth_pool,
                 self._provider,
                 self._creds,
                 self._auth_file,
@@ -1298,6 +1295,8 @@ class CodexTokenRotator:
                 "oauth credential persistence failed provider=%s",
                 self._provider,
             )
+            return False
+        return True
 
     def _canary_skip_rotation(self, cred: dict[str, Any]) -> bool:
         """Return True when canary policy forbids rotating this credential.
