@@ -1538,3 +1538,54 @@ class TestCompletionTokensParam:
         body = {"max_tokens": 128}
         _rename_max_tokens_for_provider(body, "openrouter")
         assert body == {"max_tokens": 128}
+
+
+class TestApimToolReasoningCompatibility:
+    def test_gpt6_function_tools_disable_unsupported_reasoning_effort(self):
+        from tusker_gateway.passthrough import _adapt_apim_tool_reasoning
+
+        body = {
+            "model": "gpt-6-luna",
+            "reasoning_effort": "high",
+            "tools": [{"type": "function", "function": {"name": "bash"}}],
+        }
+        _adapt_apim_tool_reasoning(body, "apim")
+        assert body["reasoning_effort"] == "none"
+
+    def test_apim_gpt6_without_function_tools_keeps_reasoning(self):
+        from tusker_gateway.passthrough import _adapt_apim_tool_reasoning
+
+        body = {"model": "gpt-6-luna", "reasoning_effort": "high", "tools": []}
+        _adapt_apim_tool_reasoning(body, "apim")
+        assert body["reasoning_effort"] == "high"
+
+    def test_apim_gpt6_without_reasoning_setting_is_unchanged(self):
+        from tusker_gateway.passthrough import _adapt_apim_tool_reasoning
+
+        body = {
+            "model": "gpt-6-luna",
+            "tools": [{"type": "function", "function": {"name": "bash"}}],
+        }
+        _adapt_apim_tool_reasoning(body, "apim")
+        assert "reasoning_effort" not in body
+
+    def test_apim_gpt6_explicit_none_is_preserved(self):
+        from tusker_gateway.passthrough import _adapt_apim_tool_reasoning
+
+        body = {
+            "model": "gpt-6-luna",
+            "reasoning_effort": "none",
+            "tools": [{"type": "function", "function": {"name": "bash"}}],
+        }
+        _adapt_apim_tool_reasoning(body, "apim")
+        assert body["reasoning_effort"] == "none"
+
+    def test_other_provider_and_apim_models_are_unchanged(self):
+        from tusker_gateway.passthrough import _adapt_apim_tool_reasoning
+
+        tool = [{"type": "function", "function": {"name": "bash"}}]
+        other_provider = {"model": "gpt-6-luna", "reasoning_effort": "high", "tools": tool}
+        other_model = {"model": "gpt-5.6-luna", "reasoning_effort": "high", "tools": tool}
+        _adapt_apim_tool_reasoning(other_provider, "openai")
+        _adapt_apim_tool_reasoning(other_model, "apim")
+        assert other_provider["reasoning_effort"] == other_model["reasoning_effort"] == "high"

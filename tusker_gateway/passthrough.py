@@ -102,6 +102,24 @@ def _normalize_reasoning_effort(value: Any) -> Any:
 _COMPLETION_TOKENS_PROVIDERS = frozenset({"apim"})
 
 
+def _adapt_apim_tool_reasoning(body: dict[str, Any], provider: str) -> None:
+    """Apply APIM's gpt-6-luna chat-completions tool constraint.
+
+    This deployment rejects function tools when ``reasoning_effort`` is set
+    to anything other than ``none``. Keep the client's setting for other
+    routes/models and for requests without function tools.
+    """
+    if provider.lower() != "apim" or str(body.get("model", "")).lower() != "gpt-6-luna":
+        return
+    tools = body.get("tools")
+    has_function_tools = isinstance(tools, list) and any(
+        isinstance(tool, dict) and tool.get("type") == "function" for tool in tools
+    )
+    effort = body.get("reasoning_effort")
+    if has_function_tools and effort is not None and str(effort).lower() != "none":
+        body["reasoning_effort"] = "none"
+
+
 def _rename_max_tokens_for_provider(body: dict[str, Any], provider: str) -> None:
     """Rename ``max_tokens`` → ``max_completion_tokens`` for providers that
     reject the legacy name. Mutates ``body`` in place.
@@ -2271,6 +2289,7 @@ class PassthroughClient:
             effort = body.get("reasoning_effort")
             if isinstance(effort, str):
                 body["reasoning_effort"] = _normalize_reasoning_effort(effort)
+        _adapt_apim_tool_reasoning(body, provider)
         _rename_max_tokens_for_provider(body, provider)
         return headers, body
 

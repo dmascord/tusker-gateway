@@ -140,6 +140,31 @@ async def test_request_body_preserves_explicit_tool_choice():
     assert body["tool_choice"] == "required"
 
 
+@pytest.mark.asyncio
+async def test_apim_gpt6_function_tools_use_supported_reasoning_effort():
+    http = _mock_http({"choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]})
+    client = PassthroughClient(_cfg(
+        provider_api_keys={"apim": "apim-test-key"},
+        providers={"apim": {
+            "base_url": "https://apim.example.test",
+            "chat_path": "/v1/chat/completions",
+            "auth_type": "api_key_header",
+            "api_key_header": "api-key",
+        }},
+    ), QualityDB(":memory:"), http)
+    await client.chat(
+        "apim",
+        "gpt-6-luna",
+        [{"role": "user", "content": "run the function"}],
+        tools=[{"type": "function", "function": {"name": "bash"}}],
+        extra_body={"reasoning_effort": "high"},
+    )
+    body = http.request.call_args.kwargs.get("json")
+    assert body["model"] == "gpt-6-luna"
+    assert body["tools"][0]["type"] == "function"
+    assert body["reasoning_effort"] == "none"
+
+
 @pytest.mark.parametrize("provider", ["google", "openai"])
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize("endpoint", ["/v1/chat/completions", "/v1/responses"])
