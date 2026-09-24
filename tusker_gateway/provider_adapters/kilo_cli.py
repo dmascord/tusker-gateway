@@ -13,7 +13,7 @@ from urllib.parse import urljoin
 from pathlib import Path
 from typing import Any
 
-from tusker_gateway.errors import BadRequestError, ProviderError, ProviderRouteDisabledError
+from tusker_gateway.errors import BadRequestError, GatewayError, ProviderError, ProviderRouteDisabledError
 from tusker_gateway.provider_adapters.claude_code import (
     _normalise_tools,
     _prompt,
@@ -29,6 +29,30 @@ def _enabled() -> bool:
     return os.environ.get("TUSKER_KILO_CLI_ENABLED", "").strip().lower() in {
         "1", "true", "yes", "on",
     }
+
+
+# Worker responses that describe the request instead of the worker's health.
+# ``tusker_gateway.kilo_worker`` returns 400 for its own request rejections
+# (for example text-only content), so collapsing those into a generic 502
+# would report a client mistake as a provider outage.
+_WORKER_REQUEST_FAILURE_STATUSES = frozenset({400, 413, 415, 422, 428})
+
+
+def _worker_error(status: int, message: Any, code: Any) -> GatewayError:
+    """Translate a Kilo worker HTTP failure into the client-visible error."""
+    error_message = message if isinstance(message, str) and message.strip() else None
+    error_code = code if isinstance(code, str) and code.strip() else None
+    if status in _WORKER_REQUEST_FAILURE_STATUSES:
+        error: GatewayError = BadRequestError(
+            error_message or "Kilo worker request failed",
+            code=error_code or "kilo_worker_failed",
+        )
+        error.status = status
+        return error
+    return ProviderError(
+        error_message or "Kilo worker request failed",
+        code=error_code or "kilo_worker_failed",
+    )
 
 
 def _model_for_cli(model: str) -> str:
@@ -319,11 +343,10 @@ class KiloCLIAdapter:
                         ) from exc
                     if response.status >= 400:
                         error = payload.get("error", {}) if isinstance(payload, dict) else {}
-                        code = error.get("code") if isinstance(error, dict) else None
-                        message = error.get("message") if isinstance(error, dict) else None
-                        raise ProviderError(
-                            message or "Kilo worker request failed",
-                            code=code or "kilo_worker_failed",
+                        raise _worker_error(
+                            response.status,
+                            error.get("message") if isinstance(error, dict) else None,
+                            error.get("code") if isinstance(error, dict) else None,
                         )
         except asyncio.TimeoutError as exc:
             raise ProviderError("Kilo worker request timed out", code="upstream_timeout") from exc
@@ -365,11 +388,10 @@ class KiloCLIAdapter:
                             except (ValueError, aiohttp.ContentTypeError):
                                 payload = {}
                             error = payload.get("error", {}) if isinstance(payload, dict) else {}
-                            raise ProviderError(
-                                error.get("message", "Kilo worker request failed")
-                                if isinstance(error, dict) else "Kilo worker request failed",
-                                code=error.get("code", "kilo_worker_failed")
-                                if isinstance(error, dict) else "kilo_worker_failed",
+                            raise _worker_error(
+                                response.status,
+                                error.get("message") if isinstance(error, dict) else None,
+                                error.get("code") if isinstance(error, dict) else None,
                             )
                         async for chunk in response.content.iter_any():
                             if chunk:
