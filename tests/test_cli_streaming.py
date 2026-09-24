@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from tusker_gateway.errors import ProviderError
 from tusker_gateway.provider_adapters.cli_streaming import (
     claude_text_from_event,
     stream_cli_jsonl,
@@ -49,6 +50,14 @@ class _Process:
 
     async def wait(self):
         return self.returncode
+
+
+class _StderrReader:
+    def __init__(self, data: bytes):
+        self._data = data
+
+    async def read(self):
+        return self._data
 
 
 @pytest.mark.parametrize("event,extractor", [
@@ -106,3 +115,28 @@ async def test_claude_partial_text_delta_is_forwarded_but_other_events_are_not()
     ):
         frames = [item async for item in stream]
     assert json.loads(sse_data_payload(frames[0]))["choices"][0]["delta"]["content"] == "token"
+
+
+@pytest.mark.asyncio
+async def test_nonzero_cli_exit_logs_bounded_stderr_preview():
+    stderr = b"cli: fatal auth error\n" + b"x" * 600
+    process = _Process([])
+    process.returncode = 1
+    process.stderr = _StderrReader(stderr)
+    stream = stream_cli_jsonl(
+        ["fake-cli"], env={}, prompt=b"prompt", model="kilo-cli/kilo/kilo-auto/free",
+        timeout=1, text_extractor=text_from_event, error_code="kilo_cli_failed",
+    )
+    with patch(
+        "tusker_gateway.provider_adapters.cli_streaming.asyncio.create_subprocess_exec",
+        new=AsyncMock(return_value=process),
+    ), patch("tusker_gateway.provider_adapters.cli_streaming.logger") as log:
+        with pytest.raises(ProviderError) as exc:
+            [item async for item in stream]
+
+    assert exc.value.code == "kilo_cli_failed"
+    (message, rc, size, preview), _ = log.warning.call_args
+    assert message == "CLI stream exited rc=%s stderr_bytes=%d stderr=%r"
+    assert (rc, size) == (1, len(stderr))
+    assert preview == stderr.decode("utf-8")[:512]
+    assert len(preview) == 512

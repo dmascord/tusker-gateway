@@ -134,7 +134,11 @@ def stream_cli_jsonl(
                 raise ProviderError(timeout_message, code="upstream_timeout") from exc
             stderr = await stderr_task if stderr_task else b""
             if proc.returncode != 0 and call_value is None:
-                logger.warning("CLI stream exited rc=%s stderr_bytes=%d", proc.returncode, len(stderr))
+                stderr_preview = stderr.decode("utf-8", errors="replace")[:512]
+                logger.warning(
+                    "CLI stream exited rc=%s stderr_bytes=%d stderr=%r",
+                    proc.returncode, len(stderr), stderr_preview,
+                )
                 raise ProviderError("CLI request failed", code=error_code)
             if not emitted:
                 raise ProviderError("CLI returned no assistant output", code="invalid_upstream_response")

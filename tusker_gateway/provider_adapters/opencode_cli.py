@@ -236,7 +236,11 @@ class OpenCodeCLIAdapter:
                 raise ProviderError("Could not start OpenCode CLI", code="opencode_cli_failed") from exc
 
         if proc.returncode != 0:
-            logger.warning("opencode-cli exited rc=%s stderr_bytes=%d", proc.returncode, len(stderr))
+            stderr_preview = stderr.decode("utf-8", errors="replace")[:512]
+            logger.warning(
+                "opencode-cli exited rc=%s stderr_bytes=%d stderr=%r",
+                proc.returncode, len(stderr), stderr_preview,
+            )
             raise ProviderError("OpenCode CLI request failed", code="opencode_cli_failed")
         text = self._extract_text(stdout)
         if text is None:

@@ -201,3 +201,22 @@ async def test_cli_error_and_missing_binary_are_actionable(monkeypatch):
         with pytest.raises(ProviderError) as exc:
             await adapter.chat(provider="opencode-cli", model="big-pickle", messages=[])
     assert exc.value.code == "invalid_upstream_response"
+
+
+@pytest.mark.asyncio
+async def test_nonzero_exit_logs_bounded_stderr_preview(monkeypatch):
+    monkeypatch.setenv("TUSKER_OPENCODE_CLI_ENABLED", "true")
+    stderr = b"opencode: fatal auth error\n" + b"x" * 600
+    with patch("tusker_gateway.provider_adapters.opencode_cli.shutil.which", return_value="opencode"), \
+         patch("tusker_gateway.provider_adapters.opencode_cli.asyncio.create_subprocess_exec",
+               new=AsyncMock(return_value=_FakeProcess(b"", stderr=stderr, returncode=1))), \
+         patch("tusker_gateway.provider_adapters.opencode_cli.logger") as log:
+        with pytest.raises(ProviderError) as exc:
+            await OpenCodeCLIAdapter().chat(provider="opencode-cli", model="big-pickle", messages=[])
+
+    assert exc.value.code == "opencode_cli_failed"
+    (message, rc, size, preview), _ = log.warning.call_args
+    assert message == "opencode-cli exited rc=%s stderr_bytes=%d stderr=%r"
+    assert (rc, size) == (1, len(stderr))
+    assert preview == stderr.decode("utf-8")[:512]
+    assert len(preview) == 512
