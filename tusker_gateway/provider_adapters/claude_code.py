@@ -1,8 +1,11 @@
-"""Conservative adapter for Anthropic's official Claude Code CLI.
+"""Adapter for Anthropic's official Claude Code CLI.
 
 The adapter uses the runtime's existing Claude Code login without reading,
 copying, refreshing, or persisting credentials. Built-in CLI tools are off;
 only request-scoped MCP proxies for the client's declared tools are exposed.
+Text and base64 image content are supported; images travel through Claude
+Code's ``stream-json`` input as base64 content blocks (remote image URLs are
+rejected because the CLI's fetcher honours robots.txt).
 """
 
 from __future__ import annotations
@@ -100,7 +103,10 @@ def _enabled() -> bool:
     }
 
 
-def _as_text(content: Any) -> str:
+def _as_text(
+    content: Any, *, allow_images: bool = False,
+    provider_label: str = "claude-code-cli",
+) -> str:
     if content is None:
         return ""
     if isinstance(content, str):
@@ -108,15 +114,88 @@ def _as_text(content: Any) -> str:
     if isinstance(content, list):
         parts: list[str] = []
         for item in content:
-            if isinstance(item, dict) and item.get("type") == "text":
-                parts.append(str(item.get("text", "")))
-            else:
-                raise BadRequestError(
-                    "claude-code-cli currently accepts text-only message content",
-                    code="unsupported_message_content",
-                )
+            if isinstance(item, dict):
+                kind = str(item.get("type") or "").strip().lower()
+                if kind in {"text", "input_text"}:
+                    parts.append(str(item.get("text", "")))
+                    continue
+                if allow_images and kind in {"image_url", "input_image"}:
+                    parts.append("[image]")
+                    continue
+            raise BadRequestError(
+                f"{provider_label} currently accepts text-only message content",
+                code="unsupported_message_content",
+            )
         return "\n".join(parts)
     raise BadRequestError("Message content must be text", code="invalid_message_content")
+
+
+def _image_blocks(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collect base64 image blocks from every message for Claude stream-json input.
+
+    Remote URLs are rejected: the CLI fetcher honours robots.txt and
+    fails unpredictably, so only deterministic base64 data URLs are forwarded.
+    """
+    from tusker_gateway.tool_formats import _ANTHROPIC_IMAGE_DATA_URL_RE
+
+    blocks: list[dict[str, Any]] = []
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            kind = str(part.get("type") or "").strip().lower()
+            if kind not in {"image_url", "input_image"}:
+                continue
+            url = part.get("image_url")
+            if isinstance(url, dict):
+                url = url.get("url")
+            if not isinstance(url, str) or not url:
+                raise BadRequestError(
+                    "Message image block must contain a non-empty image_url",
+                    code="invalid_image_url",
+                )
+            match = _ANTHROPIC_IMAGE_DATA_URL_RE.fullmatch(url)
+            if match is None:
+                raise BadRequestError(
+                    "claude-code-cli accepts base64 image data URLs only; "
+                    "convert remote images before sending",
+                    code="invalid_image_url",
+                )
+            blocks.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": match.group(1),
+                    "data": match.group(2),
+                },
+            })
+    return blocks
+
+
+def _stream_json_input(prompt: str, images: list[dict[str, Any]]) -> bytes:
+    """Encode transcript plus image blocks as Claude stream-json input."""
+    content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+    content.extend(images)
+    message = {"type": "user", "message": {"role": "user", "content": content}}
+    return (json.dumps(message, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def _stream_json_result(stdout: bytes) -> dict[str, Any]:
+    """Return the final ``result`` event from a stream-json transcript."""
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if isinstance(event, dict) and event.get("type") == "result":
+            return event
+    raise ProviderError(
+        "Claude Code CLI response did not contain a result",
+        code="invalid_upstream_response",
+    )
 
 
 def _normalise_tools(tools: list[dict[str, Any]] | None, tool_choice: Any) -> list[dict[str, Any]]:
@@ -239,7 +318,10 @@ def _frame_tool_call(frame: bytes) -> dict[str, Any] | None:
     return None
 
 
-def _prompt(messages: list[dict[str, Any]], *, has_tools: bool, tool_choice: Any) -> str:
+def _prompt(
+    messages: list[dict[str, Any]], *, has_tools: bool, tool_choice: Any,
+    allow_images: bool = False, provider_label: str = "claude-code-cli",
+) -> str:
     from tusker_gateway.tool_formats import normalize_tool_calls
 
     supported = {"system", "developer", "user", "assistant"}
@@ -250,17 +332,19 @@ def _prompt(messages: list[dict[str, Any]], *, has_tools: bool, tool_choice: Any
         role = str(message.get("role", ""))
         if role == "tool":
             call_id = str(message.get("tool_call_id") or "")
-            content = _as_text(message.get("content", ""))
+            content = _as_text(message.get("content", ""), provider_label=provider_label)
             if call_id:
                 result_ids.add(call_id)
             transcript.append(f"<gateway_tool_result call_id={json.dumps(call_id)}>\n{content}\n</gateway_tool_result>")
             continue
         if role not in supported:
             raise BadRequestError(
-                f"claude-code-cli does not support {role!r} messages yet",
+                f"{provider_label} does not support {role!r} messages yet",
                 code="unsupported_message_role",
             )
-        content = _as_text(message.get("content", ""))
+        content = _as_text(
+            message.get("content", ""), allow_images=allow_images, provider_label=provider_label,
+        )
         if content:
             transcript.append(f"<{role}>\n{content}\n</{role}>")
         calls = message.get("tool_calls")
@@ -358,7 +442,11 @@ class ClaudeCodeCLIAdapter:
             )
 
         tool_manifest = _normalise_tools(tools, tool_choice)
-        prompt = _prompt(messages, has_tools=bool(tool_manifest), tool_choice=tool_choice)
+        images = _image_blocks(messages)
+        prompt = _prompt(
+            messages, has_tools=bool(tool_manifest), tool_choice=tool_choice,
+            allow_images=bool(images),
+        )
 
         answered_calls = _answered_tool_calls(messages)
         # Keep the child environment allowlisted (no gateway/provider secrets).
@@ -381,9 +469,10 @@ class ClaudeCodeCLIAdapter:
                 )
 
             temp_dir = Path(tempfile.mkdtemp(prefix="tusker-claude-stream-"))
+            input_format = ["--input-format", "stream-json"] if images else []
             command = [
                 resolved, "-p", "--output-format", "stream-json", "--verbose",
-                "--include-partial-messages", "--model", cli_model,
+                "--include-partial-messages", *input_format, "--model", cli_model,
                 "--tools", "", "--permission-mode",
                 "dontAsk" if tool_manifest else "plan",
                 "--permission-prompts", "none", "--no-session-persistence",
@@ -414,7 +503,9 @@ class ClaudeCodeCLIAdapter:
             timeout = max(10.0, float(os.environ.get("TUSKER_CLAUDE_CODE_TIMEOUT_SECS", "600")))
             return self._guarded_stream(
                 stream_cli_jsonl(
-                    command, env=env, prompt=prompt.encode(), model=model, timeout=timeout,
+                    command, env=env,
+                    prompt=_stream_json_input(prompt, images) if images else prompt.encode(),
+                    model=model, timeout=timeout,
                     text_extractor=claude_text_from_event, event_error_extractor=stream_error,
                     call_file=call_file,
                     cleanup_dir=temp_dir, error_code="claude_code_cli_failed",
@@ -425,8 +516,12 @@ class ClaudeCodeCLIAdapter:
 
         with tempfile.TemporaryDirectory(prefix="tusker-claude-") as temp_name:
             temp_dir = Path(temp_name)
+            input_format = ["--input-format", "stream-json"] if images else []
+            output_format = ["--output-format", "stream-json", "--verbose"] if images else [
+                "--output-format", "json",
+            ]
             command = [
-                resolved, "-p", "--output-format", "json", "--model", cli_model,
+                resolved, "-p", *input_format, *output_format, "--model", cli_model,
                 "--tools", "", "--permission-mode",
                 "dontAsk" if tool_manifest else "plan",
                 "--permission-prompts", "none",
@@ -464,7 +559,8 @@ class ClaudeCodeCLIAdapter:
                     env=env,
                     start_new_session=True,
                 )
-                communicate_task = asyncio.create_task(proc.communicate(prompt.encode()))
+                stdin_payload = _stream_json_input(prompt, images) if images else prompt.encode()
+                communicate_task = asyncio.create_task(proc.communicate(stdin_payload))
                 timeout = max(
                     10.0,
                     float(os.environ.get("TUSKER_CLAUDE_CODE_TIMEOUT_SECS", "600")),
@@ -557,7 +653,7 @@ class ClaudeCodeCLIAdapter:
                 raise ClaudeAuthRequiredError()
             raise ProviderError("Claude Code CLI request failed", code="claude_code_cli_failed")
         try:
-            result = json.loads(stdout)
+            result = _stream_json_result(stdout) if images else json.loads(stdout)
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise ProviderError(
                 "Claude Code CLI returned malformed JSON",

@@ -72,7 +72,10 @@ class OpenCodeCLIAdapter:
             raise ProviderError("OpenCode CLI is not installed in the runtime", code="opencode_cli_unavailable")
 
         tool_manifest = _normalise_tools(tools, tool_choice)
-        prompt = _prompt(messages, has_tools=bool(tool_manifest), tool_choice=tool_choice)
+        prompt = _prompt(
+            messages, has_tools=bool(tool_manifest), tool_choice=tool_choice,
+            provider_label="opencode-cli",
+        )
         env = {
             "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
             "HOME": os.environ.get("HOME", "/home/tusker"),

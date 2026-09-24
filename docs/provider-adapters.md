@@ -31,8 +31,11 @@ ordinary OpenAI `tool_calls` response for the connected harness to validate,
 approve, and execute. On the next turn, the assistant call and client tool
 result are replayed as history. Tool-bearing runs use `dontAsk` with a strict
 MCP config and allow only this gateway MCP server; text-only runs use plan
-mode. Images and other multimodal message content remain unsupported and are
-rejected rather than silently dropped. Streaming requests use Claude Code's
+Text and image content are supported when the upstream provider accepts it
+(currently base64 image data URLs are forwarded to Claude Code's
+``stream-json`` input; remote URL fetch is rejected because it depends on the
+target site's robots.txt). Other multimodal content such as audio or video is
+still rejected rather than silently dropped. Streaming requests use Claude Code's
 `stream-json` partial-message output and forward assistant text deltas as
 OpenAI SSE while the CLI is still running. Lifecycle and diagnostic events
 are not exposed as assistant text; CLI errors after a stream starts are sent

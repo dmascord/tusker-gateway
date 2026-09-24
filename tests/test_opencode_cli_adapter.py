@@ -220,3 +220,19 @@ async def test_nonzero_exit_logs_bounded_stderr_preview(monkeypatch):
     assert (rc, size) == (1, len(stderr))
     assert preview == stderr.decode("utf-8")[:512]
     assert len(preview) == 512
+
+
+
+@pytest.mark.asyncio
+async def test_opencode_rejects_image_content_naming_opencode(monkeypatch):
+    monkeypatch.setenv("TUSKER_OPENCODE_CLI_ENABLED", "true")
+    with patch("tusker_gateway.provider_adapters.opencode_cli.shutil.which", return_value="opencode"):
+        with pytest.raises(BadRequestError) as exc:
+            await OpenCodeCLIAdapter().chat(
+                provider="opencode-cli", model="big-pickle",
+                messages=[{"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}},
+                ]}], stream=False,
+            )
+    assert exc.value.code == "unsupported_message_content"
+    assert "opencode-cli currently accepts text-only" in exc.value.message

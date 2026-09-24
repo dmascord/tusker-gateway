@@ -160,15 +160,16 @@ async def test_cli_returns_client_tool_call_without_executing_it(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_cli_rejects_non_text_but_replays_tool_history(monkeypatch):
+async def test_cli_rejects_malformed_image_and_replays_tool_history(monkeypatch):
     monkeypatch.setenv("TUSKER_CLAUDE_CODE_ENABLED", "true")
     adapter = ClaudeCodeCLIAdapter()
-    with pytest.raises(BadRequestError, match="text-only"):
+    with pytest.raises(BadRequestError, match="non-empty image_url"):
         await adapter.chat(
             provider="claude-code-cli", model="sonnet",
             messages=[{"role": "user", "content": [{"type": "image_url"}]}], stream=False,
         )
     from tusker_gateway.provider_adapters.claude_code import _prompt
+
     prompt = _prompt(
         [
             {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function",
@@ -204,6 +205,109 @@ async def test_cli_invokes_allowlisted_model_and_converts_result(monkeypatch):
     assert "USER" in spawn.await_args.kwargs["env"]
     assert "TMPDIR" in spawn.await_args.kwargs["env"]
     assert spawn.await_args.kwargs["env"]["DISABLE_AUTOUPDATER"] == "1"
+
+
+@pytest.mark.asyncio
+async def test_cli_sends_base64_images_via_stream_json_input(monkeypatch):
+    monkeypatch.setenv("TUSKER_CLAUDE_CODE_ENABLED", "true")
+    data_url = "data:image/png;base64," + "aGk="
+    captured: dict[str, bytes] = {}
+
+    class RecordingProcess(_FakeProcess):
+        async def communicate(self, _input: bytes | None = None):
+            captured["stdin"] = _input or b""
+            return (
+                b'{"type":"system","subtype":"init"}\n'
+                b'{"type":"result","subtype":"success","is_error":false,"result":"red",'
+                b'"session_id":"s9","usage":{"input_tokens":5,"output_tokens":1}}\n',
+                b"",
+            )
+
+    proc = RecordingProcess(b"")
+    with patch("tusker_gateway.provider_adapters.claude_code.shutil.which", return_value="/bin/claude"), \
+         patch("tusker_gateway.provider_adapters.claude_code.asyncio.create_subprocess_exec",
+               new=AsyncMock(return_value=proc)) as spawn:
+        result = await ClaudeCodeCLIAdapter().chat(
+            provider="claude-code-cli", model="sonnet",
+            messages=[{"role": "user", "content": [
+                {"type": "text", "text": "colour?"},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ]}], stream=False,
+        )
+    assert result["choices"][0]["message"]["content"] == "red"
+    args = spawn.await_args.args
+    assert args[args.index("--input-format") + 1] == "stream-json"
+    assert args[args.index("--output-format") + 1] == "stream-json"
+    payload = json.loads(captured["stdin"].decode())
+    assert payload["type"] == "user"
+    content = payload["message"]["content"]
+    assert content[0] == {"type": "text", "text": "<user>\ncolour?\n[image]\n</user>"}
+    assert content[1]["type"] == "image"
+    assert content[1]["source"]["type"] == "base64"
+    assert content[1]["source"]["data"] == "aGk="
+
+
+@pytest.mark.asyncio
+async def test_cli_stream_image_request_feeds_stream_json(monkeypatch):
+    monkeypatch.setenv("TUSKER_CLAUDE_CODE_ENABLED", "true")
+    data_url = "data:image/png;base64," + "aGVsbG8="
+
+    class RecordingWriter(_FakeWriter):
+        def __init__(self):
+            self.data = b""
+
+        def write(self, _data):
+            self.data += _data
+
+        def getvalue(self) -> bytes:
+            return self.data
+
+    fake_stdin = RecordingWriter()
+    stdout = (
+        b'{"type":"stream_event","event":{"type":"content_block_delta",'
+        b'"delta":{"type":"text_delta","text":"Blue"}}}\n'
+        b'{"type":"result","subtype":"success","is_error":false,"result":"Blue"}\n'
+    )
+
+    proc = _FakeStreamingProcess.__new__(_FakeStreamingProcess)
+    proc.pid = 1234
+    proc.stdin = fake_stdin
+    proc.stdout = _FakeReader(stdout)
+    proc.stderr = _FakeReader(b"")
+    proc.returncode = 0
+
+    with patch("tusker_gateway.provider_adapters.claude_code.shutil.which", return_value="claude"), \
+         patch("tusker_gateway.provider_adapters.claude_code.asyncio.create_subprocess_exec",
+               new=AsyncMock(return_value=proc)) as spawn:
+        result = await ClaudeCodeCLIAdapter().chat(
+            provider="claude-code-cli", model="sonnet",
+            messages=[{"role": "user", "content": [
+                {"type": "text", "text": "colour?"},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ]}], stream=True,
+        )
+        frames = [frame async for frame in result]
+    assert json.loads(sse_data_payload(frames[0]))["choices"][0]["delta"]["content"] == "Blue"
+    assert fake_stdin.getvalue().endswith(b"\n")
+    payload = json.loads(fake_stdin.getvalue().decode())
+    assert payload["type"] == "user"
+    assert payload["message"]["content"][1]["source"]["type"] == "base64"
+    args = spawn.await_args.args
+    assert args[args.index("--input-format") + 1] == "stream-json"
+    assert "--include-partial-messages" in args
+
+
+@pytest.mark.asyncio
+async def test_cli_rejects_remote_image_urls(monkeypatch):
+    monkeypatch.setenv("TUSKER_CLAUDE_CODE_ENABLED", "true")
+    with pytest.raises(BadRequestError, match="data URL") as exc:
+        await ClaudeCodeCLIAdapter().chat(
+            provider="claude-code-cli", model="sonnet",
+            messages=[{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "https://example.com/x.png"}},
+            ]}], stream=False,
+        )
+    assert exc.value.code == "invalid_image_url"
 
 
 @pytest.mark.asyncio
