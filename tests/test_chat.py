@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import aiohttp
 import json
 import os
 from types import SimpleNamespace
@@ -2098,6 +2099,194 @@ async def test_chat_stream_malformed_tool_markup_retries_before_visible_output(a
     assert pool_manager.select.call_args_list[1].kwargs["excluded"] == {
         ("alibaba", "malformed-model")
     }
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_retries_upstream_transport_abort_before_visible_output(app, client):
+    """A truncated upstream body must fail over while only the role frame is sent."""
+    pool_manager = MagicMock()
+    pool_manager.select.side_effect = [
+        ("xiaomi", "truncating-model"),
+        ("openrouter", "healthy-model"),
+    ]
+    pool_manager.fallback_pools.return_value = ()
+    app["pool_manager"] = pool_manager
+
+    async def truncating_stream(*args, **kwargs):
+        yield b'data: {"choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}\n\n'
+        raise aiohttp.ClientPayloadError(
+            "Response payload is not completed: "
+            "<TransferEncodingError: 400, message='Not enough data to satisfy transfer length header.'>"
+        )
+
+    async def healthy_stream(*args, **kwargs):
+        yield b'data: {"choices":[{"delta":{"content":"recovered output"}}]}\n\n'
+        yield b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    with patch(
+        "tusker_gateway.endpoints.PassthroughClient.chat",
+        new_callable=AsyncMock,
+    ) as mock_chat:
+        mock_chat.side_effect = [truncating_stream(), healthy_stream()]
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-code",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+            },
+            headers=HEADERS_AUTH,
+        )
+        body = await response.read()
+
+    assert response.status == 200
+    assert b"gateway: upstream output was unusable; trying another model" in body
+    assert b"recovered output" in body
+    assert b"Upstream provider error" not in body
+    assert b"data: [DONE]" in body
+    assert pool_manager.select.call_count == 2
+    assert pool_manager.select.call_args_list[1].kwargs["excluded"] == {
+        ("xiaomi", "truncating-model")
+    }
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_retries_cli_adapter_failure_before_visible_output(app, client):
+    """A non-zero CLI exit before any text must fail over transparently."""
+    pool_manager = MagicMock()
+    pool_manager.select.side_effect = [
+        ("kilo-cli", "kilo/free"),
+        ("openrouter", "healthy-model"),
+    ]
+    pool_manager.fallback_pools.return_value = ()
+    app["pool_manager"] = pool_manager
+
+    async def cli_failure(*args, **kwargs):
+        raise ProviderError("CLI request failed", code="cli_failed")
+        yield  # pragma: no cover
+
+    async def healthy_stream(*args, **kwargs):
+        yield b'data: {"choices":[{"delta":{"content":"recovered output"}}]}\n\n'
+        yield b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    with patch(
+        "tusker_gateway.endpoints.PassthroughClient.chat",
+        new_callable=AsyncMock,
+    ) as mock_chat:
+        mock_chat.side_effect = [cli_failure(), healthy_stream()]
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-code",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+            },
+            headers=HEADERS_AUTH,
+        )
+        body = await response.read()
+
+    assert response.status == 200
+    assert b"gateway: upstream output was unusable; trying another model" in body
+    assert b"recovered output" in body
+    assert b"Upstream provider error" not in body
+    assert b"data: [DONE]" in body
+    assert pool_manager.select.call_count == 2
+    assert pool_manager.select.call_args_list[1].kwargs["excluded"] == {
+        ("kilo-cli", "kilo/free")
+    }
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_retries_upstream_idle_timeout_before_visible_output(app, client):
+    """An upstream that stops sending before content must fail over, not stall."""
+    pool_manager = MagicMock()
+    pool_manager.select.side_effect = [
+        ("xiaomi", "stalling-model"),
+        ("openrouter", "healthy-model"),
+    ]
+    pool_manager.fallback_pools.return_value = ()
+    app["pool_manager"] = pool_manager
+
+    async def idle_stream(*args, **kwargs):
+        yield b'data: {"choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}\n\n'
+        raise asyncio.TimeoutError("chunk_budget>90s")
+
+    async def healthy_stream(*args, **kwargs):
+        yield b'data: {"choices":[{"delta":{"content":"recovered output"}}]}\n\n'
+        yield b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    with patch(
+        "tusker_gateway.endpoints.PassthroughClient.chat",
+        new_callable=AsyncMock,
+    ) as mock_chat:
+        mock_chat.side_effect = [idle_stream(), healthy_stream()]
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-code",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+            },
+            headers=HEADERS_AUTH,
+        )
+        body = await response.read()
+
+    assert response.status == 200
+    assert b"gateway: upstream output was unusable; trying another model" in body
+    assert b"recovered output" in body
+    assert b"Upstream provider error" not in body
+    assert b"data: [DONE]" in body
+    assert pool_manager.select.call_count == 2
+    assert pool_manager.select.call_args_list[1].kwargs["excluded"] == {
+        ("xiaomi", "stalling-model")
+    }
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_transport_abort_after_visible_output_is_not_respliced(app, client):
+    """Once assistant content reached the client, a transport abort must NOT re-route."""
+    pool_manager = MagicMock()
+    pool_manager.select.side_effect = [
+        ("xiaomi", "truncating-model"),
+        ("openrouter", "healthy-model"),
+    ]
+    pool_manager.fallback_pools.return_value = ()
+    app["pool_manager"] = pool_manager
+
+    async def truncating_stream(*args, **kwargs):
+        yield b'data: {"choices":[{"delta":{"content":"partial answer"}}]}\n\n'
+        raise aiohttp.ClientPayloadError("Response payload is not completed")
+
+    async def healthy_stream(*args, **kwargs):
+        yield b'data: {"choices":[{"delta":{"content":"should not appear"}}]}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    with patch(
+        "tusker_gateway.endpoints.PassthroughClient.chat",
+        new_callable=AsyncMock,
+    ) as mock_chat:
+        mock_chat.side_effect = [truncating_stream(), healthy_stream()]
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-code",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+            },
+            headers=HEADERS_AUTH,
+        )
+        body = await response.read()
+
+    assert response.status == 200
+    assert b"partial answer" in body
+    assert b"Upstream provider error" in body
+    assert b"should not appear" not in body
+    assert b"gateway: upstream output was unusable" not in body
+    assert b"data: [DONE]" in body
+    assert pool_manager.select.call_count == 1
 
 
 @pytest.mark.asyncio

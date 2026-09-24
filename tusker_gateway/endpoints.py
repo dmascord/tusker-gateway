@@ -13,7 +13,8 @@ import time
 import uuid
 from typing import Any, AsyncIterator
 
-from aiohttp import ContentTypeError, web
+from aiohttp import ClientError, ContentTypeError, web
+from aiohttp.http_exceptions import TransferEncodingError
 
 from tusker_gateway.cache import ResponseCache, make_cache_key, make_caller_scope
 from tusker_gateway.budget import BudgetTracker
@@ -3452,6 +3453,44 @@ def _public_provider_failure_response(
     )
 
 
+# Post-commit stream failures that may still fail over to another pool
+# candidate: the client has received only the assistant role frame, so nothing
+# assistant-visible is lost by splicing in a different route. These are the
+# codes the chat streaming path (passthrough SSE envelopes, premature EOF,
+# idle reads) and the CLI adapters actually raise. Validation, approval, and
+# rate-limit failures keep their dedicated handling, and ``upstream_error`` is
+# media-provider only.
+_STREAM_RECOVERY_CODES = frozenset({
+    "provider_error",
+    "upstream_timeout",
+    "upstream_stream_incomplete",
+    "upstream_stream_invalid",
+    "invalid_upstream_response",
+    "cli_failed",
+    "claude_code_cli_failed",
+    "kilo_cli_failed",
+    "kilo_worker_unavailable",
+    "opencode_cli_failed",
+})
+
+
+def _stream_failure_can_fail_over(exc: BaseException) -> bool:
+    """Whether a committed-stream failure is retryable before visible output."""
+    if isinstance(exc, (ProviderStreamLoopError, MalformedToolCallError)):
+        return True
+    if str(getattr(exc, "code", "") or "") in _STREAM_RECOVERY_CODES:
+        return True
+    return isinstance(
+        exc,
+        (
+            ClientError,
+            TransferEncodingError,
+            asyncio.TimeoutError,
+            asyncio.IncompleteReadError,
+        ),
+    )
+
+
 def _public_stream_error(
     exc: BaseException,
     *,
@@ -6005,15 +6044,24 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                                                 {"pool": pool_name, "provider": provider, "model": target_model},
                                             )
                             break
-                        except (ProviderStreamLoopError, MalformedToolCallError) as stream_recovery_exc:
+                        except (
+                            ProviderError,
+                            ClientError,
+                            TransferEncodingError,
+                            asyncio.TimeoutError,
+                            asyncio.IncompleteReadError,
+                        ) as stream_recovery_exc:
                             # The role event and SSE headers are already sent,
                             # but a model can still be changed safely until an
                             # assistant data frame has reached the client.
-                            # Never splice providers after visible output.
+                            # Never splice providers after visible output, and
+                            # only for failures that carry no usable content
+                            # (transport aborts and CLI adapter exits).
                             if (
                                 cycle_fallbacks >= 1
                                 or stream_visible_output
                                 or pool_name is None
+                                or not _stream_failure_can_fail_over(stream_recovery_exc)
                             ):
                                 raise
                             cycle_fallbacks += 1
@@ -6022,7 +6070,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                                 _quarantine_tool_response_failure(
                                     config, failed_provider, failed_model, stream_recovery_exc
                                 )
-                            else:
+                            elif isinstance(stream_recovery_exc, ProviderStreamLoopError):
                                 _quarantine_stream_loop(
                                     config, failed_provider, failed_model, stream_recovery_exc
                                 )
@@ -6031,7 +6079,11 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                                     breaker.record_failure,
                                     failed_provider,
                                     failed_model,
-                                    cooldown_secs=_cooldown_for_exc(stream_recovery_exc),
+                                    cooldown_secs=(
+                                        _cooldown_for_exc(stream_recovery_exc)
+                                        if isinstance(stream_recovery_exc, GatewayError)
+                                        else None
+                                    ),
                                 )
                             failed_stream = (
                                 result.iterator
