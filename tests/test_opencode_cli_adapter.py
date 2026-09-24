@@ -111,6 +111,25 @@ async def test_explicit_opencode_api_key_is_forwarded_without_aliasing_zen_key(m
 
 
 @pytest.mark.asyncio
+async def test_deployment_scoped_zen_key_is_forwarded_only_when_explicitly_enabled(monkeypatch):
+    monkeypatch.setenv("TUSKER_OPENCODE_CLI_ENABLED", "true")
+    monkeypatch.delenv("OPENCODE_API_KEY", raising=False)
+    monkeypatch.setenv("TUSKER_OPENCODE_CLI_API_KEY", "worker-scoped-key")
+    monkeypatch.setenv("OPENCODE_ZEN_API_KEY", "unaliased-provider-key")
+    stdout = json.dumps({"type": "text", "part": {"text": "ok"}}).encode()
+    with patch("tusker_gateway.provider_adapters.opencode_cli.shutil.which", return_value="/opt/opencode"), \
+         patch("tusker_gateway.provider_adapters.opencode_cli.asyncio.create_subprocess_exec",
+               new=AsyncMock(return_value=_FakeProcess(stdout))) as spawn:
+        await OpenCodeCLIAdapter().chat(
+            provider="opencode-cli", model="big-pickle", messages=[{"role": "user", "content": "hi"}],
+        )
+    env = spawn.await_args.kwargs["env"]
+    assert env["OPENCODE_API_KEY"] == "worker-scoped-key"
+    assert "TUSKER_OPENCODE_CLI_API_KEY" not in env
+    assert "OPENCODE_ZEN_API_KEY" not in env
+
+
+@pytest.mark.asyncio
 async def test_mcp_tool_invocation_becomes_openai_tool_call(monkeypatch):
     monkeypatch.setenv("TUSKER_OPENCODE_CLI_ENABLED", "1")
 

@@ -13,7 +13,9 @@ cannot choose an executable or import arbitrary code.
 The built-in `claude-code-cli` adapter invokes the official `claude -p` CLI
 using the runtime's existing Claude Code login. It does not inspect, copy,
 refresh, or persist Claude credentials. It is not a ZDR route and is not in
-any default model pool.
+the privacy pool. Production explicitly includes `claude-code-cli/sonnet` in
+the code pool; the currently configured `claude.ai` consumer login retains
+requests according to Anthropic's consumer data policy.
 
 To opt in, install and authenticate Claude Code in the gateway runtime, then
 set `TUSKER_CLAUDE_CODE_ENABLED=true`. The executable defaults to `claude` on
@@ -84,9 +86,10 @@ uses OpenCode Zen model IDs (`opencode/<model>`); a short model name such as
 `opencode` on `PATH`, with `TUSKER_OPENCODE_CLI_PATH` and
 `TUSKER_OPENCODE_CLI_TIMEOUT_SECS` available for operator overrides. The CLI
 uses its existing OpenCode login by default. An explicit `OPENCODE_API_KEY`
-is forwarded to the child; the gateway's `OPENCODE_ZEN_API_KEY` is not aliased
-to it because those credentials have different sources and may have different
-service-policy eligibility.
+is forwarded to the child. Deployments may deliberately set
+`TUSKER_OPENCODE_CLI_API_KEY` to provide the CLI-specific credential; the
+adapter maps only that explicit variable to `OPENCODE_API_KEY` in its child.
+It never silently aliases the gateway's `OPENCODE_ZEN_API_KEY`.
 
 Each request runs from a private temporary working directory with project
 configuration and default plugins disabled. Text-only requests do not inject
@@ -99,7 +102,8 @@ non-interactive permission handling remains in effect for other tools, so
 operators should also review any global CLI configuration used by the gateway.
 Follow-up tool calls and results are replayed as transcript history. The
 gateway image includes the pinned OpenCode v2 CLI executable (currently
-2.0.15); this adapter is disabled by default and excluded from default pools.
+2.0.15). Production explicitly enables this adapter and includes
+`opencode-cli/big-pickle` in the code pool.
 
 Set `TUSKER_OPENCODE_CLI_PATH` when an operator-managed installation should
 be used instead. OpenCode Zen may still reject CLI/API use based on account or
@@ -123,8 +127,9 @@ Each request receives high-priority inline `KILO_CONFIG_CONTENT`, disables
 project config, denies tools by default, and exposes only request-scoped MCP
 proxies for client-declared tools. The proxy returns an OpenAI tool call to
 the connected harness; it never executes that call. Like the other CLI
-adapters, Kilo is local/non-ZDR, excluded from default pools, and streaming
-is returned after the CLI completes rather than as incremental token deltas.
+adapters, Kilo is local/non-ZDR. Production explicitly includes
+`kilo-cli/kilo/kilo-auto/free` in the code pool; streaming is returned after
+the CLI completes rather than as incremental token deltas.
 In Kubernetes, the gateway forwards Kilo requests to the dedicated
 `tusker-kilo-worker` service, pinned to node `visor` and isolated by a
 NetworkPolicy that permits ingress only from the gateway pod. The worker has
@@ -137,6 +142,8 @@ locally by leaving `TUSKER_KILO_WORKER_URL` unset. The gateway image includes
 the pinned Kilo CLI (currently 7.7.9); set `TUSKER_KILO_CLI_PATH` to use an
 operator-managed installation instead.
 
-Kilo routes remain non-ZDR and must not be added to the privacy pool. The
+Kilo Auto Free may route to providers that retain or use prompts for
+improvement, so it must not receive confidential data or enter the privacy
+pool. Big Pickle is likewise not privacy eligible during its free period. The
 worker is deliberately not a general-purpose proxy: its model allowlist is
 separate from the main gateway's pool configuration.

@@ -88,7 +88,10 @@ class OpenCodeCLIAdapter:
         # the gateway HTTP provider credential and is not interchangeable with
         # the CLI's OPENCODE_API_KEY; silently aliasing it can override a valid
         # CLI login with a key that Zen rejects for CLI use.
-        opencode_api_key = os.environ.get("OPENCODE_API_KEY")
+        opencode_api_key = (
+            os.environ.get("OPENCODE_API_KEY")
+            or os.environ.get("TUSKER_OPENCODE_CLI_API_KEY")
+        )
         if opencode_api_key:
             env["OPENCODE_API_KEY"] = opencode_api_key
         for name in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "OPENCODE_TEST_HOME"):
