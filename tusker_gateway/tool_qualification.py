@@ -320,6 +320,11 @@ async def probe_model(
         "temperature": 0,
         "max_tokens": 192,
     }
+    # APIM's gpt-6-luna only accepts function tools when reasoning_effort is
+    # none. Send a non-none value so the gateway's compatibility adapter is
+    # exercised by qualification just as it is by normal client requests.
+    if provider.lower() == "apim" and model.lower() == "gpt-6-luna":
+        payload["reasoning_effort"] = "high"
     started = time.monotonic()
     calls: dict[int, dict[str, str]] = {}
     text_parts: list[str] = []

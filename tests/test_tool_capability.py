@@ -79,9 +79,11 @@ class _ProbeResponse:
 class _ProbeSession:
     def __init__(self):
         self.headers: dict[str, str] | None = None
+        self.payload: dict | None = None
 
     def post(self, _url, **kwargs):
         self.headers = kwargs["headers"]
+        self.payload = kwargs["json"]
         return _ProbeResponse()
 
 
@@ -117,6 +119,40 @@ def test_non_opencode_probe_omits_session_header():
 
     assert session.headers is not None
     assert "X-Opencode-Session" not in session.headers
+
+
+def test_apim_gpt6_probe_exercises_reasoning_compatibility_adapter():
+    session = _ProbeSession()
+
+    asyncio.run(
+        probe_model(
+            session,
+            base_url="https://apim.test",
+            api_key="test-key",
+            provider="apim",
+            model="gpt-6-luna",
+        )
+    )
+
+    assert session.payload is not None
+    assert session.payload["reasoning_effort"] == "high"
+
+
+def test_other_provider_probe_does_not_add_reasoning_effort():
+    session = _ProbeSession()
+
+    asyncio.run(
+        probe_model(
+            session,
+            base_url="https://provider.test",
+            api_key="test-key",
+            provider="openrouter",
+            model="test-model",
+        )
+    )
+
+    assert session.payload is not None
+    assert "reasoning_effort" not in session.payload
 
 
 def test_tool_capability_db_round_trip_and_gate(tmp_path):
