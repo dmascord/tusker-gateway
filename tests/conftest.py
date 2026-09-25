@@ -31,9 +31,10 @@ def setup_auth_file(tmp_path, monkeypatch):
     auth_file = tmp_path / "auth.json"
     auth_file.write_text(json.dumps({"version": 1, "credential_pool": {}}))
     monkeypatch.setenv("TUSKER_AUTH_FILE", str(auth_file))
-    # Test app expects HEADERS_AUTH = "Bearer sk-secret-dev" to work, so make
-    # that the only accepted key for tests that don't override api_keys.
+    # Explicit test credentials. Production auth has no hardcoded dev-key
+    # bypass; this value is supplied through test configuration only.
     monkeypatch.setenv("API_KEYS", "sk-secret-dev")
+    monkeypatch.setenv("TUSKER_APPROVAL_HMAC_KEY", "test-approval-hmac-key")
     return auth_file
 
 
@@ -73,11 +74,14 @@ def restore_provider_endpoints():
 
 def _create_test_app(config=None):
     cfg = config or load_config()
-    # Default test config: only accept the well-known dev key so the test
-    # client fixtures (HEADERS_AUTH) work without per-test setup. Tests that
-    # need a different auth scheme override cfg["api_keys"] explicitly.
+    # Tests must explicitly configure api_keys. load_config() generates a random
+    # key when API_KEYS is unset, which ensures the gateway is never configured
+    # with a dev key by default.
     if not cfg.get("api_keys"):
-        cfg["api_keys"] = ["sk-secret-dev"]
+        raise RuntimeError(
+            "_create_test_app requires explicitly configured API_KEYS; "
+            "do not default to sk-secret-dev"
+        )
     app = web.Application(client_max_size=10 * 1024 * 1024)
     app["config"] = cfg
     app["http_session"] = None

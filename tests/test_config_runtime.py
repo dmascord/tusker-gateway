@@ -137,15 +137,16 @@ def test_legacy_mode_app_has_no_config_store(monkeypatch) -> None:
     assert "config_runtime" not in app
 
 
-def test_legacy_mode_auth_dev_bypass_works(monkeypatch) -> None:
-    """When no config_store and empty legacy api_keys, dev key is accepted."""
+def test_legacy_mode_empty_keys_reject_hardcoded_dev_key(monkeypatch) -> None:
+    """No hardcoded dev-key bypass: an empty key list rejects every token."""
     _env_state(None)
     app = _make_app(config={"api_keys": []})
     middleware = AuthMiddleware()
     req = make_mocked_request(
         "GET", "/chat", headers={"Authorization": "Bearer sk-secret-dev"}, app=app
     )
-    asyncio.run(middleware.verify(req))  # no raise
+    with pytest.raises(Exception):
+        asyncio.run(middleware.verify(req))
 
 
 def test_legacy_mode_runtime_config_returns_fallback(monkeypatch) -> None:
@@ -376,14 +377,16 @@ async def test_auth_dev_bypass_eliminated_when_db_keys_authoritative() -> None:
 
 
 @pytest.mark.asyncio
-async def test_auth_dev_bypass_still_works_when_legacy_fallback_empty_no_store() -> None:
+async def test_legacy_mode_empty_keys_reject_all_tokens() -> None:
+    """No dev key bypass: empty key list rejects every token."""
     _env_state(None)
     app = _make_app(config={"api_keys": []})
     middleware = AuthMiddleware()
     req = make_mocked_request(
         "GET", "/chat", headers={"Authorization": "Bearer sk-secret-dev"}, app=app
     )
-    await middleware.verify(req)
+    with pytest.raises(Exception):
+        await middleware.verify(req)
 
 
 @pytest.mark.asyncio

@@ -35,12 +35,17 @@ def _json_bytes(value: Any) -> bytes:
 
 
 def _approval_key() -> bytes:
-    """Resolve a stable signing key without exposing credential material."""
-    raw = (
-        os.environ.get("TUSKER_APPROVAL_HMAC_KEY")
-        or os.environ.get("TUSKER_AUDIT_HMAC_KEY")
-        or os.environ.get("API_KEYS", "tusker-dev-approval-key")
-    )
+    """Resolve a stable signing key.
+
+    Requires TUSKER_APPROVAL_HMAC_KEY or TUSKER_AUDIT_HMAC_KEY to be
+    configured. Raises RuntimeError if neither is set.
+    """
+    raw = os.environ.get("TUSKER_APPROVAL_HMAC_KEY") or os.environ.get("TUSKER_AUDIT_HMAC_KEY")
+    if not raw:
+        raise RuntimeError(
+            "TUSKER_APPROVAL_HMAC_KEY or TUSKER_AUDIT_HMAC_KEY must be "
+            "configured when MCP guard is in use"
+        )
     return hashlib.sha256(raw.encode()).digest()
 
 

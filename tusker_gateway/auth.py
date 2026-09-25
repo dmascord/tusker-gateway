@@ -15,7 +15,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_DEV_KEY = "sk-secret-dev"
+# No dev-key bypass: an empty api_keys list must never accept a hardcoded
+# credential. load_config() generates a random key when API_KEYS is unset,
+# so a misconfigured deployment fails closed with 401s instead of opening.
 
 
 class AuthMiddleware:
@@ -75,14 +77,6 @@ class AuthMiddleware:
 
         cfg = self.resolve_config(request)
         allowed = cfg.get("api_keys", [])
-        db_keys_authoritative = cfg.get("config_db_keys_authoritative", False)
-        # Dev key bypass: only when no DB-authoritative key section is
-        # active (legacy env-only deployment). An authoritative empty
-        # section means "no keys permitted" — dev key must NOT work.
-        if not allowed and not db_keys_authoritative and secrets.compare_digest(token, _DEV_KEY):
-            logger.debug("auth OK (dev key)")
-            self._attach_identity(request, token)
-            return
 
         for candidate in allowed:
             if secrets.compare_digest(token, str(candidate)):
