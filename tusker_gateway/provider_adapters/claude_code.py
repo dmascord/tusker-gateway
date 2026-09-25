@@ -14,10 +14,12 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import sys
 import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -101,6 +103,79 @@ def _enabled() -> bool:
     return os.environ.get("TUSKER_CLAUDE_CODE_ENABLED", "").strip().lower() in {
         "1", "true", "yes", "on",
     }
+ 
+def _quota_error_indicated(*parts: bytes | str) -> bool:
+    """Detect Claude's subscription/usage exhaustion wording in CLI output."""
+    text = " ".join(
+        part.decode("utf-8", errors="ignore") if isinstance(part, bytes) else part
+        for part in parts
+    ).lower()
+    return any(phrase in text for phrase in (
+        "session limit", "usage limit", "usage_limit", "limit reached",
+        "subscription limit", "quota", "out of credits", "rate limit",
+        "too many requests",
+    ))
+
+
+_RESET_AT_RE = re.compile(
+    r"reset(?:s|ting)?(?:\s+at)?\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*"
+    r"(?:\(utc\)|utc)",
+    re.IGNORECASE,
+)
+
+
+def _seconds_until_reset(text: str, *, now: datetime | None = None) -> float | None:
+    """Seconds until the UTC reset time named in a quota message, if parseable.
+
+    Claude reports e.g. ``You've hit your session limit · resets 4am (UTC)``.
+    """
+    match = _RESET_AT_RE.search(text or "")
+    if match is None:
+        return None
+    hour = int(match.group(1))
+    minute = int(match.group(2) or 0)
+    meridiem = (match.group(3) or "").lower()
+    if meridiem == "pm" and hour < 12:
+        hour += 12
+    elif meridiem == "am" and hour == 12:
+        hour = 0
+    if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+        return None
+    current = now or datetime.now(timezone.utc)
+    target = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= current:
+        target += timedelta(days=1)
+    return max(1.0, (target - current).total_seconds())
+
+
+def _quota_limit_error(message: str) -> ProviderError:
+    """Build a CLI quota failure the breaker backs off for a full window."""
+    error = ProviderError(
+        "Claude Code CLI hit its upstream usage limit; retry after the window resets",
+        code="claude_code_cli_quota",
+    )
+    error.upstream_body = message
+    reset_secs = _seconds_until_reset(message)
+    if reset_secs is not None:
+        error.retry_after_secs = reset_secs
+    return error
+
+def _cli_result_message(stdout: bytes) -> str | None:
+    """Best-effort ``result`` text from CLI stdout, even on a failed exit."""
+    text = stdout.decode("utf-8", errors="replace").strip()
+    if not text:
+        return None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("{"):
+            continue
+        try:
+            event = json.loads(stripped)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if isinstance(event, dict) and isinstance(event.get("result"), str):
+            return event["result"]
+    return None
 
 
 def _as_text(
@@ -463,6 +538,8 @@ class ClaudeCodeCLIAdapter:
                 message = event.get("result") if isinstance(event.get("result"), str) else ""
                 if event.get("api_error_status") == 401 or _auth_error_indicated(message):
                     return ClaudeAuthRequiredError()
+                if _quota_error_indicated(message):
+                    return _quota_limit_error(message)
                 return ProviderError(
                     "Claude Code CLI could not complete the request; check its local login and account status",
                     code="claude_code_cli_failed",
@@ -648,6 +725,9 @@ class ClaudeCodeCLIAdapter:
             )
             if _auth_error_indicated(stdout, stderr):
                 raise ClaudeAuthRequiredError()
+            quota_message = _cli_result_message(stdout)
+            if quota_message and _quota_error_indicated(quota_message):
+                raise _quota_limit_error(quota_message)
             auth_status = await claude_auth_status(executable=resolved)
             if auth_status["status"] == "login_required":
                 raise ClaudeAuthRequiredError()
@@ -673,6 +753,9 @@ class ClaudeCodeCLIAdapter:
             )
             if api_status == 401 or _auth_error_indicated(result.get("result", "")):
                 raise ClaudeAuthRequiredError()
+            message = result.get("result") if isinstance(result.get("result"), str) else ""
+            if _quota_error_indicated(message):
+                raise _quota_limit_error(message)
             auth_status = await claude_auth_status(executable=resolved)
             if auth_status["status"] == "login_required":
                 raise ClaudeAuthRequiredError()

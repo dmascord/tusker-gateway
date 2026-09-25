@@ -3468,6 +3468,7 @@ _STREAM_RECOVERY_CODES = frozenset({
     "invalid_upstream_response",
     "cli_failed",
     "claude_code_cli_failed",
+    "claude_code_cli_quota",
     "kilo_cli_failed",
     "kilo_worker_unavailable",
     "opencode_cli_failed",

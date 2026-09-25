@@ -40,9 +40,13 @@ _QUOTA_HINTS = (
     "quota", "quota exceeded", "usage limit", "usage_limit",
     "capacity", "insufficient", "out of credits", "out of quota",
     "billing", "payment required", "payment_required", "subscription limit",
-    "limit reached", "monthly limit",
+    "limit reached", "monthly limit", "session limit",
     "daily limit", "budget exhausted",
 )
+
+# Error codes whose presence signals a quota/session-limit even without body evidence.
+# Matches as a substring so adding new quota-ish codes (e.g. X_quota) works automatically.
+_QUOTA_CODE_MARKERS = ("quota", "rate_limited")
 
 
 def is_account_quota_exhausted(body: str | None) -> bool:
@@ -441,20 +445,38 @@ def _cooldown_seconds_for_provider_error(exc: Any) -> float | None:
     block, agentic-harness-only, or a quota-gated not-found) would otherwise
     be re-probed every 60s forever.
 
+    - An explicit ``retry_after_secs`` on the error wins: a local transport
+      (CLI adapter) may know the exact reset time (``resets 4am (UTC)``).
+    - Local transports carry no upstream status; a quota-shaped error code or
+      quota/usage-limit body still earns the long quota window.
     - 401 / 403 / 404 (and a quota/usage-limit body) → long cooldown.
     - 5xx (transient overload) → ``None`` (let the policy cooldown apply).
     """
+    explicit = getattr(exc, "retry_after_secs", None)
+    if isinstance(explicit, (int, float)) and not isinstance(explicit, bool) and explicit > 0:
+        return min(float(explicit), MAX_COOLDOWN_SECS)
+    quota_cooldown = float(os.environ.get("TUSKER_RETRY_QUOTA_COOLDOWN", "3600"))
     status = getattr(exc, "upstream_status", None)
-    # Unknown status or a transient 5xx may recover; use the policy cooldown.
-    if status is None or status >= 500:
-        return None
+    code = str(getattr(exc, "code", "") or "")
     body = getattr(exc, "upstream_body", None) or ""
     body_lower = body.lower()
+    # Local (non-HTTP) transports such as the CLI adapters carry no upstream
+    # status. A reported usage/session limit is a long-lived window; the 60s
+    # policy cooldown would re-probe and burn quota until it resets.
+    if status is None:
+        if any(marker in code for marker in _QUOTA_CODE_MARKERS) or any(
+            hint in body_lower for hint in _QUOTA_HINTS
+        ):
+            return quota_cooldown
+        return None
+    # A transient 5xx may recover; use the policy cooldown.
+    if status >= 500:
+        return None
     # A quota-exhausted body on a non-429 status is a long-lived daily/monthly
     # window (e.g. OpenRouter "free-models-per-day-high-balance" surfaced as
     # 404). Back off until it plausibly resets, not 60s.
     if any(hint in body_lower for hint in _QUOTA_HINTS):
-        return float(os.environ.get("TUSKER_RETRY_QUOTA_COOLDOWN", "3600"))
+        return quota_cooldown
     # 401 auth / 403 forbidden / 404 not-found: permanent for this key/account.
     return PERMANENT_ERROR_COOLDOWN_SECS
 

@@ -864,3 +864,72 @@ async def test_claude_nonzero_exit_logs_bounded_stderr_preview(monkeypatch, capl
     assert "login error:" in caplog.text
     # Preview is bounded so a runaway stack trace can't blow up the log.
     assert caplog.text.count("x") <= 513
+
+
+@pytest.mark.asyncio
+async def test_claude_cli_session_limit_on_nonzero_exit_uses_reset_window(monkeypatch):
+    """A session-limit result must not surface as a generic 60s-cycled failure."""
+    monkeypatch.setenv("TUSKER_CLAUDE_CODE_ENABLED", "true")
+    payload = {
+        "type": "result", "subtype": "error_during_execution", "is_error": True,
+        "result": "You've hit your session limit · resets 4am (UTC)",
+        "session_id": "s1",
+    }
+    proc = _FakeProcess(json.dumps(payload).encode(), returncode=1)
+    with patch("tusker_gateway.provider_adapters.claude_code.shutil.which", return_value="/bin/claude"), \
+         patch("tusker_gateway.provider_adapters.claude_code.asyncio.create_subprocess_exec",
+               new=AsyncMock(return_value=proc)):
+        with pytest.raises(ProviderError) as exc:
+            await ClaudeCodeCLIAdapter().chat(
+                provider="claude-code-cli", model="sonnet",
+                messages=[{"role": "user", "content": "hi"}], stream=False,
+            )
+    assert exc.value.code == "claude_code_cli_quota"
+    assert "session limit" in exc.value.upstream_body
+    # Parsed from "resets 4am (UTC)": within the next 24h, at least a minute away.
+    assert 60 <= exc.value.retry_after_secs <= 86400
+
+
+@pytest.mark.asyncio
+async def test_claude_cli_is_error_result_classifies_session_limit(monkeypatch):
+    """rc=0 with is_error=true and limit wording raises the quota code too."""
+    monkeypatch.setenv("TUSKER_CLAUDE_CODE_ENABLED", "true")
+    payload = {
+        "session_id": "s2", "is_error": True,
+        "result": "You've hit your usage limit · resets 4am (UTC)",
+    }
+    proc = _FakeProcess(json.dumps(payload).encode())
+    with patch("tusker_gateway.provider_adapters.claude_code.shutil.which", return_value="/bin/claude"), \
+         patch("tusker_gateway.provider_adapters.claude_code.asyncio.create_subprocess_exec",
+               new=AsyncMock(return_value=proc)):
+        with pytest.raises(ProviderError) as exc:
+            await ClaudeCodeCLIAdapter().chat(
+                provider="claude-code-cli", model="sonnet",
+                messages=[{"role": "user", "content": "hi"}], stream=False,
+            )
+    assert exc.value.code == "claude_code_cli_quota"
+    assert getattr(exc.value, "retry_after_secs", None)
+
+
+@pytest.mark.asyncio
+async def test_claude_cli_quota_error_drives_long_breaker_cooldown(monkeypatch):
+    """End-to-end: the raised quota error classifies to the long quota window."""
+    from tusker_gateway.cooldown import _cooldown_seconds_for_provider_error
+
+    monkeypatch.setenv("TUSKER_CLAUDE_CODE_ENABLED", "true")
+    payload = {
+        "session_id": "s3", "is_error": True,
+        "result": "You've hit your session limit · resets 4am (UTC)",
+    }
+    proc = _FakeProcess(json.dumps(payload).encode(), returncode=1)
+    with patch("tusker_gateway.provider_adapters.claude_code.shutil.which", return_value="/bin/claude"), \
+         patch("tusker_gateway.provider_adapters.claude_code.asyncio.create_subprocess_exec",
+               new=AsyncMock(return_value=proc)):
+        with pytest.raises(ProviderError) as exc:
+            await ClaudeCodeCLIAdapter().chat(
+                provider="claude-code-cli", model="sonnet",
+                messages=[{"role": "user", "content": "hi"}], stream=False,
+            )
+    seconds = _cooldown_seconds_for_provider_error(exc.value)
+    assert seconds == exc.value.retry_after_secs
+    assert 60 <= seconds <= 86400
