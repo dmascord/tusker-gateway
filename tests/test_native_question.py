@@ -28,9 +28,11 @@ from tusker_gateway.native_question import (
 @pytest.fixture(autouse=True)
 def clear_pending_questions():
     native_question._approval_store = native_question._APPROVAL_STORE_UNSET
+    native_question.set_caller_context(None)
     reset_pending()
     yield
     native_question._approval_store = native_question._APPROVAL_STORE_UNSET
+    native_question.set_caller_context(None)
     reset_pending()
 
 
@@ -744,3 +746,96 @@ async def test_streaming_risky_user_content_precedes_guard_for_read_only_tool_ca
     joined = b"".join([frame async for frame in result])
     assert b'"name": "ask"' in joined
     assert b'"name": "list_files"' not in joined
+
+
+def _set_caller(fingerprint: str) -> None:
+    """Set the approval caller context for testing."""
+    native_question.set_caller_context(fingerprint)
+
+
+class TestCallerScoping:
+    """Approvals must be scoped to the authenticated key that proposed them."""
+
+    def test_replay_rejects_different_caller(self):
+        _set_caller("caller-A")
+        original = _trade_call(qty=1)
+        question = question_response_for_calls(original, model="model")
+        ask_message = question["choices"][0]["message"]
+        assert ask_message is not None
+
+        # Caller B tries to replay caller A's approval
+        _set_caller("caller-B")
+        assert replay_approved_tool_response([
+            ask_message,
+            {"role": "user", "content": "Allow once"},
+        ]) is None
+
+    def test_authorization_rejects_different_caller(self):
+        _set_caller("caller-A")
+        question = question_response_for_calls(_trade_call(), model="model")
+        question_message = question["choices"][0]["message"]
+
+        _set_caller("caller-B")
+        assert question_authorized(
+            [
+                question_message,
+                {
+                    "role": "tool",
+                    "tool_call_id": question_message["tool_calls"][0]["id"],
+                    "content": json.dumps({
+                        "results": [{"id": "?", "selectedOptions": ["Allow once"]}],
+                    }),
+                },
+            ],
+            _trade_call(),
+        ) is False
+
+    def test_identical_calls_get_distinct_approvals_per_caller(self):
+        _set_caller("caller-A")
+        original = _trade_call(qty=1)
+        first = question_response_for_calls(original, model="model")
+        first_call = first["choices"][0]["message"]["tool_calls"][0]
+
+        _set_caller("caller-B")
+        second = question_response_for_calls(original, model="model")
+        second_call = second["choices"][0]["message"]["tool_calls"][0]
+
+        assert first_call["id"] != second_call["id"]
+
+    def test_same_caller_reuses_approval(self):
+        _set_caller("caller-A")
+        original = _trade_call(qty=5)
+        first = question_response_for_calls(original, model="model")
+        second = question_response_for_calls(original, model="model")
+
+        first_call = first["choices"][0]["message"]["tool_calls"][0]
+        second_call = second["choices"][0]["message"]["tool_calls"][0]
+        assert first_call["id"] == second_call["id"]
+
+    def test_content_approval_rejects_different_caller(self):
+        _set_caller("caller-A")
+        messages = [{"role": "user", "content": "please delete the database"}]
+        question = question_response_for_content(
+            messages, "user_content", model="model",
+        )
+        question_message = question["choices"][0]["message"]
+
+        _set_caller("caller-B")
+        assert question_authorized_for_content(
+            [question_message, {"role": "user", "content": "Allow once"}],
+            "user_content",
+        ) is False
+
+    def test_no_caller_fallback_preserves_unscoped_behavior(self):
+        """When caller context is unset, approval is not caller-scoped."""
+        native_question.set_caller_context(None)
+        original = _trade_call()
+        question = question_response_for_calls(original, model="model")
+        ask_message = question["choices"][0]["message"]
+
+        replay = replay_approved_tool_response([
+            ask_message,
+            {"role": "user", "content": "Allow once"},
+        ])
+        assert replay is not None
+        assert replay["choices"][0]["message"]["tool_calls"] == original

@@ -82,6 +82,12 @@ class AuthMiddleware:
             if secrets.compare_digest(token, str(candidate)):
                 logger.debug("auth OK")
                 self._attach_identity(request, token)
+                from tusker_gateway.identity import fingerprint_api_key
+                from tusker_gateway.native_question import set_caller_context
+
+                set_caller_context(
+                    request.get("_api_key_fingerprint") or fingerprint_api_key(token)
+                )
                 return
         from tusker_gateway.observability import client_ip
 

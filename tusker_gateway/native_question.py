@@ -14,6 +14,7 @@ import re
 import secrets
 import time
 import uuid
+from contextvars import ContextVar
 from typing import Any
 
 from tusker_gateway.question_adapters import (
@@ -43,6 +44,35 @@ _PENDING: dict[str, dict[str, Any]] = {}
 _TTL_SECS = 300
 _APPROVAL_STORE_UNSET = object()
 _approval_store: Any = _APPROVAL_STORE_UNSET
+
+# Caller identity for the in-flight request. Approvals are bound to the
+# authenticated key that proposed them so a different key cannot consume
+# another caller's approval by replaying its approval_id. The auth
+# middleware sets this at the start of every authenticated request; when it
+# is unset (direct unit-test calls, deployments without an identity store)
+# caller scoping is skipped exactly as before.
+_CALLER_FINGERPRINT: ContextVar[str | None] = ContextVar(
+    "tusker_approval_caller", default=None
+)
+
+
+def set_caller_context(fingerprint: str | None) -> None:
+    """Bind the current request's authenticated caller for approval scoping."""
+    _CALLER_FINGERPRINT.set(fingerprint)
+
+
+def _caller_matches(pending: dict[str, Any]) -> bool:
+    """True when a pending approval belongs to the current caller.
+
+    An unset caller context or a legacy record written before caller scoping
+    existed is treated as a match so unauthenticated/direct callers keep the
+    previous behaviour. Once both sides carry a fingerprint they must agree.
+    """
+    current = _CALLER_FINGERPRINT.get()
+    if current is None:
+        return True
+    recorded = pending.get("caller")
+    return recorded is None or recorded == current
 
 
 def _store() -> Any:
@@ -403,6 +433,7 @@ def question_response_for_calls(
             if pending.get("scope", "calls") == "calls"
             and pending.get("signature") == signature
             and pending.get("action") == action
+            and _caller_matches(pending)
         ),
         None,
     )
@@ -418,6 +449,7 @@ def question_response_for_calls(
             "action": action,
             "adapter": adapter.key,
             "audit": audit,
+            "caller": _CALLER_FINGERPRINT.get(),
         }
         _persist_pending(call_id, _PENDING[call_id])
         _audit(audit, {
@@ -515,6 +547,7 @@ def replay_approved_tool_response(
         call_id
         for call_id, pending in _PENDING.items()
         if pending.get("scope", "calls") == "calls"
+        and _caller_matches(pending)
     ]
     for message in messages:
         if not isinstance(message, dict):
@@ -571,7 +604,11 @@ def replay_approved_tool_response(
                 unbound_results.append(content)
 
     for call_id, pending in list(_PENDING.items()):
-        if pending.get("scope", "calls") != "calls" or call_id not in questions:
+        if (
+            pending.get("scope", "calls") != "calls"
+            or call_id not in questions
+            or not _caller_matches(pending)
+        ):
             continue
         found, approved = _extract_answer(results.get(call_id))
         if not found and unbound_results:
@@ -645,6 +682,7 @@ def question_response_for_content(
             and pending.get("action") == action
             and pending.get("signature") == signature
             and isinstance(pending.get("response"), dict)
+            and _caller_matches(pending)
         ):
             response = pending["response"]
             if pending.get("adapter", "omp") != adapter.key:
@@ -705,6 +743,7 @@ def question_response_for_content(
         "action": action,
         "adapter": adapter.key,
         "audit": audit,
+        "caller": _CALLER_FINGERPRINT.get(),
     }
     _audit(audit, {
         "event_type": "tool.approval.proposed",
@@ -791,7 +830,11 @@ def question_authorized(
     for call_id, pending in list(_PENDING.items()):
         if pending.get("scope", "calls") != "calls":
             continue
-        if pending.get("signature") != expected_signature or call_id not in questions:
+        if (
+            pending.get("signature") != expected_signature
+            or call_id not in questions
+            or not _caller_matches(pending)
+        ):
             continue
         found, approved = _extract_answer(results.get(call_id))
         # OMP/OpenCode may submit the selected option as the next user turn
@@ -910,6 +953,7 @@ def question_authorized_for_content(
             pending.get("scope") != "content"
             or pending.get("action") != action
             or pending.get("signature") not in accepted_signatures
+            or not _caller_matches(pending)
             or (
                 call_id not in questions
                 and call_id not in result_ids
