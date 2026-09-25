@@ -27,6 +27,7 @@ Topic-specific:
 
 | Doc | Topic |
 |---|---|
+| `docs/audit-2026-09-25-gateway-improvements.md` | Comprehensive security, API, reliability, and ops audit with implementation plan. |
 | `IMAGE_VIDEO_GENERATION_ANALYSIS.md` | Provider key audit (2026-08-24), endpoint shape vs. configured URLs. |
 | `OTHER_PROVIDERS_CAPABILITIES.md` | Per-provider capability survey beyond chat. |
 | `README_IMAGE_GENERATION.md` | Image gen architecture (OpenAI GPT Image + Codex pathway). |
