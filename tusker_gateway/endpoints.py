@@ -108,6 +108,7 @@ from tusker_gateway.sse import (
     sse_heartbeat_loop,
 )
 from tusker_gateway.tracing import Tracer
+from tusker_gateway.tool_formats import tool_diagnostics_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -2280,6 +2281,51 @@ def _tool_call_signature(calls: list[dict[str, Any]]) -> str:
     return ",".join(signature) or "none"
 
 
+def _tool_call_integrity_signature(calls: list[dict[str, Any]]) -> str:
+    """Return payload-free fingerprints for comparing tool arguments across hops."""
+    signature: list[str] = []
+    for index, call in enumerate(calls):
+        function = call.get("function") or {}
+        name = str(function.get("name") or "unknown")[:80]
+        arguments = _tool_argument_text(function.get("arguments"))
+        encoded = arguments.encode("utf-8")
+        digest = hashlib.sha256(encoded).hexdigest()
+        signature.append(f"{index}:{name}:utf8={len(encoded)}:sha256={digest}")
+    return ",".join(signature) or "none"
+
+
+def _tool_history_integrity_signature(messages: Any) -> str:
+    """Fingerprint prior tool calls/results without logging their contents."""
+    if not isinstance(messages, list):
+        return "none"
+    signature: list[str] = []
+    for message_index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        content = message.get("content")
+        if role == "tool" and isinstance(content, str):
+            encoded = content.encode("utf-8")
+            signature.append(
+                f"{message_index}:tool_result:utf8={len(encoded)}:"
+                f"sha256={hashlib.sha256(encoded).hexdigest()}"
+            )
+        if role == "assistant":
+            calls = message.get("tool_calls")
+            if isinstance(calls, list):
+                for call_index, call in enumerate(calls):
+                    if not isinstance(call, dict):
+                        continue
+                    function = call.get("function") or {}
+                    arguments = _tool_argument_text(function.get("arguments"))
+                    encoded = arguments.encode("utf-8")
+                    signature.append(
+                        f"{message_index}:tool_call_{call_index}:utf8={len(encoded)}:"
+                        f"sha256={hashlib.sha256(encoded).hexdigest()}"
+                    )
+    return ",".join(signature) or "none"
+
+
 def _is_native_question_arguments(arguments: Any) -> bool:
     """Recognize the OMP built-in ``ask`` payload independent of its schema."""
     if not isinstance(arguments, dict) or not isinstance(arguments.get("questions"), list):
@@ -2819,7 +2865,7 @@ async def _prepare_stream_result(
             )
             logger.info(
                 "tool stream preflight provider=%s model=%s request_id=%s decision=%s "
-                "frames=%d bytes=%d calls=%s",
+                "frames=%d bytes=%d calls=%s integrity=%s",
                 provider,
                 model,
                 request_id or "unknown",
@@ -2827,6 +2873,11 @@ async def _prepare_stream_result(
                 len(buffered),
                 buffered_bytes,
                 _tool_call_signature(assembled_calls),
+                (
+                    _tool_call_integrity_signature(assembled_calls)
+                    if tool_diagnostics_enabled()
+                    else "disabled"
+                ),
             )
         except Exception:
             await _close_async_iterator(iterator)
@@ -5663,6 +5714,16 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
             # Guards may normalize or remove request fields, so derive cache
             # eligibility and routing from the final body.
             tools = body.get("tools") if isinstance(body.get("tools"), list) else None
+            if tool_diagnostics_enabled():
+                history_signature = _tool_history_integrity_signature(
+                    body.get("messages")
+                )
+                if history_signature != "none":
+                    logger.info(
+                        "tool history integrity rid=%s items=%s",
+                        request_id,
+                        history_signature,
+                    )
             pool_name = _pool_name(body) or "passthrough"
             conversation_id = _request_conversation_id(request, body, api_key)
             set_access_log_context(request, pool=pool_name)
