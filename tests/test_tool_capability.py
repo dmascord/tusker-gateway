@@ -590,3 +590,65 @@ def test_probe_transport_classification_is_bounded():
     ) is False
     assert _classify_http_failure(402, "Payment required")[2] == "quota"
     assert _classify_http_failure(502, "provider down")[0] == ToolCapabilityLevel.UNAVAILABLE
+
+
+def test_catalog_registry_prefers_injected_live_rotators():
+    """When the gateway's live rotators are supplied, the codex catalog
+    client must use them as its token source instead of building a new
+    read-only rotator (which fails with HTTP 401 on stale tokens)."""
+    from tusker_gateway import tool_qualification as tq
+
+    class _FakeRotator:
+        async def get_token(self):
+            return "live-token"
+
+    config = {
+        "providers": {"openai-codex": {}},
+        "provider_api_keys": {},
+        "credential_pools": {
+            "openai-codex": [{"access_token": "a", "refresh_token": "r"}],
+        },
+    }
+    registry = tq._catalog_registry(
+        config,
+        credential_rotators={"openai-codex": _FakeRotator()},
+    )
+    client = registry.get_client("openai-codex")
+    assert client is not None
+    assert client._token_source is not None
+    # The token source must be the live rotator's bound method, not a
+    # freshly constructed read-only rotator's.
+    assert getattr(client._token_source, "__self__", None).__class__ is _FakeRotator
+
+
+def test_catalog_registry_builds_read_only_rotator_without_live_rotators(monkeypatch):
+    """Standalone runs (no injected rotators) keep the read-only rotator
+    behaviour — refresh stays disabled so shared refresh tokens survive."""
+    from tusker_gateway import tool_qualification as tq
+
+    constructed: list[dict] = []
+
+    class _RecordingRotator:
+        def __init__(self, credentials, **kwargs):
+            constructed.append(kwargs)
+            self._kwargs = kwargs
+
+        async def get_token(self):
+            return None
+
+    monkeypatch.setattr(
+        "tusker_gateway.passthrough.CodexTokenRotator",
+        _RecordingRotator,
+    )
+    config = {
+        "providers": {"openai-codex": {}},
+        "provider_api_keys": {},
+        "credential_pools": {
+            "openai-codex": [{"access_token": "a", "refresh_token": "r"}],
+        },
+    }
+    registry = tq._catalog_registry(config)
+    client = registry.get_client("openai-codex")
+    assert client is not None
+    assert len(constructed) == 1
+    assert constructed[0].get("refresh_enabled") is False

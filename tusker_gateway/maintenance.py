@@ -94,6 +94,7 @@ async def run_maintenance_cycle(
     limit: int = 12,
     timeout_secs: float = 30.0,
     max_age_secs: float = 86_400.0,
+    credential_rotators: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run one bounded tool-qualification batch and purge expired cooldowns."""
     config = load_config()
@@ -109,6 +110,7 @@ async def run_maintenance_cycle(
         # The qualification runner skips active provider/model quarantines by
         # default, so maintenance cannot turn a known outage into a retry storm.
         ignore_cooldowns=False,
+        credential_rotators=credential_rotators,
     )
     passed = sum(1 for result in results if result.get("status") == "passed")
     return {
@@ -193,6 +195,7 @@ async def run_structured_maintenance_cycle(
     limit: int = 4,
     timeout_secs: float = 45.0,
     max_age_secs: float = 21_600.0,
+    credential_rotators: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Refresh Hindsight-compatible candidates and report pool coverage."""
     from tusker_gateway.pools import PoolManager
@@ -207,6 +210,7 @@ async def run_structured_maintenance_cycle(
         limit=limit,
         ignore_cooldowns=False,
         manager=manager,
+        credential_rotators=credential_rotators,
     )
     qualified = qualified_count(
         manager=manager,
@@ -242,6 +246,7 @@ async def run_modality_maintenance_cycle(
     max_age_secs: float = 86_400.0,
     transient_max_age_secs: float | None = None,
     per_probe_delay_secs: float = 0.0,
+    credential_rotators: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Probe input modality on a small batch of candidates across the pool set.
 
@@ -288,6 +293,7 @@ async def run_modality_maintenance_cycle(
         per_probe_delay_secs=per_probe_delay_secs,
         limit=limit,
         ignore_cooldowns=False,
+        credential_rotators=credential_rotators,
     )
     counts: dict[str, int] = {}
     for result in results:
@@ -303,7 +309,11 @@ async def run_modality_maintenance_cycle(
     }
 
 
-async def qualification_maintenance_loop(stop_event: asyncio.Event) -> None:
+async def qualification_maintenance_loop(
+    stop_event: asyncio.Event,
+    *,
+    credential_rotators: dict[str, Any] | None = None,
+) -> None:
     """Rotate small qualification batches without blocking gateway startup."""
     config = load_config()
     pools = _maintenance_pools(config)
@@ -470,6 +480,7 @@ async def qualification_maintenance_loop(stop_event: asyncio.Event) -> None:
                     limit=limit,
                     timeout_secs=timeout_secs,
                     max_age_secs=max_age_secs,
+                    credential_rotators=credential_rotators,
                 )
                 logger.info("qualification maintenance result=%s", summary)
                 if structured_enabled:
@@ -479,6 +490,7 @@ async def qualification_maintenance_loop(stop_event: asyncio.Event) -> None:
                         limit=structured_limit,
                         timeout_secs=structured_timeout_secs,
                         max_age_secs=structured_max_age_secs,
+                        credential_rotators=credential_rotators,
                     )
                     logger.info(
                         "structured qualification result=%s",
@@ -511,6 +523,7 @@ async def qualification_maintenance_loop(stop_event: asyncio.Event) -> None:
                     max_age_secs=modality_max_age_secs,
                     transient_max_age_secs=modality_transient_max_age_secs,
                     per_probe_delay_secs=modality_per_probe_delay_secs,
+                    credential_rotators=credential_rotators,
                 )
                 logger.info(
                     "modality qualification result=%s",
@@ -533,6 +546,7 @@ async def qualification_maintenance_loop(stop_event: asyncio.Event) -> None:
                 limit=limit,
                 timeout_secs=timeout_secs,
                 max_age_secs=max_age_secs,
+                credential_rotators=credential_rotators,
             )
             logger.info("qualification maintenance result=%s", summary)
             if structured_enabled:
@@ -542,6 +556,7 @@ async def qualification_maintenance_loop(stop_event: asyncio.Event) -> None:
                     limit=structured_limit,
                     timeout_secs=structured_timeout_secs,
                     max_age_secs=structured_max_age_secs,
+                    credential_rotators=credential_rotators,
                 )
                 logger.info(
                     "structured qualification result=%s",
@@ -574,6 +589,7 @@ async def qualification_maintenance_loop(stop_event: asyncio.Event) -> None:
                     max_age_secs=modality_max_age_secs,
                     transient_max_age_secs=modality_transient_max_age_secs,
                     per_probe_delay_secs=modality_per_probe_delay_secs,
+                    credential_rotators=credential_rotators,
                 )
                 logger.info(
                     "modality qualification result=%s",

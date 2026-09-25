@@ -551,3 +551,84 @@ def test_schema_migration_renames_auto_free_to_auto_catalog(tmp_path) -> None:
     }
     assert "auto_catalog" in fresh_cols
     assert "auto_free" not in fresh_cols
+
+
+def test_rebuild_rotators_constructs_new_provider_without_error(monkeypatch):
+    """A reload that introduces a provider without an existing rotator must
+    construct one (not crash with NameError) and wire auth_file only for
+    openai-codex."""
+    from tusker_gateway.passthrough import CodexTokenRotator
+
+    store = _make_store()
+    monkeypatch.setattr(
+        store,
+        "runtime_config",
+        lambda fallback: {
+            "credential_pools": {
+                "openai-codex": [{"access_token": "a", "refresh_token": "r"}],
+                "github-copilot": [{"access_token": "gh", "refresh_token": "gr"}],
+            },
+            "auth_file": "/tmp/auth.json",
+            "providers": {},
+        },
+    )
+    app = _make_app({"providers": {}})
+    app["config_store"] = store
+    runtime = ConfigRuntime(app)
+    runtime._last_media_providers = frozenset()
+
+    runtime._rebuild_rotators()
+
+    codex_rot = app["credential_rotators"].get("openai-codex")
+    copilot_rot = app["credential_rotators"].get("github-copilot")
+    assert isinstance(codex_rot, CodexTokenRotator)
+    assert isinstance(copilot_rot, CodexTokenRotator)
+    # Codex dual-writes the Hermes auth.json; other providers must not.
+    assert codex_rot._auth_file == "/tmp/auth.json"
+    assert copilot_rot._auth_file is None
+
+
+def test_poll_does_not_advance_generation_when_apply_fails(monkeypatch):
+    """A failed ``_apply`` must leave ``_generation`` at the last applied
+    generation so the next poll retries instead of silently skipping the
+    change forever."""
+    store = _make_store()
+    generation = {"value": 1}
+
+    def fake_reload_now():
+        generation["value"] += 1
+        store.generation = generation["value"]
+        return True
+
+    monkeypatch.setattr(store, "reload_now", fake_reload_now)
+    _env_state("1")
+    app = _make_app()
+    app["config_store"] = store
+    runtime = ConfigRuntime(app)
+    runtime._generation = 1
+
+    applied: list[int] = []
+
+    def failing_apply(gen):
+        applied.append(gen)
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(runtime, "_apply", failing_apply)
+
+    async def scenario():
+        stop = asyncio.Event()
+
+        async def stop_soon():
+            await asyncio.sleep(0.05)
+            stop.set()
+
+        stopper = asyncio.create_task(stop_soon())
+        try:
+            await runtime._poll(stop, interval_secs=0.01)
+        finally:
+            stopper.cancel()
+
+    asyncio.run(scenario())
+
+    assert applied  # the new generation was attempted
+    assert runtime._generation == 1  # NOT advanced past the failure

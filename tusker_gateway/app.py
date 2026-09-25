@@ -478,7 +478,10 @@ def create_app() -> web.Application:
             from tusker_gateway.maintenance import qualification_maintenance_loop
 
             app["qualification_task"] = asyncio.create_task(
-                qualification_maintenance_loop(stop_event),
+                qualification_maintenance_loop(
+                    stop_event,
+                    credential_rotators=app.get("credential_rotators"),
+                ),
                 name="qualification-maintenance",
             )
             startup_log.info("qualification maintenance task started")

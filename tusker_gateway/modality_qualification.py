@@ -221,6 +221,8 @@ def _catalog_registry(
     config: dict[str, Any],
     capability_db: ModelCapabilityDB,
     session: aiohttp.ClientSession,
+    *,
+    credential_rotators: dict[str, Any] | None = None,
 ) -> CatalogRegistry:
     """Build catalog clients with the same auth isolation as the gateway."""
     registry = CatalogRegistry.default(
@@ -233,6 +235,15 @@ def _catalog_registry(
     for provider, client in registry._clients.items():
         client.set_api_key(keys.get(provider))
 
+    # Read-only token source by default: a standalone qualification job must
+    # never consume the shared single-use Codex refresh token — the rotated
+    # result could not be persisted here and would kill the credential for
+    # the gateway (refresh_token_reused).
+    #
+    # In-process maintenance passes the gateway's LIVE rotators instead:
+    # those refresh and persist via the DB CAS path, so catalog enumeration
+    # uses the same tokens (and refresh semantics) as request routing.
+    live = credential_rotators or {}
     credential_pools = config.get("credential_pools", {})
     if isinstance(credential_pools, dict):
         from tusker_gateway.passthrough import CodexTokenRotator
@@ -243,13 +254,15 @@ def _catalog_registry(
             "github-copilot-enterprise",
         ):
             client = registry.get_client(provider)
-            credentials = credential_pools.get(provider)
-            if client is None or not isinstance(credentials, list) or not credentials:
+            if client is None or keys.get(provider):
                 continue
-            # Read-only token source: a standalone qualification job must
-            # never consume the shared single-use Codex refresh token —
-            # the rotated result could not be persisted here and would
-            # kill the credential for the gateway (refresh_token_reused).
+            existing = live.get(provider)
+            if existing is not None and callable(getattr(existing, "get_token", None)):
+                client.set_token_source(existing.get_token)
+                continue
+            credentials = credential_pools.get(provider)
+            if not isinstance(credentials, list) or not credentials:
+                continue
             rotator = CodexTokenRotator(
                 credentials,
                 http_client=session,
@@ -365,6 +378,7 @@ async def run_qualification(
     model_pairs: set[tuple[str, str]] | None = None,
     include_unadvertised: bool = False,
     ignore_cooldowns: bool = False,
+    credential_rotators: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Qualify one input modality across selected pool candidates."""
     config = load_config()
@@ -395,7 +409,12 @@ async def run_qualification(
         if str(provider).strip() and str(model).strip()
     }
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_secs)) as session:
-        registry = _catalog_registry(config, capability_db, session)
+        registry = _catalog_registry(
+            config,
+            capability_db,
+            session,
+            credential_rotators=credential_rotators,
+        )
         await registry.refresh_all(session)
         manager = PoolManager(config)
         manager.catalog_registry = registry

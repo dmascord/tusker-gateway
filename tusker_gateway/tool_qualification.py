@@ -84,6 +84,7 @@ def _catalog_registry(
     config: dict[str, Any],
     *,
     http_client: aiohttp.ClientSession | None = None,
+    credential_rotators: dict[str, Any] | None = None,
 ) -> CatalogRegistry:
     """Build and authenticate catalogs for every configured provider."""
     registry = CatalogRegistry.default(config.get("providers"))
@@ -99,6 +100,13 @@ def _catalog_registry(
     # disabled: refreshing here would consume the shared single-use refresh
     # token and the rotated result could not be persisted (no auth_file, no
     # DB callback), permanently killing the credential for the gateway.
+    #
+    # In-process maintenance passes the gateway's LIVE rotators instead: those
+    # refresh and persist via the DB CAS path, so catalog enumeration uses
+    # the same tokens (and refresh semantics) as request routing. Building a
+    # second read-only rotator in-process would enumerate with stale env
+    # credentials and fail the provider catalog with HTTP 401 on every cycle.
+    live = credential_rotators or {}
     credential_pools = config.get("credential_pools", {})
     if isinstance(credential_pools, dict):
         from tusker_gateway.passthrough import CodexTokenRotator
@@ -110,6 +118,10 @@ def _catalog_registry(
         ):
             client = registry.get_client(provider)
             if client is None or keys.get(provider):
+                continue
+            existing = live.get(provider)
+            if existing is not None and callable(getattr(existing, "get_token", None)):
+                client.set_token_source(existing.get_token)
                 continue
             credentials = credential_pools.get(provider)
             if not isinstance(credentials, list) or not credentials:
@@ -483,6 +495,7 @@ async def run_qualification(
     providers: set[str] | None = None,
     model_pairs: set[tuple[str, str]] | None = None,
     ignore_cooldowns: bool = False,
+    credential_rotators: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Qualify selected static and auto-discovered chat models for one pool."""
     config = load_config()
@@ -503,7 +516,9 @@ async def run_qualification(
         )
     timeout = aiohttp.ClientTimeout(total=timeout_secs, sock_read=timeout_secs)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        registry = _catalog_registry(config, http_client=session)
+        registry = _catalog_registry(
+            config, http_client=session, credential_rotators=credential_rotators
+        )
         await registry.refresh_all(session)
         manager = PoolManager(config)
         manager.catalog_registry = registry

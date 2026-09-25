@@ -440,7 +440,7 @@ class ConfigRuntime:
                 from tusker_gateway.passthrough import CodexTokenRotator
                 rot = CodexTokenRotator(
                     clean,
-                    auth_file=provider_auth,
+                    auth_file=(auth_file if provider == "openai-codex" else None),
                     provider=provider,
                     persist_credentials=persist_cb,
                     load_credentials=load_cb,
@@ -521,10 +521,13 @@ class ConfigRuntime:
                 await asyncio.to_thread(store.reload_now)
                 new_gen = store.generation
                 if new_gen != old_gen:
-                    self._generation = new_gen
                     self._error = None
                     logger.info("config generation changed %s -> %s; applying", old_gen, new_gen)
+                    # Commit the generation only after a successful apply so a
+                    # failed rebuild is retried on the next poll instead of
+                    # being silently skipped forever.
                     self._apply(new_gen)
+                    self._generation = new_gen
             except ConfigUnavailableError as exc:
                 self._error = self._redact(str(exc))
                 logger.debug("config poll unavailable: %s", self._error)

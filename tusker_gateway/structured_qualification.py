@@ -351,7 +351,9 @@ async def run_structured_qualification(
     model_pairs: set[tuple[str, str]] | None = None,
     ignore_cooldowns: bool = False,
     catalog_registry: Any | None = None,
+    credential_rotators: dict[str, Any] | None = None,
     manager: PoolManager | None = None,
+
 ) -> list[dict[str, Any]]:
     """Probe configured general-chat candidates in one pool.
 
@@ -373,7 +375,11 @@ async def run_structured_qualification(
         if registry is None:
             from tusker_gateway.tool_qualification import _catalog_registry
 
-            registry = _catalog_registry(config, http_client=session)
+            registry = _catalog_registry(
+                config,
+                http_client=session,
+                credential_rotators=credential_rotators,
+            )
             await registry.refresh_all(session)
         manager.catalog_registry = registry
         manager.extend_pools_with_auto_catalog()

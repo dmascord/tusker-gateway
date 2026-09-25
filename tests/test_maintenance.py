@@ -257,3 +257,87 @@ async def test_needs_probe_differentiates_passed_from_unavailable(monkeypatch):
         )
     finally:
         mq.time.time = orig_time
+
+
+@pytest.mark.asyncio
+async def test_maintenance_cycle_forwards_credential_rotators(monkeypatch, tmp_path):
+    """In-process maintenance must hand the gateway's live rotators to the
+    tool runner so catalog enumeration uses refreshable credentials."""
+    captured: dict = {}
+
+    async def fake_run_qualification(**kwargs):
+        captured.update(kwargs)
+        return []
+
+    sentinel = {"openai-codex": object()}
+    monkeypatch.setattr(
+        "tusker_gateway.maintenance.load_config",
+        lambda: {"quality_db_path": str(tmp_path / "quality.db")},
+    )
+    monkeypatch.setattr(
+        "tusker_gateway.maintenance.run_qualification",
+        fake_run_qualification,
+    )
+
+    await run_maintenance_cycle(pool_name="code", credential_rotators=sentinel)
+
+    assert captured["credential_rotators"] is sentinel
+
+
+@pytest.mark.asyncio
+async def test_structured_cycle_forwards_credential_rotators(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    from tusker_gateway.maintenance import run_structured_maintenance_cycle
+
+    captured: dict = {}
+
+    async def fake_run_structured(**kwargs):
+        captured.update(kwargs)
+        return []
+
+    sentinel = {"openai-codex": object()}
+    manager = SimpleNamespace(
+        config={"quality_db_path": str(tmp_path / "q.db")},
+        models={},
+        _model_capability_db=object(),
+    )
+    monkeypatch.setattr(
+        "tusker_gateway.pools.PoolManager",
+        lambda config: manager,
+    )
+    monkeypatch.setattr(
+        "tusker_gateway.maintenance.run_structured_qualification",
+        fake_run_structured,
+    )
+    monkeypatch.setattr(
+        "tusker_gateway.maintenance.qualified_count",
+        lambda **kwargs: 0,
+    )
+
+    await run_structured_maintenance_cycle(credential_rotators=sentinel)
+
+    assert captured["credential_rotators"] is sentinel
+
+
+@pytest.mark.asyncio
+async def test_modality_cycle_forwards_credential_rotators(monkeypatch):
+    captured: dict = {}
+
+    async def fake_run_qualification(**kwargs):
+        captured.update(kwargs)
+        return []
+
+    sentinel = {"openai-codex": object()}
+    monkeypatch.setenv("API_KEYS", "test-key-1")
+    monkeypatch.setattr(
+        "tusker_gateway.modality_qualification.run_qualification",
+        fake_run_qualification,
+    )
+
+    await run_modality_maintenance_cycle(
+        pool_names=("code",),
+        credential_rotators=sentinel,
+    )
+
+    assert captured["credential_rotators"] is sentinel
