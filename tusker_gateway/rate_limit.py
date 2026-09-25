@@ -155,62 +155,81 @@ class RateLimiter:
         self.stats.checks += 1
         assert self._db is not None
         with self._db.connection() as conn:
-            row = conn.execute(
-                "SELECT tokens, last_refill_at FROM buckets WHERE fingerprint = ?",
-                (fp,),
-            ).fetchone()
-
-        if row is None:
-            # First time we see this key — start with a full bucket.
-            tokens = policy.burst
-            last_refill = now
-        else:
-            tokens, last_refill = row
-            # Refill: tokens += rate * elapsed_secs, capped at burst.
-            elapsed = max(0.0, now - last_refill)
-            tokens = min(policy.burst, tokens + elapsed * policy.rate_per_sec)
-
-        if tokens >= cost:
-            tokens -= cost
-            with self._db.connection() as conn:
+            # Refill and consume inside a single transaction so concurrent
+            # checks cannot both read a sufficient balance and both consume.
+            # The refill is expressed in SQL (CASE instead of MIN/MAX) so it
+            # is atomic on both SQLite and PostgreSQL, and the consume is a
+            # relative conditional decrement whose rowcount decides the winner.
+            conn.execute(
+                """UPDATE buckets SET
+                    tokens = CASE
+                        WHEN last_refill_at >= ? THEN tokens
+                        ELSE CASE
+                            WHEN tokens + (? - last_refill_at) * ? > ? THEN ?
+                            ELSE tokens + (? - last_refill_at) * ?
+                        END
+                    END,
+                    last_refill_at = ?
+                WHERE fingerprint = ?""",
+                (
+                    now,           # last_refill_at >= now
+                    now,           # (? - last_refill_at) now
+                    policy.rate_per_sec,  # * rate_per_sec
+                    policy.burst,  # > burst
+                    policy.burst,  # THEN burst
+                    now,           # second (? - last_refill_at) now
+                    policy.rate_per_sec,  # * rate_per_sec
+                    now,           # top-level last_refill_at = now
+                    fp,            # WHERE fingerprint
+                ),
+            )
+            updated = conn.execute(
+                """
+                UPDATE buckets SET tokens = tokens - ?
+                WHERE fingerprint = ? AND tokens >= ?
+                """,
+                (cost, fp, cost),
+            ).rowcount
+            if not updated:
+                # The bucket may not exist yet (first-insert race). Create it
+                # with a full burst; ON CONFLICT DO NOTHING lets exactly one
+                # writer win, then retry the conditional consume once.
                 conn.execute(
                     """
                     INSERT INTO buckets (fingerprint, tokens, last_refill_at)
                     VALUES (?, ?, ?)
-                    ON CONFLICT(fingerprint) DO UPDATE SET
-                        tokens = excluded.tokens,
-                        last_refill_at = excluded.last_refill_at
+                    ON CONFLICT(fingerprint) DO NOTHING
                     """,
-                    (fp, tokens, now),
+                    (fp, policy.burst, now),
                 )
-                conn.commit()
+                updated = conn.execute(
+                    """
+                    UPDATE buckets SET tokens = tokens - ?
+                    WHERE fingerprint = ? AND tokens >= ?
+                    """,
+                    (cost, fp, cost),
+                ).rowcount
+            row = conn.execute(
+                "SELECT tokens FROM buckets WHERE fingerprint = ?",
+                (fp,),
+            ).fetchone()
+            tokens = row[0] if row is not None else 0.0
+
+        if updated:
             self.stats.allowed += 1
             logger.debug('rate limit check key=%s allowed=True', fp[:8])
             return RateLimitDecision(allowed=True, remaining=tokens)
-        else:
-            # Persist the refilled amount so we don't lose refill progress.
-            with self._db.connection() as conn:
-                conn.execute(
-                    """
-                    INSERT INTO buckets (fingerprint, tokens, last_refill_at)
-                    VALUES (?, ?, ?)
-                    ON CONFLICT(fingerprint) DO UPDATE SET
-                        tokens = excluded.tokens,
-                        last_refill_at = excluded.last_refill_at
-                    """,
-                    (fp, tokens, now),
-                )
-                conn.commit()
-            deficit = cost - tokens
-            retry = deficit / policy.rate_per_sec if policy.rate_per_sec > 0 else 60.0
-            self.stats.blocked += 1
-            logger.warning('rate limit blocked key=%s (remaining=%.1f)', fp[:8], tokens)
-            return RateLimitDecision(
-                allowed=False,
-                remaining=tokens,
-                retry_after=retry,
-                reason=f"rate limit exceeded (refill {policy.rate_per_sec}/s, burst {policy.burst})",
-            )
+
+        deficit = cost - tokens
+        retry = deficit / policy.rate_per_sec if policy.rate_per_sec > 0 else 60.0
+        self.stats.blocked += 1
+        logger.warning('rate limit blocked key=%s (remaining=%.1f)', fp[:8], tokens)
+        return RateLimitDecision(
+            allowed=False,
+            remaining=tokens,
+            retry_after=retry,
+            reason=f"rate limit exceeded (refill {policy.rate_per_sec}/s, burst {policy.burst})",
+        )
 
     def stats_snapshot(self) -> dict[str, int]:
         return self.stats.snapshot()

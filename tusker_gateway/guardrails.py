@@ -41,8 +41,40 @@ class OutputLengthGuard:
         return GuardResult()
 
 
-_EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
-_CC_RE = re.compile(r"\b\d{4}[ -]?\d{4}[ -]?\d{4}[ -]?\d{4}\b")
+_EMAIL_RE = re.compile(
+    r"(?<![a-zA-Z0-9._%+-])"
+    r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}"
+    r"(?![a-zA-Z0-9])"
+)
+
+# 13-19 digit runs with optional space/dash grouping. This is a *candidate*
+# matcher only; a match is redacted only when it also passes the Luhn
+# checksum, so order numbers and other long digit strings stay intact.
+_CC_RE = re.compile(r"\b\d(?:[ -]?\d){12,18}\b")
+
+
+def _is_valid_credit_card(number: str) -> bool:
+    """Validate a candidate card number with the Luhn checksum."""
+    digits = [int(c) for c in number if c.isdigit()]
+    if len(digits) < 13 or len(digits) > 19:
+        return False
+    checksum = 0
+    for index, digit in enumerate(reversed(digits)):
+        if index % 2 == 1:
+            digit *= 2
+            if digit > 9:
+                digit -= 9
+        checksum += digit
+    return checksum % 10 == 0
+
+
+def _redact_cc(match: re.Match[str]) -> str:
+    """Redact the match only when it is a Luhn-valid card number."""
+    candidate = match.group(0)
+    if _is_valid_credit_card(candidate):
+        return "[REDACTED-CC]"
+    return candidate
+
 
 _LANGUAGE_WORDS: dict[str, frozenset[str]] = {
     "en": frozenset("the and is are to of in for please what how can with this that you".split()),
@@ -144,7 +176,7 @@ class PIIRedactionGuard:
                 new_messages.append(msg)
                 continue
             new_content = _EMAIL_RE.sub("[REDACTED-EMAIL]", content)
-            new_content = _CC_RE.sub("[REDACTED-CC]", new_content)
+            new_content = _CC_RE.sub(_redact_cc, new_content)
             if new_content != content:
                 mutated = True
                 new_messages.append({**msg, "content": new_content})
@@ -157,16 +189,14 @@ class PIIRedactionGuard:
 
 
 _DEFAULT_INJECTION_PATTERNS: list[str] = [
-    "ignore previous instructions",
-    "ignore all previous",
-    "you are now",
-    "system prompt:",
-    "disregard your instructions",
-    "new instructions:",
-    "forget everything",
-    "override your",
-    "act as if you have no",
-    "pretend you are",
+    r"^(?:please\s+|kindly\s+)?ignore\s+(?:previous|all)\s+instructions",
+    r"^you\s+are\s+(?:now\s+)?(?:a|an)\s+\w+",
+    r"^(?:system|new)\s+(?:prompt|instructions)\s*:",
+    r"^disregard\s+(?:your|all|the)?\s*instructions",
+    r"^forget\s+everything",
+    r"^override\s+your",
+    r"^act\s+as\s+if\s+you\s+have\s+no",
+    r"^pretend\s+you\s+are",
 ]
 
 
@@ -180,12 +210,23 @@ class PromptInjectionGuard:
     causes normal agent/tool loops to fail closed. System/developer messages
     are caller-controlled instructions and are likewise outside this input
     guard's scope.
+
+    Patterns use ``re.search`` with ``IGNORECASE | MULTILINE``. Default
+    patterns are ``^``-anchored so quoted/described injection phrases
+    appearing mid-message no longer trigger false positives.
     """
 
     extra_patterns: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
-        self._patterns: list[str] = _DEFAULT_INJECTION_PATTERNS + self.extra_patterns
+        self._compiled_defaults = [
+            re.compile(p, re.IGNORECASE | re.MULTILINE)
+            for p in _DEFAULT_INJECTION_PATTERNS
+        ]
+        self._compiled_extra = [
+            re.compile(re.escape(p), re.IGNORECASE)
+            for p in self.extra_patterns
+        ]
 
     async def check(self, body: dict[str, Any]) -> GuardResult:
         messages = body.get("messages")
@@ -208,9 +249,8 @@ class PromptInjectionGuard:
                 text = content
             else:
                 continue
-            lower = text.lower()
-            for pat in self._patterns:
-                if pat.lower() in lower:
+            for pat in self._compiled_defaults + self._compiled_extra:
+                if pat.search(text):
                     return GuardResult(allowed=False, message="possible prompt injection detected")
         return GuardResult()
 

@@ -44,6 +44,7 @@ import time
 import traceback
 import uuid
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Iterator
 
@@ -255,27 +256,35 @@ class Tracer:
             logger.warning("OTLP export error: %s", exc)
 
 
-# -- Current-span tracking (process-local) --------------------------------
+# -- Current-span tracking (per-context) -----------------------------------
 
-_current: list[Span] = []
+# Each asyncio task (and thus each aiohttp request handler, which runs in its
+# own context copy) sees an independent immutable stack. A tuple is required:
+# ContextVar.set() must install a *new* value per context, so the stack must
+# never be mutated in place.
+_current_span_stack: ContextVar[tuple[Span, ...]] = ContextVar(
+    "tusker_span_stack", default=()
+)
 
 
 def _push_current(span: Span) -> None:
-    _current.append(span)
+    _current_span_stack.set(_current_span_stack.get() + (span,))
 
 
 def _pop_current(span: Span) -> None:
-    if _current and _current[-1] is span:
-        _current.pop()
-    else:
-        try:
-            _current.remove(span)
-        except ValueError:
-            pass
+    stack = _current_span_stack.get()
+    if stack and stack[-1] is span:
+        _current_span_stack.set(stack[:-1])
+        return
+    # span not on top: rebuild without it (defensive, mirrors old try/except intent)
+    if span in stack:
+        idx = stack.index(span)
+        _current_span_stack.set(stack[:idx] + stack[idx + 1 :])
 
 
 def _last_span_id() -> str | None:
-    return _current[-1].span_id if _current else None
+    stack = _current_span_stack.get()
+    return stack[-1].span_id if stack else None
 
 
 def load_tracer_config_from_env(env: dict[str, str] | None = None) -> TracerConfig:

@@ -1696,8 +1696,17 @@ async def _stream_with_model_alias(
     upstream_model: str,
     alias: str,
     wrapped: AsyncIterator[bytes],
+    *,
+    match_any: bool = False,
 ) -> AsyncIterator[bytes]:
-    """Rewrite only model metadata, buffering fragmented SSE events."""
+    """Rewrite only model metadata, buffering fragmented SSE events.
+
+    By default only chunks whose ``model`` equals ``upstream_model`` are
+    rewritten, preserving provider-specific alias translation. When
+    ``match_any`` is true, every chunk carrying a string model is rewritten
+    to ``alias`` - used for gateway-owned pool routes where the upstream
+    model id is implementation detail.
+    """
     buffer = b""
     try:
         async for chunk in wrapped:
@@ -1712,10 +1721,20 @@ async def _stream_with_model_alias(
                     data = json.loads(payload) if payload else None
                 except (ValueError, UnicodeDecodeError):
                     data = None
-                if isinstance(data, dict) and data.get("model") == upstream_model:
+                if (
+                    isinstance(data, dict)
+                    and isinstance(data.get("model"), str)
+                    and (match_any or data.get("model") == upstream_model)
+                ):
                     data["model"] = alias
-                    fields = [line for line in frame.splitlines() if not line.startswith(b"data:")]
-                    fields.append(b"data: " + json.dumps(data, ensure_ascii=False).encode())
+                    fields = [
+                        line
+                        for line in frame.splitlines()
+                        if not line.startswith(b"data:")
+                    ]
+                    fields.append(
+                        b"data: " + json.dumps(data, ensure_ascii=False).encode()
+                    )
                     frame = b"\n".join(fields)
                 yield frame + b"\n\n"
         if buffer:

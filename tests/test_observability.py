@@ -141,77 +141,56 @@ class TestAccessLog:
         assert record["tenant"] == "engineering"
         assert record["key_fingerprint"] == "a" * 64
 class TestClientIP:
-    """Real client IP extraction: CF-Connecting-IP > X-Forwarded-For leftmost > request.remote."""
+    """client_ip only honours forwarded headers from trusted proxy peers."""
 
-    def test_cf_connecting_ip(self):
-        """CF-Connecting-IP takes priority over XFF."""
+    @staticmethod
+    def _request(headers: dict, peer_ip: str | None = None) -> web.Request:
+        """Build a mocked request with an optional direct peer address."""
         request = make_mocked_request("GET", "/")
-        request = _patch_headers(
-            request,
+        from multidict import CIMultiDict
+
+        request._headers = CIMultiDict(headers)
+        if peer_ip is not None:
+            request._transport_peername = (peer_ip, 11111)
+        return request
+
+    def test_cf_connecting_ip_from_trusted_proxy(self) -> None:
+        request = self._request(
             {"CF-Connecting-IP": "198.51.100.42", "X-Forwarded-For": "10.0.0.1"},
+            peer_ip="173.245.48.1",
         )
         assert client_ip(request) == "198.51.100.42"
 
-    def test_xff_chain(self):
-        """Leftmost XFF entry is the original client (Cloudflare: client, edge)."""
-        request = make_mocked_request("GET", "/")
-        request = _patch_headers(
-            request, {"X-Forwarded-For": "203.0.113.1, 10.0.0.1, 192.168.1.1"}
+    def test_xff_chain_from_trusted_proxy(self) -> None:
+        request = self._request(
+            {"X-Forwarded-For": "203.0.113.1, 10.0.0.1, 192.168.1.1"},
+            peer_ip="103.21.244.5",
         )
         assert client_ip(request) == "203.0.113.1"
 
-    def test_xff_single(self):
-        """Single XFF value is returned directly."""
-        request = make_mocked_request("GET", "/")
-        request = _patch_headers(request, {"X-Forwarded-For": "203.0.113.1"})
-        assert client_ip(request) == "203.0.113.1"
-
-    def test_xff_with_spaces(self):
-        """Leftmost XFF entry with surrounding whitespace is stripped."""
-        request = make_mocked_request("GET", "/")
-        request = _patch_headers(request, {"X-Forwarded-For": "  203.0.113.55  ,  10.0.0.2  "})
+    def test_xff_with_spaces_from_trusted_proxy(self) -> None:
+        request = self._request(
+            {"X-Forwarded-For": "  203.0.113.55  ,  10.0.0.2  "},
+            peer_ip="104.16.0.1",
+        )
         assert client_ip(request) == "203.0.113.55"
 
-    def test_no_headers_fallback(self):
-        """No CF or XFF falls back to 'unknown' (mocked request.remote is None)."""
-        request = make_mocked_request("GET", "/")
+    def test_untrusted_peer_ignores_cf_and_xff(self) -> None:
+        request = self._request(
+            {"CF-Connecting-IP": "198.51.100.42", "X-Forwarded-For": "203.0.113.1"},
+            peer_ip="203.0.113.9",
+        )
+        assert client_ip(request) == "203.0.113.9"
+
+    def test_no_headers_falls_back_to_remote(self) -> None:
+        request = self._request({}, peer_ip="192.0.2.50")
+        assert client_ip(request) == "192.0.2.50"
+
+    def test_no_peer_metadata_returns_unknown(self) -> None:
+        request = self._request({})
         assert client_ip(request) == "unknown"
-    def test_cf_connecting_ip(self):
-        """Cloudflare CF-Connecting-IP takes priority over XFF."""
-        request = make_mocked_request("GET", "/")
-        request = _patch_headers(
-            request,
-            {"CF-Connecting-IP": "198.51.100.42", "X-Forwarded-For": "10.0.0.1"},
-        )
-        assert client_ip(request) == "198.51.100.42"
-
-    def test_xff_chain(self):
-        """Leftmost XFF entry is the original client (Cloudflare format: client, edge)."""
-        request = make_mocked_request("GET", "/")
-        request = _patch_headers(
-            request, {"X-Forwarded-For": "203.0.113.1, 10.0.0.1, 192.168.1.1"}
-        )
-        assert client_ip(request) == "203.0.113.1"
-
-    def test_xff_with_spaces(self):
-        """Leftmost XFF entry with surrounding whitespace is stripped."""
-        request = make_mocked_request("GET", "/")
-        request = _patch_headers(request, {"X-Forwarded-For": "  203.0.113.55  ,  10.0.0.2  "})
-        assert client_ip(request) == "203.0.113.55"
-
-    def test_no_headers_fallback(self):
-        """No CF or XFF falls back to request.remote (or 'unknown' in mocked)."""
-        request = make_mocked_request("GET", "/")
 
 
-def _patch_headers(request: web.Request, headers: dict) -> web.Request:
-    """Patch a mocked request's headers dict for XFF testing."""
-    # make_mocked_request creates a request with frozen headers.
-    # Replace the _headers object with a mutable MultiDictProxy.
-    from multidict import CIMultiDict
-    from yarl import URL
-    request._headers = CIMultiDict(headers)
-    return request
 
 
 class TestRequestIDMiddleware:

@@ -6,6 +6,34 @@
 
 This document captures all findings from the 2026-09-25 security, API correctness, reliability, and operations audit, with concrete implementation steps for each item.
 
+## Implementation status (2026-09-25 remediation pass)
+
+All P0/P1 findings and the P2 durability/ops findings below are implemented
+and covered by regression tests. Full offline suite:
+`python3 -m pytest tests/ -p no:cacheprovider --ignore=tests/test_passthrough_providers.py -q`
+→ **1397 passed, 8 skipped**.
+
+| Finding | Status | Key change |
+|---------|--------|------------|
+| 1.1 Deadline/idempotency unwired | ✅ fixed | middleware attached in `app.py` |
+| 1.2 Metrics/dashboard fail-open | ✅ fixed | 401 when `TUSKER_METRICS_TOKEN` unset |
+| 1.3 Approval cross-tenant binding | ✅ fixed | caller-scoped approvals |
+| 1.4 Hardcoded dev/MCP keys | ✅ fixed | removed from config |
+| 2.1 429 mangled into 502 | ✅ fixed | upstream status preserved |
+| 2.2 Response model alias leak | ✅ fixed | advertised alias normalized in responses |
+| 2.3 Swarm route 400 | ✅ fixed | `_route_target` maps `kind=swarm` |
+| 3.1 Rate-limit check-then-insert race | ✅ fixed | single atomic txn + conditional decrement |
+| 3.2 Trace parent process-global | ✅ fixed | contextvars span stack |
+| 3.3 Half-open probe stampede | ✅ fixed | atomic `half_open_probes` reservation |
+| 3.4 Permanent failures process-local | ✅ fixed | `permanent_failures` table + startup hydration |
+| 5.1 Forwarded-IP spoofing | ✅ fixed | `client_ip` trusts CF/XFF only from `TUSKER_TRUSTED_PROXY_RANGES` peers (Cloudflare defaults) |
+| 5.2 Guardrail false positives | ✅ fixed | Luhn gate for card candidates, `^`-anchored injection patterns |
+| Docs accuracy (P3 4.4) | ✅ updated | README/docs reconciled this pass |
+
+**Not deployed:** the changes above are local-only. `rsync` + `./k8s/deploy.sh`
+requires operator confirmation (destructive-action policy) and a live smoke
+test of `/health`, `/ready`, and a chat completion afterwards.
+
 ---
 
 ## Legend

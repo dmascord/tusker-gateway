@@ -122,7 +122,7 @@ async def test_pii_multiple_pii_in_one_message():
     g = PIIRedactionGuard()
     body = {
         "messages": [
-            {"role": "user", "content": "Email bob@test.com card 1234567890123456"},
+            {"role": "user", "content": "Email bob@test.com card 4111111111111111"},
         ]
     }
     result = await g.check(body)
@@ -130,6 +130,20 @@ async def test_pii_multiple_pii_in_one_message():
     c = result.modified_body["messages"][0]["content"]
     assert "[REDACTED-EMAIL]" in c
     assert "[REDACTED-CC]" in c
+
+
+@pytest.mark.asyncio
+async def test_pii_non_luhn_digit_run_not_redacted():
+    """16-digit non-card numbers (order IDs) must survive PII redaction."""
+    g = PIIRedactionGuard()
+    body = {
+        "messages": [
+            {"role": "user", "content": "order 1234567812345678 shipped"},
+        ]
+    }
+    result = await g.check(body)
+    assert result.allowed
+    assert result.modified_body is None
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +197,25 @@ async def test_injection_custom_pattern():
     }
     result = await g.check(body)
     assert not result.allowed
+
+
+@pytest.mark.asyncio
+async def test_injection_quoted_mid_message_passes():
+    """Injection phrases quoted or described mid-message are not attacks."""
+    g = PromptInjectionGuard()
+    body = {
+        "messages": [
+            {
+                "role": "user",
+                "content": (
+                    "The security docs warn that a common attack is "
+                    "'ignore previous instructions'. Summarise the doc."
+                ),
+            },
+        ]
+    }
+    result = await g.check(body)
+    assert result.allowed
 
 
 @pytest.mark.asyncio

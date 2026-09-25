@@ -183,6 +183,42 @@ and GitHub Actions dependencies weekly. Live provider tests remain outside CI
 because they consume credentials and quota; run them as a controlled deployment
 smoke test.
 
+## 6. Client-IP attribution and guardrails
+
+### Client-IP trust gate
+
+`CF-Connecting-IP` and `X-Forwarded-For` are honoured only when the direct
+peer (the connection source) belongs to one of the CIDRs in
+`TUSKER_TRUSTED_PROXY_RANGES`. The default list covers the Cloudflare IPv4
+and IPv6 ranges; override with your own edge / proxy CIDRs when fronting the
+gateway with a different network. Requests from untrusted peers are logged
+and audited under the raw peer address, never under the spoofable header
+value. This gate protects the access log, the audit chain, and rate-limit
+identity from impersonation.
+
+### Guardrails
+
+Set `TUSKER_GUARDRAILS_ENABLED=true` to run a preflight pipeline before
+provider dispatch:
+
+- `OutputLengthGuard` clamps `max_tokens` to `TUSKER_MAX_OUTPUT_TOKENS`
+  (default 4096) so a request cannot exceed the configured output ceiling.
+- `PIIRedactionGuard` replaces emails with `[REDACTED-EMAIL]` and
+  Luhn-valid card numbers with `[REDACTED-CC]` in user messages only.
+  Long digit runs that do not pass the Luhn checksum (e.g. order IDs) are
+  passed through unchanged.
+- `PromptInjectionGuard` blocks suspicious directives that appear at the
+  start of a user message (`^ignore previous instructions`, `^you are now`,
+  etc., with an optional `please`/`kindly` politeness prefix). Operator-
+  supplied extra patterns from `TUSKER_GUARDRAILS_INJECTION_PATTERNS` match
+  anywhere in the message as plain substrings. Assistant and tool messages
+  are never scanned.
+- `HarnessSystemPromptGuard` prepends an immutable system prompt to
+  requests whose principal matches `TUSKER_GUARDRAILS_HARNESS_PRINCIPALS`
+  (default `omp-harness`), establishing the untrusted-data delimiter
+  contract.
+
+
 ## Recommended rollout
 
 1. Deploy deadlines and observe timeout rates.

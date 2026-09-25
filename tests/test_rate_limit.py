@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import threading
 import time
 
 import pytest
@@ -188,3 +189,55 @@ def test_load_config_default_with_both_json_and_env():
 def test_key_fingerprint_deterministic():
     assert _key_fingerprint("k1") == _key_fingerprint("k1")
     assert _key_fingerprint("k1") != _key_fingerprint("k2")
+
+
+def _run_checks_concurrently(rl: RateLimiter, api_key: str, n: int) -> list[bool]:
+    results: list[bool] = []
+    lock = threading.Lock()
+    barrier = threading.Barrier(n)
+
+    def worker():
+        barrier.wait()
+        d = rl.check(api_key)
+        with lock:
+            results.append(d.allowed)
+
+    threads = [threading.Thread(target=worker, name=f"worker-{i}") for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return results
+
+
+def test_concurrent_checks_cannot_overconsume(tmp_rl_path):
+    """Regression: concurrent `check()` calls must not over-consume the bucket.
+
+    The test creates a bucket with a burst of 5 tokens and launches 20
+    threads that all call :meth:`RateLimiter.check` with a cost of one token.
+    Exactly five checks should succeed; the remaining fifteen must be
+    denied.  The final token count must be zero.
+    """
+    fp = _key_fingerprint("k")
+    rl = _tracker(tmp_rl_path, {fp: RateLimitPolicy(rate_per_sec=0.0, burst=5.0)})
+    results = _run_checks_concurrently(rl, "k", 20)
+    assert sum(1 for a in results if a) == 5
+    # All bucket tokens should be exhausted to exactly zero.
+    assert rl.snapshot()[fp]["tokens"] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_first_insert_race_single_bucket(tmp_rl_path):
+    """Regression: concurrent first requests must not create duplicate buckets.
+
+    Ten threads simultaneously call :meth:`RateLimiter.check` for a brand-new
+    key with a burst of three tokens.  Only three requests should succeed
+    and the bucket should contain intermediate token counts, but the bucket
+    must still exist only once.
+    """
+    fp = _key_fingerprint("fresh")
+    rl = _tracker(tmp_rl_path, {fp: RateLimitPolicy(rate_per_sec=0.0, burst=3.0)})
+    results = _run_checks_concurrently(rl, "fresh", 10)
+    assert sum(1 for a in results if a) == 3
+    # There should be a single bucket containing zero remaining tokens.
+    assert len(rl.snapshot()) == 1
+    assert rl.snapshot()[fp]["tokens"] == pytest.approx(0.0, abs=1e-9)

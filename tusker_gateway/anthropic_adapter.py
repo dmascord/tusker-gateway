@@ -261,6 +261,8 @@ def _pool_name_for_anthropic(model: str) -> str:
     route = resolve_route(model, {"model": model})
     if route.kind in {"pool", "code"} and route.pool_name:
         return route.pool_name
+    if route.kind == "swarm":
+        return "swarm"
     return "passthrough"
 
 

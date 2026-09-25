@@ -68,6 +68,7 @@ from tusker_gateway.passthrough import (
     _safe_upstream_body,
     _sanitize_opencode_session_id,
     _stable_opencode_session_id,
+    _stream_with_model_alias,
 )
 from tusker_gateway.context_limits import (
     estimate_prompt_tokens,
@@ -87,7 +88,14 @@ from tusker_gateway.pools import PoolManager
 from tusker_gateway.provider_usage import is_capacity_error
 from tusker_gateway.quality import QualityDB
 from tusker_gateway.rate_limit import RateLimiter
-from tusker_gateway.routing import LEGACY_MODEL_IDS, resolve_route
+from tusker_gateway.routing import (
+    GATEWAY_PROVIDER,
+    LEGACY_MODEL_IDS,
+    LEGACY_POOL_COMPAT_ALIASES,
+    POOL_ALIASES,
+    resolve_route,
+    split_model,
+)
 from tusker_gateway.semantic_cache import make_semantic_scope, response_contains_tool_calls
 from tusker_gateway.model_capability import MODEL_CAPABILITY_PROBE_VERSION
 from tusker_gateway.storage import StorageUnavailableError
@@ -2828,9 +2836,35 @@ async def _prepare_stream_result(
     return _PreparedStream(_early_stream(first_frame, rest, result))
 
 
+
+def _client_facing_model_alias(requested_model: Any) -> str | None:
+    """Return the model id clients should see, or None to leave as-is.
+
+    Pool and default-code routes hide the concrete backend behind a virtual
+    alias, so responses must echo the client's requested string instead of
+    leaking the provider's internal model id (which also breaks
+    client-side caches and routing keyed on the advertised name).
+    Explicit provider-prefixed passthrough keeps the upstream identity
+    because the client selected that exact model.
+    """
+    if not isinstance(requested_model, str):
+        return None
+    model = requested_model.strip()
+    if not model:
+        return None
+    route = resolve_route(model, {"model": model})
+    if route.kind not in {"pool", "code"}:
+        return None
+    return model
+
+
 def _pool_name(body: dict[str, Any]) -> str | None:
     route = resolve_route(body.get("model"), body)
-    return route.pool_name or "code" if route.kind in {"pool", "code"} else None
+    if route.kind in {"pool", "code"}:
+        return route.pool_name or "code"
+    if route.kind == "swarm":
+        return "swarm"
+    return None
 
 
 def _tool_choice_requires_call(tool_choice: Any) -> bool:
@@ -5337,8 +5371,11 @@ def _validate_chat_body(body: Any) -> dict[str, Any]:
 
 def _route_target(config: dict[str, Any], body: dict[str, Any]) -> tuple[str, str]:
     route = resolve_route(body.get("model"), body)
-    if route.kind in {"pool", "code"}:
-        pool_name = route.pool_name or "code"
+    if route.kind in {"pool", "code", "swarm"}:
+        if route.kind == "swarm":
+            pool_name = "swarm"
+        else:
+            pool_name = route.pool_name or "code"
         selected = PoolManager(config).select(
             pool_name,
             required_input_modalities=_required_input_modalities(body.get("messages")),
@@ -5630,6 +5667,11 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
             conversation_id = _request_conversation_id(request, body, api_key)
             set_access_log_context(request, pool=pool_name)
 
+            # Model id clients must see: the requested virtual alias for
+            # gateway-routed requests (pool/default code), so responses and
+            # stream frames never leak the concrete upstream model id.
+            response_alias = _client_facing_model_alias(body.get("model"))
+
             # Rate-limit pre-flight (cheapest check, runs first).
             if ratelimit is not None and api_key:
                 try:
@@ -5893,7 +5935,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                     },
                 )
                 await stream_resp.prepare(request)
-                role_frame = sse_frame(format_openai_chunk(role="assistant"))
+                role_frame = sse_frame(format_openai_chunk(role="assistant", model=response_alias))
                 await stream_resp.write(role_frame)
                 stream_stop = asyncio.Event()
                 stream_hb_interval = _sse_heartbeat_secs()
@@ -5964,6 +6006,10 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                     result,
                     source=f"{provider}/{target_model}",
                 )
+
+            # Gateway-routed responses echo the alias; passthrough keeps upstream id.
+            if response_alias is not None and isinstance(result, dict):
+                result["model"] = response_alias
 
             if budget is not None and api_key and isinstance(result, dict):
                 usage = result.get("usage") or {}
@@ -6082,6 +6128,13 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                                         ),
                                     )
                                 )
+                                if response_alias is not None and response_alias != target_model:
+                                    stream_result = _stream_with_model_alias(
+                                        target_model,
+                                        response_alias,
+                                        stream_result,
+                                        match_any=True,
+                                    )
                                 async for chunk in stream_result:
                                     await resp.write(chunk)
                                     stream_frame_count += 1
@@ -6681,6 +6734,12 @@ async def _responses_handler_impl(request: web.Request) -> web.Response | web.St
             request_id=request.get("_request_id"),
             conversation_id=conversation_id,
         )
+
+        # Mirror the chat handler: cache entries must carry the client-facing
+        # model so cross-endpoint hits never leak the concrete upstream id.
+        responses_alias = _client_facing_model_alias(body.get("model"))
+        if responses_alias is not None and isinstance(result, dict):
+            result["model"] = responses_alias
         set_access_log_context(
             request,
             provider=provider,

@@ -4,6 +4,7 @@ Provides structured access logging per HTTP request with correlation IDs,
 latency tracking, and upstream model selection information.
 """
 
+import ipaddress
 import json
 import logging
 import os
@@ -20,19 +21,51 @@ def client_ip(request: web.Request) -> str:
     """Return the real client IP for a request.
 
     Prioritises:
-    1. CF-Connecting-IP (Cloudflare) — real client IP if forwarded by Cloudflare.
-    2. X-Forwarded-For leftmost — works for Cloudflare (client, edge) and
-       direct reverse-proxies.  The leftmost entry is the original client.
-    3. request.remote — falls back for in-cluster and direct connections.
+    1. CF-Connecting-IP (Cloudflare) — *only* when the peer is a trusted proxy.
+    2. X-Forwarded-For leftmost — same trust gate.
+    3. The direct peer address — returned unchanged when the peer is not a
+       trusted proxy, so untrusted callers cannot spoof their logged IP.
     """
-    cf_ip = request.headers.get("CF-Connecting-IP", "")
-    if cf_ip:
-        return cf_ip.strip()
-    xff = request.headers.get("X-Forwarded-For", "")
-    if xff:
-        # Leftmost entry is the original client (Cloudflare appends edge IP).
-        return xff.split(",")[0].strip()
-    return request.remote or "unknown"
+    peer = request.remote
+    if peer and _is_trusted_proxy(peer):
+        cf_ip = request.headers.get("CF-Connecting-IP", "")
+        if cf_ip:
+            return cf_ip.strip()
+        xff = request.headers.get("X-Forwarded-For", "")
+        if xff:
+            return xff.split(",")[0].strip()
+    return peer or "unknown"
+
+
+# Trusted proxy networks whose forwarded client-IP headers are honoured.
+# A request's CF-Connecting-IP / X-Forwarded-For is trusted only when the
+# direct peer itself belongs to one of these networks; otherwise the headers
+# are ignored so untrusted callers cannot spoof logged or audited IPs.
+_TRUSTED_CIDRS = [
+    ipaddress.ip_network(cidr.strip(), strict=False)
+    for cidr in os.environ.get(
+        "TUSKER_TRUSTED_PROXY_RANGES",
+        # Cloudflare IPv4 + IPv6 ranges. Override with your own proxy network
+        # (e.g. an in-cluster ingress CIDR) when not fronted by Cloudflare.
+        "173.245.48.0/20,103.21.244.0/20,141.101.64.0/18,198.41.128.0/17,"
+        "162.158.0.0/10,104.16.0.0/12,104.17.0.0/15,104.18.0.0/14,"
+        "104.19.0.0/16,104.20.0.0/14,104.24.0.0/14,104.28.0.0/14,"
+        "104.30.0.0/15,104.32.0.0/11,2606:4700::/32,2803:f800::/32,"
+        "2400:cb00::/32,2a06:98c0::/29,2c0f:fb50::/32",
+    ).split(",")
+    if cidr.strip()
+]
+
+
+def _is_trusted_proxy(ip_str: str) -> bool:
+    """Return True when *ip_str* belongs to a configured trusted proxy network."""
+    try:
+        addr = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+    return any(addr in cidr for cidr in _TRUSTED_CIDRS)
+
+
 _ACCESS_LOG_CONTEXT_KEY = "_access_log_context"
 _ACCESS_LOG_FIELDS = frozenset({
     "provider",

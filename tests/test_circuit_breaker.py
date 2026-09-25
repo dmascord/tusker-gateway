@@ -234,3 +234,64 @@ def test_payment_required_non429_returns_long_cooldown():
         upstream_body="Payment required to access this resource",
     )
     assert _cooldown_seconds_for_provider_error(exc) == 3600.0
+
+
+def test_half_open_admits_exactly_max_probes(tmp_breaker_path):
+    """When half_open_max_probes=N, concurrent check() calls admit exactly N probes."""
+    import threading
+    # Test with max_probes=1: only 1 allowed.
+    cb1 = CircuitBreaker(_cfg(tmp_breaker_path, consecutive_failures=1, cooldown_secs=0.02, half_open_max_probes=1))
+    cb1.record_failure("p", "m")
+    import time
+    time.sleep(0.05)  # wait for cooldown
+    results = []
+    def try_check():
+        results.append(cb1.check("p", "m"))
+    threads = [threading.Thread(target=try_check) for _ in range(10)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    allowed = [d for d in results if d.allowed]
+    assert len(allowed) == 1, f"Expected 1 allowed probe, got {len(allowed)}"
+    # Test with max_probes=2: exactly 2 allowed.
+    cb2 = CircuitBreaker(_cfg(tmp_breaker_path, consecutive_failures=1, cooldown_secs=0.02, half_open_max_probes=2))
+    cb2.record_failure("p", "m")
+    time.sleep(0.05)
+    results2 = []
+    def try_check2():
+        results2.append(cb2.check("p", "m"))
+    threads2 = [threading.Thread(target=try_check2) for _ in range(10)]
+    for t in threads2:
+        t.start()
+    for t in threads2:
+        t.join()
+    allowed2 = [d for d in results2 if d.allowed]
+    assert len(allowed2) == 2, f"Expected 2 allowed probes, got {len(allowed2)}"
+
+
+def test_probe_success_resets_counter(tmp_breaker_path):
+    """After a half-open probe records success, the breaker closes and counter resets."""
+    cb = CircuitBreaker(_cfg(tmp_breaker_path, consecutive_failures=1, cooldown_secs=0.05, half_open_max_probes=2))
+    cb.record_failure("p", "m")
+    time.sleep(0.1)
+    d = cb.check("p", "m")
+    assert d.allowed and d.state == BreakerState.HALF_OPEN
+    # Record success - should close the breaker and reset the probe counter.
+    cb.record_success("p", "m")
+    # Subsequent check should be allowed (closed).
+    d2 = cb.check("p", "m")
+    assert d2.allowed and d2.state == BreakerState.CLOSED
+
+
+def test_probe_failure_reopens(tmp_breaker_path):
+    """After a half-open probe records failure, the breaker reopens."""
+    cb = CircuitBreaker(_cfg(tmp_breaker_path, consecutive_failures=1, cooldown_secs=0.05))
+    cb.record_failure("p", "m")
+    time.sleep(0.1)
+    d = cb.check("p", "m")
+    assert d.allowed and d.state == BreakerState.HALF_OPEN
+    # Record failure - should reopen the breaker.
+    cb.record_failure("p", "m")
+    d2 = cb.check("p", "m")
+    assert not d2.allowed and d2.state == BreakerState.OPEN

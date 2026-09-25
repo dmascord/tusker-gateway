@@ -1,11 +1,21 @@
 """Unit tests for the OTLP tracer (Release 2)."""
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
 
-from tusker_gateway.tracing import Span, Tracer, TracerConfig, load_tracer_config_from_env
+from tusker_gateway.tracing import (
+    Span,
+    Tracer,
+    TracerConfig,
+    _current_span_stack,
+    _last_span_id,
+    _push_current,
+    _pop_current,
+    load_tracer_config_from_env,
+)
 
 
 def test_disabled_tracer_no_export():
@@ -142,3 +152,79 @@ def test_otlp_body_structure():
     decoded = json.loads(encoded)
     assert "resourceSpans" in decoded
     assert decoded["resourceSpans"][0]["scopeSpans"][0]["scope"]["name"] == "tusker-gateway"
+# ---------------------------------------------------------------------------
+# Current-span stack isolation (contextvars)
+# ---------------------------------------------------------------------------
+
+async def test_concurrent_requests_have_independent_span_stacks():
+    """Interleaved requests must never observe each other's current span.
+
+    Regression test for the process-global span stack: with a shared list,
+    request A reading the current span while B's parent was also live got
+    B's span, corrupting parent/child chains.
+    """
+    tracer = Tracer(TracerConfig(endpoint=""))
+    both_parents_open = asyncio.Event()
+    opened = 0
+    parent_ids: dict[str, str] = {}
+    current_during_request: dict[str, str | None] = {}
+
+    async def request(label: str) -> None:
+        nonlocal opened
+        with tracer.span(f"{label}-parent") as parent:
+            parent_ids[label] = parent.span_id
+            opened += 1
+            if opened == 2:
+                both_parents_open.set()
+            await both_parents_open.wait()
+            # Both requests now hold a live parent span; the current span of
+            # THIS task must be its own parent, never the sibling's.
+            current_during_request[label] = _last_span_id()
+            with tracer.span(f"{label}-child") as child:
+                await asyncio.sleep(0)
+                assert child.parent_span_id == parent.span_id
+            assert _last_span_id() == parent.span_id
+
+    await asyncio.gather(request("a"), request("b"))
+
+    assert parent_ids["a"] != parent_ids["b"]
+    assert current_during_request["a"] == parent_ids["a"]
+    assert current_during_request["b"] == parent_ids["b"]
+    assert _last_span_id() is None
+
+
+async def test_pop_restores_parent():
+    tracer = Tracer(TracerConfig(endpoint=""))
+    with tracer.span("parent") as parent:
+        with tracer.span("child") as child:
+            assert _last_span_id() == child.span_id
+        assert _last_span_id() == parent.span_id
+    assert _last_span_id() is None
+
+
+async def test_pop_foreign_span_is_noop_safe():
+    tracer = Tracer(TracerConfig(endpoint=""))
+    with tracer.span("kept") as kept:
+        foreign = Span(
+            name="foreign",
+            trace_id="tid",
+            span_id="foreign-span-id",
+        )
+        # Never pushed: must not raise and must not disturb the stack.
+        _pop_current(foreign)
+        assert _current_span_stack.get() == (kept,)
+        assert _last_span_id() == kept.span_id
+    assert _last_span_id() is None
+
+
+async def test_pop_mid_stack_span_removes_only_that_span():
+    """Defensive path: popping a span buried in the stack leaves the rest."""
+    tracer = Tracer(TracerConfig(endpoint=""))
+    with tracer.span("root") as root:
+        middle = Span(name="middle", trace_id="tid", span_id="middle-span-id")
+        _push_current(middle)
+        with tracer.span("leaf") as leaf:
+            assert _last_span_id() == leaf.span_id
+        _pop_current(middle)
+        assert _last_span_id() == root.span_id
+    assert _last_span_id() is None

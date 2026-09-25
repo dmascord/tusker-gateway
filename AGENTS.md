@@ -58,7 +58,7 @@ always fine.
 
 `pytest tests/ -p no:cacheprovider` — skip
 `tests/test_passthrough_providers.py` for offline runs (hits live upstreams).
-~894 passed + 3 skipped.
+~1397 passed + 8 skipped (offline, 2026-09-25; use `--ignore=tests/test_passthrough_providers.py`).
 
 ## visor USB-flap monitor — DEPLOYMENT STATUS UNCLEAR (2026-09-14 audit)
 

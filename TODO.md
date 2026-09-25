@@ -142,3 +142,36 @@ Audit done before further action. Items in priority order:
 
 - Removing orphaned replica directories from `/mnt/longhorn-ssd/replicas/` on visor.
 - Installing or removing the usb-flap-monitor systemd timer.
+
+## 2026-09-25 audit remediation pass
+
+Findings and remediation plan: `docs/audit-2026-09-25-gateway-improvements.md`
+(implementation status table at the top of that doc). All P0 and P1 findings
+plus the P2 durability/ops findings are implemented locally; the full offline
+suite passes (~1397 passed, 8 skipped).
+
+### Implemented
+
+- **P0**: deadline + idempotency middleware attached in `app.py`;
+  `/metrics` and `/dashboard` fail closed when `TUSKER_METRICS_TOKEN` is
+  unset; approvals bound to the caller fingerprint (`native_question.py`,
+  wired from `auth.py`); hardcoded dev/MCP keys removed.
+- **P1 API contract**: upstream 429 status preserved end-to-end; response
+  `model` carries the advertised alias; `_route_target` maps `kind=swarm`
+  to the swarm pool.
+- **P1 concurrency**: rate-limit `check()` is a single atomic SQL
+  transaction with a conditional decrement; trace span stack uses
+  `ContextVar` (per-request isolation); circuit-breaker half-open probe
+  slots reserved via atomic `UPDATE ... WHERE half_open_probes < ?`.
+- **P2 durability/ops**: `permanent_failures` table + startup hydration in
+  `app.py`; `client_ip` honours forwarded headers only from
+  `TUSKER_TRUSTED_PROXY_RANGES` peers; PII redaction filters card
+  candidates with the Luhn checksum and injection patterns are
+  `^`-anchored; docs reconciled (README design decisions,
+  `docs/enterprise-controls.md` §6, `docs/capability-catalog.md`).
+
+### Pending (destructive-action confirmation required)
+
+- Commit + push to `origin/main`.
+- Deploy to cluster (`rsync` → `./k8s/deploy.sh` on visor).
+- Live smoke test: `/health`, `/ready`, one chat completion.

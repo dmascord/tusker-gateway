@@ -26,3 +26,7 @@ Tusker-Gateway is a specialized AI gateway optimized for high-reliability provid
 *   **Audit Integrity**: Optional append-only request events use SHA-256 or HMAC-SHA-256 chaining.
 *   **Retry Safety**: Bounded request deadlines and persistent idempotency prevent runaway and duplicate non-streaming work.
 *   **Release Safety**: CI tests supported Python versions, scans dependencies, and blocks undefined-name defects.
+* **Caller-Scoped Approvals**: Native approval records are bound to the authenticated caller fingerprint, preventing cross-tenant approval replay.
+* **Trusted Client-IP Attribution**: `CF-Connecting-IP` and `X-Forwarded-For` are accepted only from peers in `TUSKER_TRUSTED_PROXY_RANGES`.
+* **Guardrail Preflight**: Output-token clamping, email and Luhn-valid card redaction, anchored prompt-injection detection, and harness delimiter protection run before provider dispatch when enabled.
+* **Concurrent-State Safety**: Rate-limit consumption and half-open circuit probes use atomic reservations; trace span stacks use `ContextVar` isolation; permanent failure markers persist across restarts.

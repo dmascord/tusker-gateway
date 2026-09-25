@@ -18,14 +18,16 @@ Trigger policy (configurable per provider):
       window (default 0.5 over last 20 calls)
 
 Half-open semantics:
-    Only ONE in-flight probe is allowed while half-open. All other requests
-    are short-circuited. If the probe succeeds, full traffic resumes; if it
-    fails, the breaker reopens for another cooldown period.
+    A configurable number of in-flight probes (default 1) are allowed while
+    half-open. The probe gate is atomic: concurrent check() calls increment a
+    per-route counter; when the counter reaches the limit, subsequent requests
+    are short-circuited. If all admitted probes succeed, full traffic resumes;
+    if any fails, the breaker reopens for another cooldown period.
 
 Storage:
     SQLite at the configured path. State per (provider, model) is small:
     `state`, `consecutive_failures`, `window_failures`, `window_total`,
-    `window_started_at`, `opened_at`, `half_open_probe_inflight`.
+    `window_started_at`, `opened_at`, `half_open_probe_inflight`, `half_open_probes`.
     Failure events are NOT persisted (we only keep the rolling counter)
     because the breaker is a coarse-grained mechanism; precise per-call
     failure history belongs in `quality.py`.
@@ -137,6 +139,7 @@ class CircuitBreaker:
                     opened_at REAL,
                     cooldown_secs REAL,
                     half_open_probe_inflight INTEGER NOT NULL DEFAULT 0,
+                    half_open_probes INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (provider, model)
                 )
                 """
@@ -159,6 +162,14 @@ class CircuitBreaker:
                     + ("IF NOT EXISTS " if self._db.is_postgres else "")
                     + "cooldown_secs REAL"
                 )
+            # Migration: add half_open_probes column for atomic per-row probe
+            # reservation counting under concurrency.
+            if "half_open_probes" not in cols:
+                conn.execute(
+                    "ALTER TABLE breakers ADD COLUMN "
+                    + ("IF NOT EXISTS " if self._db.is_postgres else "")
+                    + "half_open_probes INTEGER NOT NULL DEFAULT 0"
+                )
             # A half-open reservation belongs to the process that made the
             # probe. If that process was restarted or killed while the
             # request was in flight, the persisted reservation would
@@ -166,7 +177,8 @@ class CircuitBreaker:
             # and restart their normal cooldown.
             conn.execute(
                 "UPDATE breakers SET state = ?, half_open_probe_inflight = 0, "
-                "opened_at = ? WHERE state = ? AND half_open_probe_inflight = 1",
+                "half_open_probes = 0, opened_at = ? "
+                "WHERE state = ? AND half_open_probe_inflight = 1",
                 (BreakerState.OPEN.value, time.time(), BreakerState.HALF_OPEN.value),
             )
             conn.commit()
@@ -184,32 +196,37 @@ class CircuitBreaker:
         row = self._read(provider, model)
         state = BreakerState(row["state"]) if row else BreakerState.CLOSED
         opened_at = row["opened_at"] if row else None
-        in_flight = bool(row["half_open_probe_inflight"]) if row else False
 
         if state == BreakerState.CLOSED:
             return BreakerDecision(allowed=True, state=BreakerState.CLOSED)
 
+        policy = self._policy_for(provider)
+        max_probes = policy.half_open_max_probes
+
         if state == BreakerState.OPEN:
-            policy = self._policy_for(provider)
             cooldown = (
                 row.get("cooldown_secs")
                 if row and row.get("cooldown_secs")
                 else policy.cooldown_secs
             )
             if opened_at is None or (now - opened_at) >= cooldown:
-                # Transition to HALF_OPEN; allow the caller to probe.
-                self._update(provider, model,
-                             state=BreakerState.HALF_OPEN.value,
-                             half_open_probe_inflight=1)
-                self.stats.half_open_probes += 1
-                logger.info('breaker %s/%s -> HALF_OPEN (probe)', provider, model)
+                # Transition to HALF_OPEN and atomically reserve a probe slot.
+                if self._reserve_probe(provider, model, max_probes, from_open=True):
+                    self.stats.half_open_probes += 1
+                    logger.info("breaker %s/%s -> HALF_OPEN (probe)", provider, model)
+                    return BreakerDecision(
+                        allowed=True,
+                        state=BreakerState.HALF_OPEN,
+                        reason="half_open_probe",
+                    )
+                self.stats.short_circuits += 1
                 return BreakerDecision(
-                    allowed=True,
+                    allowed=False,
                     state=BreakerState.HALF_OPEN,
-                    reason="half_open_probe",
+                    reason="half-open probe limit",
                 )
             self.stats.short_circuits += 1
-            logger.debug('breaker %s/%s OPEN, short-circuiting', provider, model)
+            logger.debug("breaker %s/%s OPEN, short-circuiting", provider, model)
             remaining = max(0.0, cooldown - (now - (opened_at or now)))
             return BreakerDecision(
                 allowed=False,
@@ -217,22 +234,72 @@ class CircuitBreaker:
                 reason=f"circuit open ({remaining:.0f}s remaining)",
             )
 
-        # HALF_OPEN
-        if in_flight:
-            self.stats.short_circuits += 1
+        # HALF_OPEN: atomically reserve another slot when available.
+        if self._reserve_probe(provider, model, max_probes):
+            self.stats.half_open_probes += 1
             return BreakerDecision(
-                allowed=False,
+                allowed=True,
                 state=BreakerState.HALF_OPEN,
-                reason="half_open probe in flight",
+                reason="half_open_probe",
             )
-        # Allow exactly one more probe.
-        self._update(provider, model, half_open_probe_inflight=1)
-        self.stats.half_open_probes += 1
+        self.stats.short_circuits += 1
         return BreakerDecision(
-            allowed=True,
+            allowed=False,
             state=BreakerState.HALF_OPEN,
-            reason="half_open_probe",
+            reason="half-open probe limit",
         )
+
+    def _reserve_probe(
+        self, provider: str, model: str, max_probes: int, *, from_open: bool = False
+    ) -> bool:
+        """Atomically reserve a half-open probe slot for one route."""
+        assert self._db is not None
+        if from_open:
+            # Transition from OPEN to HALF_OPEN. Match rows already in either
+            # OPEN (stale read) or HALF_OPEN (concurrent transition) state.
+            # Reset probe count and reserve the first slot.
+            where = (
+                "provider = ? AND model = ? AND state IN (?, ?) "
+                "AND half_open_probes < ?"
+            )
+            params = (
+                provider,
+                model,
+                BreakerState.OPEN.value,
+                BreakerState.HALF_OPEN.value,
+                max_probes,
+            )
+            # Rows in OPEN/ HALF_OPEN always enter with half_open_probes=0
+            # (every reopen path resets it), so a pure increment reserves
+            # the slot without clobbering a concurrent reservation.
+            sets = "state = ?, half_open_probes = half_open_probes + 1, half_open_probe_inflight = 1"
+            with self._db.connection() as conn:
+                cursor = conn.execute(
+                    f"UPDATE breakers SET {sets} WHERE {where}",
+                    (BreakerState.HALF_OPEN.value, *params),
+                )
+                conn.commit()
+                return cursor.rowcount == 1
+        else:
+            # Already in HALF_OPEN: atomically increment probe count if under limit.
+            where = (
+                "provider = ? AND model = ? AND state = ? "
+                "AND half_open_probes < ?"
+            )
+            params = (
+                provider,
+                model,
+                BreakerState.HALF_OPEN.value,
+                max_probes,
+            )
+            sets = "half_open_probes = half_open_probes + 1, half_open_probe_inflight = 1"
+            with self._db.connection() as conn:
+                cursor = conn.execute(
+                    f"UPDATE breakers SET {sets} WHERE {where}",
+                    params,
+                )
+                conn.commit()
+                return cursor.rowcount == 1
 
     def record_success(self, provider: str, model: str) -> None:
         if not self._config.enabled:
@@ -256,6 +323,7 @@ class CircuitBreaker:
                 window_started_at=time.time(),
                 opened_at=None,
                 half_open_probe_inflight=0,
+                half_open_probes=0,
             )
             return
         # CLOSED: roll the window.
@@ -293,6 +361,7 @@ class CircuitBreaker:
                     state=BreakerState.OPEN.value,
                     opened_at=time.time(),
                     half_open_probe_inflight=0,
+                    half_open_probes=0,
                     **({"cooldown_secs": cooldown_secs} if cooldown_secs else {}),
                 )
                 return
@@ -333,6 +402,7 @@ class CircuitBreaker:
                 window_total=new_window["window_total"],
                 window_started_at=new_window["window_started_at"],
                 opened_at=time.time(),
+                half_open_probes=0,
                 **({"cooldown_secs": cooldown_secs} if cooldown_secs else {}),
             )
         else:
@@ -388,7 +458,7 @@ class CircuitBreaker:
         columns = (
             "provider, model, state, consecutive_failures, window_failures, "
             "window_total, window_started_at, opened_at, cooldown_secs, "
-            "half_open_probe_inflight"
+            "half_open_probe_inflight, half_open_probes"
         )
         with self._db.connection() as conn:
             row = conn.execute(
