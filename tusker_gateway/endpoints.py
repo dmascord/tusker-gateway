@@ -1226,13 +1226,24 @@ async def _normalize_stream(
             )
             raise
 
-    async for chunk in diagnostic_raw_stream():
+    async def delimited_raw_stream() -> AsyncIterator[bytes]:
+        """Dispatch a final SSE event even if upstream omits its blank line."""
+        async for upstream_chunk in diagnostic_raw_stream():
+            yield upstream_chunk
+        # EventSource dispatches a pending final event when the stream closes.
+        # Complete it locally so a final tool-argument/content delta is not
+        # discarded just because the provider omitted its event terminator.
+        yield b"\n\n"
+
+    async for chunk in delimited_raw_stream():
         buffer += chunk
         while True:
             frame, remainder = split_sse_frame(buffer)
             if frame is None:
                 break
             buffer = remainder
+            if not frame.strip():
+                continue
             stream_diag["frames"] += 1
             framed = frame + b"\n\n"
             stripped = frame.strip()

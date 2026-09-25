@@ -167,3 +167,37 @@ async def test_large_bash_tool_turn_is_preserved_end_to_end(
     assert len(history_diagnostics) == 1
     assert f"sha256={digest}" in history_diagnostics[0]
     assert f"sha256={output_digest}" in history_diagnostics[0]
+
+
+@pytest.mark.asyncio
+async def test_final_unterminated_tool_argument_delta_is_not_lost():
+    """A final tool-call event without SSE's blank-line terminator is retained."""
+    from tusker_gateway.endpoints import _assemble_stream_tool_calls, _normalize_stream
+
+    command = "".join(f"printf 'line-{i:04d}\\n'\n" for i in range(700))
+    arguments = json.dumps({"command": command}, ensure_ascii=False, separators=(",", ":"))
+
+    async def upstream():
+        yield _sse({"choices": [{
+            "index": 0,
+            "delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call-final-frame",
+                "type": "function",
+                "function": {"name": "bash", "arguments": arguments},
+            }]},
+            "finish_reason": None,
+        }]})[:-2]
+
+    frames = [frame async for frame in _normalize_stream(
+        upstream(),
+        provider="test",
+        model="integrity-model",
+        tools_requested=True,
+        require_tool_call=True,
+    )]
+    calls = _assemble_stream_tool_calls(frames)
+
+    assert len(calls) == 1
+    assert calls[0]["function"]["arguments"] == arguments
+    assert json.loads(calls[0]["function"]["arguments"])["command"] == command
