@@ -3385,6 +3385,53 @@ def _is_capacity_failure(exc: BaseException | None) -> bool:
     return is_capacity_error(detail)
 
 
+def _provider_rate_limit_response(exc: RateLimitError) -> web.Response:
+    """Surface a provider 429 instead of collapsing it into a 502.
+
+    Preserving the status and Retry-After lets the client back off on the
+    provider's own schedule. The upstream body stays hidden; only a generic
+    message plus the quota signal (when the body indicates quota exhaustion)
+    are exposed.
+    """
+    quota_exhausted = is_account_quota_exhausted(str(getattr(exc, "body", None) or ""))
+    headers: dict[str, str] = {}
+    if quota_exhausted:
+        # Machine-readable signal for the maintenance qualification path;
+        # mirrors the existing capacity-failure handler.
+        headers["X-Tusker-Provider-Failure"] = "provider_quota"
+    retry_after = _provider_retry_after_header(exc.headers)
+    if retry_after is None:
+        try:
+            retry_after = str(
+                max(1, int(float(os.environ.get("TUSKER_PROVIDER_RETRY_AFTER_SECS", "5"))))
+            )
+        except (TypeError, ValueError):
+            retry_after = "5"
+    headers["Retry-After"] = retry_after
+    message = (
+        "Upstream provider quota exhausted; retry after the upstream quota window resets."
+        if quota_exhausted
+        else "Upstream provider rate limit exceeded; retry shortly."
+    )
+    return web.json_response(
+        openai_error(message, code="rate_limit_exceeded", error_type="rate_limit_error"),
+        status=429,
+        headers=headers,
+    )
+
+
+def _provider_retry_after_header(headers: dict[str, str] | None) -> str | None:
+    """Case-insensitive Retry-After lookup from the provider's response headers."""
+    if not headers:
+        return None
+    for key, value in headers.items():
+        if str(key).lower() == "retry-after":
+            candidate = str(value).strip()
+            if candidate:
+                return candidate
+    return None
+
+
 def _public_provider_failure_response(
     exc: BaseException,
     *,
@@ -3398,6 +3445,9 @@ def _public_provider_failure_response(
     in the caller; here we only return a generic message plus a stable
     error code the caller can switch on.
     """
+    if isinstance(exc, RateLimitError):
+        return _provider_rate_limit_response(exc)
+
     if not _is_capacity_failure(exc):
         upstream_body = (
             getattr(exc, "body", None)

@@ -63,7 +63,7 @@ def test_public_provider_quota_failure_has_safe_machine_signal():
         )
     )
 
-    assert response.status == 502
+    assert response.status == 429
     assert response.headers["X-Tusker-Provider-Failure"] == "provider_quota"
 
 
@@ -269,14 +269,14 @@ def test_public_provider_quota_failure_does_not_leak_account_metric():
     response = _public_provider_failure_response(
         RateLimitError(body=secret_quota_body)
     )
-    assert response.status == 502
+    assert response.status == 429
     assert response.headers["X-Tusker-Provider-Failure"] == "provider_quota"
     body = response.body.decode("utf-8")
     assert "generativelanguage" not in body
     assert "free_tier_requests" not in body
     assert secret_quota_body not in body
     payload = json.loads(body)
-    assert payload["error"]["code"] == "provider_error"
+    assert payload["error"]["code"] == "rate_limit_exceeded"
     assert "quota" in payload["error"]["message"].lower()
 
 
@@ -1881,6 +1881,36 @@ async def test_chat_image_passthrough_does_not_select_from_pool(app, client):
     pool_manager.select.assert_not_called()
     assert mock_chat.call_args.args[:2] == ("openai", "gpt-4o")
 
+@pytest.mark.asyncio
+async def test_chat_preserves_provider_429_with_retry_after(client):
+    """A provider 429 must reach the client as 429 with its Retry-After,
+    not as a generic 502 that drops the backoff guidance."""
+    upstream = RateLimitError(
+        body="custom-upstream-quota-token=abc123 exceeded",
+        headers={"Retry-After": "30"},
+    )
+    with patch(
+        "tusker_gateway.endpoints.PassthroughClient.chat",
+        new_callable=AsyncMock,
+        side_effect=upstream,
+    ) as mock_chat:
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "openai::gpt-4o-mini",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            headers=HEADERS_AUTH,
+        )
+
+    mock_chat.assert_awaited()
+    assert resp.status == 429
+    assert resp.headers["Retry-After"] == "30"
+    payload = await resp.json()
+    assert payload["error"]["code"] == "rate_limit_exceeded"
+    assert payload["error"]["type"] == "rate_limit_error"
+    # The upstream body must never be echoed back verbatim.
+    assert "custom-upstream-quota-token" not in payload["error"]["message"]
 
 @pytest.mark.asyncio
 async def test_chat_completions_streaming(client):
