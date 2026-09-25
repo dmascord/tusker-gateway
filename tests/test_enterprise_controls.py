@@ -846,3 +846,47 @@ class TestMediaEnterpriseControls:
             assert capture.fields["model"] == model
         finally:
             await client.close()
+
+
+class TestAppFactoryEnterpriseWiring:
+    def test_create_app_attaches_enabled_enterprise_middlewares(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("API_KEYS", "factory-test-key")
+        monkeypatch.setenv("TUSKER_IDEMPOTENCY_ENABLED", "true")
+        monkeypatch.setenv(
+            "TUSKER_IDEMPOTENCY_PATH", str(tmp_path / "idempotency.db")
+        )
+
+        from tusker_gateway.app import create_app
+
+        app = create_app()
+        middleware_names = {getattr(middleware, "__name__", "") for middleware in app.middlewares}
+
+        assert "deadline_middleware" in middleware_names
+        assert "idempotency_middleware" in middleware_names
+
+    @pytest.mark.asyncio
+    async def test_create_app_idempotency_rejects_invalid_key(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("API_KEYS", "factory-test-key")
+        monkeypatch.setenv("TUSKER_IDEMPOTENCY_ENABLED", "true")
+        monkeypatch.setenv(
+            "TUSKER_IDEMPOTENCY_PATH", str(tmp_path / "idempotency.db")
+        )
+
+        from tusker_gateway.app import create_app
+
+        app = create_app()
+        client = await _client(app)
+        try:
+            response = await client.post(
+                "/v1/chat/completions",
+                headers={
+                    "Authorization": "Bearer factory-test-key",
+                    "Idempotency-Key": "has space",
+                },
+                json={"model": "hermes-code"},
+            )
+            assert response.status == 400
+            body = await response.json()
+            assert body["error"]["code"] == "invalid_idempotency_key"
+        finally:
+            await client.close()

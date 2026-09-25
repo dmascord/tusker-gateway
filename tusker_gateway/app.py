@@ -567,6 +567,10 @@ def create_app() -> web.Application:
     attach_audit_middleware(app, audit)
     app.middlewares.append(auth_middleware)
     attach_authorization_middleware(app)
+    # Deadline and idempotency middlewares.
+    # Note: these were imported but not attached - fixing the wiring.
+    attach_deadline_middleware(app, deadline_cfg)
+    attach_idempotency_middleware(app, idempotency)
     # Admin console + read-only admin API. The access middleware (session
     # cookie or Bearer key for /admin/*) runs after gateway auth middleware
     # so Bearer callers still get identity resolution.
