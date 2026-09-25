@@ -28,9 +28,10 @@ async def client():
     os.environ["TUSKER_CACHE_TTL_SECS"] = "60"
     os.environ["TUSKER_BUDGETS_ENABLED"] = "true"
     os.environ["TUSKER_BUDGETS_PATH"] = os.path.join(tmp, "budget.db")
-    api_key = "sk-test-int"
-    fp = _key_fingerprint(api_key)
-    os.environ["TUSKER_BUDGETS_JSON"] = json.dumps({fp: {"daily_tokens": 1000}})
+    os.environ["TUSKER_METRICS_TOKEN"] = "secret-test-int"
+    os.environ["TUSKER_BUDGETS_JSON"] = json.dumps({
+        _key_fingerprint("sk-test-int"): {"daily_tokens": 1000}
+    })
 
     app = create_app()
     app.on_startup.clear()
@@ -38,14 +39,11 @@ async def client():
     server = TestServer(app)
     client = TestClient(server)
     await client.start_server()
-    yield client, api_key
-    await client.close()
-
+    yield client
 
 @pytest.mark.asyncio
 async def test_metrics_endpoint_exposes_prometheus_text(client):
-    cl, api_key = client
-    resp = await cl.get("/metrics")
+    resp = await client.get("/metrics", headers={"Authorization": "Bearer secret-test-int"})
     assert resp.status == 200
     body = await resp.text()
     assert "# HELP tusker_requests_total" in body
@@ -54,9 +52,8 @@ async def test_metrics_endpoint_exposes_prometheus_text(client):
 
 @pytest.mark.asyncio
 async def test_budget_blocks_after_threshold(client):
-    cl, api_key = client
-    # Need a config where the test api_key is accepted.
-    app = cl.server.app
+    api_key = "sk-test-int"
+    app = client.server.app
     app["config"]["api_keys"] = [api_key]
     # The handler pre-flight estimates tokens from message chars. A 10k char
     # message is ~2500 tokens, well over the 1000 daily cap.
@@ -66,7 +63,7 @@ async def test_budget_blocks_after_threshold(client):
         "messages": [{"role": "user", "content": big_msg}],
     }
     # This won't actually call a provider because the budget check rejects first.
-    resp = await cl.post(
+    resp = await client.post(
         "/v1/chat/completions",
         json=payload,
         headers={"Authorization": f"Bearer {api_key}"},
@@ -76,22 +73,33 @@ async def test_budget_blocks_after_threshold(client):
     assert body["error"]["code"] == "budget_exceeded"
     assert "X-Tusker-Budget-Reason" in resp.headers
     # /metrics now records a budget block.
-    metrics_resp = await cl.get("/metrics")
+    metrics_resp = await client.get(
+        "/metrics", headers={"Authorization": "Bearer secret-test-int"}
+    )
     body = await metrics_resp.text()
     assert "tusker_budget_blocks_total" in body
 
 
 @pytest.mark.asyncio
-async def test_metrics_requires_token_when_configured(client):
+async def test_metrics_requires_token_when_configured():
     """If TUSKER_METRICS_TOKEN is set, /metrics requires the token header."""
-    import importlib
-    cl, _ = client
-    app = cl.server.app
-    # Set the token on the live app via the closure used by create_app.
-    # Simpler: re-instantiate with token set.
-    prev = os.environ.get("TUSKER_METRICS_TOKEN")
+    """/metrics is fail-closed: token configured -> 401/200; unset -> 500."""
+    # Unset token -> 500 (misconfiguration surface)
+    prev = os.environ.pop("TUSKER_METRICS_TOKEN", None)
+    app = create_app()
+    app["http_session"] = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10))
+    server = TestServer(app)
+    unconfigured_client = TestClient(server)
+    await unconfigured_client.start_server()
+    try:
+        resp = await unconfigured_client.get("/metrics")
+        assert resp.status == 500
+        resp = await unconfigured_client.get("/dashboard")
+        assert resp.status == 500
+    finally:
+        await unconfigured_client.close()
+    # Token configured -> 401 without header, 200 with valid token
     os.environ["TUSKER_METRICS_TOKEN"] = "secret-token"
-    # Re-create app to pick up the env var.
     new_app = create_app()
     new_app["http_session"] = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10))
     new_server = TestServer(new_app)
@@ -104,6 +112,9 @@ async def test_metrics_requires_token_when_configured(client):
         # Wrong token -> 401
         resp = await new_client.get("/metrics", headers={"X-Tusker-Metrics-Token": "wrong"})
         assert resp.status == 401
+        # Authorization: Bearer form is accepted for standard scrape configs
+        resp = await new_client.get("/metrics", headers={"Authorization": "Bearer secret-token"})
+        assert resp.status == 200
         # Right token -> 200
         resp = await new_client.get("/metrics", headers={"X-Tusker-Metrics-Token": "secret-token"})
         assert resp.status == 200

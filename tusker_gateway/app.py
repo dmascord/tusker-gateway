@@ -542,15 +542,34 @@ def create_app() -> web.Application:
         # and block open /admin/login.
         if request.path == "/admin" or request.path.startswith("/admin/"):
             return await handler(request)
-        # /metrics + /dashboard are opt-in authenticated.
+        # /metrics + /dashboard require a configured TUSKER_METRICS_TOKEN.
+        # Without it, the endpoint returns 500 (misconfiguration) so operators
+        # notice the gap rather than silently leaking pool/cooldown/breaker data.
         if request.path in ("/metrics", "/dashboard") or request.path.startswith("/dashboard/"):
-            if metrics_token:
-                token = request.headers.get("X-Tusker-Metrics-Token", "").strip()
-                if not _secrets_compare(token, metrics_token):
-                    return web.json_response(
-                        openai_error("metrics token required", code="invalid_api_key", error_type="invalid_request_error"),
-                        status=401,
-                    )
+            if not metrics_token:
+                return web.json_response(
+                    openai_error(
+                        "metrics token not configured: set TUSKER_METRICS_TOKEN",
+                        code="configuration_required",
+                        error_type="invalid_request_error",
+                    ),
+                    status=500,
+                )
+            token = request.headers.get("X-Tusker-Metrics-Token", "").strip()
+            if not token:
+                # Also accept Authorization: Bearer token for standard scrape
+                token = request.headers.get("Authorization", "").strip()
+                if token.lower().startswith("bearer "):
+                    token = token[7:]  # strip "Bearer " prefix
+            if not _secrets_compare(token, metrics_token):
+                return web.json_response(
+                    openai_error(
+                        "invalid metrics token",
+                        code="invalid_api_key",
+                        error_type="invalid_request_error",
+                    ),
+                    status=401,
+                )
             return await handler(request)
         try:
             await auth.verify(request)

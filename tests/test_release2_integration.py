@@ -25,10 +25,9 @@ async def client_with_rl_and_breaker():
     os.environ["TUSKER_RATELIMIT_ENABLED"] = "true"
     os.environ["TUSKER_RATELIMIT_PATH"] = os.path.join(tmp, "rl.db")
     os.environ["TUSKER_RATELIMIT_JSON"] = json.dumps({fp: {"rate_per_sec": 2, "burst": 3}})
+    os.environ["TUSKER_METRICS_TOKEN"] = "secret-rl-cb"
 
     os.environ["TUSKER_CIRCUIT_ENABLED"] = "true"
-    os.environ["TUSKER_CIRCUIT_PATH"] = os.path.join(tmp, "cb.db")
-    os.environ["TUSKER_CIRCUIT_CONSECUTIVE"] = "2"
 
     app = create_app()
     app.on_startup.clear()
@@ -110,7 +109,7 @@ async def test_video_rejects_missing_key_before_provider_call(
 @pytest.mark.asyncio
 async def test_metrics_includes_breaker_and_ratelimit_counters(client_with_rl_and_breaker):
     cl, _ = client_with_rl_and_breaker
-    resp = await cl.get("/metrics")
+    resp = await cl.get("/metrics", headers={"X-Tusker-Metrics-Token": "secret-rl-cb"})
     assert resp.status == 200
     body = await resp.text()
     # ratelimit stats are surfaced via the budget_blocks metric family.
@@ -121,7 +120,7 @@ async def test_metrics_includes_breaker_and_ratelimit_counters(client_with_rl_an
 async def test_dashboard_route_renders(client_with_rl_and_breaker):
     """The /dashboard route should always render (no DB)."""
     cl, _ = client_with_rl_and_breaker
-    resp = await cl.get("/dashboard")
+    resp = await cl.get("/dashboard", headers={"X-Tusker-Metrics-Token": "secret-rl-cb"})
     assert resp.status == 200
     body = await resp.text()
     assert "Tusker Gateway Dashboard" in body
@@ -139,7 +138,7 @@ async def test_dashboard_partials_render(client_with_rl_and_breaker):
         "/dashboard/partials/quota",
         "/dashboard/partials/quality",
     ):
-        resp = await cl.get(path)
+        resp = await cl.get(path, headers={"X-Tusker-Metrics-Token": "secret-rl-cb"})
         assert resp.status == 200, f"{path} returned {resp.status}"
 
 
