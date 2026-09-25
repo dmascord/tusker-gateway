@@ -170,8 +170,18 @@ suite passes (~1397 passed, 8 skipped).
   `^`-anchored; docs reconciled (README design decisions,
   `docs/enterprise-controls.md` §6, `docs/capability-catalog.md`).
 
-### Pending (destructive-action confirmation required)
+### Delivered (2026-09-25)
 
-- Commit + push to `origin/main`.
-- Deploy to cluster (`rsync` → `./k8s/deploy.sh` on visor).
-- Live smoke test: `/health`, `/ready`, one chat completion.
+- Committed as `a68522c` on `main` (local; push to `origin/main` still
+  pending operator decision).
+- Deployed to cluster via `rsync` → `./k8s/deploy.sh` on visor. Image
+  `registry.tusker.net.au:5000/tusker-gateway:swarm-alpine-20260925235617`,
+  digest `sha256:451dbe2d83059fe459899cf1d929d2d076f2adca98d78aced61d13a98851e96b`.
+  Deploy script verified image digest on the Ready pod and `/health` reports
+  commit `a68522cffc0fc59743e213d090e6d18397ac6be0`.
+- Live smoke passed against `https://ai.tusker.net.au`: `/health` + `/ready`
+  200 (Postgres state store healthy, config generation 545), response
+  `model` carries the advertised alias (`hermes-code`), prompt-injection
+  directive blocked with `guardrail_blocked`, idempotent replay accepted,
+  SSE chat completed, `/metrics` without token fails closed (500
+  `configuration_required`, by design per app.py middleware).
