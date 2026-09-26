@@ -1018,6 +1018,11 @@ class PoolManager:
             # for every model. Auto mode may retry an operator-curated model
             # after an unavailable probe; catalog-discovered models stay held
             # until they pass so an outage cannot turn into tool-call leakage.
+            # AUTH_FAILED is deliberately excluded from that retry hatch: a
+            # 401/403 credential rejection repeats on every retry, so the route
+            # is left out of tool-bearing selection until the credential is
+            # rotated (and _record_durable_auth_failure has already marked it
+            # permanently failed, which drops it from candidate lists too).
             if result.level == ToolCapabilityLevel.UNAVAILABLE:
                 return mode != "strict" and not spec.auto_discovered
             return False

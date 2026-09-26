@@ -10,6 +10,7 @@ state DB and `/status` payload. Configured revision: `a68522c`.
 | P0 (active routing bug: quality score clobber) | 1 | **Fixed** (`quality.py`) |
 | P0 (active routing bug: DB provider toggles cosmetic) | 1 | **Fixed** (`config_store.py`) |
 | P0 (provider dead: apim) | 1 | **Fixed** (env + DB) |
+| P1 (silent auth-failure churn in qualification probes) | 1 | **Fixed** (durable `auth_failed`) |
 | P1 (provider broken / needs operator) | 2 | Pending operator action |
 | P2 (catalog / pool hygiene) | 5 | Documented; fix candidates below |
 | P3 (cosmetic / informational) | 2 | No action |
@@ -319,3 +320,43 @@ effect on the next config hot-reload (generation 545 → 546).
   config_store loader (disabled provider merge). All previous smoke tests
   on `/health`, `/ready`, `/v1/chat/completions`, `/metrics`,
   idempotency, SSE, and guardrails must still pass after redeploy.
+
+## Follow-up remediation — durable auth-failure classification
+
+**Symptom (from the P1 Codex credential and P3 GHE Copilot findings):** a
+401/403 was classified as *transient* (`unavailable` / `auth`) everywhere, so
+the maintenance qualification loops re-probed dead routes on the short 900s
+retry window forever, and tool selection kept offering routes whose credential
+could not access the model at all. The upstream 401/403 body is sanitized
+before it reaches a probe, so probe-side classification could only see the
+gateway's 502.
+
+**Fixes:**
+
+1. `endpoints.py` — `_public_provider_failure_response` now emits
+   `X-Tusker-Provider-Failure: provider_auth` for upstream 401/403 (the same
+   machine-readable channel already used for `provider_quota`), so the durable
+   signal survives body sanitization.
+2. `tool_qualification.py` / `modality_qualification.py` /
+   `structured_qualification.py` — the classifiers return
+   `auth_failed` / `ToolCapabilityLevel.AUTH_FAILED` for 401/403 and for the
+   `provider_auth` header. `_needs_probe` gives that evidence a long re-probe
+   window (`TUSKER_*_QUALIFICATION_AUTH_RETRY_SECS`, default 604800s = 7 days,
+   i.e. credential rotation) instead of the 900s transient loop.
+3. All three runners now skip `is_permanently_failed()` candidates (counted and
+   logged as `skipped_permanent_failures`) and call the shared
+   `_record_durable_auth_failure()` on an `auth` probe failure, which marks the
+   route permanently failed in both the in-memory tracker and the persistent
+   `permanent_failures` table.
+4. `pools.py` — the tool-capability gate deliberately excludes `AUTH_FAILED`
+   from the `UNAVAILABLE` curated-model retry hatch; a credential rejection is
+   not an availability blip. Recovery is a successful request
+   (`_clear_permanently_failed`) or credential rotation past the 7-day window.
+
+**Tests:** 2 contract tests in `tests/test_chat.py` pin the `provider_auth`
+header for 401 and 403 and the no-leak guarantee;
+`tests/test_model_capability.py` updated for the new `auth_failed` contract and
+the mock now carries response headers. Full offline suite: **1407 passed,
+8 skipped**.
+
+**Status:** implemented locally; not yet deployed.

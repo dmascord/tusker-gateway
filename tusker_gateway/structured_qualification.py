@@ -32,7 +32,7 @@ from tusker_gateway.model_capability import (
 )
 from tusker_gateway.persistent_cooldown import PersistentCooldownStore
 from tusker_gateway.pools import PoolManager
-from tusker_gateway.tool_qualification import _probes_text_chat_output
+from tusker_gateway.tool_qualification import (_probes_text_chat_output, _record_durable_auth_failure)
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +69,7 @@ def _classify_http_failure(
         marker in lowered
         for marker in ("unauthorized", "forbidden", "invalid api key", "authentication")
     ):
-        return "unavailable", "auth"
+        return "auth_failed", "auth"
     if status == 402 or is_account_quota_exhausted(lowered):
         return "unavailable", "provider_quota"
     if status == 400 and any(
@@ -90,6 +90,10 @@ def _classify_http_failure(
             provider_failure = ""
     if provider_failure.lower() == "provider_quota":
         return "unavailable", "provider_quota"
+    if provider_failure.lower() == "provider_auth":
+        # The gateway preserves an upstream 401/403 through this
+        # machine-readable header even when it sanitizes the status code.
+        return "auth_failed", "auth"
     if status >= 500:
         return "unavailable", "upstream_error"
     return "unavailable", "gateway_error"
@@ -250,6 +254,20 @@ def _needs_probe(
             )
         except (TypeError, ValueError):
             retry_after = 900.0
+        return (time.time() - record.checked_at) >= retry_after
+    if record.status == "auth_failed":
+        # Durable exclusion: 401/403 repeats identically on every retry.
+        # Re-probe only after the auth retry window (credential rotation).
+        try:
+            retry_after = max(
+                60.0,
+                float(os.environ.get(
+                    "TUSKER_STRUCTURED_QUALIFICATION_AUTH_RETRY_SECS",
+                    "604800",
+                )),
+            )
+        except (TypeError, ValueError):
+            retry_after = 604_800.0
         return (time.time() - record.checked_at) >= retry_after
     return (time.time() - record.checked_at) >= max_age_secs
 
@@ -425,12 +443,23 @@ async def run_structured_qualification(
         cooldown_store: PersistentCooldownStore | None = None
         if not ignore_cooldowns and quality_path != ":memory:":
             cooldown_store = PersistentCooldownStore(Path(quality_path).parent / "cooldowns.db")
+        skipped_quarantine = 0
+        skipped_permanent = 0
         if not ignore_cooldowns:
-            pairs = [
-                pair
-                for pair in pairs
-                if not _route_is_quarantined(pair[0], pair[1], cooldown_store)
-            ]
+            from tusker_gateway.cooldown import is_permanently_failed
+
+            unquarantined = []
+            for pair in pairs:
+                if is_permanently_failed(pair[0], pair[1]):
+                    # Durable 401/403 exclusion: probing again sends the
+                    # same credential to the same failing route.
+                    skipped_permanent += 1
+                    continue
+                if _route_is_quarantined(pair[0], pair[1], cooldown_store):
+                    skipped_quarantine += 1
+                    continue
+                unquarantined.append(pair)
+            pairs = unquarantined
         # Cycle through unseen candidates before revisiting the oldest evidence.
         pairs.sort(key=lambda pair: _probe_priority(records.get(pair), pair))
         if limit is not None:
@@ -441,6 +470,18 @@ async def run_structured_qualification(
             len(pairs),
             max(1, max_concurrency),
         )
+        if skipped_quarantine:
+            logger.info(
+                "structured qualification pool=%s skipped_quarantined=%d",
+                pool_name,
+                skipped_quarantine,
+            )
+        if skipped_permanent:
+            logger.info(
+                "structured qualification pool=%s skipped_permanent_failures=%d",
+                pool_name,
+                skipped_permanent,
+            )
         semaphore = asyncio.Semaphore(max(1, max_concurrency))
 
         async def one(pair: tuple[str, str]) -> dict[str, Any]:
@@ -454,6 +495,8 @@ async def run_structured_qualification(
                     timeout_secs=timeout_secs,
                 )
                 capability_db.record(**result)
+                if result.get("failure_class") == "auth":
+                    _record_durable_auth_failure(pair[0], pair[1], cooldown_store)
                 return result
 
         return await asyncio.gather(*(one(pair) for pair in pairs))

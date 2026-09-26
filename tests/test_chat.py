@@ -224,6 +224,44 @@ def test_public_provider_non_capacity_failure_does_not_leak_upstream_body():
     assert "X-Tusker-Provider-Failure" not in response.headers
 
 
+def test_public_provider_auth_failure_has_safe_machine_signal():
+    """An upstream 401/403 is durable, not transient: the credential cannot
+    reach the model at all, so a retry fails identically.
+
+    The sanitized response must expose ``X-Tusker-Provider-Failure:
+    provider_auth`` so the maintenance qualification path classifies the route
+    as durably failed instead of re-probing it forever. The upstream body
+    (which names the credential or the missing entitlement) must never be
+    returned to the caller.
+    """
+    secret_upstream_body = (
+        '{"error":{"message":"Incorrect API key provided: sk-svcacct***fvMA",'
+        '"type":"invalid_request_error"}}'
+    )
+    exc = ProviderError(message="upstream chat failed")
+    exc.upstream_body = secret_upstream_body
+    exc.upstream_status = 401
+    response = _public_provider_failure_response(exc)
+    assert response.status == 502
+    assert response.headers["X-Tusker-Provider-Failure"] == "provider_auth"
+    body = response.body.decode("utf-8")
+    assert "sk-svcacct" not in body
+    assert "Incorrect API key" not in body
+    payload = json.loads(body)
+    assert payload["error"]["code"] == "provider_error"
+
+
+def test_public_provider_forbidden_failure_has_safe_machine_signal():
+    """403 takes the same durable path as 401 (missing entitlement)."""
+    exc = ProviderError(message="upstream chat failed")
+    exc.upstream_status = 403
+    response = _public_provider_failure_response(exc)
+    assert response.status == 502
+    assert response.headers["X-Tusker-Provider-Failure"] == "provider_auth"
+    payload = json.loads(response.body.decode("utf-8"))
+    assert payload["error"]["code"] == "provider_error"
+
+
 def test_public_direct_provider_failure_does_not_claim_pool_exhaustion():
     response = _public_provider_failure_response(
         ProviderError(message="upstream returned 502"),

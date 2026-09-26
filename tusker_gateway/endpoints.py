@@ -3543,7 +3543,18 @@ def _public_provider_failure_response(
             or str(exc)
         )
         headers = {}
-        if is_account_quota_exhausted(str(upstream_body)):
+        upstream_status = getattr(exc, "upstream_status", None)
+        if upstream_status in (401, 403):
+            # Preserve the entitlement/credential signal through the sanitized
+            # body. The maintenance qualification path uses it to classify a
+            # durable auth failure instead of re-probing a route this
+            # credential can never access.
+            headers["X-Tusker-Provider-Failure"] = "provider_auth"
+            public_message = (
+                "Upstream provider rejected the gateway credential for this "
+                "model; the route stays excluded until the credential changes."
+            )
+        elif is_account_quota_exhausted(str(upstream_body)):
             # Keep the public error body generic while exposing a safe,
             # machine-readable signal to the maintenance qualification path.
             headers["X-Tusker-Provider-Failure"] = "provider_quota"

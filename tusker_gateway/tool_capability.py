@@ -28,6 +28,12 @@ class ToolCapabilityLevel(IntEnum):
     UNSUPPORTED = 2
     STRUCTURED_STREAM = 3
     STRICT_STRUCTURED_STREAM = 4
+    # 401/403: the credential cannot access this model at all (missing
+    # entitlement, wrong tier, revoked key). This is durable — a retry sends
+    # the same credential to the same route and fails the same way — so
+    # unlike UNAVAILABLE it gets a long re-probe window (credential rotation
+    # is the only realistic recovery) instead of the short 900s retry loop.
+    AUTH_FAILED = 5
 
 
 # Ordinary assistant text may legally accompany an OpenAI tool call. Both

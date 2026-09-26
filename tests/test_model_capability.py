@@ -57,9 +57,10 @@ def test_modality_runner_probes_ollama_cloud_without_catalog_image_metadata():
 
 
 class _Response:
-    def __init__(self, status: int, body: Any):
+    def __init__(self, status: int, body: Any, headers: dict[str, str] | None = None):
         self.status = status
         self._body = body
+        self.headers = headers or {}
 
     async def __aenter__(self):
         return self
@@ -185,7 +186,7 @@ async def test_probe_input_model_separates_unsupported_from_transient():
         "unavailable",
         "rate_limited",
     )
-    assert _classify_http_failure(401, "unauthorized") == ("unavailable", "auth")
+    assert _classify_http_failure(401, "unauthorized") == ("auth_failed", "auth")
 
 
 def test_probe_payloads_cover_supported_input_shapes():

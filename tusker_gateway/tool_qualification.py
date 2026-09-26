@@ -208,7 +208,7 @@ def _classify_http_failure(
     if status in {401, 403} or any(
         marker in lowered for marker in ("unauthorized", "forbidden", "invalid api key")
     ):
-        return ToolCapabilityLevel.UNAVAILABLE, "unavailable", "auth"
+        return ToolCapabilityLevel.AUTH_FAILED, "auth_failed", "auth"
     provider_failure = ""
     if headers is not None:
         try:
@@ -219,6 +219,10 @@ def _classify_http_failure(
             provider_failure = ""
     if provider_failure == "provider_quota" or _is_account_quota_exhausted(lowered):
         return ToolCapabilityLevel.UNAVAILABLE, "unavailable", "provider_quota"
+    if provider_failure == "provider_auth":
+        # The gateway preserves an upstream 401/403 through this
+        # machine-readable header even when it sanitizes the status code.
+        return ToolCapabilityLevel.AUTH_FAILED, "auth_failed", "auth"
     if status == 429 or any(
         marker in lowered for marker in ("rate limit", "rate-limited", "quota", "temporarily")
     ):
@@ -455,6 +459,18 @@ def _needs_probe(
         except (TypeError, ValueError):
             retry_after = 900.0
         return (time.time() - record.checked_at) >= retry_after
+    if record.level == ToolCapabilityLevel.AUTH_FAILED:
+        try:
+            retry_after = max(
+                60.0,
+                float(os.environ.get(
+                    "TUSKER_TOOL_QUALIFICATION_AUTH_RETRY_SECS",
+                    "604800",
+                )),
+            )
+        except (TypeError, ValueError):
+            retry_after = 604_800.0
+        return (time.time() - record.checked_at) >= retry_after
     return (time.time() - record.checked_at) >= max_age_secs
 
 
@@ -481,6 +497,32 @@ def _route_is_quarantined(
     except Exception:
         logger.debug("persistent cooldown check failed", exc_info=True)
         return False
+
+
+def _record_durable_auth_failure(
+    provider: str,
+    model: str,
+    cooldown_store: Any | None,
+) -> None:
+    """Mark a 401/403 route as durably failed after a qualification probe.
+
+    Auth failures repeat identically on every retry: the credential either
+    has access to the model or it does not. Recording the permanent-failure
+    marker keeps future maintenance cycles from re-probing the route and
+    keeps pool selection from routing real traffic into the same 403.
+    """
+    try:
+        from tusker_gateway.cooldown import mark_permanently_failed
+
+        mark_permanently_failed(provider, model)
+    except Exception:
+        logger.debug("in-memory permanent failure marker failed", exc_info=True)
+    if cooldown_store is None:
+        return
+    try:
+        cooldown_store.record_permanent_failure(provider, model)
+    except Exception:
+        logger.debug("persistent permanent failure marker failed", exc_info=True)
 
 
 async def run_qualification(
@@ -557,9 +599,17 @@ async def run_qualification(
             )
         ]
         skipped_quarantine = 0
+        skipped_permanent = 0
         if not ignore_cooldowns:
+            from tusker_gateway.cooldown import is_permanently_failed
+
             unquarantined = []
             for pair in pairs:
+                if is_permanently_failed(pair[0], pair[1]):
+                    # Durable 401/403 exclusion: probing again sends the
+                    # same credential to the same failing route.
+                    skipped_permanent += 1
+                    continue
                 if _route_is_quarantined(pair[0], pair[1], cooldown_store):
                     skipped_quarantine += 1
                     continue
@@ -581,6 +631,12 @@ async def run_qualification(
                 pool_name,
                 skipped_quarantine,
             )
+        if skipped_permanent:
+            logger.info(
+                "tool qualification pool=%s skipped_permanent_failures=%d",
+                pool_name,
+                skipped_permanent,
+            )
 
         semaphore = asyncio.Semaphore(max(1, max_concurrency))
         provider_quota_exhausted: set[str] = set()
@@ -597,6 +653,8 @@ async def run_qualification(
                     model=pair[1],
                 )
                 capability_db.record(**result)
+                if result.get("failure_class") == "auth":
+                    _record_durable_auth_failure(pair[0], pair[1], cooldown_store)
                 if result.get("failure_class") == "provider_quota":
                     provider_quota_exhausted.add(pair[0])
                 return result

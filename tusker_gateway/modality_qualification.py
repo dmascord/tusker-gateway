@@ -41,6 +41,7 @@ from tusker_gateway.model_capability import (
     ModelCapabilityDB,
     default_model_capability_db_path,
 )
+from tusker_gateway.tool_qualification import _record_durable_auth_failure
 from tusker_gateway.pools import PoolManager, is_general_chat_model
 
 logger = logging.getLogger(__name__)
@@ -78,14 +79,32 @@ _MODALITY_TO_CAPABILITY = {
 _PROBE_UNADVERTISED_MODALITY_PROVIDERS = frozenset({"ollama-cloud"})
 
 
-def _classify_http_failure(status: int, body: str) -> tuple[str, str]:
+def _classify_http_failure(
+    status: int,
+    body: str,
+    headers: Any | None = None,
+) -> tuple[str, str]:
     """Classify a failure without retaining the upstream response body."""
     lowered = body.lower()
     if status in {401, 403} or any(
         marker in lowered
         for marker in ("unauthorized", "forbidden", "invalid api key", "authentication")
     ):
-        return "unavailable", "auth"
+        return "auth_failed", "auth"
+    provider_failure = ""
+    if headers is not None:
+        try:
+            provider_failure = str(
+                headers.get("X-Tusker-Provider-Failure", "")
+            ).strip().lower()
+        except AttributeError:
+            provider_failure = ""
+    if provider_failure == "provider_auth":
+        # The gateway preserves an upstream 401/403 through this
+        # machine-readable header even when it sanitizes the status code.
+        return "auth_failed", "auth"
+    if provider_failure == "provider_quota":
+        return "unavailable", "provider_quota"
     if status == 429 or any(
         marker in lowered
         for marker in ("rate limit", "rate-limited", "quota", "capacity", "resourceexhausted")
@@ -189,7 +208,7 @@ async def probe_input_model(
             if response.status != 200:
                 body = (await response.read())[:4096].decode("utf-8", "replace")
                 result["status"], result["failure_class"] = _classify_http_failure(
-                    response.status, body
+                    response.status, body, response.headers
                 )
                 return _finish_result(result, started)
             try:
@@ -319,10 +338,10 @@ def _needs_probe(
     Authoritative capability claims (``passed`` / ``unsupported``) are cached
     for ``max_age_secs`` — the model either advertises image input or it
     doesn't, and that does not flip at runtime. Transient evidence
-    (``unavailable`` from a 5xx / timeout / auth-error) is cached only for
+    (``unavailable`` from a 5xx / timeout) is cached only for
     ``transient_max_age_secs`` so a flaky provider can be re-probed sooner.
-    Without this split the runner would either hammer every flaky provider every
-    cycle, or wait a full 24h before retrying one that just recovered.
+    Durable ``auth_failed`` evidence skips re-probing for the configured
+    credential-rotation window (default seven days).
     """
     if force or record is None:
         return True
@@ -331,6 +350,21 @@ def _needs_probe(
     if record.probe_version != MODEL_CAPABILITY_PROBE_VERSION:
         return True
     age_secs = time.time() - record.checked_at
+    if record.status == "auth_failed":
+        # Durable exclusion: 401/403 repeats identically on every retry.
+        # Re-probe only after the auth retry window (credential rotation
+        # is the only realistic recovery), not every transient cycle.
+        try:
+            auth_window = max(
+                60.0,
+                float(os.environ.get(
+                    "TUSKER_MODALITY_QUALIFICATION_AUTH_RETRY_SECS",
+                    "604800",
+                )),
+            )
+        except (TypeError, ValueError):
+            auth_window = 604_800.0
+        return age_secs >= auth_window
     if record.status == "unavailable":
         if transient_max_age_secs is None:
             transient_max_age_secs = max_age_secs
@@ -360,6 +394,8 @@ def _route_is_quarantined(
     except Exception:
         logger.debug("persistent cooldown check failed", exc_info=True)
         return False
+
+
 
 
 async def run_qualification(
@@ -440,9 +476,15 @@ async def run_qualification(
             )
         ]
         skipped_quarantine = 0
+        skipped_permanent = 0
         if not ignore_cooldowns:
+            from tusker_gateway.cooldown import is_permanently_failed
+
             unquarantined = []
             for pair in pairs:
+                if is_permanently_failed(pair[0], pair[1]):
+                    skipped_permanent += 1
+                    continue
                 if _route_is_quarantined(pair[0], pair[1], cooldown_store):
                     skipped_quarantine += 1
                     continue
@@ -464,6 +506,12 @@ async def run_qualification(
                 "modality qualification modality=%s skipped_quarantined=%d",
                 input_modality,
                 skipped_quarantine,
+            )
+        if skipped_permanent:
+            logger.info(
+                "modality qualification modality=%s skipped_permanent_failures=%d",
+                input_modality,
+                skipped_permanent,
             )
         semaphore = asyncio.Semaphore(max(1, max_concurrency))
         probe_delay = max(0.0, per_probe_delay_secs)
@@ -490,6 +538,8 @@ async def run_qualification(
                     latency_ms=result.get("latency_ms"),
                     failure_class=result.get("failure_class"),
                 )
+                if result.get("failure_class") == "auth":
+                    _record_durable_auth_failure(pair[0], pair[1], cooldown_store)
                 # Polite gap between consecutive probes even when concurrency
                 # is 1: gives a transient provider time to recover between
                 # attempts without prolonging the cycle by orders of magnitude

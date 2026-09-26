@@ -210,6 +210,21 @@ deployed, and live-verified.
 - Deployed revision `6a7b795` (image digest `sha256:d44d4770d96e...`),
   `/health` verified, tool-call SSE smoke passed live.
 
+### Implemented (local, not yet deployed)
+
+- **Durable auth-failure classification**: upstream 401/403 no longer classified
+  as transient `unavailable` by the qualification probes. `endpoints.py` emits
+  `X-Tusker-Provider-Failure: provider_auth`; tool/modality/structured probes
+  record `auth_failed` (`ToolCapabilityLevel.AUTH_FAILED`), re-probe only after
+  `TUSKER_*_QUALIFICATION_AUTH_RETRY_SECS` (default 7 days), mark the route
+  permanently failed (in-memory + `permanent_failures` table), and the runners
+  skip permanently-failed candidates with a `skipped_permanent_failures` log.
+  `pools.py` tool gate hard-denies `AUTH_FAILED` (excluded from the
+  `UNAVAILABLE` curated-model retry hatch). Directly addresses the P1 Codex
+  401 churn and the P3 GHE Copilot auth-shaped failures. Suite: 1407 passed,
+  8 skipped. See `docs/live-audit-2026-09-26.md` §"Follow-up remediation".
+  Deploy pending (needs `rsync` + `./k8s/deploy.sh` on visor).
+
 ### Open (operator)
 
 - **P1** `openai-codex` credential `553921284e...` 401s on every call —
