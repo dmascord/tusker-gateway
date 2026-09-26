@@ -1247,27 +1247,32 @@ async def test_stream_normalizer_injects_finish_when_upstream_omits_it(client):
 
 
 @pytest.mark.asyncio
-async def test_stream_normalizer_dispatches_final_unterminated_data_event(caplog):
-    """A valid final upstream SSE event survives EOF without a blank line."""
+async def test_stream_normalizer_discards_final_unterminated_data_event(caplog):
+    """EOF does not complete an SSE event; only a blank line dispatches it."""
     from tusker_gateway.endpoints import _normalize_stream
 
     async def source():
         yield (
-            b'data: {"choices":[{"index":0,"delta":{"content":"last-line"},'
+            b'data: {"choices":[{"index":0,"delta":{"content":"complete"},'
+            b'"finish_reason":"stop"}]}\n\n'
+        )
+        yield (
+            b'data: {"choices":[{"index":0,"delta":{"content":"truncated"},'
             b'"finish_reason":null}]}'
         )
 
     frames = [frame async for frame in _normalize_stream(source(), provider="test", model="m")]
     body = b"".join(frames)
 
-    assert b'"content": "last-line"' in body
+    assert b'"content": "complete"' in body
+    assert b'"content": "truncated"' not in body
     assert b'"finish_reason": "stop"' in body
-    assert not any("dropping unterminated upstream SSE tail" in r.getMessage() for r in caplog.records)
+    assert any("dropping unterminated upstream SSE tail" in r.getMessage() for r in caplog.records)
 
 
 @pytest.mark.asyncio
-async def test_stream_normalizer_accepts_unterminated_done_sentinel(caplog):
-    """An upstream [DONE] at EOF is accepted without a false tail warning."""
+async def test_stream_normalizer_discards_unterminated_done_sentinel(caplog):
+    """Even [DONE] must be terminated as an SSE event before it is accepted."""
     from tusker_gateway.endpoints import _normalize_stream
 
     async def source():
@@ -1278,4 +1283,4 @@ async def test_stream_normalizer_accepts_unterminated_done_sentinel(caplog):
 
     assert b'"content": "complete"' in body
     assert b'"finish_reason": "stop"' in body
-    assert not any("dropping unterminated upstream SSE tail" in r.getMessage() for r in caplog.records)
+    assert any("dropping unterminated upstream SSE tail" in r.getMessage() for r in caplog.records)
