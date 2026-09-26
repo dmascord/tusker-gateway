@@ -43,7 +43,7 @@ echo "COMMIT:  ${COMMIT}"
 # --- Build ---
 echo "--- Build ---"
 cd "${SRC_DIR}"
-buildah bud --build-arg "TUSKER_COMMIT=${COMMIT}" -f Dockerfile -t "${IMAGE}" .
+buildah bud --layers --build-arg "TUSKER_COMMIT=${COMMIT}" -f Dockerfile -t "${IMAGE}" .
 
 # Capture the pushed manifest digest and fail if publication provides none.
 WORK_DIR=$(mktemp -d)

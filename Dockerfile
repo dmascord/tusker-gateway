@@ -27,36 +27,36 @@ LABEL org.opencontainers.image.title="tusker-gateway" \
        org.opencontainers.image.description="Tusker OpenAI-compatible gateway" \
        org.opencontainers.image.source="https://github.com/dmascord/tusker-gateway"
 
-ARG TUSKER_COMMIT=unknown
-ARG TUSKER_SEMANTIC_CACHE_MODEL_REVISION=1110a243fdf4706b3f48f1d95db1a4f5529b4d41
 COPY --from=cli-tools /opt/provider-cli/ /usr/local/bin/
 # Keep build-time Python imports from filling image layers with bytecode. The
 # runtime sets this too, but the model prewarm below imports a large package
 # tree before the final runtime environment is declared.
-ENV TUSKER_COMMIT=${TUSKER_COMMIT} \
-    PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONDONTWRITEBYTECODE=1
 WORKDIR /opt/tusker-gateway
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential libffi-dev libssl-dev curl \
     && rm -rf /var/lib/apt/lists/*
 
-COPY pyproject.toml ./
-COPY tusker_gateway/ ./tusker_gateway/
-# Strip any stale __pycache__ from build host — otherwise modules load
-# from .pyc files and ignore source updates.
-RUN find /opt/tusker-gateway -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
-COPY README.md ./
 
 # Install PyTorch CPU-only first to avoid pulling CUDA (5+ GB).
 RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+# Dependency layer: every heavy install happens before any gateway source is
+# copied, so a source-only change reuses this layer instead of re-downloading
+# torch/chromadb. Keep these pins in sync with pyproject.toml ([project]
+# dependencies plus the semantic-cache extra).
 RUN pip install --no-cache-dir --upgrade pip \
- && pip install --no-cache-dir ".[semantic-cache]"
+ && pip install --no-cache-dir \
+      "aiohttp>=3.9,<4" \
+      "psycopg[binary,pool]>=3.2,<4" \
+      chromadb==1.5.9 \
+      sentence-transformers==6.0.0
 
 # Bake the pinned CPU embedding model into the image.  Runtime startup is
 # offline by default, so a Hugging Face outage cannot delay or change the
 # model used for cache keys.  The cache directory is made readable by the
 # unprivileged runtime user below.
+ARG TUSKER_SEMANTIC_CACHE_MODEL_REVISION=1110a243fdf4706b3f48f1d95db1a4f5529b4d41
 ENV HF_HOME=/opt/huggingface \
     HF_HUB_DISABLE_TELEMETRY=1 \
     TUSKER_SEMANTIC_CACHE_MODEL_REVISION=${TUSKER_SEMANTIC_CACHE_MODEL_REVISION}
@@ -71,6 +71,15 @@ RUN find /opt/tusker-gateway /usr/local/lib/python3.11 \
       -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true \
  && find /opt/tusker-gateway /usr/local/lib/python3.11 \
       -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete 2>/dev/null || true
+COPY pyproject.toml ./
+COPY tusker_gateway/ ./tusker_gateway/
+# Strip any stale __pycache__ from build host — otherwise modules load
+# from .pyc files and ignore source updates.
+RUN find /opt/tusker-gateway -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+COPY README.md ./
+# Install the gateway package itself without re-resolving dependencies; the
+# dependency layer above already provides them.
+RUN pip install --no-cache-dir --no-deps .
 
 # Persistent data (quality DB, cooldowns, OAuth pool)
 RUN mkdir -p /home/tusker/.hermes && chown -R nobody:nogroup /home/tusker
@@ -78,6 +87,17 @@ ENV HOME=/home/tusker \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     DISABLE_AUTOUPDATER=1
+
+# Per-build revision baked in only at the very end so it doesn't invalidate
+# any of the cached dependency/model layers above.
+ARG TUSKER_COMMIT=unknown
+# Stamp the revision into a layer file before the ENV: buildah keys the ENV
+# layer cache on the literal instruction, not the expanded ARG value, so an
+# ENV-only stamp bakes the first build's commit forever (observed on buildah
+# 2026-09). A RUN whose file content changes per commit forces the cache miss.
+RUN printf "%s" "${TUSKER_COMMIT}" > /opt/tusker-gateway/.commit \
+ && chown nobody:nogroup /opt/tusker-gateway/.commit
+ENV TUSKER_COMMIT=${TUSKER_COMMIT}
 
 USER nobody
 
