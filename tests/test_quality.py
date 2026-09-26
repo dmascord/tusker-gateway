@@ -103,3 +103,55 @@ def test_quality_windowed_recovery():
         assert score_after_one_failure > 90.0, (
             f"one failure in window should not tank score: {score_after_one_failure:.1f}"
         )
+
+
+def test_prime_model_does_not_clobber_learned_failure_score():
+    """A pool rebuild must not reset a learned score back to 100.
+
+    Regression: ``prime_model`` previously ran an unconditional
+    ``ON CONFLICT DO UPDATE SET quality_score = 100.0``, so every config
+    hot-reload erased the failure history of broken operator-curated models
+    and selection kept routing traffic to them.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = QualityDB(os.path.join(tmpdir, "test.db"))
+
+        # Pool build primes the static entry.
+        db.prime_model("p1", "m1")
+        assert db.get_quality("p1", "m1") == 100.0
+
+        # The model then fails repeatedly.
+        for _ in range(5):
+            db.record("p1", "m1", False, 200.0)
+        degraded = db.get_quality("p1", "m1")
+        assert degraded is not None
+        assert degraded < 30.0, f"failures should de-rank the model, got {degraded:.1f}"
+
+        # A later pool rebuild / config hot-reload re-primes every static entry.
+        db.prime_model("p1", "m1")
+        assert db.get_quality("p1", "m1") == degraded, (
+            "prime_model must not overwrite a score backed by real events"
+        )
+
+
+def test_prime_model_seeds_only_uncalled_models():
+    """Fresh entries are seeded above the catalog floor; seeds are not
+    counted as real calls, and a real event recomputes the score exactly."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = QualityDB(os.path.join(tmpdir, "test.db"))
+
+        db.prime_model("p1", "fresh")
+        assert db.get_quality("p1", "fresh") == 100.0
+
+        # The pre-seed must not masquerade as a completed call.
+        with db._db.connection() as conn:
+            row = conn.execute(
+                "SELECT total_calls, success_calls FROM model_quality "
+                "WHERE provider = ? AND model = ?",
+                ("p1", "fresh"),
+            ).fetchone()
+        assert row == (0, 0), f"pre-seed must not fake call counters: {row}"
+
+        # A real success recomputes from the event window.
+        db.record("p1", "fresh", True, 0.0)
+        assert db.get_quality("p1", "fresh") == 100.0

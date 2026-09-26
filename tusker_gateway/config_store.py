@@ -359,6 +359,35 @@ class ConfigStore:
             if providers:
                 cfg["providers"] = providers
 
+            # ── provider_settings → disabled providers ────────────────
+            # Admin API writes to this table; pool construction reads
+            # ``disabled_providers`` / ``passthrough_disabled_providers``.
+            # Without this merge, a DB-level toggle is cosmetic: candidates
+            # keep getting built and routes stay reachable.
+            db_disabled: list[str] = []
+            db_passthrough_disabled: list[str] = []
+            cursor = conn.execute(
+                "SELECT provider, enabled, disabled_provider, passthrough_disabled "
+                "FROM tusker_config_provider_settings"
+            )
+            for (prov, enabled, disabled_provider, passthrough_disabled) in cursor:
+                name = str(prov).strip().lower().replace("_", "-")
+                if not name:
+                    continue
+                if int(disabled_provider) or not bool(enabled):
+                    db_disabled.append(name)
+                if int(passthrough_disabled):
+                    db_passthrough_disabled.append(name)
+            if db_disabled:
+                cfg["disabled_providers"] = _dedupe_preserve_order(
+                    list(cfg.get("disabled_providers", ())) + db_disabled
+                )
+            if db_passthrough_disabled:
+                cfg["passthrough_disabled_providers"] = _dedupe_preserve_order(
+                    list(cfg.get("passthrough_disabled_providers", ()))
+                    + db_passthrough_disabled
+                )
+
             # ── provider_api_keys ───────────────────────────────────────────
             raw_keys: dict[str, str] = {}
             cursor = conn.execute(

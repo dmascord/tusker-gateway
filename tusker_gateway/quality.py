@@ -78,35 +78,35 @@ class QualityDB:
             conn.commit()
 
     def prime_model(self, provider: str, model: str) -> None:
-        """Pre-seed a quality score for a known-good model.
+        """Pre-seed a quality score for a model that has no recorded events.
 
-        Sets quality_score to 100.0 (maximum), so that known-good static models
-        always outrank unknown catalog entries (which use the adaptive floor of ~40).
-        A single real successful event immediately overwrites the pre-seed via
-        _recompute_score, so a broken or slow model drops to its true score right
-        away. The pre-seed therefore acts as a trusted-foundation signal that is
-        safe to override — it never permanently locks a model into the top tier.
+        Static pool entries are primed to 100.0 so they outrank unknown
+        auto-discovered catalog candidates (which start near 40).  The
+        pre-seed only applies when there is no event history: once real
+        outcomes exist, the learned score survives every pool rebuild and
+        config hot-reload.  Previously the unconditional upsert reset the
+        score to 100.0 on each rebuild, erasing failure signals for broken
+        operator-curated models and sending them traffic again.
         """
         with self._db.connection() as conn:
+            existing_events = conn.execute(
+                "SELECT COUNT(*) FROM model_events WHERE provider = ? AND model = ?",
+                (provider, model),
+            ).fetchone()[0]
+            if existing_events:
+                return
             if self._db.is_postgres:
                 conn.execute(
                     "INSERT INTO model_quality (provider, model, quality_score, "
-                    "total_calls, success_calls) VALUES (?, ?, 100.0, 1, 1) "
-                    "ON CONFLICT(provider, model) DO UPDATE SET quality_score = 100.0",
+                    "total_calls, success_calls) VALUES (?, ?, 100.0, 0, 0) "
+                    "ON CONFLICT(provider, model) DO NOTHING",
                     (provider, model),
                 )
             else:
-                # SQLite: INSERT OR IGNORE avoids clobbering real event data;
-                # UPDATE then applies the pre-seed score on top.
                 conn.execute(
                     "INSERT OR IGNORE INTO model_quality "
                     "(provider, model, quality_score, total_calls, success_calls) "
-                    "VALUES (?, ?, 100.0, 1, 1)",
-                    (provider, model),
-                )
-                conn.execute(
-                    "UPDATE model_quality SET quality_score = 100.0 "
-                    "WHERE provider = ? AND model = ?",
+                    "VALUES (?, ?, 100.0, 0, 0)",
                     (provider, model),
                 )
             conn.commit()

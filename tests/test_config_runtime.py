@@ -635,3 +635,133 @@ def test_poll_does_not_advance_generation_when_apply_fails(monkeypatch):
 
     assert applied  # the new generation was attempted
     assert runtime._generation == 1  # NOT advanced past the failure
+
+
+# ===========================================================================
+# 7. Provider settings → disabled_providers merge
+# ===========================================================================
+
+def test_provider_settings_merge_into_disabled_providers(tmp_path) -> None:
+    """DB rows with enabled=0 / disabled_provider=1 populate disabled_providers."""
+    from tusker_gateway.config import load_config as _load_env
+
+    cfg = _load_env()
+    dbfile = tmp_path / "test.db"
+
+    store = ConfigStore(
+        database=str(dbfile),
+        fallback_config=cfg,
+        fallback_identity_config=IdentityConfig(),
+    )
+
+    # Reset so the first call initializes everything fresh.
+    with store._conn as conn:
+        conn.execute("DROP TABLE IF EXISTS provider_settings")
+        conn.commit()
+        # Add two DB-disabled providers; one also passthrough-disabled.
+        conn.execute(
+            "INSERT INTO provider_settings "
+            "(provider, enabled, disabled_cause, "
+            " passthrough_disabled, disabled_provider) VALUES (?, ?, ?, ?, ?)",
+            (
+                "apim",
+                0,
+                "audit-2026",
+                1,
+                1,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO provider_settings "
+            "(provider, enabled, disabled_cause, "
+            " passthrough_disabled, disabled_provider) VALUES (?, ?, ?, ?, ?)",
+            (
+                "groq",
+                0,
+                "quota-exhausted",
+                0,
+                0,
+            ),
+        )
+        conn.commit()
+
+    # Load the runtime config — this triggers the provider_settings merge.
+    rt = store.runtime_config(cfg)
+
+    # apim is DB-disabled AND passthrough-disabled
+    assert "apim" in rt.get("disabled_providers", []), \
+        f"apim missing from disabled_providers: {rt.get('disabled_providers')}"
+    assert "apim" in rt.get("passthrough_disabled_providers", []), \
+        f"apim missing from passthrough_disabled_providers"
+
+    # groq is only pool-disabled (enabled=0, no passthrough flag)
+    assert "groq" in rt.get("disabled_providers", []), \
+        f"groq missing from disabled_providers"
+    assert "groq" not in rt.get("passthrough_disabled_providers", []), \
+        "groq should NOT be passthrough-disabled"
+
+
+def test_provider_settings_merge_preserves_env_entries(tmp_path) -> None:
+    """DB disable and env disable combine without duplicate."""
+    from tusker_gateway.config import load_config as _load_env
+
+    cfg = dict(_load_env())
+    # Pre-seed an env-level disabled provider.
+    cfg["disabled_providers"] = ["cerebras"]
+
+    dbfile = tmp_path / "test.db"
+
+    store = ConfigStore(
+        database=str(dbfile),
+        fallback_config=cfg,
+        fallback_identity_config=IdentityConfig(),
+    )
+
+    with store._conn as conn:
+        conn.execute("DROP TABLE IF EXISTS provider_settings")
+        conn.commit()
+        conn.execute(
+            "INSERT INTO provider_settings "
+            "(provider, enabled, disabled_cause, "
+            " passthrough_disabled, disabled_provider) VALUES (?, ?, ?, ?, ?)",
+            ("cerebras", 0, "manual", 1, 1),
+        )
+        conn.commit()
+
+    rt = store.runtime_config(cfg)
+
+    # Should appear exactly once despite being in both env and DB.
+    entries = rt.get("disabled_providers", [])
+    count = entries.count("cerebras")
+    assert count == 1, f"duplicate cerebras in disabled_providers ({count}x)"
+
+
+def test_provider_passthrough_only_via_flag(tmp_path) -> None:
+    """A row with passthrough_disabled=1 but enabled=1 gets only into
+    passthrough_disabled_providers, not disabled_providers."""
+    from tusker_gateway.config import load_config as _load_env
+
+    cfg = _load_env()
+    dbfile = tmp_path / "test.db"
+
+    store = ConfigStore(
+        database=str(dbfile),
+        fallback_config=cfg,
+        fallback_identity_config=IdentityConfig(),
+    )
+
+    with store._conn as conn:
+        conn.execute("DROP TABLE IF EXISTS provider_settings")
+        conn.commit()
+        conn.execute(
+            "INSERT INTO provider_settings "
+            "(provider, enabled, disabled_cause, "
+            " passthrough_disabled, disabled_provider) VALUES (?, ?, ?, ?, ?)",
+            ("some-provider", 1, "pending-key-update", 1, 0),
+        )
+        conn.commit()
+
+    rt = store.runtime_config(cfg)
+
+    assert "some-provider" not in rt.get("disabled_providers", [])
+    assert "some-provider" in rt.get("passthrough_disabled_providers", [])
