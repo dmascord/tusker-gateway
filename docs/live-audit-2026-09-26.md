@@ -14,8 +14,8 @@ state DB and `/status` payload. Configured revision: `a68522c`.
 | P2 (catalog / pool hygiene) | 5 | Documented; fix candidates below |
 | P3 (cosmetic / informational) | 2 | No action |
 
-Offline suite before changes: 1400 passed, 8 skipped. After: **1403 passed,
-8 skipped** (3 regression tests added).
+Offline suite before changes: 1400 passed, 8 skipped. After: **1405 passed,
+8 skipped** (5 regression tests added — 2 prime_model, 3 provider_settings).
 
 ## P0 — Quality score clobbered on every pool rebuild (FIXED)
 
@@ -284,9 +284,9 @@ effect on the next config hot-reload (generation 545 → 546).
 - Live `/ready` after redeploy: `privacy.selectable` should drop (apim
   candidates removed from pool construction), `apim` absent from
   `/status` candidate lists.
-- Offline test suite: **1403 passed, 8 skipped** (`tests/test_quality.py`
+- Offline test suite: **1405 passed, 8 skipped** (`tests/test_quality.py`
   gained 2 regression tests for the prime-model fix;
-  `tests/test_config_runtime.py` gains a regression test for the
+  `tests/test_config_runtime.py` gained 3 regression tests for the
   provider_settings merge).
 - No request-path changes beyond `quality.py` (score recompute) and the
   config_store loader (disabled provider merge). All previous smoke tests
