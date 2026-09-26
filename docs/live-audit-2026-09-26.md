@@ -71,12 +71,19 @@ Both backends now leave existing rows alone.
 
 **Verification:**
 
-- `tests/test_quality.py`: all 4 existing tests pass (61 passed in the wider
-  pool/quality suite).
-- The 5 stuck scores were manually corrected to `2.0` (formula floor) in the
-  state DB so selection stops favouring them before the next call arrives.
-- Full offline suite: **1400 passed, 8 skipped** (up from 1397 with the
-  regression test added).
+- `tests/test_quality.py`: regression tests added
+  (`test_prime_model_does_not_clobber_learned_failure_score`,
+  `test_prime_model_seeds_only_uncalled_models`).
+- The 5 stuck scores were reset to `2.0` (formula floor) in the state DB so
+  selection stops favouring them before the next call arrives. NOTE: the
+  first correction pass (pre-deploy) only persisted for the two
+  `ollama-cloud` rows — the pre-fix gateway was still running and its next
+  pool rebuild re-clobbered the three premium entries back to `100.0`.
+  After the fixed build deployed, the two `ollama-cloud` rows *survived* a
+  full pod restart + pool rebuild at `2.0` (live proof the guard works),
+  and the three premium rows were re-corrected to `2.0` on 2026-09-26.
+- Full offline suite: **1400 passed, 8 skipped** at fix time; **1405
+  passed, 8 skipped** after adding all regression tests.
 
 ## P0 — `apim` provider returns 404 for every model (FIXED via DB)
 
@@ -263,6 +270,26 @@ correctly de-rank these models, reducing their traffic share.
 - **`/metrics` token:** `TUSKER_METRICS_TOKEN` is unset on the deployment,
   so `/metrics` and `/dashboard` continue to fail-closed with
   `configuration_required` (500). This is intentional from the audit pass.
+
+## Live verification (post-deploy)
+
+Revision `6a7b795` deployed 2026-09-26T03:39 UTC. Post-rollout checks:
+
+- `/health` reports commit `6a7b795433c1161cbef9e129bbb0cb5734080612`,
+  config generation 546, `apim` absent from `catalog_providers`.
+- `/ready` pool state: privacy configured 47 / selectable 13 (apim's 255
+  dead candidates removed); code configured 198 (github-copilot's 44
+  candidates gone); premium 37/36; swarm 2/2. State store healthy.
+- Quality table: all five clobbered models now read `quality_score=2.0`.
+  The two `ollama-cloud` rows retained their score through the pod restart
+  + pool rebuild — live proof the prime guard works.
+- Tool-call SSE smoke: PASS — one `get_weather` tool call, arguments
+  `{"city": "Sydney"}` parsed validly from the stream, complete `[DONE]`,
+  no error events.
+- Single Ready pod `tusker-gateway-8494f7f666-7j64p` on image
+  `swarm-alpine-6a7b795...` with digest `sha256:d44d4770...`; the previous
+  pod (image `000e502`, which had been live since 03:25 UTC) drained
+  cleanly during rollout.
 
 ## Configuration diff (this audit)
 
