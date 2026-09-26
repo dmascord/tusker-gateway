@@ -655,12 +655,12 @@ def test_provider_settings_merge_into_disabled_providers(tmp_path) -> None:
     )
 
     # Reset so the first call initializes everything fresh.
+    store._ensure_db()
     with store._conn as conn:
-        conn.execute("DROP TABLE IF EXISTS provider_settings")
-        conn.commit()
+        conn.execute("DELETE FROM tusker_config_provider_settings")
         # Add two DB-disabled providers; one also passthrough-disabled.
         conn.execute(
-            "INSERT INTO provider_settings "
+            "INSERT INTO tusker_config_provider_settings "
             "(provider, enabled, disabled_cause, "
             " passthrough_disabled, disabled_provider) VALUES (?, ?, ?, ?, ?)",
             (
@@ -672,7 +672,7 @@ def test_provider_settings_merge_into_disabled_providers(tmp_path) -> None:
             ),
         )
         conn.execute(
-            "INSERT INTO provider_settings "
+            "INSERT INTO tusker_config_provider_settings "
             "(provider, enabled, disabled_cause, "
             " passthrough_disabled, disabled_provider) VALUES (?, ?, ?, ?, ?)",
             (
@@ -717,11 +717,11 @@ def test_provider_settings_merge_preserves_env_entries(tmp_path) -> None:
         fallback_identity_config=IdentityConfig(),
     )
 
+    store._ensure_db()
     with store._conn as conn:
-        conn.execute("DROP TABLE IF EXISTS provider_settings")
-        conn.commit()
+        conn.execute("DELETE FROM tusker_config_provider_settings")
         conn.execute(
-            "INSERT INTO provider_settings "
+            "INSERT INTO tusker_config_provider_settings "
             "(provider, enabled, disabled_cause, "
             " passthrough_disabled, disabled_provider) VALUES (?, ?, ?, ?, ?)",
             ("cerebras", 0, "manual", 1, 1),
@@ -750,11 +750,11 @@ def test_provider_passthrough_only_via_flag(tmp_path) -> None:
         fallback_identity_config=IdentityConfig(),
     )
 
+    store._ensure_db()
     with store._conn as conn:
-        conn.execute("DROP TABLE IF EXISTS provider_settings")
-        conn.commit()
+        conn.execute("DELETE FROM tusker_config_provider_settings")
         conn.execute(
-            "INSERT INTO provider_settings "
+            "INSERT INTO tusker_config_provider_settings "
             "(provider, enabled, disabled_cause, "
             " passthrough_disabled, disabled_provider) VALUES (?, ?, ?, ?, ?)",
             ("some-provider", 1, "pending-key-update", 1, 0),
