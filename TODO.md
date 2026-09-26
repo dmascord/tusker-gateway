@@ -185,3 +185,38 @@ suite passes (~1397 passed, 8 skipped).
   directive blocked with `guardrail_blocked`, idempotent replay accepted,
   SSE chat completed, `/metrics` without token fails closed (500
   `configuration_required`, by design per app.py middleware).
+
+## 2026-09-26 live audit + remediation
+
+Findings and evidence: `docs/live-audit-2026-09-26.md`. Three P0s fixed,
+deployed, and live-verified.
+
+### Shipped
+
+- **P0 quality clobber**: `QualityDB.prime_model()` no longer resets learned
+  scores on pool rebuild (`tusker_gateway/quality.py`). Live proof: the two
+  `ollama-cloud` rows kept `2.0` through the post-deploy pod restart +
+  rebuild; all five previously-clobbered rows now read `2.0`.
+- **P0 cosmetic DB disables**: `config_store._load_db()` now merges
+  `tusker_config_provider_settings` into `disabled_providers` /
+  `passthrough_disabled_providers` (`tusker_gateway/config_store.py:362`).
+  The 09-13 `cerebras` / `nvidia` / `github-copilot` disables now actually
+  take effect; admin UI toggles are no longer cosmetic.
+- **P0 dead `apim` provider**: disabled via deployment env lists AND the
+  config DB (both surfaces agree). Privacy pool: configured 301 → 47,
+  selectable 13. Code pool: github-copilot's 44 candidates removed.
+- Regression tests: 2 in `tests/test_quality.py`, 3 in
+  `tests/test_config_runtime.py`. Full offline suite: 1405 passed, 8 skipped.
+- Deployed revision `6a7b795` (image digest `sha256:d44d4770d96e...`),
+  `/health` verified, tool-call SSE smoke passed live.
+
+### Open (operator)
+
+- **P1** `openai-codex` credential `553921284e...` 401s on every call —
+  re-enroll via `tusker_gateway.tools.enroll_codex_credential` or delete it;
+  the rotator only covers it for 2 models via `credential_model_exclusions`.
+- **P1** `opencode-go` monthly quota exhausted (35 code + 12 premium + swarm
+  `deepseek-v4-flash` degraded) — waits for reset or plan upgrade.
+- **P2 candidates** (see audit doc): groq TPM-413 model exclusions,
+  `workers-ai` 403 permission check, Google/OpenRouter non-chat catalog
+  filtering, dead `ollama-cloud deepseek-v4-flash` variant exclusions.
