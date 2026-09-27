@@ -359,4 +359,33 @@ header for 401 and 403 and the no-leak guarantee;
 the mock now carries response headers. Full offline suite: **1407 passed,
 8 skipped**.
 
-**Status:** implemented locally; not yet deployed.
+**Status:** deployed as `9cff1db` and live-verified on 2026-09-27.
+
+### Live verification — `9cff1db`
+
+- `/health` reports commit `9cff1dbec458969661a43f44695a35a76c14a877`.
+- The Ready pod is `tusker-gateway-5bff4d6897-9r99f`, running image
+  `swarm-alpine-9cff1dbec458969661a43f44695a35a76c14a877`.
+- A live `tool_qualification` run inside the pod completed successfully
+  (`exit=0`) against three `workers-ai` candidates. All returned valid JSON
+  records with HTTP 200 and `failure_class=no_tool_call`; no reachable
+  upstream 401/403 was available during this run.
+- Live endpoint smoke: non-stream chat returned HTTP 200 with the advertised
+  `hermes-code` model and `finish_reason=stop`; streaming chat with a tool
+  returned HTTP 200, tool-call deltas, `finish_reason=tool_calls`, and a
+  complete `[DONE]`; `/v1/responses` returned HTTP 200.
+- Known 403 routes (`opencode-zen`, `openrouter`, and `workers-ai`) were
+  circuit-open when pinned, so the new `provider_auth` response header was
+  not directly exercised against an upstream 401/403. The two header contract
+  tests and the offline suite cover that path.
+- `/v1/embeddings` with the `hermes-code` chat alias returned HTTP 503 because
+  no embedding route was available for that alias; this remains an offering
+  gap, not a successful embedding verification.
+- `/metrics` continued to return the documented fail-closed HTTP 500 while
+  `TUSKER_METRICS_TOKEN` is unset.
+
+Residual risk: an upstream 403 caused by a transient WAF or quota condition
+is indistinguishable from a durable entitlement failure at the current
+classification boundary. The existing permanent-failure behavior and the new
+qualification path can therefore exclude a route until recovery or operator
+cleanup; provider-specific 403 classification remains a follow-up.

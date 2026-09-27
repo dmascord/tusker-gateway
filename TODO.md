@@ -210,7 +210,7 @@ deployed, and live-verified.
 - Deployed revision `6a7b795` (image digest `sha256:d44d4770d96e...`),
   `/health` verified, tool-call SSE smoke passed live.
 
-### Implemented (local, not yet deployed)
+### Shipped — follow-up remediation (durable auth failures)
 
 - **Durable auth-failure classification**: upstream 401/403 no longer classified
   as transient `unavailable` by the qualification probes. `endpoints.py` emits
@@ -219,11 +219,21 @@ deployed, and live-verified.
   `TUSKER_*_QUALIFICATION_AUTH_RETRY_SECS` (default 7 days), mark the route
   permanently failed (in-memory + `permanent_failures` table), and the runners
   skip permanently-failed candidates with a `skipped_permanent_failures` log.
-  `pools.py` tool gate hard-denies `AUTH_FAILED` (excluded from the
-  `UNAVAILABLE` curated-model retry hatch). Directly addresses the P1 Codex
-  401 churn and the P3 GHE Copilot auth-shaped failures. Suite: 1407 passed,
+  `pools.py` hard-denies `AUTH_FAILED` in the tool gate. Suite: 1407 passed,
   8 skipped. See `docs/live-audit-2026-09-26.md` §"Follow-up remediation".
-  Deploy pending (needs `rsync` + `./k8s/deploy.sh` on visor).
+- Deployed revision `9cff1db` with image tag
+  `swarm-alpine-9cff1dbec458969661a43f44695a35a76c14a877`.
+- Live verification: `/health` reports the revision; non-stream and streaming
+  chat (including tool calls) and `/v1/responses` returned HTTP 200. The live
+  qualification runner completed with valid JSON records. Known 401/403 routes
+  were circuit-open, so the upstream `provider_auth` header path was covered
+  by contract tests rather than a live upstream auth failure.
+
+### Open offering gap
+
+- `/v1/embeddings` has no healthy configured route: `hermes-code` and
+  `voyage::voyage-3` returned 503, while the tested `openai-codex`, `google`,
+  and `alibaba` embedding routes returned `unsupported_provider`.
 
 ### Open (operator)
 
