@@ -74,6 +74,7 @@ async def _run(args: argparse.Namespace) -> int:
             f"passed={summary['passed']} "
             f"excluded={summary['excluded']} "
             f"unknown={summary['unknown']} "
+            f"preserved={summary['preserved']} "
             f"requests={summary['requests']} "
             f"rate_limited={summary['rate_limited']}"
         )

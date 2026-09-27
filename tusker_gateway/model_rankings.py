@@ -634,6 +634,17 @@ async def sync_llm_stats_rankings(
         )
         counts["unknown"] += 1
 
+    # Verdicts for models this sync was not asked about are carried over
+    # untouched. The pair set is caller-supplied and therefore config
+    # dependent: the gateway's refresh loop sees auto-catalog-expanded
+    # pools (hundreds of models) while a one-shot process may see only the
+    # env-fallback pools (tens). Swapping the whole table would delete
+    # valid verdicts for the wider inventory and silently make
+    # previously-excluded models selectable again.
+    preserved = [
+        row for slug, row in previous_by_slug.items() if slug not in seen
+    ]
+
     if rate_limited:
         logger.warning(
             "llm-stats sync hit HTTP 429 after %d requests; keeping previous verdicts",
@@ -645,18 +656,27 @@ async def sync_llm_stats_rankings(
             "excluded": counts["excluded"],
             "unknown": counts["unknown"],
             "seed_kept": counts["seed_kept"],
+            # Nothing was written, so no verdict was carried into a write.
+            "preserved": 0,
             "requests": requests,
             "rate_limited": True,
             "synced_at": now,
         }
 
-    db.replace_all(rows, now)
+    if preserved:
+        logger.info(
+            "llm-stats sync preserving %d verdict(s) outside the current "
+            "pair set",
+            len(preserved),
+        )
+    db.replace_all(rows + preserved, now)
     summary = {
         "models": len(seen),
         "passed": counts["passed"],
         "excluded": counts["excluded"],
         "unknown": counts["unknown"],
         "seed_kept": counts["seed_kept"],
+        "preserved": len(preserved),
         "requests": requests,
         "rate_limited": False,
         "synced_at": now,

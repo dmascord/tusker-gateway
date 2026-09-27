@@ -274,6 +274,57 @@ async def test_sync_requires_api_key(tmp_path):
             _config(tmp_path, llm_stats_api_key=""), [("p", "m")], session
         )
 
+@pytest.mark.asyncio
+async def test_sync_preserves_verdicts_outside_pair_set(tmp_path):
+    """A narrow sync must not delete verdicts for models it was not asked about.
+
+    The caller's pair set is config dependent: the gateway's refresh loop sees
+    auto-catalog-expanded pools, while a one-shot process may see only the
+    env-fallback pools. Swapping the whole table in the narrow case would drop
+    valid exclusions and silently make weak models selectable again.
+    """
+    base = "https://llmstats.test/stats/v1"
+    db_path = str(tmp_path / "llm_stats.db")
+    db = ModelRankingsDB(db_path)
+    stale_synced_at = time.time() - 3600
+    db.replace_all(
+        [
+            _verdict("minimax-m3", "pass"),
+            _verdict(
+                "legacy-model",
+                "excluded",
+                category_rank=46,
+                category_name="code",
+                evidence="category_window",
+                synced_at=stale_synced_at,
+            ),
+        ],
+        time.time(),
+    )
+
+    routes = {
+        f"{base}/rankings?category=agents&limit=50": _Response(200, _rankings_body([])),
+        f"{base}/rankings?category=code&limit=50": _Response(
+            200, _rankings_body([("minimax-m3", 46)])
+        ),
+        f"{base}/rankings?category=general&limit=50": _Response(200, _rankings_body([])),
+    }
+    summary = await sync_llm_stats_rankings(
+        _config(tmp_path, llm_stats_db_path=db_path),
+        [("minimax", "MiniMax-M3")],
+        session=_FakeSession(routes),
+    )
+
+    assert summary["preserved"] == 1
+    rows = db.rows()
+    # The model in scope was refreshed in place.
+    assert rows["minimax-m3"]["status"] == "excluded"
+    # The out-of-scope verdict survived untouched, including its sync time.
+    assert rows["legacy-model"]["status"] == "excluded"
+    assert rows["legacy-model"]["category_rank"] == 46
+    assert rows["legacy-model"]["synced_at"] == pytest.approx(stale_synced_at)
+    assert db.excludes("legacy-model") is True
+
 
 def test_pool_model_pairs_reads_pool_configs():
     config = {
