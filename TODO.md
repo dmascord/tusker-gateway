@@ -3,6 +3,22 @@
 Active work items that span multiple sessions / PRs. Items live here
 until they ship and then move to a release-notes doc.
 
+## llm-stats sync fix deployed? (pending)
+Commit `89d593c` (fix(llm-stats): preserve verdicts outside the synced
+pair set) is pushed but **not deployed** — the running pod predates it.
+No operational urgency: the gateway's own refresh loop runs with the
+auto-catalog-expanded inventory, so it cannot shrink the verdict table.
+The fix protects narrow-sync entry points (the one-shot
+`sync_llm_stats` tool, config generations before auto-catalog expansion).
+Deploy at the next convenient window.
+
+Incident context (2026-09-27): a narrow in-pod verification sync
+replaced the whole verdict table and dropped ~112 verdicts, briefly
+making excluded models selectable. Restored in place by re-syncing
+against the live `/status` candidate inventory (157 models, 16 window
+exclusions + 11 site seeds confirmed). The sync now preserves rows for
+models outside its pair set, so this class of mistake cannot recur.
+
 ## DB-backed config store (shipped)
 
 Migrate gateway static config (provider registry, pool definitions, API
