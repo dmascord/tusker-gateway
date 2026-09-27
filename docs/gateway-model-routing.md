@@ -104,7 +104,13 @@ per-model verdicts in `llm_stats.db`:
   the cutoff (`TUSKER_LLM_STATS_MAX_RANK`, default 25). Selection prefers
   these.
 - **excluded** — present in a tracked window but best rank beyond the
-  cutoff. Dropped from every pool like a blacklist entry.
+  cutoff (`TUSKER_LLM_STATS_MAX_RANK`, default 25). What that means is
+  controlled by `TUSKER_LLM_STATS_ENFORCEMENT`:
+  `drop` (default) removes the model from every pool like a blacklist
+  entry; `prefer` keeps it selectable but orders it behind better-ranked
+  models, so traffic uses the strongest model that still has quota and
+  health and falls through to weaker ones only when the stronger ones
+  are cooling down, capacity-gated, or breaker-tripped.
 - **unknown** — absent from every top-50 window (private, local, or
   simply outside the rankings windows; fails open; selectable, no bonus).
 
@@ -149,8 +155,9 @@ Mechanics and guarantees:
   (default 7 days); after that the model degrades back to `unknown`
   unless the seed is re-imported. Set the variable to `0` to disable
   retention entirely.
-- A seeded `excluded` verdict filters exactly like a window-derived one:
-  a deep rank beyond the cutoff drops the model from its pools.
+- A seeded `excluded` verdict behaves exactly like a window-derived one:
+  a deep rank beyond the cutoff drops the model from its pools (`drop`)
+  or orders it last (`prefer`), per `TUSKER_LLM_STATS_ENFORCEMENT`.
 
 Coverage source: `docs/llm-stats-coverage-2026-09-27.md`.
 
@@ -158,6 +165,13 @@ Ranked models additionally receive a quality-score bonus at selection
 time: `max(0, cap - per_rank * (rank - 1))`, with `cap = 25.0` and
 `per_rank = 1.0` by default (`TUSKER_LLM_STATS_RANK_BOOST_CAP`,
 `TUSKER_LLM_STATS_RANK_BOOST_PER_RANK`; set per_rank to 0 to disable).
+Under `TUSKER_LLM_STATS_ENFORCEMENT=prefer` an unset per_rank instead
+defaults to `cap / (PREFER_LADDER_SPAN - 1)` (`PREFER_LADDER_SPAN=200`,
+so ~0.126 with the default cap): the decay reaches zero only at rank
+200, keeping the whole ranked range ordered so fall-through follows the
+ranking. The drop-mode default (per_rank = 1.0, zero by rank ~26) is
+unchanged.
+
 Consequences of the bounded default:
 
 - Among equally-scored (e.g. both primed) candidates the better rank wins
@@ -171,7 +185,7 @@ Consequences of the bounded default:
   pool without operator action.
 
 Set `TUSKER_LLM_STATS_RANK_BOOST_PER_RANK=0` to restore pure
-quality-score ordering.
+quality-score ordering in either mode.
 
 If a pool has `fallback_pools` configured, the same request requirements are
 applied to each fallback pool after the current pool has no eligible

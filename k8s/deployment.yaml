@@ -191,6 +191,14 @@ spec:
         # requests without emitting an interactive OMP approval question.
         - name: TUSKER_HIGH_IMPACT_MODE
           value: audit
+        # LLM Stats ranking enforcement. `prefer` keeps out-of-cutoff
+        # models selectable and orders them behind better-ranked ones
+        # instead of dropping them from every pool (the `drop` default).
+        # The rank-boost ladder then spans the full ranked range
+        # (per_rank defaults to cap/199), so fall-through follows the
+        # ranking. See docs/gateway-model-routing.md.
+        - name: TUSKER_LLM_STATS_ENFORCEMENT
+          value: prefer
         # Guardrails: enable input/output guards by default. Prompt injection
         # guard blocks "ignore previous instructions" / "you are now" / etc.;
         # harness rewriter injects an <untrusted_data> delimiter discipline

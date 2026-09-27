@@ -10,6 +10,7 @@ import pytest
 
 from tusker_gateway.model_rankings import (
     ModelRankingsDB,
+    load_llm_stats_env_config,
     normalize_slug,
     pool_model_pairs,
     sync_llm_stats_rankings,
@@ -350,18 +351,20 @@ def test_pool_model_pairs_reads_pool_configs():
 # ---------------------------------------------------------------------------
 
 
-def _pool_manager(tmpdir: str, models: list[dict[str, str]]) -> PoolManager:
-    return PoolManager(
-        {
-            "pools": {
-                "code": PoolConfig(name="code", models=models),
-            },
-            "quality_db_path": os.path.join(tmpdir, "quality.db"),
-            "llm_stats_db_path": os.path.join(tmpdir, "llm_stats.db"),
-            "excluded_providers": [],
-            "provider_api_keys": {"ollama-cloud": "k1", "xiaomi": "k2"},
-        }
-    )
+def _pool_manager(
+    tmpdir: str, models: list[dict[str, str]], **extra: Any
+) -> PoolManager:
+    config: dict[str, Any] = {
+        "pools": {
+            "code": PoolConfig(name="code", models=models),
+        },
+        "quality_db_path": os.path.join(tmpdir, "quality.db"),
+        "llm_stats_db_path": os.path.join(tmpdir, "llm_stats.db"),
+        "excluded_providers": [],
+        "provider_api_keys": {"ollama-cloud": "k1", "xiaomi": "k2"},
+    }
+    config.update(extra)
+    return PoolManager(config)
 
 
 def test_pool_filter_drops_excluded_model_and_stickiness(tmp_path):
@@ -410,6 +413,83 @@ def test_pool_filter_unknown_and_pass_models_stay_selectable(tmp_path):
 
     selected = {manager.select("code") for _ in range(4)}
     assert selected == {("ollama-cloud", "gpt-oss:120b"), ("xiaomi", "mimo-v2.5")}
+
+
+# ---------------------------------------------------------------------------
+# Rank enforcement modes
+# ---------------------------------------------------------------------------
+
+
+def test_prefer_enforcement_keeps_excluded_model_and_rotates_to_it(tmp_path):
+    """Rank orders rotation instead of gating it (enforcement=prefer).
+
+    The stronger model wins while it is healthy; when it cools down the
+    out-of-cutoff model takes over rather than the request failing.
+    """
+    db = ModelRankingsDB(str(tmp_path / "llm_stats.db"))
+    db.replace_all(
+        [
+            _verdict("mimo-v2-5", "pass", category_rank=1, category_name="agents"),
+            _verdict(
+                "gpt-oss-20b",
+                "excluded",
+                category_rank=191,
+                category_name="tool_calling",
+            ),
+        ],
+        time.time(),
+    )
+    manager = _pool_manager(
+        str(tmp_path),
+        [
+            {"provider": "xiaomi", "model": "mimo-v2.5"},
+            {"provider": "ollama-cloud", "model": "gpt-oss:20b"},
+        ],
+        llm_stats_enforcement="prefer",
+    )
+
+    assert manager.select("code") == ("xiaomi", "mimo-v2.5")
+    manager._cooldowns.cooldown("xiaomi", "mimo-v2.5", 30)
+    assert manager.select("code") == ("ollama-cloud", "gpt-oss:20b")
+
+
+def test_drop_enforcement_removes_sole_excluded_candidate(tmp_path):
+    """The default mode still treats an out-of-cutoff model as a blacklist."""
+    db = ModelRankingsDB(str(tmp_path / "llm_stats.db"))
+    db.replace_all(
+        [_verdict("gpt-oss-20b", "excluded", category_rank=41, category_name="general")],
+        time.time(),
+    )
+    manager = _pool_manager(
+        str(tmp_path), [{"provider": "ollama-cloud", "model": "gpt-oss:20b"}]
+    )
+
+    assert manager.select("code") is None
+
+
+def test_prefer_enforcement_defaults_span_the_rank_ladder(monkeypatch, tmp_path):
+    """Prefer mode must keep a rank gradient past the drop-mode cutoff.
+
+    The drop-mode decay reaches zero at rank ~26, which would leave every
+    weaker model with an identical bonus and no ordering to fall through.
+    """
+    monkeypatch.delenv("TUSKER_LLM_STATS_RANK_BOOST_PER_RANK", raising=False)
+
+    monkeypatch.delenv("TUSKER_LLM_STATS_ENFORCEMENT", raising=False)
+    drop_config: dict[str, Any] = {"quality_db_path": str(tmp_path / "quality.db")}
+    load_llm_stats_env_config(drop_config)
+    assert drop_config["llm_stats_enforcement"] == "drop"
+    assert drop_config["llm_stats_rank_boost_per_rank"] == 1.0
+
+    monkeypatch.setenv("TUSKER_LLM_STATS_ENFORCEMENT", "prefer")
+    prefer_config: dict[str, Any] = {"quality_db_path": str(tmp_path / "quality.db")}
+    load_llm_stats_env_config(prefer_config)
+    assert prefer_config["llm_stats_enforcement"] == "prefer"
+
+    manager = _pool_manager(str(tmp_path), [], **prefer_config)
+    assert manager._rank_boost(150) > 0.0
+    # Monotone: better ranks keep a strictly larger bonus across the range.
+    assert manager._rank_boost(1) > manager._rank_boost(100) > manager._rank_boost(150)
 
 
 # ---------------------------------------------------------------------------

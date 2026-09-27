@@ -342,7 +342,17 @@ class PoolManager:
         return model_is_blacklisted(self.config, provider, model)
 
     def _llm_stats_excludes(self, model: str) -> bool:
+        """Whether the LLM Stats ranking removes this model from selection.
+
+        Under ``prefer`` enforcement the ranking never removes a model: it
+        only orders candidates through ``_rank_boost``, so the strongest
+        model is used while it has quota/health and traffic falls through to
+        weaker ones (and back up again) as cooldowns, capacity gates, or
+        breakers move.
+        """
         if self._llm_stats is None:
+            return False
+        if self._llm_stats_enforcement == "prefer":
             return False
         return self._llm_stats.excludes(model)
 
@@ -399,10 +409,23 @@ class PoolManager:
             self.config.get("model_capability_db_path")
             or default_model_capability_db_path(self.config["quality_db_path"])
         )
+        # Enforcement mode is resolved once per manager: the candidate
+        # filter calls the exclusion helper for every candidate on every
+        # request, so it must not re-read and re-normalize config strings.
+        from tusker_gateway.model_rankings import (
+            DEFAULT_ENFORCEMENT,
+            ENFORCEMENT_MODES,
+            ModelRankingsDB,
+        )
+
+        enforcement = str(
+            self.config.get("llm_stats_enforcement") or DEFAULT_ENFORCEMENT
+        ).strip().lower()
+        self._llm_stats_enforcement = (
+            enforcement if enforcement in ENFORCEMENT_MODES else DEFAULT_ENFORCEMENT
+        )
         llm_stats_path = self.config.get("llm_stats_db_path")
         if llm_stats_path:
-            from tusker_gateway.model_rankings import ModelRankingsDB
-
             self._llm_stats = ModelRankingsDB(llm_stats_path)
         self._cooldowns = global_tracker()
         quality_path = self.config["quality_db_path"]

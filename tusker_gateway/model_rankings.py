@@ -74,6 +74,20 @@ DEFAULT_RANK_BOOST_CAP = 25.0
 # survives the rank cutoff (rank <= 25) receives a distinct 1..25 bonus.
 # Set to 0 to disable the rank preference entirely.
 DEFAULT_RANK_BOOST_PER_RANK = 1.0
+# How the LLM Stats ranking is enforced during pool selection:
+#   "drop"   — a model whose best rank is beyond ``llm_stats_max_rank`` is
+#              removed from every pool (blacklist semantics).
+#   "prefer" — no model is removed for its rank. The ranking only orders
+#              candidates, so traffic uses the strongest model that still
+#              has quota/health and falls through to weaker ones as the
+#              stronger ones cool down or saturate.
+DEFAULT_ENFORCEMENT = "drop"
+ENFORCEMENT_MODES = ("drop", "prefer")
+# Rank span the preference ladder covers in "prefer" enforcement. With the
+# default cap the ladder decays by ``cap / (span - 1)`` per rank so ordering
+# still separates ranks far beyond the "drop" cutoff, instead of collapsing
+# every model past it onto the same zero bonus.
+PREFER_LADDER_SPAN = 200
 # Provenance label written by the website-seed import tool. A row tagged
 # with this evidence carries a deep category rank sourced from the
 # llm-stats.com homepage leaderboards; the daily API sync only carries
@@ -735,16 +749,29 @@ def load_llm_stats_env_config(config: dict[str, Any]) -> None:
     config["llm_stats_db_path"] = os.environ.get(
         "TUSKER_LLM_STATS_DB_PATH", default_db
     )
+    mode = os.environ.get("TUSKER_LLM_STATS_ENFORCEMENT", "").strip().lower()
+    config["llm_stats_enforcement"] = (
+        mode if mode in ENFORCEMENT_MODES else DEFAULT_ENFORCEMENT
+    )
     # Rank-boost tuning for pool selection. A model whose best LLM Stats
     # rank is ``r`` receives ``max(0, cap - per_rank * (r - 1))`` added to
     # its quality score, so better-ranked models reach higher selection
     # tiers. Set per_rank to 0 to disable the preference.
-    config["llm_stats_rank_boost_cap"] = _env_number(
-        "TUSKER_LLM_STATS_RANK_BOOST_CAP", DEFAULT_RANK_BOOST_CAP, 0.0
-    )
-    config["llm_stats_rank_boost_per_rank"] = _env_number(
-        "TUSKER_LLM_STATS_RANK_BOOST_PER_RANK", DEFAULT_RANK_BOOST_PER_RANK, 0.0
-    )
+    cap = _env_number("TUSKER_LLM_STATS_RANK_BOOST_CAP", DEFAULT_RANK_BOOST_CAP, 0.0)
+    config["llm_stats_rank_boost_cap"] = cap
+    raw_per_rank = os.environ.get("TUSKER_LLM_STATS_RANK_BOOST_PER_RANK", "").strip()
+    if raw_per_rank:
+        per_rank = _env_number(
+            "TUSKER_LLM_STATS_RANK_BOOST_PER_RANK", DEFAULT_RANK_BOOST_PER_RANK, 0.0
+        )
+    elif config["llm_stats_enforcement"] == "prefer":
+        # In preference mode the ladder must span the ranked range: the
+        # drop-mode decay reaches zero at rank ~26, which would leave every
+        # weaker model with an identical (zero) bonus and no ordering.
+        per_rank = cap / float(PREFER_LADDER_SPAN - 1)
+    else:
+        per_rank = DEFAULT_RANK_BOOST_PER_RANK
+    config["llm_stats_rank_boost_per_rank"] = per_rank
     config["llm_stats_api_key"] = os.environ.get("LLMSTATS_API_KEY", "").strip()
     config["llm_stats_base_url"] = (
         os.environ.get("TUSKER_LLM_STATS_BASE_URL", "").strip().rstrip("/")

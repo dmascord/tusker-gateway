@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import time
+from pathlib import Path
 from typing import Any, AsyncIterator, Callable
 
 import aiohttp
@@ -614,7 +615,7 @@ def _stream_total_budget_overrides() -> dict[str, float]:
 
 
 def _stream_total_budget(
-    request: "web.Request | None" = None,
+    request: "aiohttp.web.Request | None" = None,
     provider: str | None = None,
 ) -> float:
     """Per-chunk idle window for SSE streams. Resets on each chunk received.
@@ -1846,35 +1847,6 @@ class PassthroughClient:
                 secrets_authoritative=secrets_authoritative,
             )
 
-    def _resolve_upstream_model(
-        provider: str,
-        model: str,
-    ) -> str:
-        """Resolve a client-facing model alias to its canonical upstream name.
-
-        If the model is not an alias for the given provider, return it unchanged.
-        Only applies to providers that do not use the Responses API adapter
-        (standard /v1/chat/completions passthrough).
-        """
-        # Only translate for providers without a Responses API adapter.
-        # Responses API models already carry their own identity.
-        endpoint = _configured_endpoint(self._config, provider)
-        if endpoint is None:
-            ep = PROVIDER_ENDPOINTS.get(provider)
-        else:
-            ep = endpoint
-        if ep and ep.get("chat_path", "").endswith("/responses"):
-            return model
-        try:
-            from tusker_gateway.config import _load_providers
-
-            registry = _load_providers()
-            pc = registry.get(provider)
-            if pc and pc.model_aliases and model in pc.model_aliases:
-                return pc.model_aliases[model]
-        except Exception:
-            pass
-        return model
 
     def _alias_for_upstream(self, provider: str, upstream_model: str) -> str | None:
         """Return the client-facing alias for a given upstream model, if one exists."""
