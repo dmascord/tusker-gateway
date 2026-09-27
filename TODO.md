@@ -3,14 +3,12 @@
 Active work items that span multiple sessions / PRs. Items live here
 until they ship and then move to a release-notes doc.
 
-## llm-stats sync fix deployed? (pending)
-Commit `89d593c` (fix(llm-stats): preserve verdicts outside the synced
-pair set) is pushed but **not deployed** — the running pod predates it.
-No operational urgency: the gateway's own refresh loop runs with the
-auto-catalog-expanded inventory, so it cannot shrink the verdict table.
-The fix protects narrow-sync entry points (the one-shot
-`sync_llm_stats` tool, config generations before auto-catalog expansion).
-Deploy at the next convenient window.
+## llm-stats sync fix deployed? (DONE 2026-09-28)
+Commit `89d593c` deployed 2026-09-28 together with `54b726a`
+(LLM Stats enforcement modes). Live `/health` reports commit `54b726a`;
+image digest verified; `TUSKER_LLM_STATS_ENFORCEMENT=prefer` active
+(per_rank=0.1256 spanning ladder, out-of-cutoff models order behind
+better-ranked ones instead of being dropped).
 
 Incident context (2026-09-27): a narrow in-pod verification sync
 replaced the whole verdict table and dropped ~112 verdicts, briefly
