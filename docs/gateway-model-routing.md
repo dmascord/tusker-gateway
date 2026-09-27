@@ -86,8 +86,92 @@ For each request to `hermes-code`/`hermes-privacy`/etc:
      streaming tool contract is required even for ordinary chat)
    - ZDR + EXCLUDED_PROVIDERS env var (privacy pool only)
 3. **Rank by quality score** (descending) from `model_quality.db`. New models
-   use an adaptive floor (median - 20.0 clamped to 20.0).
+   use an adaptive floor (median - 20.0 clamped to 20.0). Models with an LLM
+   Stats rank receive an additional score bonus (see
+   [LLM Stats rank preference](#llm-stats-rank-preference)) so better-ranked
+   models are preferred within their quality band.
 4. **Pick the top-ranked candidate** and remember it for the session.
+
+### LLM Stats rank preference
+
+The gateway periodically syncs capability rankings from
+`api.llm-stats.com` (`TUSKER_LLM_STATS_API_KEY` enables it; a daily
+background task plus the one-shot
+`python -m tusker_gateway.tools.sync_llm_stats` importer). The sync stores
+per-model verdicts in `llm_stats.db`:
+
+- **pass** — its best rank across the tracked category windows is within
+  the cutoff (`TUSKER_LLM_STATS_MAX_RANK`, default 25). Selection prefers
+  these.
+- **excluded** — present in a tracked window but best rank beyond the
+  cutoff. Dropped from every pool like a blacklist entry.
+- **unknown** — absent from every top-50 window (private, local, or
+  simply outside the rankings windows; fails open; selectable, no bonus).
+
+Evidence comes from the aggregated rankings windows only. One
+`GET /rankings?category=<cat>&limit=50` request per tracked category,
+so a sync costs five requests. Upstream caps ``limit`` at 50
+(returns 422 above it) and ignores ``offset`` / ``page`` parameters,
+so the windows cannot be paginated to look further down the leaderboard.
+The per-model detail endpoint is deliberately unused: its ranks are
+per-benchmark leaderboard positions, not cross-model category positions,
+so they are not comparable with the cutoff. Consequence: only models
+inside a tracked top-50 window can be excluded; weaker-than-window
+models stay `unknown` and selectable.
+
+#### Website seed provenance
+
+Models ranked below the top-50 windows (e.g. `gpt-oss-20b`) can be seeded
+from the llm-stats.com homepage, which publishes the same category
+leaderboards to depth ~375 as server-rendered data. The seed is an
+explicit operator action, never automatic:
+
+    # Compute without writing (safe to run anytime):
+    python -m tusker_gateway.tools.import_llm_stats_seed --dry-run
+    # Import (fetches 5 API windows for anchoring + the homepage):
+    python -m tusker_gateway.tools.import_llm_stats_seed
+    # Deterministic/offline: read a saved homepage snapshot instead of HTTP:
+    python -m tusker_gateway.tools.import_llm_stats_seed --html page.html
+
+Mechanics and guarantees:
+
+- The homepage leaderboards are parsed from named `category_id` keys and
+  accepted only when the site key matches a tracked category **and** the
+  ordered top-50 agrees with the API window (>=90% positional overlap,
+  `MATCH_MIN_OVERLAP`), or when an array matches the window exactly under
+  a different key. If the site changes shape, the affected category is
+  skipped — a wrong verdict is not producible from a mismatch.
+- Seed rows carry `evidence=site_seed` and are written only for pool
+  models **absent from every API window**; rows with API window evidence
+  are never overwritten. API evidence always wins on the next sync.
+- Seeds age out: the daily sync carries a `site_seed` row forward only
+  while it is younger than `TUSKER_LLM_STATS_SEED_MAX_AGE_SECS`
+  (default 7 days); after that the model degrades back to `unknown`
+  unless the seed is re-imported. Set the variable to `0` to disable
+  retention entirely.
+- A seeded `excluded` verdict filters exactly like a window-derived one:
+  a deep rank beyond the cutoff drops the model from its pools.
+
+Coverage source: `docs/llm-stats-coverage-2026-09-27.md`.
+
+Ranked models additionally receive a quality-score bonus at selection
+time: `max(0, cap - per_rank * (rank - 1))`, with `cap = 25.0` and
+`per_rank = 1.0` by default (`TUSKER_LLM_STATS_RANK_BOOST_CAP`,
+`TUSKER_LLM_STATS_RANK_BOOST_PER_RANK`; set per_rank to 0 to disable).
+Consequences of the bounded default:
+
+- Among equally-scored (e.g. both primed) candidates the better rank wins
+  deterministically instead of round-robin.
+- The bonus can never lift a model above a far healthier one: a rank-1
+  model with 0% learned success (`quality 2.0 + 25 = 27`) still loses to
+  a healthy unranked model (`quality ~100`). Learned failure evidence
+  always dominates.
+- Auto-catalog candidates participate too: they share the same
+  `llm_stats.db`, so discovered models with good ranks rise inside their
+  pool without operator action.
+
+Set `TUSKER_LLM_STATS_RANK_BOOST_PER_RANK=0` to restore pure
+quality-score ordering.
 
 If a pool has `fallback_pools` configured, the same request requirements are
 applied to each fallback pool after the current pool has no eligible

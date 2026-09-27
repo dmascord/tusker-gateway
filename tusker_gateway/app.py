@@ -485,6 +485,19 @@ def create_app() -> web.Application:
                 name="qualification-maintenance",
             )
             startup_log.info("qualification maintenance task started")
+        if app.get("config", {}).get("llm_stats_api_key"):
+            from tusker_gateway.model_rankings import llm_stats_refresh_loop
+
+            app["llm_stats_task"] = asyncio.create_task(
+                llm_stats_refresh_loop(
+                    app["config"],
+                    app["http_session"],
+                    stop_event,
+                ),
+                name="llm-stats-refresh",
+            )
+            startup_log.info("llm stats refresh task started")
+
         # Start config store live-reload poller when DB-backed config is enabled.
         config_runtime = app.get("config_runtime")
         if config_runtime is not None and config_runtime.enabled():
@@ -511,6 +524,7 @@ def create_app() -> web.Application:
             "catalog_task",
             "capabilities_task",
             "qualification_task",
+            "llm_stats_task",
         ):
             task = app.get(task_name)
             if task is None:

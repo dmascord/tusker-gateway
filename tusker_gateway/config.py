@@ -448,13 +448,17 @@ def load_config() -> dict[str, Any]:
         "TUSKER_MODEL_CAPABILITY_DB_PATH",
         default_capability_db,
     )
+    from tusker_gateway.model_rankings import load_llm_stats_env_config
+
+    load_llm_stats_env_config(config)
     logger.info(
-        "config loaded: %d providers, %d pools, credential_pools=%s, quality_db=%s, capability_db=%s",
+        "config loaded: %d providers, %d pools, credential_pools=%s, quality_db=%s, capability_db=%s, llm_stats_db=%s",
         len(config.get("providers", {})),
         len(config.get("pools", {})),
         {provider: len(credentials) for provider, credentials in credential_pools.items()},
         config["quality_db_path"],
         config["model_capability_db_path"],
+        config["llm_stats_db_path"],
     )
     return config
 

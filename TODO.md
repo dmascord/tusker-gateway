@@ -245,3 +245,14 @@ deployed, and live-verified.
 - **P2 candidates** (see audit doc): groq TPM-413 model exclusions,
   `workers-ai` 403 permission check, Google/OpenRouter non-chat catalog
   filtering, dead `ollama-cloud deepseek-v4-flash` variant exclusions.
+
+### Resolved (2026-09-27): LLM Stats coverage beyond the top-50 API window
+
+`/stats/v1/rankings` caps at 50 models and ignores all pagination
+parameters. The website homepage embeds the same category rankings to
+depth ~375. Resolution: option 3 — explicit website seed import — is
+implemented (`tusker_gateway/tools/import_llm_stats_seed.py`, evidence
+`site_seed`, 7-day TTL via `TUSKER_LLM_STATS_SEED_MAX_AGE_SECS`).
+Mechanics: `docs/gateway-model-routing.md` "Website seed provenance";
+investigation: `docs/llm-stats-coverage-2026-09-27.md`.
+Follow-up option remains open: ask upstream for API pagination.

@@ -11,7 +11,7 @@ state DB and `/status` payload. Configured revision: `a68522c`.
 | P0 (active routing bug: DB provider toggles cosmetic) | 1 | **Fixed** (`config_store.py`) |
 | P0 (provider dead: apim) | 1 | **Fixed** (env + DB) |
 | P1 (silent auth-failure churn in qualification probes) | 1 | **Fixed** (durable `auth_failed`) |
-| P1 (provider broken / needs operator) | 2 | Pending operator action |
+| P1 (provider broken / needs operator) | 1 | Pending (opencode-go quota, time-gated) |
 | P2 (catalog / pool hygiene) | 5 | Documented; fix candidates below |
 | P3 (cosmetic / informational) | 2 | No action |
 
@@ -154,21 +154,36 @@ so the practical change is `github-copilot`'s 44 candidates dropping out of
 the code pool (consistent with their tool-capability exclusion).
 
 
-## P1 — OpenAI Codex OAuth credential is bad (NEEDS OPERATOR)
+## P1 — OpenAI Codex OAuth credential 401 (TRANSIENT — self-healed)
 
-**Symptom:** 3 OAuth credentials in `tusker_config_oauth_credentials`
-(`openai-codex`). One of them (`553921284e349b42d6d21fa3`) returns
+**Original symptom:** one of 3 `openai-codex` credentials in
+`tusker_config_oauth_credentials` (`553921284e349b42d6d21fa3`) returned
 `401 Incorrect API key provided: sk-svcac...***fvMA` for `gpt-5.4-mini`
-and `gpt-5.4`. Other credentials appear healthy.
+and `gpt-5.4` during the 2026-09-26 audit window.
 
-**Impact:** With 3 credentials and one dead, the CodexTokenRotator should
-be skipping the bad one. Today only `credential_model_exclusions` (2 rows)
-covers the bad credential for 2 specific models. Any other model using that
-credential continues to 401. Net effect is degraded Codex reliability.
+**Re-verified 2026-09-27 — credential is healthy; no operator action
+needed.** Live evidence:
 
-**Action:** Re-enroll that credential via
-`python -m tusker_gateway.tools.enroll_codex_credential.py`, or delete it
-if it cannot be refreshed.
+- 24h of gateway logs (8451 lines): `codex auth error` = 0,
+  `oauth access token invalidated` = 0, `oauth rotator skip` = 0, while
+  `openai-codex` appears 276 times in normal serving paths.
+- `permanent_failures` contains **no** `openai-codex` rows (only `apim`,
+  from the P0 disable).
+- `model_capability` shows every `openai-codex` model
+  (`gpt-5.6-sol/terra/luna`, `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`,
+  `gpt-6-astra`) as `advertised` — none classified `auth_failed`.
+
+**Root cause of the false alarm:** a Codex access token can be revoked
+before its local JWT expiry; the rotator then sees an upstream 401,
+force-refreshes *only* the rejected slot
+(`passthrough.py:1284,2822`), and the next rotation slot picks it up. The
+audit captured one such window on one slot. A genuinely dead credential
+would instead surface as repeated 401s plus a `permanent_failures` row,
+which is absent.
+
+**Action:** none. Re-enroll only if `invalid_grant` /
+`refresh_token_reused` appears (the rotator's permanent-refresh-error
+codes) or repeated 401s persist for a single slot.
 
 ## P1 — opencode-go monthly quota exhausted (NEEDS TIME / OPERATOR)
 

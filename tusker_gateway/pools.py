@@ -262,6 +262,7 @@ class PoolManager:
     _quality: QualityDB | None = None
     _tool_capabilities: ToolCapabilityDB | None = None
     _model_capability_db: Any | None = None
+    _llm_stats: Any | None = None
     _cooldowns: CooldownTracker | None = None
     # Optional catalog registry — when set, PoolManager.extend_pools_with_catalog()
     # merges catalog-known models into the allowlist. See catalog.py.
@@ -340,6 +341,44 @@ class PoolManager:
     def _model_is_blacklisted(self, provider: str, model: str) -> bool:
         return model_is_blacklisted(self.config, provider, model)
 
+    def _llm_stats_excludes(self, model: str) -> bool:
+        if self._llm_stats is None:
+            return False
+        return self._llm_stats.excludes(model)
+
+    # LLM Stats rank boost defaults. Models with better (lower) ranks
+    # receive a quality-score bonus so they climb into higher tiers where
+    # selection prefers them. Formula:
+    #   max(0, cap - per_rank * (rank - 1))
+    # Both are overridable via ``llm_stats_rank_boost_cap`` /
+    # ``llm_stats_rank_boost_per_rank`` config keys.
+    _RANK_BOOST_CAP: float = 25.0
+    _RANK_BOOST_PER_RANK: float = 1.0
+
+    def _llm_stats_rank(self, model: str) -> int | None:
+        """Return the effective LLM Stats rank for a gateway model name."""
+        if self._llm_stats is None:
+            return None
+        return self._llm_stats.effective_rank(model)
+
+    def _rank_boost(self, rank: int) -> float:
+        """Score bonus for one rank, from the configured cap/decay."""
+        cap = self._RANK_BOOST_CAP
+        per_rank = self._RANK_BOOST_PER_RANK
+        try:
+            cap = float(self.config.get("llm_stats_rank_boost_cap", cap))
+        except (TypeError, ValueError):
+            pass
+        try:
+            per_rank = float(
+                self.config.get("llm_stats_rank_boost_per_rank", per_rank)
+            )
+        except (TypeError, ValueError):
+            pass
+        if rank <= 0 or cap <= 0.0 or per_rank <= 0.0:
+            return 0.0
+        return max(0.0, cap - per_rank * (rank - 1))
+
     def __post_init__(self):
         self.pools = dict(self.config.get("pools", {}))
         self._providers = _provider_registry(self.config)
@@ -360,6 +399,11 @@ class PoolManager:
             self.config.get("model_capability_db_path")
             or default_model_capability_db_path(self.config["quality_db_path"])
         )
+        llm_stats_path = self.config.get("llm_stats_db_path")
+        if llm_stats_path:
+            from tusker_gateway.model_rankings import ModelRankingsDB
+
+            self._llm_stats = ModelRankingsDB(llm_stats_path)
         self._cooldowns = global_tracker()
         quality_path = self.config["quality_db_path"]
         if quality_path != ":memory:":
@@ -1207,6 +1251,9 @@ class PoolManager:
                         if self._model_is_blacklisted(s.provider, s.model):
                             self._drop_stickiness(key)
                             break
+                        if self._llm_stats_excludes(s.model):
+                            self._drop_stickiness(key)
+                            break
                         if (s.provider, s.model) in catalog_unavailable:
                             self._drop_stickiness(key)
                             break
@@ -1282,6 +1329,7 @@ class PoolManager:
         filtered_structured_models: list[str] = []
         filtered_modality_models: list[str] = []
         filtered_cooldown_models: list[str] = []
+        filtered_rank_models: list[str] = []
         filter_counts = {
             "request_excluded": 0,
             "unregistered_provider": 0,
@@ -1297,12 +1345,18 @@ class PoolManager:
             "structured_output": 0,
             "cooldown": 0,
             "zdr_policy": 0,
+            "llm_stats_rank": 0,
         }
         filtered_zdr_models: list[str] = []
         filtered_context_models: list[str] = []
         for s in specs:
             if self._model_is_blacklisted(s.provider, s.model):
                 filter_counts["blacklisted_model"] += 1
+                continue
+            if self._llm_stats_excludes(s.model):
+                filter_counts["llm_stats_rank"] += 1
+                if len(filtered_rank_models) < 12:
+                    filtered_rank_models.append(f"{s.provider}/{s.model}")
                 continue
             if (s.provider, s.model) in excluded:
                 filter_counts["request_excluded"] += 1
@@ -1443,6 +1497,14 @@ class PoolManager:
                 ",".join(filtered_modality_models[:12]),
             )
 
+        if filtered_rank_models:
+            logger.info(
+                "pool '%s' llm-stats capability filter filtered=%d models=%s",
+                pool_name,
+                len(filtered_rank_models),
+                ",".join(filtered_rank_models[:12]),
+            )
+
         if requires_structured_output and candidates:
             qualified_candidates = [
                 candidate
@@ -1487,11 +1549,25 @@ class PoolManager:
             )
             return None
 
-        # 3. Rank by quality, then apply weighted selection within top tier
+        # 3. Rank by quality, then apply weighted selection within top tier.
+        # LLM Stats rank adds a score bonus (better rank = higher bonus) so
+        # ranked models climb into higher tiers; learned quality still
+        # dominates within each rank band.
         quality_list = self._quality.rank(
             [(c.provider, c.model) for c in candidates],
         )
-
+        if self._llm_stats is not None and quality_list:
+            boosted: list[tuple[str, str, float]] = []
+            for provider, model, score in quality_list:
+                rank = self._llm_stats_rank(model)
+                bonus = (
+                    self._rank_boost(rank) if rank is not None else 0.0
+                )
+                if bonus > 0.0:
+                    score = float(score) + bonus
+                boosted.append((provider, model, score))
+            boosted.sort(key=lambda entry: (-entry[2], entry[0], entry[1]))
+            quality_list = boosted
         if not quality_list:
             # Fallback: pick first candidate
             result = (candidates[0].provider, candidates[0].model)
