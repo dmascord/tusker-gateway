@@ -284,7 +284,7 @@ Mechanics: `docs/gateway-model-routing.md` "Website seed provenance";
 investigation: `docs/llm-stats-coverage-2026-09-27.md`.
 Follow-up option remains open: ask upstream for API pagination.
 
-## OpenCode warm-server path (implemented 2026-09-28, deployment pending)
+## OpenCode warm-server path (shipped 2026-09-28)
 
 `opencode-cli` requests previously paid a private `opencode serve` start per
 request (about 6s). The adapter now keeps one server alive and publishes each
@@ -310,6 +310,24 @@ configuration at start.
   session store.
 - Docs: `docs/provider-adapters.md` section "Warm server mode".
 
+### Delivered (2026-09-28)
+
+- Committed as `16220b2` on `main`; push to `origin/main` remains an operator
+  decision, as with the previous passes.
+- Deployed from the exported tree
+  `/srv/opencode/tusker-ai-gateway-build-16220b2a223fb43454ddb534116fe71c7cd2cd19`.
+  Image `registry.tusker.net.au:5000/tusker-gateway:swarm-alpine-16220b2a223fb43454ddb534116fe71c7cd2cd19`,
+  digest `sha256:b9cc71e7a9c95bac292846c41a1d1bbac37ee5f3f97b90b13a8df141fc37d6b5`.
+  `deploy.sh` verified the Ready pod's image digest, the `/health` commit, and
+  `/health` + `/ready` 200 plus the chat SSE smoke; 87s build-to-smoke.
+- Post-deploy verification ran in the new pod against the installed package:
+  `pid1: tini`, warm 4.9s first and 3.1s reused against 5.5s standalone, a tool
+  call returning `report_value {"value":"deployed-ok"}` with
+  `{"interrupted":true}` plus session delete, streaming frames with a clean
+  finish, sessions 1 to 1, and no zombies after the server was stopped.
+  The `tini` entrypoint closed the finding below: the same run that previously
+  left a zombie per server release reports `zombies after warm traffic: []`.
+
 ### New finding: unreaped children in the gateway container
 
 The container runs no init, so the gateway is PID 1 and must reap orphaned
@@ -317,12 +335,17 @@ children itself. `/proc` shows 7 zombies (`comm=opencode`, `ppid=1`) left by
 CLI-spawned servers and workers that outlived their parent. Every CLI adapter
 (`claude_code`, `kilo_cli`, `opencode_cli`) can produce them.
 
-Recommended fix: add an init to the image entrypoint (tini) rather than a
-`waitpid(-1)` loop in the gateway, because asyncio's child watcher owns its own
-children and a blanket reap would race it and break request-path waits.
+Fix applied in this pass: the image now runs `tini` as PID 1 (installed after
+the dependency layers so the torch/chromadb/model cache is not invalidated).
+An init is the right place for this rather than a `waitpid(-1)` loop in the
+gateway, because asyncio's child watcher owns its own children and a blanket
+reap would race it and break request-path waits. Verified live: PID 1 reports
+`tini` and no zombies accumulate.
 
-### Destructive actions (require confirmation)
+### Destructive actions (authorized and executed 2026-09-28)
 
 - `kubectl apply` on `k8s/deployment.yaml` (warm env plus the memory limit).
-- `./k8s/deploy.sh` rollout; the deployment uses `strategy: Recreate`, so the
-  gateway is briefly unavailable.
+- `./k8s/deploy.sh $REV` rollout; `strategy: Recreate`, so the gateway was
+  briefly unavailable during the 87s build-to-smoke run.
+- Not done, still requiring confirmation: `git push` to `origin/main`, and
+  pruning the visor build directory for this revision.
