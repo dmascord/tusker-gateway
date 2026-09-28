@@ -493,11 +493,24 @@ class ConfigRuntime:
         from tusker_gateway.providers.embed import EmbedHandler
         from tusker_gateway.providers.rerank import RerankHandler
         reg = self._app.get("capability_registry")
-        self._app["image_handler"] = ImageGenerationHandler(config, capability_registry=reg)
-        self._app["tts_handler"] = TTSHandler(config, capability_registry=reg)
-        self._app["video_handler"] = VideoHandler(config, capability_registry=reg)
-        self._app["rerank_handler"] = RerankHandler(config)
-        self._app["embed_handler"] = EmbedHandler(config)
+        image_handler = ImageGenerationHandler(config, capability_registry=reg)
+        tts_handler = TTSHandler(config, capability_registry=reg)
+        video_handler = VideoHandler(config, capability_registry=reg)
+        rerank_handler = RerankHandler(config)
+        embed_handler = EmbedHandler(config)
+        self._app["image_handler"] = image_handler
+        self._app["tts_handler"] = tts_handler
+        self._app["video_handler"] = video_handler
+        self._app["rerank_handler"] = rerank_handler
+        self._app["embed_handler"] = embed_handler
+        if not rerank_handler._configured_models():
+            logger.warning(
+                "media handler rebuild produced zero usable rerank backends"
+            )
+        if not embed_handler._configured_models():
+            logger.warning(
+                "media handler rebuild produced zero usable embedding backends"
+            )
         self._last_media_providers = fingerprint
 
 

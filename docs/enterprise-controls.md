@@ -38,11 +38,11 @@ Available scopes are:
 | `inference:images` | Image generations, edits, variations |
 | `inference:audio` | Text-to-speech |
 | `inference:video` | Video generation |
+| `inference:embeddings` | Embeddings |
 | `inference:rerank` | Reranking |
 | `models:read` | Model catalog |
 | `status:read` | Detailed runtime status |
 | `admin:read` | Read-only admin API (`/admin/*`) |
-| `*` | Every capability |
 
 Allowlist entries use shell-style patterns. Omitted lists default to `*`; an
 explicit empty list denies that dimension. Media requests use the logical
@@ -182,6 +182,23 @@ least-privilege job audits installed runtime dependencies. Dependabot checks pip
 and GitHub Actions dependencies weekly. Live provider tests remain outside CI
 because they consume credentials and quota; run them as a controlled deployment
 smoke test.
+
+## 5a. Media-route qualification
+
+Embedding and reranking backends can be verified by a bounded background probe
+without making ordinary requests depend on a cold provider check. Set
+`TUSKER_MEDIA_QUALIFICATION_ENABLED=true` to enable it. The first cycle waits
+for `TUSKER_MEDIA_QUALIFICATION_INITIAL_DELAY_SECS` (default 600 seconds), then
+tests at most `TUSKER_MEDIA_QUALIFICATION_LIMIT` routes per cycle (default 8)
+with `TUSKER_MEDIA_QUALIFICATION_TIMEOUT_SECS` (default 45 seconds), repeating
+at `TUSKER_MEDIA_QUALIFICATION_INTERVAL_SECS` (default 12 hours).
+
+Only safe evidence is persisted in the model-capability database: provider,
+model, capability, status, HTTP status, latency, failure class, and probe
+version. Prompts, documents, embeddings, and upstream response bodies are not
+stored. Transient failures remain `unavailable` and are retried on a later
+cycle; successful and unsupported results are usable for diagnostics and
+operator review.
 
 ## 6. Client-IP attribution and guardrails
 

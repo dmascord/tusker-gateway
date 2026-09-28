@@ -99,11 +99,74 @@ def fetch_chat(url, api_key, model, timeout=120):
         return {"ok": False, "reason": "chat transport failure or timeout", "content": "", "http_status": None}
 
 
+def _fetch_json(url, api_key, payload, timeout=45):
+    if not api_key:
+        return {"ok": False, "configuration_error": False, "reason": "missing API key", "http_status": None}
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": "tusker-smoke/1.0 (curl-compatible)",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read()
+            body = json.loads(raw)
+            if not isinstance(body, dict):
+                return {"ok": False, "configuration_error": False, "reason": "invalid JSON response", "http_status": response.status}
+            error = body.get("error")
+            error_code = error.get("code") if isinstance(error, dict) else None
+            if error_code in {"no_embed_providers", "no_reranker_providers"}:
+                return {"ok": False, "configuration_error": True, "reason": str(error_code), "http_status": response.status}
+            if error:
+                return {"ok": True, "configuration_error": False, "reason": "provider returned an ordinary error", "http_status": response.status}
+            return {"ok": True, "configuration_error": False, "reason": "ok", "http_status": response.status, "body": body}
+    except urllib.error.HTTPError as exc:
+        try:
+            body = json.loads(exc.read())
+        except (OSError, ValueError):
+            body = None
+        error = body.get("error") if isinstance(body, dict) else None
+        error_code = error.get("code") if isinstance(error, dict) else None
+        config_error = error_code in {"no_embed_providers", "no_reranker_providers"}
+        return {
+            "ok": not config_error,
+            "configuration_error": config_error,
+            "reason": str(error_code or f"HTTP {exc.code} from gateway"),
+            "http_status": exc.code,
+        }
+    except (OSError, urllib.error.URLError, ValueError):
+        return {"ok": False, "configuration_error": False, "reason": "media transport or JSON failure", "http_status": None}
+
+
+def fetch_media(url, api_key, timeout=45):
+    checks = {
+        "embeddings": ("/v1/embeddings", {"model": "hermes-embed", "input": "deployment smoke"}, "data"),
+        "rerank": ("/v1/rerank", {"model": "hermes-reranker", "query": "smoke", "documents": ["deployment smoke"]}, "results"),
+    }
+    results = {}
+    for name, (path, payload, result_key) in checks.items():
+        result = _fetch_json(url.rstrip("/") + path, api_key, payload, timeout)
+        if result["ok"] and "body" in result and not isinstance(result["body"].get(result_key), list):
+            result = {**result, "ok": False, "reason": f"response missing {result_key} list"}
+        results[name] = result
+    failures = [
+        f"{name}: {result['reason']}"
+        for name, result in results.items()
+        if result["configuration_error"] or not result["ok"]
+    ]
+    return {"ok": not failures, "reason": "; ".join(failures) if failures else "ok", "checks": results}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", required=True)
     parser.add_argument("--model", default="hermes-code")
     parser.add_argument("--timeout", type=float, default=120)
+    parser.add_argument("--skip-media", action="store_true")
     args = parser.parse_args()
     if args.timeout <= 0:
         parser.error("--timeout must be positive")
@@ -113,10 +176,19 @@ def main():
     signal.setitimer(signal.ITIMER_REAL, args.timeout)
     try:
         result = fetch_chat(args.url, os.environ.get("SMOKE_API_KEY", ""), args.model, args.timeout)
+        media = None if args.skip_media else fetch_media(
+            args.url.rsplit("/v1/", 1)[0], os.environ.get("SMOKE_API_KEY", ""), args.timeout
+        )
+        if not result["ok"]:
+            combined = result
+        elif media is not None and not media["ok"]:
+            combined = {"ok": False, "reason": media["reason"], "http_status": None}
+        else:
+            combined = result
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
-    print(json.dumps({k: v for k, v in result.items() if k != "content"}))
-    return 0 if result["ok"] else 1
+    print(json.dumps({k: v for k, v in combined.items() if k != "content"}))
+    return 0 if combined["ok"] else 1
 
 
 if __name__ == "__main__":

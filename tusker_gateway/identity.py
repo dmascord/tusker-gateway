@@ -22,6 +22,7 @@ from tusker_gateway.routing import resolve_route
 logger = logging.getLogger(__name__)
 
 _WILDCARD = ("*",)
+
 _ROUTE_SCOPES = {
     ("GET", "/status"): "status:read",
     ("GET", "/v1/models"): "models:read",
@@ -33,6 +34,7 @@ _ROUTE_SCOPES = {
     ("POST", "/v1/images/variations"): "inference:images",
     ("POST", "/v1/audio/speech"): "inference:audio",
     ("POST", "/v1/videos"): "inference:video",
+    ("POST", "/v1/embeddings"): "inference:embeddings",
     ("POST", "/v1/rerank"): "inference:rerank",
     ("GET", "/admin/diagnostics"): "admin:read",
     ("GET", "/admin/providers"): "admin:read",

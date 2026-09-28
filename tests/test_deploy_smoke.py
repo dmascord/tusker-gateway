@@ -173,3 +173,37 @@ def test_total_stream_limit_applies_across_frames(monkeypatch):
     assert smoke_chat.check_stream([_chunk_frame("hello")] * 10 + [_frame("[DONE]")])["ok"] is False
 
 
+
+def test_media_smoke_accepts_ordinary_provider_error(monkeypatch):
+    calls = []
+
+    def fake_fetch(url, api_key, payload, timeout):
+        calls.append((url, payload))
+        return {
+            "ok": True,
+            "configuration_error": False,
+            "reason": "provider returned an ordinary error",
+            "http_status": 503,
+        }
+
+    monkeypatch.setattr(smoke_chat, "_fetch_json", fake_fetch)
+    result = smoke_chat.fetch_media("https://gateway.test", "sk-test")
+    assert result["ok"] is True
+    assert len(calls) == 2
+
+
+def test_media_smoke_fails_on_missing_backend_configuration(monkeypatch):
+    def fake_fetch(url, api_key, payload, timeout):
+        code = "no_embed_providers" if url.endswith("/v1/embeddings") else "no_reranker_providers"
+        return {
+            "ok": False,
+            "configuration_error": True,
+            "reason": code,
+            "http_status": 503,
+        }
+
+    monkeypatch.setattr(smoke_chat, "_fetch_json", fake_fetch)
+    result = smoke_chat.fetch_media("https://gateway.test", "sk-test")
+    assert result["ok"] is False
+    assert "no_embed_providers" in result["reason"]
+    assert "no_reranker_providers" in result["reason"]

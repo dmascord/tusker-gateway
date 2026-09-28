@@ -120,7 +120,9 @@ class TestEnterpriseIdentity:
             )
 
         app.router.add_post("/v1/chat/completions", handler)
+        app.router.add_post("/v1/embeddings", handler)
         app.router.add_post("/v1/images/generations", handler)
+        app.router.add_post("/v1/rerank", handler)
         client = await _client(app)
         try:
             headers = {"Authorization": f"Bearer {api_key}"}
@@ -147,6 +149,22 @@ class TestEnterpriseIdentity:
             )
             assert scope_denied.status == 403
             assert (await scope_denied.json())["error"]["code"] == "insufficient_scope"
+
+            embedding_scope_denied = await client.post(
+                "/v1/embeddings",
+                headers=headers,
+                json={"model": "hermes-embed", "input": "safe"},
+            )
+            assert embedding_scope_denied.status == 403
+            assert (await embedding_scope_denied.json())["error"]["code"] == "insufficient_scope"
+
+            rerank_scope_denied = await client.post(
+                "/v1/rerank",
+                headers=headers,
+                json={"model": "hermes-reranker", "query": "safe", "documents": ["safe"]},
+            )
+            assert rerank_scope_denied.status == 403
+            assert (await rerank_scope_denied.json())["error"]["code"] == "insufficient_scope"
         finally:
             await client.close()
 

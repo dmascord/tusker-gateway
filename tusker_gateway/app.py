@@ -485,6 +485,21 @@ def create_app() -> web.Application:
                 name="qualification-maintenance",
             )
             startup_log.info("qualification maintenance task started")
+        media_qualification_enabled = os.environ.get(
+            "TUSKER_MEDIA_QUALIFICATION_ENABLED", "0"
+        ).strip().lower()
+        if media_qualification_enabled not in {"0", "false", "no", "off"}:
+            from tusker_gateway.media_qualification import media_qualification_loop
+
+            app["media_qualification_task"] = asyncio.create_task(
+                media_qualification_loop(
+                    stop_event,
+                    base_url="http://127.0.0.1:8642",
+                    credential_rotators=app.get("credential_rotators"),
+                ),
+                name="media-qualification",
+            )
+            startup_log.info("media qualification task started")
         if app.get("config", {}).get("llm_stats_api_key"):
             from tusker_gateway.model_rankings import llm_stats_refresh_loop
 
@@ -524,6 +539,7 @@ def create_app() -> web.Application:
             "catalog_task",
             "capabilities_task",
             "qualification_task",
+            "media_qualification_task",
             "llm_stats_task",
         ):
             task = app.get(task_name)

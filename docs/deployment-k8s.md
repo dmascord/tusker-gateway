@@ -53,6 +53,14 @@ truncated streams, missing credentials, and time/size limits fail deployment.
 The gateway key is passed through `SMOKE_API_KEY`, not printed or passed on the
 helper's command line. Do not replace this check with a truncated `curl` preview.
 
+The optional background media qualification task can verify configured
+embedding and rerank routes without adding a cold probe to request latency.
+Production enables it with a bounded eight-route batch and a twelve-hour
+cadence. The deployment smoke sends one authenticated request to each media
+route and fails only on transport/shape failures or explicit
+`no_embed_providers` / `no_reranker_providers` configuration errors; ordinary
+upstream quota or provider errors remain visible but do not block rollout.
+
 ## 4. DNS
 
 `ai.tusker.net.au` already points at the cluster LB. The gateway shares the
