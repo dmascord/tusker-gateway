@@ -327,6 +327,11 @@ configuration at start.
   finish, sessions 1 to 1, and no zombies after the server was stopped.
   The `tini` entrypoint closed the finding below: the same run that previously
   left a zombie per server release reports `zombies after warm traffic: []`.
+- Per-adapter warm decision recorded in `docs/provider-adapters.md` ("Which
+  adapters can keep a server warm"): `kilo_cli` and `opencode_cli` keep a
+  server; `claude_code` does not, because the CLI has no server mode and its
+  init measured 0.14-0.15s as a native binary, so a warm server has nothing to
+  save (OpenCode's server start is about 6s by comparison).
 
 ### New finding: unreaped children in the gateway container
 

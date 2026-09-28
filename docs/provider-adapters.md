@@ -164,6 +164,40 @@ streaming failure after the first frame propagates, because the client already
 holds partial output. `TUSKER_OPENCODE_WARM_ENABLED=0` disables the path
 entirely.
 
+### Which adapters can keep a server warm
+
+| Adapter | Warm path | Basis |
+|---|---|---|
+| `kilo_cli` | yes, in the worker pod | `kilo serve` publishes the HTTP API the broker pointer addresses |
+| `opencode_cli` | yes, child of the gateway | `opencode serve` plus the same broker pointer (above) |
+| `claude_code` | no | no request server exists to keep warm, and CLI start is not the cost |
+
+`claude_code` deliberately has no warm path. Evidence from the production
+container (2026-09-28):
+
+- Claude Code 2.x is a native binary - the image copies
+  `claude-code-linux-${arch}/claude`, not a Node entrypoint. `claude --version`
+  measured 0.01s and full CLI init (`claude --help`) 0.14-0.15s, against a
+  roughly 6s OpenCode server start and 1.3s for `kilo --help`. There is no
+  startup large enough for a warm server to remove. MCP configuration loading is
+  the largest CLI-side cost (`claude mcp list` measured 2.8s), but the adapter's
+  tool requests use request-scoped proxies that a shared process cannot carry.
+- The CLI exposes no `serve` or daemon subcommand. `claude --help` lists
+  `agents`, `attach`, `auth`, `auto-mode`, `doctor`, `gateway` (an enterprise
+  auth/telemetry gateway), `import`, `install`, `logs`, `mcp`, `plugin`,
+  `project`, `respawn`, `rm`, `setup-token`, `stop|kill`, `ultrareview`, and
+  `update`. `--bg` starts a *session* in the background addressed by a session
+  id (`claude attach`, `logs`, `stop`, `rm`) - a conversation handle, not a
+  request server with a stable endpoint.
+- Each Claude request needs its own MCP proxy and call file so the client's tool
+  call returns to that request (see "Claude Code CLI" above). A background
+  session cannot carry a per-request bridge, so reusing one would break the
+  tool-call contract that `kilo_cli` and `opencode_cli` satisfy through the
+  pointer file.
+
+If Claude Code latency ever needs work, the levers are session reuse
+(`--resume`) or provider selection, not a warm server.
+
 ## Kilo Code CLI
 
 The `kilo-cli` adapter runs `kilo run --format json --model provider/model`.
