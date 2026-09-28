@@ -404,3 +404,80 @@ is indistinguishable from a durable entitlement failure at the current
 classification boundary. The existing permanent-failure behavior and the new
 qualification path can therefore exclude a route until recovery or operator
 cleanup; provider-specific 403 classification remains a follow-up.
+
+## Revision `90ff4b0` — media-route strictness and DB-backed `embed_path` (2026-09-28)
+
+**Status:** deployed as `90ff4b0` and live-verified on 2026-09-28.
+
+### Shipped
+
+- **A — strict media model validation.** `/v1/embeddings` and `/v1/rerank`
+  reject a model that routes to no configured backend with HTTP 400
+  `unsupported_model` (naming the accepted models) instead of dispatching to
+  every backend and surfacing an upstream failure. A bare model name that
+  matches a configured backend now pins that provider instead of being
+  broadcast. This closes the offering gap recorded under `9cff1db`, where
+  `/v1/embeddings` answered a chat alias with HTTP 503.
+- **A2 — client-caused 4xx is not an availability signal.** New shared helper
+  `cooldown.is_request_level_error`: `_mark_failure` in both media handlers
+  records no breaker failure and no cooldown for a client-caused 4xx, while
+  quota-shaped bodies still take the long window. One bad request can no
+  longer quarantine a route.
+- **B — `embed_path` is config, not startup state.** `tusker_config_providers`
+  carries `embed_path` (DDL plus an `_ensure_column` upgrade for existing
+  databases), the migration tool and the admin provider API read and write it,
+  and `ConfigRuntime._rebuild_media_handlers` rebuilds the embed and rerank
+  handlers when provider names, base URLs, embed/rerank endpoints or keys
+  change instead of keeping the startup instances.
+
+12 new tests across `tests/test_embed_provider.py`, `tests/test_rerank.py` and
+`tests/test_config_store.py`; full offline suite **1482 passed, 8 skipped**.
+
+### Live verification — `90ff4b0`
+
+- `/health` reports commit `90ff4b02e24d3d8c58cb0fa23b4ade96606512cd`; the
+  Ready pod serves that image and `/ready` returns HTTP 200.
+- Invalid model on both routes → HTTP 400 `unsupported_model`: chat alias
+  `hermes-code` on `/v1/embeddings`, an unknown `provider/model` pin, and an
+  unknown bare name on `/v1/rerank`.
+- Valid calls → HTTP 200: `hermes-embed` (`nomic-embed-text`, 768 dims),
+  `voyage-3` (1024 dims), a batch of 3, `hermes-reranker` (`rerank-2`), a
+  cohere pin (`rerank-v3.5`), and `top_n=1`.
+- Cooldown/breaker state after the invalid calls: no entry for any embed or
+  rerank provider. The only active windows were pre-existing — `github-copilot`
+  and `github-copilot-enterprise` (set 26 and 8.5 days earlier) and
+  `opencode-go` (set by live traffic, not by these probes).
+
+### Incident during this deployment (self-inflicted, resolved)
+
+- After the deploy, `/v1/embeddings` returned HTTP 503 `no_embed_providers`
+  while `/v1/rerank` returned HTTP 200.
+- Cause: `90ff4b0` rebuilds the media handlers from the DB config, and all 29
+  `tusker_config_providers` rows predated the `embed_path` column, so every row
+  read `embed_path = NULL`. The rows did carry `rerank_path`, which is why only
+  embeddings broke. Before this revision the handlers were built once from the
+  static config, so the missing column was invisible.
+- Resolution: the documented sync
+  `python3 -m tusker_gateway.tools.migrate_config_to_db --update` was run in the
+  pod — 29 providers, 22 API keys and 4 pools updated (3 credential pools
+  skipped, insert-only), generation 601. The runtime polled, rebuilt the
+  handlers, and `/v1/embeddings` returned HTTP 200. No credential pool, key or
+  audit row was overwritten.
+- **Operational rule** (consistent with AGENTS "DB-backed config store"): a
+  revision that adds a provider field is not live until the migration sync has
+  run. Deploying the manifest alone leaves the new column NULL and silently
+  empties the affected route.
+- The config store resolves to the shared **postgres** state DB
+  (`is_postgres: True`); `/home/tusker/.hermes/config.db` is a 0-byte vestigial
+  path and is not used by the store.
+
+### Follow-ups recorded (not implemented)
+
+- `k8s/deploy.sh` smoke-tests chat only. A media-route smoke that distinguishes
+  "no providers configured" (HTTP 503) from an upstream outage would have caught
+  this incident at rollout time.
+- A warning log when a media handler is rebuilt with zero backends would surface
+  the same misconfiguration in logs.
+
+Not in this pass: Gap C (`/v1/embeddings` requires no API scope) and Gap D (no
+capability qualification for media routes).
