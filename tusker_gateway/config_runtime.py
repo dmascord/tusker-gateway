@@ -463,10 +463,11 @@ class ConfigRuntime:
         else:
             self._app.pop("codex_rotator", None)
     def _rebuild_media_handlers(self, config: dict[str, Any]) -> None:
-        """Rebuild media handlers when their relevant config changed.
+        """Rebuild media handlers (image, TTS, video, embed, rerank) on change.
 
-        Compares a fingerprint of provider names, base URLs and API keys —
-        not just the provider name set — so URL/key edits rebuild too.
+        Compares a fingerprint of provider names, base URLs, embed/rerank
+        endpoints and API keys — not just the provider name set — so URL,
+        endpoint and key edits rebuild too.
         """
         providers = config.get("providers", {}) or {}
         keys = config.get("provider_api_keys", {}) or {}
@@ -475,6 +476,12 @@ class ConfigRuntime:
                 str(name).lower(),
                 str(p.get("base_url", "")) if isinstance(p, dict) else str(getattr(p, "base_url", "")),
                 str(keys.get(name, "")),
+                str(p.get("embed_path", "") or "")
+                if isinstance(p, dict)
+                else str(getattr(p, "embed_path", "") or ""),
+                str(p.get("rerank_path", "") or "")
+                if isinstance(p, dict)
+                else str(getattr(p, "rerank_path", "") or ""),
             )
             for name, p in providers.items()
         )
@@ -483,10 +490,14 @@ class ConfigRuntime:
         from tusker_gateway.providers.image_generation import ImageGenerationHandler
         from tusker_gateway.providers.tts import TTSHandler
         from tusker_gateway.providers.video import VideoHandler
+        from tusker_gateway.providers.embed import EmbedHandler
+        from tusker_gateway.providers.rerank import RerankHandler
         reg = self._app.get("capability_registry")
         self._app["image_handler"] = ImageGenerationHandler(config, capability_registry=reg)
         self._app["tts_handler"] = TTSHandler(config, capability_registry=reg)
         self._app["video_handler"] = VideoHandler(config, capability_registry=reg)
+        self._app["rerank_handler"] = RerankHandler(config)
+        self._app["embed_handler"] = EmbedHandler(config)
         self._last_media_providers = fingerprint
 
 

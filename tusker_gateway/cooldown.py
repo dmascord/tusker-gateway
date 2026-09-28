@@ -436,6 +436,33 @@ def _cooldown_seconds_for_429(exc: dict[str, Any]) -> float:
     return 60.0
 
 
+
+# Upstream rejections that describe the request rather than provider health:
+# unknown or unavailable model, oversized input, malformed body, unsupported
+# parameter. Media handlers apply this before recording a failure, because one
+# bad model name previously cooled every embedding and rerank backend and the
+# provider-wide window then made the whole surface answer 503 for an hour.
+# The chat path keeps the existing permanent-error policy; it validates models
+# against the catalog before dispatch.
+REQUEST_LEVEL_STATUSES = frozenset({400, 404, 405, 409, 413, 414, 415, 422})
+
+
+def is_request_level_error(exc: Any) -> bool:
+    """Return True when an upstream error describes the request, not health.
+
+    Quota-shaped bodies are excluded: they describe the account rather than
+    the request, and :func:`_cooldown_seconds_for_provider_error` assigns them
+    the long window they deserve.
+    """
+    status = getattr(exc, "upstream_status", None)
+    if isinstance(status, bool) or not isinstance(status, int):
+        return False
+    if status not in REQUEST_LEVEL_STATUSES:
+        return False
+    body = str(getattr(exc, "upstream_body", "") or "").lower()
+    return not any(hint in body for hint in _QUOTA_HINTS)
+
+
 def _cooldown_seconds_for_provider_error(exc: Any) -> float | None:
     """Derive a circuit-breaker cooldown for a non-429 provider error.
 

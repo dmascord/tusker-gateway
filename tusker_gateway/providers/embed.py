@@ -20,6 +20,7 @@ from tusker_gateway.cooldown import (
     _cooldown_seconds_for_429,
     _cooldown_seconds_for_provider_error,
     global_tracker,
+    is_request_level_error,
 )
 from tusker_gateway.errors import (
     BadRequestError,
@@ -209,6 +210,15 @@ class EmbedHandler:
             if self._backend_config(name) is not None
         }
 
+    def _configured_models(self) -> list[tuple[str, str]]:
+        """Return ``(provider, model)`` for every usable embedding backend."""
+        models: list[tuple[str, str]] = []
+        for provider in self._provider_order():
+            backend = self._backend_for(provider)
+            if backend is not None and backend.model:
+                models.append((provider, backend.model))
+        return models
+
     def _resolve_model(self, model: Any) -> tuple[str | None, str | None]:
         """Return ``(provider_pin, model_override)`` for a client model."""
         if model is None or not isinstance(model, str):
@@ -264,7 +274,20 @@ class EmbedHandler:
             if "ollama-cloud" in known:
                 return "ollama-cloud", value
 
-        return None, value
+        # A bare name that matches a configured backend model pins that
+        # provider. Anything else is unroutable: broadcasting an unknown name
+        # to every backend made one bad model string an outage, because each
+        # backend rejected the request and their cooldowns stacked up.
+        configured = self._configured_models()
+        for provider, model_name in configured:
+            if model_name.lower() == lower:
+                return provider, value
+        available = ", ".join(dict.fromkeys(model for _, model in configured))
+        raise BadRequestError(
+            f"Unknown embedding model '{value}'. Use 'hermes-embed', a "
+            f"'<provider>/<model>' pin, or a configured model ({available})",
+            code="unsupported_model",
+        )
 
     def backends_for_model(
         self, model: Any
@@ -551,6 +574,12 @@ class EmbedHandler:
         error: GatewayError,
         breaker: Any | None,
     ) -> None:
+        if is_request_level_error(error):
+            # The request was unacceptable, not the provider: record no
+            # failure and set no cooldown, so one bad model name or oversized
+            # input cannot quarantine the route for every other caller.
+            return
+
         if breaker is not None:
             breaker.record_failure(backend.provider, backend.model)
 
@@ -640,10 +669,11 @@ class EmbedHandler:
                 last_error = exc
                 self._mark_failure(backend, exc, breaker)
                 logger.warning(
-                    "embed backend failed provider=%s model=%s error=%s",
+                    "embed backend failed provider=%s model=%s error=%s status=%s",
                     backend.provider,
                     backend.model,
                     exc.code or type(exc).__name__,
+                    getattr(exc, "upstream_status", None) or "-",
                 )
                 continue
 

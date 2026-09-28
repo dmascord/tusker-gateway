@@ -1,6 +1,8 @@
 """Safety invariants for the DB-backed configuration store."""
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 
 from tusker_gateway.config_store import ConfigConflictError, ConfigStore
@@ -149,3 +151,46 @@ def test_persist_credentials_returns_false_on_cas_conflict(tmp_path):
     stale = _cred("stale-refresh")
     assert store.persist_credentials("openai-codex", stale, _cred("nope")) is False
     assert store.load_oauth_credentials("openai-codex") == [live]
+
+
+def test_provider_embed_path_round_trips_through_store(tmp_path):
+    """embed_path is a first-class provider field, not just rerank_path."""
+    store = ConfigStore(database=tmp_path / "config.db")
+    store.upsert_provider({
+        "name": "voyage",
+        "base_url": "https://api.voyageai.com",
+        "embed_path": "/v1/embeddings",
+        "rerank_path": "/v1/rerank",
+    })
+
+    assert store.snapshot()["providers"]["voyage"]["embed_path"] == "/v1/embeddings"
+
+    provider = store.runtime_config({})["providers"]["voyage"]
+    assert provider.embed_path == "/v1/embeddings"
+    assert provider.rerank_path == "/v1/rerank"
+
+
+def test_embed_path_column_is_added_to_a_legacy_database(tmp_path):
+    """An existing deployment's provider table gains the column on startup."""
+    db_path = tmp_path / "legacy.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "CREATE TABLE tusker_config_providers ("
+            "name TEXT PRIMARY KEY, base_url TEXT NOT NULL, "
+            "chat_path TEXT NOT NULL DEFAULT '/v1/chat/completions', "
+            "auth_env TEXT, pool_env TEXT, model_header TEXT, api_key_header TEXT, "
+            "models_path TEXT, rerank_path TEXT, model_aliases TEXT, "
+            "zdr_ok INTEGER NOT NULL DEFAULT 0, "
+            "heavyweight INTEGER NOT NULL DEFAULT 0, "
+            "created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+            "updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+        )
+
+    store = ConfigStore(database=db_path)
+    store.upsert_provider({
+        "name": "voyage",
+        "base_url": "https://api.voyageai.com",
+        "embed_path": "/v1/embeddings",
+    })
+
+    assert store.snapshot()["providers"]["voyage"]["embed_path"] == "/v1/embeddings"

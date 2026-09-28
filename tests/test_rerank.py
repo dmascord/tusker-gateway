@@ -7,7 +7,9 @@ from typing import Any
 import pytest
 
 from tusker_gateway.config import DEFAULT_PROVIDER_REGISTRY
-from tusker_gateway.providers.rerank import RerankHandler
+from tusker_gateway.cooldown import global_tracker
+from tusker_gateway.errors import BadRequestError, ProviderError
+from tusker_gateway.providers.rerank import RerankBackend, RerankHandler
 
 
 class _FakeResponse:
@@ -239,3 +241,110 @@ async def test_models_advertise_reranker(client):
     assert response.status == 200
     ids = {item["id"] for item in (await response.json())["data"]}
     assert "hermes-reranker" in ids
+
+
+class _RecordingBreaker:
+    """Breaker double that records what the handler reports to it."""
+
+    def __init__(self) -> None:
+        self.failures: list[tuple[str, str]] = []
+        self.successes: list[tuple[str, str]] = []
+
+    def record_failure(self, provider: str, model: str) -> None:
+        self.failures.append((provider, model))
+
+    def record_success(self, provider: str, model: str) -> None:
+        self.successes.append((provider, model))
+
+    def check(self, provider: str, model: str) -> Any:
+        class _Decision:
+            allowed = True
+
+        return _Decision()
+
+
+def _cohere_backend() -> RerankBackend:
+    return RerankBackend(
+        provider="cohere",
+        url="https://api.cohere.com/v2/rerank",
+        model="rerank-v3.5",
+        api_key="cohere-test-key",
+        style="cohere",
+    )
+
+
+@pytest.mark.asyncio
+async def test_unknown_rerank_model_is_rejected_without_contacting_backends(
+    tmp_path, monkeypatch
+):
+    """An unknown model must 400 instead of being broadcast to every backend."""
+    monkeypatch.setenv("TUSKER_RERANKER_PROVIDERS", "cohere")
+    handler = RerankHandler(_config(tmp_path, ("cohere",)))
+    session = _FakeSession([])
+
+    with pytest.raises(BadRequestError) as excinfo:
+        await handler.rerank(
+            {"model": "x", "query": "query", "documents": ["document"]},
+            session=session,
+        )
+
+    assert excinfo.value.code == "unsupported_model"
+    assert "hermes-reranker" in excinfo.value.message
+    assert session.calls == []
+
+
+def test_bare_configured_rerank_model_pins_to_its_provider(tmp_path, monkeypatch):
+    monkeypatch.setenv("TUSKER_RERANKER_PROVIDERS", "cohere")
+    monkeypatch.setenv("TUSKER_RERANKER_COHERE_MODEL", "cohere-v4-rerank")
+    handler = RerankHandler(_config(tmp_path, ("cohere",)))
+
+    backends, override = handler.backends_for_model("cohere-v4-rerank")
+
+    assert override == "cohere-v4-rerank"
+    assert [(backend.provider, backend.model) for backend in backends] == [
+        ("cohere", "cohere-v4-rerank")
+    ]
+
+
+def test_request_level_rejection_does_not_cool_or_trip_breaker(tmp_path):
+    """One unacceptable request must not quarantine the route for everyone."""
+    handler = RerankHandler(_config(tmp_path, ("cohere",)))
+    breaker = _RecordingBreaker()
+    tracker = global_tracker()
+    error = ProviderError(
+        "Reranker provider rejected the request", code="provider_error"
+    )
+    error.upstream_status = 400
+    error.upstream_body = '{"message": "documents too large"}'
+    # White-box: the provider-wide sentinel is not reachable through clear().
+    tracker._provider_default.pop("cohere", None)
+
+    try:
+        handler._mark_failure(_cohere_backend(), error, breaker)
+
+        assert breaker.failures == []
+        assert tracker.is_cooldown("cohere", "rerank-v3.5") is False
+    finally:
+        tracker.clear("cohere", "rerank-v3.5")
+        tracker.clear_failures("cohere")
+        tracker._provider_default.pop("cohere", None)
+
+
+def test_provider_health_failure_still_cools_and_records(tmp_path):
+    handler = RerankHandler(_config(tmp_path, ("cohere",)))
+    breaker = _RecordingBreaker()
+    tracker = global_tracker()
+    error = ProviderError(
+        "Reranker provider authentication failed", code="auth_error"
+    )
+    error.upstream_status = 401
+
+    try:
+        handler._mark_failure(_cohere_backend(), error, breaker)
+
+        assert breaker.failures == [("cohere", "rerank-v3.5")]
+        assert tracker.is_cooldown("cohere", "rerank-v3.5") is True
+    finally:
+        tracker.clear("cohere", "rerank-v3.5")
+        tracker.clear_failures("cohere")
+        tracker._provider_default.pop("cohere", None)

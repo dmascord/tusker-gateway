@@ -144,6 +144,13 @@ class ConfigStore:
                 definition="TEXT",
                 is_pg=is_pg,
             )
+            self._ensure_column(
+                conn,
+                table="tusker_config_providers",
+                column="embed_path",
+                definition="TEXT",
+                is_pg=is_pg,
+            )
 
             if is_pg:
                 conn.execute(
@@ -312,12 +319,12 @@ class ConfigStore:
             # ── providers ──────────────────────────────────────────────────
             providers: dict[str, ProviderConfig] = {}
             cursor = conn.execute("SELECT name, base_url, chat_path, auth_env, pool_env, "
-                                 "model_header, models_path, rerank_path, model_aliases, "
-                                 "api_key_header, zdr_ok, heavyweight "
+                                 "model_header, models_path, rerank_path, embed_path, "
+                                 "model_aliases, api_key_header, zdr_ok, heavyweight "
                                  "FROM tusker_config_providers")
             for (name, base_url, chat_path, auth_env, pool_env, model_header,
-                 models_path, rerank_path, model_aliases_raw, api_key_header,
-                 zdr_ok, heavyweight) in cursor:
+                 models_path, rerank_path, embed_path, model_aliases_raw,
+                 api_key_header, zdr_ok, heavyweight) in cursor:
                 aliases: dict[str, str] = {}
                 if model_aliases_raw:
                     try:
@@ -352,6 +359,7 @@ class ConfigStore:
                     api_key_header=str(api_key_header) if api_key_header else None,
                     models_path=expand_env_placeholders(str(models_path) if models_path else None),
                     rerank_path=expand_env_placeholders(str(rerank_path) if rerank_path else None),
+                    embed_path=expand_env_placeholders(str(embed_path) if embed_path else None),
                     model_aliases=aliases,
                     zdr_ok=bool(zdr_ok),
                     heavyweight=bool(heavyweight),
@@ -558,8 +566,8 @@ class ConfigStore:
             # providers
             cursor = conn.execute(
                 "SELECT name, base_url, chat_path, auth_env, pool_env, model_header, "
-                "api_key_header, models_path, rerank_path, model_aliases, zdr_ok, "
-                "heavyweight, created_at, updated_at FROM tusker_config_providers"
+                "api_key_header, models_path, rerank_path, embed_path, model_aliases, "
+                "zdr_ok, heavyweight, created_at, updated_at FROM tusker_config_providers"
             )
             for row in cursor:
                 name = str(row[0]).lower()
@@ -573,11 +581,12 @@ class ConfigStore:
                     "api_key_header": str(row[6]) if row[6] else None,
                     "models_path": expand_env_placeholders(str(row[7]) if row[7] else None),
                     "rerank_path": expand_env_placeholders(str(row[8]) if row[8] else None),
-                    "model_aliases": _try_json(row[9]),
-                    "zdr_ok": bool(row[10]),
-                    "heavyweight": bool(row[11]),
-                    "created_at": str(row[12]) if row[12] else None,
-                    "updated_at": str(row[13]) if row[13] else None,
+                    "embed_path": expand_env_placeholders(str(row[9]) if row[9] else None),
+                    "model_aliases": _try_json(row[10]),
+                    "zdr_ok": bool(row[11]),
+                    "heavyweight": bool(row[12]),
+                    "created_at": str(row[13]) if row[13] else None,
+                    "updated_at": str(row[14]) if row[14] else None,
                 }
 
             # provider_settings
@@ -735,9 +744,9 @@ class ConfigStore:
                 conn.execute(
                     "INSERT INTO tusker_config_providers "
                     "(name, base_url, chat_path, auth_env, pool_env, model_header, "
-                    "api_key_header, models_path, rerank_path, model_aliases, "
-                    "zdr_ok, heavyweight) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "api_key_header, models_path, rerank_path, embed_path, "
+                    "model_aliases, zdr_ok, heavyweight) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT (name) DO UPDATE SET "
                     "base_url=excluded.base_url, chat_path=excluded.chat_path, "
                     "auth_env=excluded.auth_env, pool_env=excluded.pool_env, "
@@ -745,6 +754,7 @@ class ConfigStore:
                     "api_key_header=excluded.api_key_header, "
                     "models_path=excluded.models_path, "
                     "rerank_path=excluded.rerank_path, "
+                    "embed_path=excluded.embed_path, "
                     "model_aliases=excluded.model_aliases, "
                     "zdr_ok=excluded.zdr_ok, heavyweight=excluded.heavyweight, "
                     "updated_at=CURRENT_TIMESTAMP",
@@ -758,6 +768,7 @@ class ConfigStore:
                         _null(body.get("api_key_header")),
                         _null(body.get("models_path")),
                         _null(body.get("rerank_path")),
+                        _null(body.get("embed_path")),
                         model_aliases_raw,
                         int(bool(body.get("zdr_ok"))),
                         int(bool(body.get("heavyweight"))),
@@ -1418,7 +1429,7 @@ _TABLE_SCHEMAS: dict[str, tuple[str, str]] = {
         "chat_path TEXT NOT NULL DEFAULT '/v1/chat/completions', "
         "auth_env TEXT, pool_env TEXT, model_header TEXT, "
         "api_key_header TEXT, "
-        "models_path TEXT, rerank_path TEXT, model_aliases TEXT, "
+        "models_path TEXT, rerank_path TEXT, embed_path TEXT, model_aliases TEXT, "
         "zdr_ok INTEGER NOT NULL DEFAULT 0, heavyweight INTEGER NOT NULL DEFAULT 0, "
         "created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP, "
         "updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP",

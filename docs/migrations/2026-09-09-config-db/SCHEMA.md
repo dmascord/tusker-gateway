@@ -49,8 +49,10 @@ CREATE TABLE IF NOT EXISTS tusker_config_providers (
     auth_env            TEXT,
     pool_env            TEXT,
     model_header        TEXT,
+    api_key_header      TEXT,
     models_path         TEXT,
     rerank_path         TEXT,
+    embed_path          TEXT,
     model_aliases       TEXT,   -- JSON object
     zdr_ok              INTEGER NOT NULL DEFAULT 0,
     heavyweight         INTEGER NOT NULL DEFAULT 0,

@@ -61,6 +61,7 @@ closes it during application shutdown.
 - `base_url`
 - `chat_path`
 - optional native `rerank_path` for dedicated reranking providers
+- optional native `embed_path` for dedicated embedding providers
 - `auth_type`: `bearer` or `oauth`
 - optional provider model header
 

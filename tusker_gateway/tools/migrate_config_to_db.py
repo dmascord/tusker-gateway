@@ -71,6 +71,7 @@ def _section_counts(
                     "api_key_header": provider.api_key_header,
                     "models_path": provider.models_path,
                     "rerank_path": provider.rerank_path,
+                    "embed_path": provider.embed_path,
                     "model_aliases": dict(provider.model_aliases) if provider.model_aliases else None,
                     "zdr_ok": provider.zdr_ok,
                     "heavyweight": provider.heavyweight,

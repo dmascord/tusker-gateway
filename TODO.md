@@ -437,3 +437,34 @@ cleaned by deleting exactly those 6 model rows and the 5 provider-wide rows
 `kubectl rollout restart deployment/tusker-gateway` reloaded a clean tracker;
 `/status` cooldowns for those providers then read empty and every case above
 returned 200.
+
+### Fix applied (2026-09-28)
+
+- **Defect A.** `_resolve_model` in `providers/embed.py` and
+  `providers/rerank.py` now rejects a model that matches no configured backend
+  with 400 `unsupported_model` (naming the accepted models), and a bare name
+  that matches a configured backend model pins that provider instead of being
+  broadcast to every backend. New shared helper `cooldown.is_request_level_error`
+  makes `_mark_failure` in both handlers record no breaker failure and no
+  cooldown for a client-caused 4xx (quota-shaped bodies keep the long window),
+  so one bad request can no longer quarantine the route. The reject is logged
+  with its upstream status.
+- **Defect B.** `tusker_config_providers` now carries `embed_path` (table DDL
+  plus an `_ensure_column` upgrade for existing databases), the migration tool
+  and the admin provider API read and write it, and
+  `ConfigRuntime._rebuild_media_handlers` rebuilds the embed and rerank
+  handlers when provider names, base URLs, embed/rerank endpoints or keys
+  change instead of leaving the startup instances in place.
+
+Verification: 12 new tests across `tests/test_embed_provider.py`,
+`tests/test_rerank.py` and `tests/test_config_store.py` (unknown model rejected
+without upstream contact, configured bare name pins, client-4xx records nothing,
+auth failure still cools, quota body still cools, `embed_path` round-trip,
+legacy-database column upgrade). Full suite:
+`pytest tests/ -p no:cacheprovider --ignore=tests/test_passthrough_providers.py`
+→ 1482 passed, 8 skipped. Throwaway proof of the rebuild path: an unchanged
+provider fingerprint preserves the handler instances, an endpoint edit rebuilds
+both, and the rebuilt embed handler reads the new provider config.
+
+Not in this pass: Gap C (`/v1/embeddings` requires no scope) and Gap D (no
+capability qualification for media routes).
