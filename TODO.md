@@ -1,9 +1,22 @@
 # Project TODOs
 
+## Strength probe (shipped 2026-09-28, commit c53baef)
+`tusker_gateway.tools.probe_strength` measures llm-stats-unknown pool
+models with a coding/tool-calling question bank and calibrates them
+onto the rank ladder via reference models (conflict-checked). First
+live result: big-pickle and syn:small:text ~rank 96 (glm-4.7-class),
+above gpt-oss-20b (191). Follow-ups:
+- synthetic 429s truncate syn:small:text runs (7 failed questions);
+  re-run to refresh its estimate (was 61.5 clean, placed at 96 floor).
+- Reference pick is manual (--refs); a consistency-preserving auto
+  search over ranked pool models would remove that.
+- Bank generation: re-probe every reference after any question change.
+
 Active work items that span multiple sessions / PRs. Items live here
 until they ship and then move to a release-notes doc.
 
 ## llm-stats sync fix deployed? (DONE 2026-09-28)
+
 Commit `89d593c` deployed 2026-09-28 together with `54b726a`
 (LLM Stats enforcement modes). Live `/health` reports commit `54b726a`;
 image digest verified; `TUSKER_LLM_STATS_ENFORCEMENT=prefer` active
