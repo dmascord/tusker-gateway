@@ -66,7 +66,7 @@ def test_verdict_db_round_trip_and_fail_open(tmp_path):
     db.replace_all(
         [
             _verdict("gpt-oss-20b", "excluded", category_rank=41, category_name="general"),
-            _verdict("minimax-m3", "pass", category_rank=46, category_name="code"),
+            _verdict("minimax-m3", "pass", category_rank=46, evidence="category_window"),
             _verdict("syn-large-text", "unknown", evidence="not_in_llm_stats"),
         ],
         time.time(),
@@ -955,3 +955,197 @@ async def test_seed_tool_dry_run_does_not_write(tmp_path, monkeypatch):
     rc = await tool._run(_Args())
     assert rc == 0
     assert db_path.exists() is False or ModelRankingsDB(str(db_path)).rows() == {}
+
+
+# ---------------------------------------------------------------------------
+# Strength probe (apply_probe / expire_probe / grading / calibration)
+# ---------------------------------------------------------------------------
+
+
+def test_apply_probe_skips_window_and_seed_but_overwrites_probe(tmp_path):
+    db = ModelRankingsDB(str(tmp_path / "llm_stats.db"))
+    db.replace_all(
+        [
+            _verdict("minimax-m3", "pass", category_rank=46, evidence="category_window"),
+            _verdict("big-pickle", "pass", category_rank=60, category_name="probe"),
+        ],
+        time.time(),
+    )
+    outcome = db.apply_probe(
+        [
+            {
+                "slug": "minimax-m3",
+                "status": "pass",
+                "category_rank": 3,
+                "category_name": "probe",
+            },
+            {
+                "slug": "big-pickle",
+                "status": "pass",
+                "category_rank": 12,
+                "category_name": "probe",
+            },
+            {
+                "slug": "syn-small-text",
+                "status": "pass",
+                "category_rank": 80,
+                "category_name": "probe",
+            },
+        ],
+        time.time(),
+    )
+
+    assert outcome == {"written": 2, "skipped_evidence": 1}
+    rows = db.rows()
+    assert rows["minimax-m3"]["category_rank"] == 46  # window evidence wins
+    assert rows["big-pickle"]["category_rank"] == 12  # refreshed
+    assert rows["syn-small-text"]["evidence"] == "probe"
+
+
+def test_apply_probe_preserves_site_seed(tmp_path):
+    db = ModelRankingsDB(str(tmp_path / "llm_stats.db"))
+    db.replace_all(
+        [_verdict("gpt-oss-20b", "excluded", category_rank=191, evidence="site_seed")],
+        time.time(),
+    )
+    outcome = db.apply_probe(
+        [
+            {
+                "slug": "gpt-oss-20b",
+                "status": "pass",
+                "category_rank": 5,
+                "category_name": "probe",
+            }
+        ],
+        time.time(),
+    )
+
+    assert outcome["written"] == 0
+    assert db.rows()["gpt-oss-20b"]["evidence"] == "site_seed"
+
+
+def test_expire_probe_removes_only_stale_probe_rows(tmp_path):
+    now = time.time()
+    db = ModelRankingsDB(str(tmp_path / "llm_stats.db"))
+    db.replace_all(
+        [
+            _verdict("old-probe", "pass", category_rank=40, evidence="probe", synced_at=now - 20 * 86_400),
+            _verdict("fresh-probe", "pass", category_rank=41, evidence="probe", synced_at=now - 60.0),
+            _verdict("old-window", "pass", category_rank=42, evidence="category_window", synced_at=now - 90 * 86_400),
+        ],
+        now,
+    )
+
+    removed = db.expire_probe(14 * 86_400.0, now)
+
+    assert removed == 1
+    rows = db.rows()
+    assert "old-probe" not in rows
+    assert "fresh-probe" in rows
+    assert "old-window" in rows
+
+
+def _chat_payload(content: str) -> dict[str, Any]:
+    return {"choices": [{"message": {"role": "assistant", "content": content}}]}
+
+
+def _tools_payload(name: str | None, arguments: Any) -> dict[str, Any]:
+    calls = (
+        []
+        if name is None
+        else [{"function": {"name": name, "arguments": arguments}}]
+    )
+    return {"choices": [{"message": {"role": "assistant", "tool_calls": calls}}]}
+
+
+def test_probe_grades_coding_and_reasoning_items():
+    from tusker_gateway.tools.probe_strength import QUESTIONS, grade
+
+    by_note = {q["grade_note"]: q for q in QUESTIONS if q["mode"] == "chat"}
+    slice_q = by_note["slice excludes index 3"]
+    rec_q = by_note["120 - 24 = 96"]
+    assert grade(_chat_payload("yak ANSWER: [2, 3]"), slice_q)
+    assert not grade(_chat_payload("ANSWER: [1, 2, 3, 4]"), slice_q)
+    assert grade(_chat_payload("ANSWER: 96"), rec_q)
+    assert not grade(_chat_payload("ANSWER: 120"), rec_q)
+
+
+def test_probe_grades_tool_calls_by_name_and_arguments():
+    from tusker_gateway.tools.probe_strength import QUESTIONS, grade
+
+    tool_qs = {q["expect_name"]: q for q in QUESTIONS if q["mode"] == "tools"}
+    read_q = tool_qs["read_file"]
+    ticket_q = tool_qs["create_ticket"]
+    inhibit_q = tool_qs[None]
+
+    assert grade(
+        _tools_payload("read_file", '{"path": "/etc/hostname"}'), read_q
+    )
+    assert not grade(
+        _tools_payload("read_file", '{"path": "/etc/passwd"}'), read_q
+    )
+    assert not grade(_tools_payload("write_file", '{"path": "/etc/hostname"}'), read_q)
+    # Two calls for a single-call instruction is a compliance failure.
+    twice = {"choices": [{"message": {"tool_calls": [
+        {"function": {"name": "read_file", "arguments": '{"path": "/etc/hostname"}'}},
+        {"function": {"name": "read_file", "arguments": '{"path": "/etc/hostname"}'}},
+    ]}}]}
+    assert not grade(twice, read_q)
+    # Broken JSON arguments fail instead of crashing the grader.
+    assert not grade(_tools_payload("create_ticket", "{not json"), ticket_q)
+    # Multi-arg fidelity: array + enum must match exactly.
+    assert grade(
+        _tools_payload(
+            "create_ticket",
+            '{"title": "DB latency", "priority": "high", '
+            '"assignee": "ada", "labels": ["ops", "urgent"]}',
+        ),
+        ticket_q,
+    )
+    assert not grade(
+        _tools_payload(
+            "create_ticket",
+            '{"title": "DB latency", "priority": "high", '
+            '"assignee": "ada", "labels": ["urgent", "ops"]}',
+        ),
+        ticket_q,
+    )
+    # Inhibition item: any tool call is a failure, none is correct.
+    assert grade(_tools_payload(None, "{}"), inhibit_q)
+    assert not grade(
+        _tools_payload("get_weather", '{"city": "Paris"}'), inhibit_q
+    )
+
+
+def test_probe_interpolation_matches_reference_ranks():
+    from tusker_gateway.tools.probe_strength import _interpolate_rank
+
+    curve = [(100.0, 3), (70.0, 15), (20.0, 191)]
+    # Reference scores resolve to their own ranks (via the piecewise map).
+    assert _interpolate_rank(100.0, curve) == 3
+    assert _interpolate_rank(70.0, curve) == 15
+    assert _interpolate_rank(20.0, curve) == 191
+    # Between references: monotone, rank-decreasing with score.
+    mid = _interpolate_rank(85.0, curve)
+    assert 3 < mid < 15
+    assert _interpolate_rank(90.0, curve) < mid < _interpolate_rank(75.0, curve)
+    # Beyond the curve: extrapolate one step, clamped to the ladder.
+    assert _interpolate_rank(105.0, curve) == 2
+    assert _interpolate_rank(0.0, curve) == 192
+    assert _interpolate_rank(50.0, []) is None
+
+
+def test_probe_curve_conflict_detects_inverted_references():
+    from tusker_gateway.tools.probe_strength import _calibrate, _curve_conflict
+
+    # A rank-191 model outscoring a rank-15 model invalidates the curve.
+    curve = _calibrate(
+        [{"score": 100.0, "rank": 191}, {"score": 92.3, "rank": 15}]
+    )
+    assert _curve_conflict(curve)
+
+    # Consistent references keep the curve usable.
+    good = _calibrate(
+        [{"score": 100.0, "rank": 3}, {"score": 70.0, "rank": 15}]
+    )
+    assert not _curve_conflict(good)

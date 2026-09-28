@@ -161,6 +161,34 @@ Mechanics and guarantees:
 
 Coverage source: `docs/llm-stats-coverage-2026-09-27.md`.
 
+#### Strength probe for unknown models
+
+Models absent from every llm-stats window (aggregator aliases like
+`opencode-cli/big-pickle`, private models like `synthetic/syn:*`) are
+`unknown` and select without a rank bonus — below every ranked model,
+even weak ones. The strength probe measures them on the same yardstick:
+
+    # Report without writing (safe to run anytime):
+    python -m tusker_gateway.tools.probe_strength --dry-run
+    # Probe every unknown pool model and write probe verdicts:
+    python -m tusker_gateway.tools.probe_strength
+    # Explicit targets/references:
+    python -m tusker_gateway.tools.probe_strength \
+        --models opencode-cli/big-pickle \
+        --refs zai/glm-5.3-flash,groq/openai/gpt-oss-20b
+
+It sends a deterministic, mechanically graded question bank (multi-step
+arithmetic, multiple choice, code-output prediction, strict JSON
+instructions; temperature 0) through the gateway's own
+`provider/model` passthrough. Reference models with known ranks are
+probed with the same questions, producing a (score, rank) calibration
+curve; each probed model's ladder position is interpolated from its
+score. Results are written with `evidence=probe`: window and site-seed
+evidence always win, re-running the probe refreshes estimates, and
+probe rows age out after 14 days (`--expire-age`) unless refreshed.
+Never edit the question bank without re-probing every reference model —
+scores are only comparable within one bank generation.
+
 Ranked models additionally receive a quality-score bonus at selection
 time: `max(0, cap - per_rank * (rank - 1))`, with `cap = 25.0` and
 `per_rank = 1.0` by default (`TUSKER_LLM_STATS_RANK_BOOST_CAP`,

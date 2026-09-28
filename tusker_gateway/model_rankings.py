@@ -94,6 +94,13 @@ PREFER_LADDER_SPAN = 200
 # it forward while it remains fresher than ``seed_max_age_secs`` and
 # only for models absent from every tracked API window.
 SEED_EVIDENCE = "site_seed"
+# Evidence kind for strength-probe verdicts written by
+# ``tusker_gateway.tools.probe_strength``: verifiable question sets are
+# sent to models with no rankings presence and their scores are
+# interpolated onto the ladder against reference models with known
+# ranks. Probe rows never overwrite window or site-seed evidence and
+# are refreshed (not aged) by re-running the probe.
+PROBE_EVIDENCE = "probe"
 # Default lifetime (seconds) for site_seed rows before the daily sync
 # degrades them back to "unknown". 7 days keeps deep coverage honest
 # against weekly category drift while still capping stale seeds.
@@ -423,6 +430,68 @@ class ModelRankingsDB:
                 )
                 written += 1
         return {"written": written, "skipped_window": skipped}
+
+    def apply_probe(
+        self, rows: list[dict[str, Any]], synced_at: float
+    ) -> dict[str, int]:
+        """Import strength-probe verdicts without clobbering stronger evidence.
+
+        Rows with ``category_window`` or ``site_seed`` evidence are
+        authoritative and left untouched. Probe rows upsert everywhere
+        else and replace earlier probe rows (re-probing refreshes the
+        estimate). Returns ``{"written": N, "skipped_evidence": M}``.
+        """
+        written = 0
+        skipped = 0
+        with self._db.connection() as conn:
+            for row in rows:
+                cursor = conn.execute(
+                    "SELECT evidence FROM llm_stats_verdicts WHERE slug = ?",
+                    (row["slug"],),
+                )
+                existing = cursor.fetchone()
+                if existing and existing[0] in ("category_window", SEED_EVIDENCE):
+                    skipped += 1
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO llm_stats_verdicts (
+                        slug, status, category_rank, category_name,
+                        evidence, synced_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(slug) DO UPDATE SET
+                        status = excluded.status,
+                        category_rank = excluded.category_rank,
+                        category_name = excluded.category_name,
+                        evidence = excluded.evidence,
+                        synced_at = excluded.synced_at
+                    """,
+                    (
+                        row["slug"],
+                        row["status"],
+                        row.get("category_rank"),
+                        row.get("category_name"),
+                        PROBE_EVIDENCE,
+                        row.get("synced_at", synced_at),
+                    ),
+                )
+                written += 1
+        return {"written": written, "skipped_evidence": skipped}
+
+    def expire_probe(self, max_age_secs: float, now: float) -> int:
+        """Drop probe rows older than ``max_age_secs``; returns rows removed.
+
+        Probe estimates describe a snapshot of the upstream model behind
+        an alias; without expiry a stale estimate would outrank fresher
+        evidence forever. Window and seed rows are never touched.
+        """
+        with self._db.connection() as conn:
+            cursor = conn.execute(
+                "DELETE FROM llm_stats_verdicts WHERE evidence = ? "
+                "AND synced_at < ?",
+                (PROBE_EVIDENCE, now - max_age_secs),
+            )
+            return int(cursor.rowcount or 0)
 
     def status(self) -> dict[str, Any]:
         """Summary for /status-style reporting."""
