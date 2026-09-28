@@ -3,6 +3,11 @@
 The server never executes a client tool. It atomically publishes the requested
 name/arguments into a private request-scoped file; the parent adapter observes
 that event, stops Claude Code, and returns a normal OpenAI tool call upstream.
+
+When ``TUSKER_MCP_BROKER_DIR`` is set the bridge is shared by a warm,
+long-lived agent server, so it resolves each request's manifest and call
+channel from ``active.json`` inside that directory instead of its own
+environment.
 """
 
 from __future__ import annotations
@@ -29,8 +34,28 @@ def _error(request_id: Any, code: int, message: str) -> None:
     _write({"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}})
 
 
+def _resolve_path(setting: str, env_name: str) -> str | None:
+    """Resolve a request-scoped path, honouring a shared broker pointer.
+
+    A warm, long-lived MCP bridge serves many requests, so its manifest and call
+    channel cannot come from its own environment. ``TUSKER_MCP_BROKER_DIR``
+    points at a directory whose ``active.json`` names the request in flight.
+    """
+    broker_dir = os.environ.get("TUSKER_MCP_BROKER_DIR")
+    if broker_dir:
+        try:
+            active = json.loads((Path(broker_dir) / "active.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            active = None
+        if isinstance(active, dict):
+            value = active.get(setting)
+            if isinstance(value, str) and value:
+                return value
+    return os.environ.get(env_name)
+
+
 def _load_manifest() -> list[dict[str, Any]]:
-    path = os.environ.get("TUSKER_MCP_MANIFEST")
+    path = _resolve_path("manifest", "TUSKER_MCP_MANIFEST")
     if not path:
         return []
     try:
@@ -41,7 +66,7 @@ def _load_manifest() -> list[dict[str, Any]]:
 
 
 def _publish_call(tool: dict[str, Any], arguments: Any) -> None:
-    path = os.environ.get("TUSKER_MCP_CALL_FILE")
+    path = _resolve_path("call", "TUSKER_MCP_CALL_FILE")
     if not path:
         raise RuntimeError("missing request-scoped call channel")
     if not isinstance(arguments, dict):
@@ -69,9 +94,11 @@ def _publish_call(tool: dict[str, Any], arguments: Any) -> None:
             pass
 
 
+def _tools_by_mcp_name() -> dict[str, dict[str, Any]]:
+    return {tool["mcp_name"]: tool for tool in _load_manifest() if isinstance(tool, dict)}
+
+
 def main() -> None:
-    tools = _load_manifest()
-    by_mcp_name = {tool["mcp_name"]: tool for tool in tools if isinstance(tool, dict)}
     for line in sys.stdin:
         try:
             request = json.loads(line)
@@ -103,12 +130,12 @@ def main() -> None:
                         "description": tool.get("description", ""),
                         "inputSchema": tool.get("input_schema", {"type": "object"}),
                     }
-                    for tool in by_mcp_name.values()
+                    for tool in _tools_by_mcp_name().values()
                 ],
             })
         elif method == "tools/call":
             tool_name = params.get("name")
-            tool = by_mcp_name.get(tool_name)
+            tool = _tools_by_mcp_name().get(tool_name)
             if tool is None:
                 _error(request_id, -32602, "Unknown gateway tool")
                 continue

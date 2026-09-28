@@ -147,6 +147,32 @@ adapter reads JSON events as they arrive and forwards assistant text deltas
 as OpenAI SSE; lifecycle and diagnostic events are filtered out. Tool calls
 continue to be returned as normal OpenAI tool-call deltas. The gateway
 heartbeat stays active while waiting for the first CLI text event.
+
+### Warm worker servers
+
+The worker keeps two long-lived `kilo serve` processes so request handling does
+not pay Kilo's provider and session startup on every call:
+
+- a **text** server started without an MCP bridge, used for requests that carry
+  no tools;
+- a **tool** server started with one shared MCP bridge that resolves each
+  request's tools through a broker pointer file.
+
+Kilo lists MCP tools per session, but its MCP configuration is fixed at server
+startup, so the shared bridge reads `<broker>/active.json` for the in-flight
+request's manifest and call channel. Warm tool requests are therefore
+serialized, and each request enables its own tools through the session `tools`
+map using Kilo's fully-qualified tool ids (`gateway_<manifest mcp name>`).
+Request manifests beyond the pre-authorized id range (`_WARM_TOOL_INDEX_LIMIT`,
+128) skip the warm path. Sessions are aborted and deleted after every request,
+so the server's session store stays bounded.
+
+Every warm failure - a refused turn, an invalid session, a timeout, or a server
+startup error - degrades to the isolated per-request `kilo run` path, so tool
+correctness never depends on the warm path. `TUSKER_KILO_WARM_ENABLED=0`
+disables both servers, and the worker's `/healthz` reports `warm_text` and
+`warm_tools`.
+
 In Kubernetes, the gateway forwards Kilo requests to the dedicated
 `tusker-kilo-worker` service, pinned to node `visor` and isolated by a
 NetworkPolicy that permits ingress only from the gateway pod. The worker has

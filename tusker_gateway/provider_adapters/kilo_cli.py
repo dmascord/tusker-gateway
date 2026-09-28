@@ -38,6 +38,15 @@ def _enabled() -> bool:
 _WORKER_REQUEST_FAILURE_STATUSES = frozenset({400, 413, 415, 422, 428})
 
 
+# Request-scoped tool manifests carry index-based MCP names (``gateway_tool_N``),
+# so a shared warm server must pre-authorize that bounded name space. Requests
+# with more tools than this fall back to the isolated per-request CLI path.
+_WARM_TOOL_INDEX_LIMIT = 128
+# The shared MCP bridge reads one active pointer, so warm tool requests run one
+# at a time per worker; this keeps tool schemas and call channels request-scoped.
+_WARM_TOOL_LOCK = asyncio.Lock()
+
+
 def _worker_error(status: int, message: Any, code: Any) -> GatewayError:
     """Translate a Kilo worker HTTP failure into the client-visible error."""
     error_message = message if isinstance(message, str) and message.strip() else None
@@ -98,6 +107,68 @@ def _provider_api_key(model: str) -> tuple[str, str] | None:
     return None
 
 
+def _point_broker(pointer: Path, manifest_file: Path, call_file: Path) -> None:
+    """Atomically name the request the shared MCP bridge must serve."""
+    temporary = pointer.with_name(f".{pointer.name}.{os.urandom(4).hex()}")
+    temporary.write_text(
+        json.dumps({"manifest": str(manifest_file), "call": str(call_file)}),
+        encoding="utf-8",
+    )
+    os.replace(temporary, pointer)
+
+
+def _clear_broker(pointer: Path) -> None:
+    """Best-effort release of the shared bridge so no stale tools are served."""
+    temporary = pointer.with_name(f".{pointer.name}.{os.urandom(4).hex()}")
+    try:
+        temporary.write_text("{}", encoding="utf-8")
+        os.replace(temporary, pointer)
+    except OSError:
+        pass
+
+
+async def _open_kilo_session(session: Any, server_url: str, directory: Path) -> str:
+    """Create the per-request chat session on the warm Kilo server."""
+    import aiohttp
+
+    try:
+        async with session.post(f"{server_url}/session", json={"directory": str(directory)}) as response:
+            payload = await response.json()
+    except (ValueError, aiohttp.ContentTypeError) as exc:
+        raise ProviderError("Kilo warm server returned an invalid session", code="invalid_upstream_response") from exc
+    session_id = payload.get("id") if isinstance(payload, dict) else None
+    if not isinstance(session_id, str) or not session_id:
+        raise ProviderError("Kilo warm server did not create a session", code="kilo_cli_failed")
+    return session_id
+
+
+async def _post_kilo_message(
+    session: Any, server_url: str, session_id: str, body: dict[str, Any],
+) -> dict[str, Any]:
+    """Submit one prompt and return the completed turn (Kilo replies when done)."""
+    import aiohttp
+
+    try:
+        async with session.post(f"{server_url}/session/{session_id}/message", json=body) as response:
+            payload = await response.json()
+    except (ValueError, aiohttp.ContentTypeError) as exc:
+        raise ProviderError("Kilo warm server returned an invalid response", code="invalid_upstream_response") from exc
+    if response.status >= 400 or not isinstance(payload, dict):
+        raise ProviderError("Kilo warm server rejected the request", code="kilo_cli_failed")
+    return payload
+
+
+async def _close_kilo_session(session: Any, server_url: str, session_id: str) -> None:
+    """Abort a running turn and delete the session so the server store stays bounded."""
+    for method in ("post", "delete"):
+        suffix = "/abort" if method == "post" else ""
+        try:
+            async with getattr(session, method)(f"{server_url}/session/{session_id}{suffix}") as response:
+                await response.read()
+        except Exception:  # cleanup must never fail the request it is cleaning up
+            logger.debug("kilo warm session cleanup failed (%s)", method)
+
+
 class KiloCLIAdapter:
     """Run Kilo in headless mode and proxy client tools through request-scoped MCP."""
 
@@ -138,6 +209,28 @@ class KiloCLIAdapter:
             return await self._warm_chat(
                 warm_server_url, cli_model, model, messages,
             )
+        warm_tool_url = os.environ.get("TUSKER_KILO_WARM_TOOL_SERVER_URL", "").strip()
+        broker_dir = os.environ.get("TUSKER_MCP_BROKER_DIR", "").strip()
+        if warm_tool_url and broker_dir and tools:
+            try:
+                warm_tool_completion = await self._warm_tool_chat(
+                    server_url=warm_tool_url,
+                    broker_dir=broker_dir,
+                    model=model,
+                    cli_model=cli_model,
+                    messages=messages,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                )
+            except Exception as exc:  # degrade to the isolated CLI path, never fail the request
+                logger.warning("kilo warm tool path unavailable (%s); using isolated CLI", type(exc).__name__)
+                warm_tool_completion = None
+            if warm_tool_completion is not None:
+                return (
+                    ClaudeCodeCLIAdapter._stream_completion(warm_tool_completion, stream)
+                    if stream
+                    else warm_tool_completion
+                )
         executable = self._executable or os.environ.get("TUSKER_KILO_CLI_PATH") or "kilo"
         resolved = shutil.which(executable)
 
@@ -367,6 +460,128 @@ class KiloCLIAdapter:
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         }
 
+
+    async def _warm_tool_chat(
+        self,
+        *,
+        server_url: str,
+        broker_dir: str,
+        model: str,
+        cli_model: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        tool_choice: Any,
+    ) -> dict[str, Any] | None:
+        """Run a tool request on the warm server through the shared MCP bridge.
+
+        Kilo lists MCP tools per session, so the bridge resolves this request's
+        manifest from ``active.json``. Requests are serialized: the pointer names
+        exactly one in-flight request, and the request's tool names are enabled
+        explicitly through the session ``tools`` map.
+        """
+        import aiohttp
+
+        tool_manifest = _normalise_tools(tools, tool_choice)
+        if not tool_manifest or len(tool_manifest) > _WARM_TOOL_INDEX_LIMIT:
+            return None
+        provider_id, _, model_id = cli_model.partition("/")
+        if not provider_id or not model_id:
+            return None
+
+        prompt = _prompt(
+            messages, has_tools=True, tool_choice=tool_choice, provider_label="kilo-cli",
+        )
+        enabled = {f"gateway_{item['mcp_name']}": True for item in tool_manifest}
+        timeout = max(10.0, float(os.environ.get("TUSKER_KILO_CLI_TIMEOUT_SECS", "600")))
+        request_body = {
+            "model": {"providerID": provider_id, "modelID": model_id},
+            "agent": os.environ.get("TUSKER_KILO_WARM_AGENT", "code"),
+            "tools": enabled,
+            "parts": [{"type": "text", "text": prompt}],
+        }
+
+        async with _WARM_TOOL_LOCK:
+            request_dir = Path(tempfile.mkdtemp(prefix="tusker-kilo-warm-"))
+            manifest_file = request_dir / "tools.json"
+            call_file = request_dir / "tool-call.json"
+            manifest_file.write_text(json.dumps(tool_manifest), encoding="utf-8")
+            pointer = Path(broker_dir) / "active.json"
+            _point_broker(pointer, manifest_file, call_file)
+            started = asyncio.get_running_loop().time()
+            try:
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
+                    session_id = await _open_kilo_session(session, server_url, request_dir)
+                    message_task = asyncio.create_task(
+                        _post_kilo_message(session, server_url, session_id, request_body),
+                    )
+                    call_task = asyncio.create_task(_read_tool_call(call_file, message_task))
+                    tool_call: dict[str, Any] | None = None
+                    payload: dict[str, Any] | None = None
+                    try:
+                        tool_call = await asyncio.wait_for(asyncio.shield(call_task), timeout)
+                        if message_task.done() and not message_task.cancelled():
+                            payload = message_task.result()
+                    except asyncio.TimeoutError as exc:
+                        message_task.cancel()
+                        call_task.cancel()
+                        raise ProviderError(
+                            "Kilo warm tool request timed out", code="upstream_timeout",
+                        ) from exc
+                    except asyncio.CancelledError:
+                        message_task.cancel()
+                        call_task.cancel()
+                        raise
+                    finally:
+                        await _close_kilo_session(session, server_url, session_id)
+
+                    elapsed = asyncio.get_running_loop().time() - started
+                    if tool_call is not None:
+                        if (
+                            not isinstance(tool_call.get("name"), str)
+                            or not isinstance(tool_call.get("arguments"), dict)
+                        ):
+                            raise ProviderError(
+                                "Kilo returned an invalid tool request",
+                                code="invalid_upstream_response",
+                            )
+                        logger.info("kilo warm tool call model=%s elapsed_s=%.3f", cli_model, elapsed)
+                        return ClaudeCodeCLIAdapter._tool_completion(model, tool_call)
+                    if payload is None:
+                        raise ProviderError(
+                            "Kilo warm server returned no completion",
+                            code="invalid_upstream_response",
+                        )
+                    info = payload.get("info") if isinstance(payload.get("info"), dict) else {}
+                    if info.get("error"):
+                        raise ProviderError("Kilo warm turn failed", code="kilo_cli_failed")
+                    parts = payload.get("parts")
+                    text = "".join(
+                        part["text"]
+                        for part in parts
+                        if isinstance(part, dict)
+                        and part.get("type") == "text"
+                        and isinstance(part.get("text"), str)
+                    ) if isinstance(parts, list) else ""
+                    if not text:
+                        raise ProviderError(
+                            "Kilo warm server returned no assistant response",
+                            code="invalid_upstream_response",
+                        )
+                    logger.info("kilo warm text model=%s elapsed_s=%.3f", cli_model, elapsed)
+                    return {
+                        "id": f"chatcmpl-kilo-{os.urandom(8).hex()}",
+                        "object": "chat.completion",
+                        "model": model,
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": text},
+                            "finish_reason": "stop",
+                        }],
+                        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                    }
+            finally:
+                shutil.rmtree(request_dir, ignore_errors=True)
+                _clear_broker(pointer)
 
     async def _worker_chat(
         self, *, worker_url: str, model: str, cli_model: str,
