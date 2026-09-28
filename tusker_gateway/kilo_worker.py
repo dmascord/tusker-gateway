@@ -14,12 +14,50 @@ from tusker_gateway.errors import BadRequestError, ProviderError, ProviderRouteD
 from tusker_gateway.provider_adapters.kilo_cli import KiloCLIAdapter
 
 logger = logging.getLogger("tusker_gateway.kilo_worker")
+_WARM_SERVER: asyncio.subprocess.Process | None = None
+_WARM_SERVER_URL = "http://127.0.0.1:4096"
+_WARM_SERVER_LOCK = asyncio.Lock()
 _ALLOWED_MODELS = frozenset({
     "groq/openai/gpt-oss-20b",
     "groq/qwen/qwen3.8-27b",
     "kilo/kilo-auto/free",
 })
 _CONCURRENCY = asyncio.Semaphore(2)
+
+
+async def _ensure_warm_server() -> str:
+    global _WARM_SERVER
+    async with _WARM_SERVER_LOCK:
+        if _WARM_SERVER is not None and _WARM_SERVER.returncode is None:
+            return _WARM_SERVER_URL
+        started = asyncio.get_running_loop().time()
+        _WARM_SERVER = await asyncio.create_subprocess_exec(
+            "kilo", "serve", "--pure", "--hostname", "127.0.0.1",
+            "--port", _WARM_SERVER_URL.rsplit(":", 1)[1],
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+        await asyncio.sleep(0.2)
+        logger.info("kilo warm server started pid=%s startup_s=%.3f", _WARM_SERVER.pid, asyncio.get_running_loop().time() - started)
+        return _WARM_SERVER_URL
+
+
+async def _stop_warm_server(_app: web.Application) -> None:
+    global _WARM_SERVER
+    process = _WARM_SERVER
+    _WARM_SERVER = None
+    if process is not None and process.returncode is None:
+        process.terminate()
+        try:
+            await asyncio.wait_for(process.wait(), 5)
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+
+
+async def _start_warm_server(_app: web.Application) -> None:
+    os.environ["TUSKER_KILO_WARM_SERVER_URL"] = await _ensure_warm_server()
 
 
 async def health(_request: web.Request) -> web.Response:
@@ -96,6 +134,8 @@ async def chat(request: web.Request) -> web.Response:
 
 def create_app() -> web.Application:
     app = web.Application(client_max_size=4 * 1024 * 1024)
+    app.on_startup.append(_start_warm_server)
+    app.on_cleanup.append(_stop_warm_server)
     app.router.add_get("/healthz", health)
     app.router.add_post("/v1/chat/completions", chat)
     return app

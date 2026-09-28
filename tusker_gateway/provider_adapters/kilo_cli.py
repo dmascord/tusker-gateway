@@ -133,8 +133,14 @@ class KiloCLIAdapter:
                 tools=tools,
                 tool_choice=tool_choice,
             )
+        warm_server_url = os.environ.get("TUSKER_KILO_WARM_SERVER_URL", "").strip()
+        if warm_server_url and not stream and not tools:
+            return await self._warm_chat(
+                warm_server_url, cli_model, model, messages,
+            )
         executable = self._executable or os.environ.get("TUSKER_KILO_CLI_PATH") or "kilo"
         resolved = shutil.which(executable)
+
         if not resolved:
             raise ProviderError("Kilo CLI is not installed in the runtime", code="kilo_cli_unavailable")
 
@@ -312,9 +318,58 @@ class KiloCLIAdapter:
         }
         return ClaudeCodeCLIAdapter._stream_completion(completion, stream) if stream else completion
 
-    @staticmethod
+    async def _warm_chat(
+        self,
+        server_url: str,
+        cli_model: str,
+        public_model: str,
+        messages: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Use a persistent Kilo server for text-only requests.
+
+        The small attach client still starts per request, but Kilo's model
+        provider/session initialization stays warm. Tool requests deliberately
+        use the isolated path above because their MCP manifest is request-scoped.
+        """
+        prompt = _prompt(messages, has_tools=False, tool_choice=None, provider_label="kilo-cli")
+        executable = self._executable or os.environ.get("TUSKER_KILO_CLI_PATH") or "kilo"
+        resolved = shutil.which(executable)
+        if not resolved:
+            raise ProviderError("Kilo CLI is not installed in the runtime", code="kilo_cli_unavailable")
+        command = [resolved, "run", "--pure", "--format", "json", "--attach", server_url, "--model", cli_model]
+        timeout = max(10.0, float(os.environ.get("TUSKER_KILO_CLI_TIMEOUT_SECS", "600")))
+        started = asyncio.get_running_loop().time()
+        proc = await asyncio.create_subprocess_exec(
+            *command,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=os.environ.copy(),
+            start_new_session=True,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(prompt.encode()), timeout)
+        except asyncio.TimeoutError as exc:
+            await _stop_process(proc)
+            raise ProviderError("Kilo warm request timed out", code="upstream_timeout") from exc
+        logger.info("kilo warm request model=%s elapsed_s=%.3f rc=%s", cli_model, asyncio.get_running_loop().time() - started, proc.returncode)
+        if proc.returncode != 0:
+            logger.warning("kilo warm client failed rc=%s stderr=%r", proc.returncode, stderr.decode(errors="replace")[:512])
+            raise ProviderError("Kilo warm request failed", code="kilo_cli_failed")
+        text = self._extract_text(stdout)
+        if text is None:
+            raise ProviderError("Kilo warm request returned no completion", code="invalid_upstream_response")
+        return {
+            "id": f"chatcmpl-kilo-{os.urandom(8).hex()}",
+            "object": "chat.completion",
+            "model": public_model,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        }
+
+
     async def _worker_chat(
-        *, worker_url: str, model: str, cli_model: str,
+        self, *, worker_url: str, model: str, cli_model: str,
         messages: list[dict[str, Any]], stream: bool,
         tools: list[dict[str, Any]] | None, tool_choice: Any,
     ) -> dict[str, Any] | Any:
