@@ -90,9 +90,10 @@ Auth expiry is not recorded as provider/model health failure or quarantine.
 
 ## OpenCode CLI
 
-The `opencode-cli` adapter runs `opencode run --standalone --format json` and
-uses OpenCode Zen model IDs (`opencode/<model>`); a short model name such as
-`big-pickle` is expanded to `opencode/big-pickle`. Set
+The `opencode-cli` adapter drives `opencode run --format json`, either against a
+long-lived server or (see "Warm server mode" below) an isolated per-request
+`--standalone` server, and uses OpenCode Zen model IDs (`opencode/<model>`); a
+short model name such as `big-pickle` is expanded to `opencode/big-pickle`. Set
 `TUSKER_OPENCODE_CLI_ENABLED=true` to enable it. The executable defaults to
 `opencode` on `PATH`, with `TUSKER_OPENCODE_CLI_PATH` and
 `TUSKER_OPENCODE_CLI_TIMEOUT_SECS` available for operator overrides. The CLI
@@ -122,6 +123,46 @@ service policy; the adapter does not bypass those restrictions.
 For streaming requests, JSON text events are forwarded incrementally as
 OpenAI SSE; other CLI lifecycle/diagnostic events are not presented as model
 content, and the gateway heartbeat remains active while awaiting output.
+
+### Warm server mode
+
+By default (`TUSKER_OPENCODE_WARM_ENABLED=1`) the adapter keeps one
+`opencode serve` alive and sends requests through it instead of paying a private
+server start per request. Measured in production, a follow-up request drops from
+roughly 8-10 seconds to about 5; the first request after the server is released
+pays that startup once (about 6 seconds).
+
+The server fixes its MCP configuration when it starts, so tool requests cannot
+use per-request inline config. The adapter publishes each request through the
+same broker pointer the Kilo warm path uses
+(`TUSKER_OPENCODE_WARM_BROKER_DIR/active.json`): the bridge that the server
+spawned resolves the manifest and call file per tool call. That pointer names
+exactly one request, so warm requests are serialized - a concurrent OpenCode
+request queues behind the in-flight one instead of sharing a bridge.
+
+Request lifecycle:
+
+- the adapter starts a server, or adopts the one it recorded, and replaces any
+  other server so the pointer contract holds;
+- each request runs `opencode run --format json` from a private empty working
+  directory and streams its JSON events;
+- a tool call is detected from the pointer's call file, generation is
+  interrupted (`POST /api/session/{id}/interrupt`), the child is stopped, and the
+  call returns to the client;
+- the session is deleted (`DELETE /api/session/{id}`) so the server's session
+  store and its ephemeral storage stay bounded;
+- `TUSKER_OPENCODE_WARM_IDLE_SECS` (default 300, `0` disables) releases the
+  server once traffic stops.
+
+The server is a child of the gateway and shares its cgroup: expect roughly
+160 MiB resident while warm, so the container memory limit must leave room for
+it plus one transient `opencode run` client.
+
+If the server cannot start, or a non-streaming request fails inside it, the
+adapter logs a warning and falls back to the isolated `--standalone` path. A
+streaming failure after the first frame propagates, because the client already
+holds partial output. `TUSKER_OPENCODE_WARM_ENABLED=0` disables the path
+entirely.
 
 ## Kilo Code CLI
 

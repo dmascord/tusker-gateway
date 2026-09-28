@@ -283,3 +283,46 @@ implemented (`tusker_gateway/tools/import_llm_stats_seed.py`, evidence
 Mechanics: `docs/gateway-model-routing.md` "Website seed provenance";
 investigation: `docs/llm-stats-coverage-2026-09-27.md`.
 Follow-up option remains open: ask upstream for API pagination.
+
+## OpenCode warm-server path (implemented 2026-09-28, deployment pending)
+
+`opencode-cli` requests previously paid a private `opencode serve` start per
+request (about 6s). The adapter now keeps one server alive and publishes each
+request through the Kilo-style broker pointer, because a server fixes its MCP
+configuration at start.
+
+- Code: `tusker_gateway/provider_adapters/opencode_cli.py` (server lifecycle,
+  broker pointer, serialized requests, per-request session delete).
+  `TUSKER_OPENCODE_WARM_ENABLED=1` by default; `TUSKER_OPENCODE_WARM_IDLE_SECS`
+  (default 300) releases the server; `TUSKER_OPENCODE_WARM_BROKER_DIR` overrides
+  the pointer directory.
+- Manifest: `k8s/deployment.yaml` enables the path with a 1800s idle window and
+  raises `resources.limits.memory` 1Gi to 2Gi. Evidence: the warm server
+  measured ~160MiB resident, the gateway process alone ~600MiB RSS, and a
+  transient `opencode run` client adds ~200MiB; the 1Gi limit left no margin.
+- Tests: 9 new cases in `tests/test_opencode_cli_adapter.py` (26 in that file).
+  Full offline suite: 1470 passed, 8 skipped.
+- Live verification (in-pod, modified package copied to `/tmp`, production Zen
+  endpoint): standalone 7.9s/10.2s versus warm 13.9s first (includes the server
+  start) and 5.7s reused; a tool call returned through the broker pointer with
+  `{"interrupted":true}` plus session delete; streaming frames and clean finish;
+  sessions 17 to 17 across four requests, so the deletes bound the server's
+  session store.
+- Docs: `docs/provider-adapters.md` section "Warm server mode".
+
+### New finding: unreaped children in the gateway container
+
+The container runs no init, so the gateway is PID 1 and must reap orphaned
+children itself. `/proc` shows 7 zombies (`comm=opencode`, `ppid=1`) left by
+CLI-spawned servers and workers that outlived their parent. Every CLI adapter
+(`claude_code`, `kilo_cli`, `opencode_cli`) can produce them.
+
+Recommended fix: add an init to the image entrypoint (tini) rather than a
+`waitpid(-1)` loop in the gateway, because asyncio's child watcher owns its own
+children and a blanket reap would race it and break request-path waits.
+
+### Destructive actions (require confirmation)
+
+- `kubectl apply` on `k8s/deployment.yaml` (warm env plus the memory limit).
+- `./k8s/deploy.sh` rollout; the deployment uses `strategy: Recreate`, so the
+  gateway is briefly unavailable.

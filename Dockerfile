@@ -81,6 +81,14 @@ COPY README.md ./
 # dependency layer above already provides them.
 RUN pip install --no-cache-dir --no-deps .
 
+# CLI adapters spawn provider CLIs, which spawn servers and workers of their
+# own. Those outlive their parent, are reparented to PID 1, and accumulate as
+# zombies because PID 1 never reaps them (7 observed live on 2026-09-28). Run a
+# real init so orphans are reaped. Installed after the dependency layers so the
+# torch/chromadb/model cache above is not invalidated by this change.
+RUN apt-get update && apt-get install -y --no-install-recommends tini \
+ && rm -rf /var/lib/apt/lists/*
+
 # Persistent data (quality DB, cooldowns, OAuth pool)
 RUN mkdir -p /home/tusker/.hermes && chown -R nobody:nogroup /home/tusker
 ENV HOME=/home/tusker \
@@ -104,4 +112,4 @@ USER nobody
 HEALTHCHECK --interval=10s --timeout=3s --start-period=15s --retries=3 \
     CMD curl -f http://127.0.0.1:8642/health || exit 1
 
-ENTRYPOINT ["python", "-m", "tusker_gateway"]
+ENTRYPOINT ["tini", "--", "python", "-m", "tusker_gateway"]

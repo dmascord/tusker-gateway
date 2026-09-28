@@ -50,6 +50,14 @@ spec:
           value: http://tusker-kilo-worker.hermes.svc.cluster.local:8643
         - name: TUSKER_OPENCODE_CLI_ENABLED
           value: 'true'
+        # Keep one OpenCode server alive so requests do not each pay a private
+        # server start (~6s). The server is released after the idle window, so a
+        # long window is the point: it costs ~160MiB resident while warm, and a
+        # restart costs about as much as one request.
+        - name: TUSKER_OPENCODE_WARM_ENABLED
+          value: '1'
+        - name: TUSKER_OPENCODE_WARM_IDLE_SECS
+          value: '1800'
         - name: TUSKER_OPENCODE_CLI_API_KEY
           valueFrom:
             secretKeyRef:
@@ -557,14 +565,19 @@ spec:
               - '10'
         resources:
           requests:
-            memory: 768Mi
+            memory: 1Gi
             cpu: 500m
             ephemeral-storage: 1Gi
           limits:
             # The cluster admission policy expects resources.limits to exist;
             # ephemeral-storage caps stay well within the 2Gi/4Gi defaults
             # (see ValidatingAdmissionPolicy 'ephemeral-storage-limit').
-            memory: 1Gi
+            #
+            # Memory: the gateway process alone measured ~600MiB RSS, and the
+            # warm OpenCode server adds ~160MiB resident plus a transient
+            # ~200MiB `opencode run` client per request. 1Gi left no margin for
+            # that, so an OOMKill was one busy request away.
+            memory: 2Gi
             ephemeral-storage: 4Gi
       volumes:
       - name: tusker-home
