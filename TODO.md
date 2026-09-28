@@ -354,3 +354,86 @@ reap would race it and break request-path waits. Verified live: PID 1 reports
   briefly unavailable during the 87s build-to-smoke run.
 - Not done, still requiring confirmation: `git push` to `origin/main`, and
   pruning the visor build directory for this revision.
+
+## Embeddings and rerank end-to-end (audited 2026-09-28)
+
+Both media surfaces work end to end in production. Verified live after
+restoring the gateway; every case below returned HTTP 200:
+
+- `/v1/embeddings`: no model, `hermes-embed`, `local-llm/nomic-embed-text`
+  pin and a 3-input batch all resolve to the Jetson
+  (`http://10.0.0.212:11434`, `nomic-embed-text`, 768 dims), and the returned
+  vector is byte-identical to a direct call to that endpoint.
+  `voyage/voyage-3` pin returns 1024 dims.
+- `/v1/rerank`: `hermes-reranker` and `cohere/rerank-v3.5` both resolve to
+  Cohere `rerank-v3.5` with correct ordering (0.8332 for the matching
+  document) and `top_n` honored.
+
+### Defect A (reproduced live): one bad model name takes the whole surface down
+
+A request whose model name no backend accepts poisons every configured
+backend:
+
+- It is not rejected. `EmbedHandler._resolve_model` (`providers/embed.py:212`)
+  and `RerankHandler._resolve_model` (`providers/rerank.py:198`) only reject
+  names pinned to a *known* provider, so an unknown bare name is forwarded to
+  every backend as an upstream model override (`backends_for_model`:
+  `embed.py:269`, `rerank.py:246`).
+- Every backend then fails, and `_mark_failure` (`embed.py:548`,
+  `rerank.py:617`) records a breaker failure plus a cooldown. The window comes
+  from `_cooldown_seconds_for_provider_error` (`cooldown.py:439`), which maps
+  any non-5xx, non-quota 4xx to `PERMANENT_ERROR_COOLDOWN_SECS` (3600s
+  default). Three consecutive failures additionally arm a provider-wide window
+  (`embed.py:582-585`, `rerank.py:648-651`).
+- Observed: a probe with `model=hermes-code` created cooldowns for
+  `(local-llm,hermes-code)`, `(synthetic,hermes-code)`,
+  `(openrouter,hermes-code)`; a probe with `model=x` created
+  `(cohere,x)`, `(voyage,x)`, `(jina,x)` — exactly the two provider sets.
+  Every later request, from any client and for any model, then returned
+  `503 no_healthy_models` in 0.0s because `is_cooldown` skipped every backend.
+- The state is durable: it lives in the state DB and is hydrated at startup
+  (`app.py:316-320`), so it survives restarts for the full hour.
+
+Fix direction: reject unknown models (and names pinned to unknown providers)
+with 400 `unsupported_model` on both routes instead of forwarding them, and
+exclude client-caused 4xx from failure accounting and long cooldowns — only
+genuine provider failures (429, 5xx, auth/not-found for a valid model) should
+cool a backend.
+
+### Defect B (latent): the DB config store cannot express `embed_path`
+
+- `tusker_config_providers` persists `rerank_path` but has no `embed_path`
+  column, and `_apply` (`config_store.py:314`) builds `ProviderConfig` without
+  it.
+- `ConfigRuntime._rebuild_media_handlers` (`config_runtime.py:465`) rebuilds
+  image/TTS/video handlers only; `embed_handler`/`rerank_handler` are created
+  once from the startup config (`app.py:283-284`). Net effect: embeddings and
+  rerank read the static registry (which has `embed_path`) and so work, but
+  silently ignore DB provider/key edits until a restart, and would lose
+  embedding support entirely if repointed at the DB registry.
+
+### Gap C: `/v1/embeddings` requires no scope
+
+`identity.py:252` resolves the required scope from `_ROUTE_SCOPES`. `/v1/rerank`
+is listed as `inference:rerank` but `/v1/embeddings` is not, so
+`required_scope` is `None` and the scope check is skipped entirely for
+embeddings. Pool gating still applies (`identity.py:268-270`: `/v1/rerank` →
+`rerank`, everything else → `media`), as do caller model/provider allowlists
+(`identity.py:256-266`). Effect: a caller deliberately denied rerank scope
+retains embeddings access, so least-privilege granularity is inconsistent
+between the two media surfaces.
+
+### Gap D: no media capability qualification
+
+Chat has capability qualification and permanent-failure gating (`pools.py` and
+the qualification modules); embeddings and rerank have neither, so cooldown and
+breaker state is the only health signal.
+
+### Incident note (self-inflicted, resolved)
+
+The cooldown state in Defect A was created by this audit's own probes. It was
+cleaned by deleting exactly those 6 model rows and the 5 provider-wide rows
+(no breaker, permanent-failure, key or config row touched), then
+`kubectl rollout restart deployment/tusker-gateway` reloaded a clean tracker;
+`/status` cooldowns for those providers then read empty and every case above
+returned 200.
