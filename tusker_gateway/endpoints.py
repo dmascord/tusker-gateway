@@ -1935,24 +1935,24 @@ _SHELL_HIGH_IMPACT_RE = re.compile(
 # Adaptive mode keeps confirmation for actions whose blast radius is difficult
 # to recover from even when the latest user turn explicitly requests them.
 _ADAPTIVE_CRITICAL_SHELL_RE = re.compile(
-    r"(?:^|[;&|]\\s*|[\"'])\\s*(?:sudo\\s+)?(?:"
-    r"kubectl\\s+drain\\b|"
-    r"kubectl\\s+delete\\s+(?:namespace|node|persistentvolume(?:claim)?|pv|pvc|crd)\\b|"
-    r"git\\s+push\\b[^;&|]*--force(?:-with-lease)?\\b|"
-    r"(?:drop|truncate)\\s+(?:database|schema)\\b|"
-    r"(?:mkfs|shutdown|reboot|poweroff)\\b|"
-    r"dd\\s+if=)",
+    r"(?:^|[;&|]\s*|[\"'])\s*(?:sudo\s+)?(?:"
+    r"kubectl\s+drain\b|"
+    r"kubectl\s+delete\s+(?:namespace|node|persistentvolume(?:claim)?|pv|pvc|crd)\b|"
+    r"git\s+push\b[^;&|]*--force(?:-with-lease)?\b|"
+    r"(?:drop|truncate)\s+(?:database|schema)\b|"
+    r"(?:mkfs|shutdown|reboot|poweroff)\b|"
+    r"dd\s+if=)",
     re.IGNORECASE,
 )
 
 _ADAPTIVE_RM_RF_RE = re.compile(
-    r"(?:^|[;&|]\\s*)\\s*(?:sudo\\s+)?rm\\s+-[a-z]*r[a-z]*f?\\s+"
-    r"(?P<target>(?:\"[^\"]+\"|'[^']+'|[^;&|\\s]+))",
+    r"(?:^|[;&|]\s*)\s*(?:sudo\s+)?rm\s+-[a-z]*r[a-z]*f?\s+"
+    r"(?P<target>(?:\"[^\"]+\"|'[^']+'|[^;&|\s]+))",
     re.IGNORECASE,
 )
 _ADAPTIVE_WORKFLOW_INTENT_RE = re.compile(
-    r"\\b(?:build|rebuild|compile|package|deploy|redeploy|test|testing|"
-    r"integration\\s+test|end[- ]to[- ]end|e2e|release)\\b",
+    r"\b(?:build|rebuild|compile|package|deploy|redeploy|test|testing|"
+    r"integration\s+test|end[- ]to[- ]end|e2e|release)\b",
     re.IGNORECASE,
 )
 _ADAPTIVE_DISPOSABLE_RELATIVE = frozenset({
@@ -2005,7 +2005,7 @@ def _adaptive_expand_cleanup_target(target: str) -> str | None:
     # the gateway policy engine.
     if any(token in value for token in ("$(", "`", "*", "?", "[", "]", "{", "}")):
         return None
-    variable = re.fullmatch(r"\\$([A-Za-z_][A-Za-z0-9_]*)", value)
+    variable = re.fullmatch(r"\$([A-Za-z_][A-Za-z0-9_]*)", value)
     if variable:
         resolved = os.environ.get(variable.group(1))
         return resolved.strip() if isinstance(resolved, str) and resolved.strip() else None
