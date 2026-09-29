@@ -24,11 +24,17 @@ def suspicious_model_threshold() -> int:
         return 3
 
 
-def record_suspicious_behavior(provider: str, model: str) -> tuple[int, bool]:
-    """Record one blocked action; return ``(count, newly_blacklisted)``."""
+def record_suspicious_behavior(
+    provider: str,
+    model: str,
+    *,
+    weight: int = 1,
+) -> tuple[int, bool]:
+    """Record blocked behavior and return the score and blacklist transition."""
     key = _key(provider, model)
+    delta = max(1, int(weight))
     with _lock:
-        _suspicious_counts[key] += 1
+        _suspicious_counts[key] += delta
         count = _suspicious_counts[key]
         newly_blacklisted = count >= suspicious_model_threshold() and key not in _runtime_blacklist
         if newly_blacklisted:
