@@ -19,7 +19,7 @@ renders with `--local` and applies the tag, and with `imagePullPolicy: Always` a
 re-push of that tag would have silently changed what a restarted pod executes
 while `/health` still reported the same commit.
 
-Evidence (production deploy deliberately not re-run): `/health`, git HEAD and the
+Evidence (verified before the deploy recorded below): `/health`, git HEAD and the
 Deployment annotation all report `1ca0a6e8...`; the tag
 `swarm-alpine-1ca0a6e8...` resolves to `sha256:05bf11d7...`, equal to the running
 imageID of the gateway and of the kilo worker; `verify-provenance.sh` failed on
@@ -28,6 +28,22 @@ with `kubectl set image --local`, the tag guard against the real registry (fires
 `FORCE_TAG=1` overrides) and `verify_image_digest` - extracted from `deploy.sh` -
 against the live cluster (passes on the correct digest, fails closed on a wrong
 digest and on an empty selector).
+
+Shipped live 2026-09-29 as `8d06095` - the script's first end-to-end run, on a
+new tag from HEAD so no tag was overwritten. Build and push produced
+`sha256:c783d3d51b19b6e554c3e595b864b9fc02738dd5d1cfca10d14b9dfa4da22751`; the
+tag guard passed, digest verification matched for the gateway and the kilo
+worker, the smoke tests passed (`/health` 200, `/ready` 200, chat SSE
+`{"ok": true}`), and `/health` reported `8d06095`. The deploy printed the pin
+diff, which was applied on the workstation. The live Deployment spec and both
+running pods now carry `repo@sha256:c783d3d5...` plus the `tusker.net.au/*`
+annotations, and `verify-provenance.sh` reports full agreement: tracked pin =
+live spec = pod imageIDs = recorded tag digest = `/health` = git HEAD.
+
+Noticed while reading the build log (pre-existing, unrelated): buildah warns
+`HEALTHCHECK is not supported for OCI image format and will be ignored`, so the
+Dockerfile's HEALTHCHECK does not apply to the pushed image; the k8s
+startup/readiness/liveness probes are what actually gate the pod.
 
 ## Metrics scrape auth wired end to end (2026-09-29)
 
