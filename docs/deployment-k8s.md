@@ -41,6 +41,13 @@ config manifests requires operator authorization. The script verifies the
 running ready pod's image digest against the pushed digest and checks the public
 `/health` revision before reporting success.
 
+After a deploy is verified, delete its build directory on visor - the trees
+accumulate at roughly 4 MB per revision and are reproducible from git:
+
+```bash
+ssh visor "rm -rf /srv/opencode/tusker-ai-gateway-build-$REV"
+```
+
 ### Provenance: digest pinning and drift checks
 
 Every deploy pins the image by digest, not by tag: `kubectl set image` renders

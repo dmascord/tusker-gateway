@@ -40,10 +40,21 @@ running pods now carry `repo@sha256:c783d3d5...` plus the `tusker.net.au/*`
 annotations, and `verify-provenance.sh` reports full agreement: tracked pin =
 live spec = pod imageIDs = recorded tag digest = `/health` = git HEAD.
 
-Noticed while reading the build log (pre-existing, unrelated): buildah warns
-`HEALTHCHECK is not supported for OCI image format and will be ignored`, so the
-Dockerfile's HEALTHCHECK does not apply to the pushed image; the k8s
-startup/readiness/liveness probes are what actually gate the pod.
+Residuals from this pass (2026-09-29): the `HEALTHCHECK is not supported for OCI
+image format` warning is pre-existing and the directive is inert on OCI-format
+pushes, so the Dockerfile's HEALTHCHECK is removed (with a comment) and the k8s
+probes stay the only gate. Gateway placement stays unconstrained - it scheduled
+onto wytch, both nodes are Ready and the RWX home volume is reachable from
+either, so pinning it to visor would only add build-host contention and remove
+reschedule freedom. `tmp/` is gitignored so the audit probes stay out of the
+tracked tree. visor build directories are pruned after each verified deploy,
+keeping the running revision's tree (documented in `docs/deployment-k8s.md`).
+
+Still open, needs a policy call: the Prometheus targets for kube-proxy, etcd,
+scheduler and controller-manager stay down until that monitoring release is
+reconfigured (kube-prometheus-stack values, not this repo), and the idle
+Longhorn claims for unused workloads (pr-agent, legacy tusker-home) stay
+detached until those workloads are decided on.
 
 ## Metrics scrape auth wired end to end (2026-09-29)
 

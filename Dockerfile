@@ -109,7 +109,8 @@ ENV TUSKER_COMMIT=${TUSKER_COMMIT}
 
 USER nobody
 
-HEALTHCHECK --interval=10s --timeout=3s --start-period=15s --retries=3 \
-    CMD curl -f http://127.0.0.1:8642/health || exit 1
+# No HEALTHCHECK here: the image is pushed in OCI format, where buildah drops the
+# directive ("HEALTHCHECK is not supported for OCI image format"), and the k8s
+# startup/readiness/liveness probes are what actually gate a pod.
 
 ENTRYPOINT ["tini", "--", "python", "-m", "tusker_gateway"]

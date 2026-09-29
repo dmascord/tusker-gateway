@@ -8,3 +8,4 @@ __pycache__/
 !.env.example
 data/
 *.har
+tmp/
