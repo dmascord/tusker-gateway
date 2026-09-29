@@ -1974,6 +1974,12 @@ def _adaptive_requires_approval(
             return True
         if name in _SHELL_TOOL_NAMES and _ADAPTIVE_CRITICAL_SHELL_RE.search(argument_text):
             return True
+        # Generic/browser/computer tools are too ambiguous to auto-authorize:
+        # the broad argument regex may have matched an instrument token or
+        # side-effect hidden inside a nested payload. Keep approval unless the
+        # classifier has a narrow deterministic rule for this tool family.
+        if name not in _SHELL_TOOL_NAMES and name != "send_message":
+            return True
         if not user_authorized:
             return True
     return False
