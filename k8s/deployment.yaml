@@ -209,10 +209,12 @@ spec:
         # affirmative. Defaults to true (safe).
         - name: TUSKER_HIGH_IMPACT_GREYLIST_FORCE_DENY
           value: 'true'
-        # Temporary investigation mode: record high-impact triggers and allow
-        # requests without emitting an interactive OMP approval question.
+        # Adaptive mode: inspect the concrete proposed tool call. Explicitly
+        # requested non-critical actions proceed without another prompt and are
+        # audited; financial, destructive/critical, greylisted, or autonomous
+        # high-impact actions still require the native question approval.
         - name: TUSKER_HIGH_IMPACT_MODE
-          value: audit
+          value: adaptive
         # LLM Stats ranking enforcement. `prefer` keeps out-of-cutoff
         # models selectable and orders them behind better-ranked ones
         # instead of dropping them from every pool (the `drop` default).
