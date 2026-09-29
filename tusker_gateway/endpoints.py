@@ -1932,6 +1932,53 @@ _SHELL_HIGH_IMPACT_RE = re.compile(
 )
 
 
+# Adaptive mode keeps confirmation for actions whose blast radius is difficult
+# to recover from even when the latest user turn explicitly requests them.
+_ADAPTIVE_CRITICAL_SHELL_RE = re.compile(
+    r"(?:^|[;&|]\s*|[\"'])\s*(?:sudo\s+)?(?:"
+    r"rm\s+-[a-z]*r[a-z]*f?\s+(?:/|~)(?:\s|$)|"
+    r"kubectl\s+drain\b|"
+    r"kubectl\s+delete\s+(?:namespace|node|persistentvolume(?:claim)?|pv|pvc|crd)\b|"
+    r"git\s+push\b[^;&|]*--force(?:-with-lease)?\b|"
+    r"(?:drop|truncate)\s+(?:database|schema)\b|"
+    r"(?:mkfs|shutdown|reboot|poweroff)\b|"
+    r"dd\s+if=)",
+    re.IGNORECASE,
+)
+
+
+def _adaptive_requires_approval(
+    calls: list[dict[str, Any]],
+    *,
+    messages: Any = None,
+    explicitly_authorized: bool = False,
+    greylisted: bool = False,
+    force_deny: bool = False,
+    argument_regex: re.Pattern[str] | None = None,
+) -> bool:
+    """Return whether adaptive mode must interrupt for native approval."""
+    if not calls:
+        return False
+    user_authorized = explicitly_authorized or _explicit_high_impact_authorization(messages)
+    for call in calls:
+        kind = _high_impact_call_kind(call, argument_regex=argument_regex)
+        if kind is None:
+            continue
+        function = call.get("function") or {}
+        name = str(function.get("name") or "").strip().lower()
+        argument_text = _tool_argument_text(function.get("arguments"))
+        if greylisted and force_deny:
+            return True
+        # Financial/order execution always keeps a human in the loop.
+        if name in {"place_trade", "submit_order"}:
+            return True
+        if name in _SHELL_TOOL_NAMES and _ADAPTIVE_CRITICAL_SHELL_RE.search(argument_text):
+            return True
+        if not user_authorized:
+            return True
+    return False
+
+
 def _compiled_argument_regex(config: dict[str, Any]) -> re.Pattern[str]:
     """Resolve the argument regex from config, falling back to the built-in verbs."""
     try:
@@ -2074,7 +2121,10 @@ def _native_content_question_if_needed(
     out of the approval protocol and guarantees a single OMP ask call.
     """
     action = _high_impact_content_kind(messages, content_regex=content_regex)
-    if high_impact_mode() == "audit":
+    # In adaptive mode, user text is a signal rather than an approval trigger.
+    # Wait for the concrete proposed tool call so deterministic policy can
+    # evaluate the actual operation and arguments.
+    if high_impact_mode() in {"audit", "adaptive"}:
         return None
     if not action or question_authorized_for_content(
         messages, action, request_id=request_id, audit=audit
@@ -2118,7 +2168,8 @@ def _enforce_high_impact_approval(
         risky = _high_impact_content_kind(messages, content_regex=content_regex)
     if risky is None:
         return
-    if high_impact_mode() == "audit":
+    mode = high_impact_mode()
+    if mode == "audit":
         source_role = None
         source_message_index = None
         source_content_sha256 = None
@@ -2201,6 +2252,41 @@ def _enforce_high_impact_approval(
             source_message_index, call_signature,
         )
         return
+    if mode == "adaptive" and not _adaptive_requires_approval(
+        calls,
+        messages=messages,
+        explicitly_authorized=explicitly_authorized,
+        greylisted=greylisted,
+        force_deny=force_deny,
+        argument_regex=argument_regex,
+    ):
+        event = {
+            "event_type": "high_impact.adaptive",
+            "decision": "allowed_by_deterministic_policy",
+            "mode": "adaptive",
+            "request_id": request_id or "unknown",
+            "provider": provider,
+            "model": model,
+            "action": risky,
+            "tool_names": [
+                str((call.get("function") or {}).get("name") or "unknown")[:80]
+                for call in calls[:8]
+            ],
+            "tool_call_signature": _tool_call_signature(calls),
+            "greylisted": greylisted,
+            "explicitly_authorized": explicitly_authorized
+            or _explicit_high_impact_authorization(messages),
+        }
+        writer = getattr(audit, "write_sync", None)
+        if callable(writer):
+            writer(event)
+        logger.info(
+            "high-impact action allowed by adaptive policy provider=%s model=%s "
+            "request_id=%s action=%s",
+            provider, model, request_id or "unknown", risky,
+        )
+        return
+
     # A greylisted model never gets the "explicitly authorized" shortcut when
     # the operator hasn't opted out. This is the safe default: a goal-injected
     # harness must still trip the gate even when the user turn happens to
@@ -2259,13 +2345,21 @@ def _explicit_high_impact_authorization(messages: Any) -> bool:
         )
     if not isinstance(content, str):
         return False
-    if re.search(r"\b(?:do not|don't|dont|never|not authorized|unauthorized)\b", content, re.I):
+    if re.search(
+        r"\b(?:do not|don't|dont|never|not authorized|unauthorized|"
+        r"without\s+(?:sending|executing|running|deploying|deleting|removing|"
+        r"pushing|merging|transferring|buying|selling))\b",
+        content,
+        re.I,
+    ):
         return False
     return bool(
         re.search(
             r"\b(?:i\s+(?:explicitly\s+)?(?:approve|authorize)|"
             r"go\s+ahead\s+and|proceed\s+with|place\s+the\s+order|"
-            r"make\s+the\s+purchase)\b",
+            r"make\s+the\s+purchase)\b|"
+            r"^\s*(?:please\s+)?(?:send|delete|remove|deploy|restart|reboot|"
+            r"merge|push|publish|transfer|wire|buy|sell|place|submit|execute|run)\b",
             content,
             re.I,
         )
@@ -2542,7 +2636,24 @@ def _validate_complete_tool_response(
         if content_action
         else False
     )
-    if calls and native_questions and high_impact_mode() != "audit" and not native_authorized:
+    mode = high_impact_mode()
+    adaptive_call_approval = (
+        mode == "adaptive"
+        and _adaptive_requires_approval(
+            calls,
+            messages=messages,
+            explicitly_authorized=explicitly_authorized,
+            greylisted=greylisted,
+            force_deny=force_deny,
+            argument_regex=argument_regex,
+        )
+    )
+    if (
+        calls
+        and native_questions
+        and (mode == "approval" or adaptive_call_approval)
+        and not native_authorized
+    ):
         question_response = question_response_for_calls(
             calls,
             model=model,
@@ -2552,7 +2663,7 @@ def _validate_complete_tool_response(
         )
         if question_response is not None:
             return question_response
-    if content_action and high_impact_mode() != "audit" and not native_authorized:
+    if content_action and mode == "approval" and not native_authorized:
         return question_response_for_content(
             messages,
             content_action,
@@ -2693,7 +2804,10 @@ async def _prepare_stream_result(
     # call can leak before the native approval question replaces it.
     buffer_before_client = (
         tools_may_produce_high_impact(tools)
-        or _high_impact_content_kind(messages, content_regex=content_regex) is not None
+        or (
+            high_impact_mode() == "approval"
+            and _high_impact_content_kind(messages, content_regex=content_regex) is not None
+        )
     )
 
     async def _early_stream(
@@ -2745,7 +2859,7 @@ async def _prepare_stream_result(
             )
             if (
                 content_action
-                and high_impact_mode() != "audit"
+                and high_impact_mode() == "approval"
                 and not native_content_authorized
                 and not assembled_calls
             ):
@@ -2784,7 +2898,22 @@ async def _prepare_stream_result(
                     request_id=request_id,
                     audit=audit,
                 )
-                if high_impact_mode() != "audit" and not native_authorized:
+                stream_mode = high_impact_mode()
+                adaptive_call_approval = (
+                    stream_mode == "adaptive"
+                    and _adaptive_requires_approval(
+                        assembled_calls,
+                        messages=messages,
+                        explicitly_authorized=explicitly_authorized,
+                        greylisted=greylisted,
+                        force_deny=force_deny,
+                        argument_regex=argument_regex,
+                    )
+                )
+                if (
+                    (stream_mode == "approval" or adaptive_call_approval)
+                    and not native_authorized
+                ):
                     question_response = question_response_for_calls(
                         assembled_calls,
                         model=model,
@@ -2805,7 +2934,7 @@ async def _prepare_stream_result(
                             request_id or "unknown",
                         )
                         return
-                if content_action and high_impact_mode() != "audit" and not native_content_authorized:
+                if content_action and stream_mode == "approval" and not native_content_authorized:
                     question_response = question_response_for_content(
                         messages,
                         content_action,
@@ -2839,7 +2968,7 @@ async def _prepare_stream_result(
                     native_authorized=native_authorized,
                     audit=audit,
                 )
-            if content_action and high_impact_mode() != "audit" and not native_content_authorized:
+            if content_action and high_impact_mode() == "approval" and not native_content_authorized:
                 question_response = question_response_for_content(
                     messages,
                     content_action,
