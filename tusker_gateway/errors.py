@@ -54,6 +54,32 @@ class HighImpactApprovalRequiredError(GatewayError):
         self.action = action
 
 
+
+class ToolPolicyDeniedError(ProviderError):
+    """A provider proposed a tool action forbidden by deterministic policy."""
+
+    def __init__(
+        self,
+        *,
+        provider: str,
+        model: str,
+        rule: str,
+        newly_blacklisted: bool = False,
+    ) -> None:
+        # Deliberately generic: do not expose the matched rule/path to the
+        # upstream/model-facing retry context.
+        super().__init__(
+            "operation_not_permitted",
+            code="tool_policy_denied",
+        )
+        self.provider = provider
+        self.model = model
+        self.rule = rule
+        self.newly_blacklisted = newly_blacklisted
+        self.upstream_status = 502
+        self.upstream_body = "operation_not_permitted"
+
+
 class NoHealthyModelsError(BadRequestError):
     """A pool has no currently eligible upstream candidate.
 
