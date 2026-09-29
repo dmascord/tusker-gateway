@@ -5978,6 +5978,8 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                     )
             pool_name = _pool_name(body) or "passthrough"
             conversation_id = _request_conversation_id(request, body, api_key)
+            from tusker_gateway.native_question import set_conversation_context
+            set_conversation_context(conversation_id)
             set_access_log_context(request, pool=pool_name)
 
             # Model id clients must see: the requested virtual alias for
@@ -6949,6 +6951,8 @@ async def _responses_handler_impl(request: web.Request) -> web.Response | web.St
             {**body, "messages": messages},
             _resolve_api_key(request),
         )
+        from tusker_gateway.native_question import set_conversation_context
+        set_conversation_context(conversation_id)
         cache: ResponseCache | None = request.app.get("cache")
         sem_cache = request.app.get("semantic_cache")
         breaker: CircuitBreaker | None = request.app.get("breaker")
