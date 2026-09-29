@@ -11,6 +11,7 @@ import tusker_gateway.native_question as native_question
 from tusker_gateway.approval_store import ApprovalStore
 from tusker_gateway.endpoints import _adaptive_requires_approval
 from tusker_gateway.endpoints import _deterministic_tool_denial
+from tusker_gateway.errors import ToolPolicyDeniedError
 from tusker_gateway.endpoints import _native_content_question_if_needed
 from tusker_gateway.endpoints import _validate_complete_tool_response
 from tusker_gateway.endpoints import _prepare_stream_result
@@ -96,6 +97,29 @@ def test_policy_does_not_deny_scoped_build_cleanup():
     assert _deterministic_tool_denial(
         _bash_call("rm -rf /tmp/tusker-build-123")
     ) is None
+
+
+def test_denied_call_never_becomes_native_question(monkeypatch):
+    monkeypatch.setenv("TUSKER_HIGH_IMPACT_MODE", "adaptive")
+    response = {
+        "choices": [{"message": {"role": "assistant", "tool_calls": _bash_call(
+            "cat ~/.ssh/id_rsa"
+        )}}]
+    }
+    with pytest.raises(ToolPolicyDeniedError) as denied:
+        _validate_complete_tool_response(
+            response,
+            [{"type": "function", "function": {"name": "bash"}}],
+            provider="provider",
+            model="model",
+            request_id="req-deny-before-question",
+            require_tool_call=False,
+            reject_empty=False,
+            messages=[{"role": "user", "content": "Inspect the environment."}],
+            native_questions=True,
+        )
+    assert denied.value.code == "tool_policy_denied"
+    assert denied.value.message == "operation_not_permitted"
 
 
 def test_adaptive_policy_allows_explicit_noncritical_action(monkeypatch):
