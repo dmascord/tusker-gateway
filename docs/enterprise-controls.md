@@ -107,7 +107,12 @@ Three high-impact modes are available:
   temporary investigation rather than as the normal safety posture.
 
 Audit events contain bounded metadata and hashes, not raw prompts, tool
-arguments, or secrets. Audit persistence continues to follow
+arguments, or secrets. Pending native approvals are scoped to the authenticated
+caller and stable conversation when available. Their exact replay payload is
+encrypted at rest in the shared PostgreSQL approval store using
+`TUSKER_KEY_ENCRYPTION_KEY` (or `ENCRYPTION_KEY`), and approvals have both a
+5-minute idle expiry and a 15-minute absolute lifetime. SQLite remains a
+development/test-only fallback. Audit persistence continues to follow
 `TUSKER_AUDIT_FAIL_CLOSED`.
 
 Operational knobs:
