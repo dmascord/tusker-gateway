@@ -92,8 +92,14 @@ class QualityDB:
             existing_events = conn.execute(
                 "SELECT COUNT(*) FROM model_events WHERE provider = ? AND model = ?",
                 (provider, model),
-            ).fetchone()[0]
-            if existing_events:
+            ).fetchone()
+            if existing_events is None:
+                # Advisory state store unavailable: reads come back as noop
+                # cursors and writes are no-ops, so there is nothing to seed.
+                # Indexing the noop row raised TypeError and crash-looped the
+                # gateway at startup until PostgreSQL returned.
+                return
+            if existing_events[0]:
                 return
             if self._db.is_postgres:
                 conn.execute(
@@ -260,8 +266,14 @@ class QualityDB:
     def status(self) -> dict[str, Any]:
         """Return summary status for /status endpoint."""
         with self._db.connection() as conn:
-            count = conn.execute("SELECT COUNT(*) FROM model_quality").fetchone()[0]
-            healthy = conn.execute(
+            count_row = conn.execute("SELECT COUNT(*) FROM model_quality").fetchone()
+            healthy_row = conn.execute(
                 "SELECT COUNT(*) FROM model_quality WHERE quality_score >= 50.0"
-            ).fetchone()[0]
-        return {"total_models": count, "healthy_models": healthy}
+            ).fetchone()
+        if count_row is None or healthy_row is None:
+            # Degraded state store: report empty rather than failing /status.
+            return {"total_models": 0, "healthy_models": 0}
+        return {
+            "total_models": int(count_row[0]),
+            "healthy_models": int(healthy_row[0]),
+        }

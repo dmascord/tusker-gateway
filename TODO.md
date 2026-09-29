@@ -56,6 +56,34 @@ reconfigured (kube-prometheus-stack values, not this repo), and the idle
 Longhorn claims for unused workloads (pr-agent, legacy tusker-home) stay
 detached until those workloads are decided on.
 
+## Degraded-mode startup crash fixed (2026-09-29)
+
+Found live while verifying the `8d06095` deploy: `wytch` went NotReady (~06:40Z)
+and evicted its pods, which took the gateway's PostgreSQL state store away. The
+gateway then crash-looped 5 times (`Back-off restarting failed container`) until
+postgres was ready six minutes later - even though the storage layer had already
+logged `entering in-memory degraded mode`. Root cause: `QualityDB.prime_model`
+indexed the advisory noop row directly (`).fetchone()[0]`), so
+`PoolManager.__post_init__` raised `TypeError: 'NoneType' object is not
+subscriptable` out of `create_app()`; degraded mode was unreachable at startup.
+`QualityDB.status()` indexed its counts the same way, so `/status` would have
+500'd during an outage.
+
+Fixed by treating a noop row as "no data" in both places
+(`tusker_gateway/quality.py`), with a regression test that drives a real
+degraded `Database`. The rest of the advisory stores (model_capability,
+model_rankings, persistent_cooldown, provider_usage, tool_capability,
+circuit_breaker, rate_limit, idempotency) already guard their `fetchone()`
+results; `budget`, `config_store`, `rate_limit` and `idempotency` run with the
+`critical` policy, which raises instead of degrading.
+
+Evidence: a pre-fix tree exported from `f651a5e` crashes on an unreachable state
+store with the production traceback, while the fixed tree boots, serves
+`/health` 200 and reports `state_store` `{backend: degraded, degraded: true}`;
+the new test fails before the fix and passes after; offline suite 1488 passed,
+8 skipped. Not yet deployed - production still runs the pre-fix image, so the
+crash-loop remains until the next deploy.
+
 ## Metrics scrape auth wired end to end (2026-09-29)
 
 Prometheus had been getting `500 configuration_required` from every

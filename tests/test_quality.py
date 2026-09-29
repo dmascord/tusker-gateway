@@ -155,3 +155,31 @@ def test_prime_model_seeds_only_uncalled_models():
         # A real success recomputes from the event window.
         db.record("p1", "fresh", True, 0.0)
         assert db.get_quality("p1", "fresh") == 100.0
+
+
+def test_degraded_state_store_does_not_crash_quality_reads(monkeypatch):
+    """An unavailable advisory state store returns noop rows.
+
+    Regression: ``prime_model`` indexed ``fetchone()[0]`` directly, so a state
+    store outage at startup raised TypeError ("'NoneType' object is not
+    subscriptable") out of ``PoolManager.__post_init__`` and crash-looped the
+    gateway until PostgreSQL returned - the opposite of the documented
+    degraded mode.  ``status()`` indexed its counts the same way.
+    """
+    from tusker_gateway import storage
+
+    def _unavailable(_target):
+        raise OSError("state store unreachable")
+
+    monkeypatch.setattr(storage, "_pool_for", _unavailable)
+    monkeypatch.setattr(storage, "_STORAGE_STATUS", dict(storage._STORAGE_STATUS))
+    monkeypatch.setenv("TUSKER_STATE_DATABASE_URL", "postgresql://state.invalid/tusker")
+
+    db = QualityDB("quality.db")
+
+    db.prime_model("p1", "m1")  # raised TypeError before the fix
+    assert db.get_quality("p1", "m1") is None
+    assert db.status() == {"total_models": 0, "healthy_models": 0}
+
+    db.record("p1", "m1", True, 12.0)
+    assert db.rank([("p1", "m1")]) == [("p1", "m1", 50.0)]

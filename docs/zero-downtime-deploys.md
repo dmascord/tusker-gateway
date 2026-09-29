@@ -38,6 +38,12 @@ See "History" for the failed August 2026 attempts that delayed this.
    critical stores fail closed with a controlled `503`; they do not fall
    back to shared SQLite files.
 
+   Degraded mode returns an empty, cursor-shaped result: `execute()` yields a
+   noop cursor whose `fetchone()` is `None` and `fetchall()` is `[]`, and writes
+   are no-ops. Callers must treat a `None` row as "no data" rather than indexing
+   it - indexing a noop row raises `TypeError` (this crash-looped startup from
+   `PoolManager` model priming on 2026-09-29).
+
 5. **SSE smoke test in `k8s/deploy.sh`.** After `/health` and
    `/ready`, the deploy script posts a streaming
    `/v1/chat/completions` request through the public ingress with a
