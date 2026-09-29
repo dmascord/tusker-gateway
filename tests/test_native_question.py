@@ -9,6 +9,7 @@ import pytest
 
 import tusker_gateway.native_question as native_question
 from tusker_gateway.approval_store import ApprovalStore
+from tusker_gateway.endpoints import _adaptive_requires_approval
 from tusker_gateway.endpoints import _native_content_question_if_needed
 from tusker_gateway.endpoints import _validate_complete_tool_response
 from tusker_gateway.endpoints import _prepare_stream_result
@@ -50,6 +51,100 @@ class _Audit:
 
     def write_sync(self, event):
         self.events.append(dict(event))
+
+
+def _bash_call(command: str):
+    return [{
+        "id": "call-bash",
+        "type": "function",
+        "function": {"name": "bash", "arguments": json.dumps({"command": command})},
+    }]
+
+
+def test_adaptive_policy_allows_explicit_noncritical_action(monkeypatch):
+    monkeypatch.setenv("TUSKER_HIGH_IMPACT_MODE", "adaptive")
+    assert _adaptive_requires_approval(
+        _bash_call("rm -rf /tmp/tusker-build"),
+        messages=[{"role": "user", "content": "Please delete the temporary build."}],
+    ) is False
+
+
+def test_adaptive_policy_requires_approval_for_autonomous_action(monkeypatch):
+    monkeypatch.setenv("TUSKER_HIGH_IMPACT_MODE", "adaptive")
+    assert _adaptive_requires_approval(
+        _bash_call("rm -rf /tmp/tusker-build"),
+        messages=[{"role": "user", "content": "Inspect the build and fix anything needed."}],
+    ) is True
+
+
+def test_adaptive_policy_keeps_critical_shell_confirmation(monkeypatch):
+    monkeypatch.setenv("TUSKER_HIGH_IMPACT_MODE", "adaptive")
+    assert _adaptive_requires_approval(
+        _bash_call("sudo reboot"),
+        messages=[{"role": "user", "content": "Please reboot the server."}],
+    ) is True
+
+
+def test_adaptive_policy_keeps_financial_confirmation(monkeypatch):
+    monkeypatch.setenv("TUSKER_HIGH_IMPACT_MODE", "adaptive")
+    assert _adaptive_requires_approval(
+        _trade_call(),
+        messages=[{"role": "user", "content": "Please place the order."}],
+    ) is True
+
+
+def test_adaptive_content_signal_does_not_preflight_question(monkeypatch):
+    monkeypatch.setenv("TUSKER_HIGH_IMPACT_MODE", "adaptive")
+    response = _native_content_question_if_needed(
+        [{"role": "user", "content": "Please submit_order now."}],
+        model="requested-model",
+        content_regex=re.compile(r"submit[_ -]?order", re.IGNORECASE),
+        request_id="req-adaptive",
+    )
+    assert response is None
+
+
+def test_adaptive_complete_guard_allows_explicit_noncritical_call(monkeypatch):
+    monkeypatch.setenv("TUSKER_HIGH_IMPACT_MODE", "adaptive")
+    response = {
+        "choices": [{"message": {"role": "assistant", "tool_calls": _bash_call(
+            "rm -rf /tmp/tusker-build"
+        )}}]
+    }
+    allowed = _validate_complete_tool_response(
+        response,
+        [{"type": "function", "function": {"name": "bash"}}],
+        provider="provider",
+        model="model",
+        request_id="req-adaptive-explicit",
+        require_tool_call=False,
+        reject_empty=False,
+        messages=[{"role": "user", "content": "Please delete the temporary build."}],
+        native_questions=True,
+    )
+    assert allowed == response
+
+
+def test_adaptive_complete_guard_questions_autonomous_noncritical_call(monkeypatch):
+    monkeypatch.setenv("TUSKER_HIGH_IMPACT_MODE", "adaptive")
+    response = {
+        "choices": [{"message": {"role": "assistant", "tool_calls": _bash_call(
+            "rm -rf /tmp/tusker-build"
+        )}}]
+    }
+    question = _validate_complete_tool_response(
+        response,
+        [{"type": "function", "function": {"name": "bash"}}],
+        provider="provider",
+        model="model",
+        request_id="req-adaptive-auto",
+        require_tool_call=False,
+        reject_empty=False,
+        messages=[{"role": "user", "content": "Inspect the build and fix anything needed."}],
+        native_questions=True,
+    )
+    call = question["choices"][0]["message"]["tool_calls"][0]
+    assert call["function"]["name"] == "ask"
 
 
 def test_risky_call_becomes_native_question_tool_call():
