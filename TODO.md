@@ -88,7 +88,7 @@ logged `systemd-logind: The system will reboot now!` at 16:38:09 from a login
 session of user `tusker`, followed by an orderly shutdown (services stopped,
 DHCP released, link down at 16:38:44) and a return at 16:54:10. An operator or
 automation session requested that reboot; the gateway deploy finished at ~16:37
-and touched nothing on `wytch`.
+and issued no reboot or node-maintenance command on `wytch`.
 
 Deployed as `481f868` the same day (`sha256:bc856ed53a6c448296322f42a4daa9b21d2815d04787837d698e1067ca28f935`,
 tag guard clean, gateway and kilo-worker digests verified, smoke health/ready
