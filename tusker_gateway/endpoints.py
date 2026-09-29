@@ -1935,16 +1935,113 @@ _SHELL_HIGH_IMPACT_RE = re.compile(
 # Adaptive mode keeps confirmation for actions whose blast radius is difficult
 # to recover from even when the latest user turn explicitly requests them.
 _ADAPTIVE_CRITICAL_SHELL_RE = re.compile(
-    r"(?:^|[;&|]\s*|[\"'])\s*(?:sudo\s+)?(?:"
-    r"rm\s+-[a-z]*r[a-z]*f?\s+(?:/|~)(?:\s|$)|"
-    r"kubectl\s+drain\b|"
-    r"kubectl\s+delete\s+(?:namespace|node|persistentvolume(?:claim)?|pv|pvc|crd)\b|"
-    r"git\s+push\b[^;&|]*--force(?:-with-lease)?\b|"
-    r"(?:drop|truncate)\s+(?:database|schema)\b|"
-    r"(?:mkfs|shutdown|reboot|poweroff)\b|"
-    r"dd\s+if=)",
+    r"(?:^|[;&|]\\s*|[\"'])\\s*(?:sudo\\s+)?(?:"
+    r"kubectl\\s+drain\\b|"
+    r"kubectl\\s+delete\\s+(?:namespace|node|persistentvolume(?:claim)?|pv|pvc|crd)\\b|"
+    r"git\\s+push\\b[^;&|]*--force(?:-with-lease)?\\b|"
+    r"(?:drop|truncate)\\s+(?:database|schema)\\b|"
+    r"(?:mkfs|shutdown|reboot|poweroff)\\b|"
+    r"dd\\s+if=)",
     re.IGNORECASE,
 )
+
+_ADAPTIVE_RM_RF_RE = re.compile(
+    r"(?:^|[;&|]\\s*)\\s*(?:sudo\\s+)?rm\\s+-[a-z]*r[a-z]*f?\\s+"
+    r"(?P<target>(?:\"[^\"]+\"|'[^']+'|[^;&|\\s]+))",
+    re.IGNORECASE,
+)
+_ADAPTIVE_WORKFLOW_INTENT_RE = re.compile(
+    r"\\b(?:build|rebuild|compile|package|deploy|redeploy|test|testing|"
+    r"integration\\s+test|end[- ]to[- ]end|e2e|release)\\b",
+    re.IGNORECASE,
+)
+_ADAPTIVE_DISPOSABLE_RELATIVE = frozenset({
+    "build",
+    "dist",
+    "out",
+    "target",
+    ".cache",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".tox",
+})
+
+
+def _adaptive_workflow_authorized(messages: Any) -> bool:
+    """Recognize an explicit build/deploy/test workflow in the latest user turn."""
+    if not isinstance(messages, list):
+        return False
+    latest = next(
+        (
+            message
+            for message in reversed(messages)
+            if isinstance(message, dict) and message.get("role") == "user"
+        ),
+        None,
+    )
+    if not isinstance(latest, dict):
+        return False
+    content = latest.get("content")
+    if isinstance(content, list):
+        content = " ".join(
+            str(item.get("text", ""))
+            for item in content
+            if isinstance(item, dict) and item.get("type") == "text"
+        )
+    return isinstance(content, str) and bool(_ADAPTIVE_WORKFLOW_INTENT_RE.search(content))
+
+
+def _adaptive_expand_cleanup_target(target: str) -> str | None:
+    """Resolve a cleanup target only when expansion is deterministic here.
+
+    Unknown shell variables fail closed rather than being guessed. This keeps
+    `rm -rf $SOMETHING` gated unless the gateway can prove where it points.
+    """
+    value = target.strip().strip("\"'")
+    if not value:
+        return None
+    # Reject shell substitutions/globs: their runtime meaning is not known to
+    # the gateway policy engine.
+    if any(token in value for token in ("$(", "`", "*", "?", "[", "]", "{", "}")):
+        return None
+    variable = re.fullmatch(r"\\$([A-Za-z_][A-Za-z0-9_]*)", value)
+    if variable:
+        resolved = os.environ.get(variable.group(1))
+        return resolved.strip() if isinstance(resolved, str) and resolved.strip() else None
+    return os.path.expanduser(value)
+
+
+def _adaptive_safe_cleanup(command: str) -> bool:
+    """Return True only when every recursive-delete target is disposable."""
+    matches = list(_ADAPTIVE_RM_RF_RE.finditer(command))
+    if not matches:
+        return False
+    for match in matches:
+        resolved = _adaptive_expand_cleanup_target(match.group("target"))
+        if not resolved:
+            return False
+        normalized = os.path.normpath(resolved)
+
+        # Absolute cleanup is allowed only below OS temp roots, never the root
+        # itself. /tmp/foo is disposable; /tmp, /, $HOME and /srv are not.
+        if os.path.isabs(normalized):
+            temp_roots = ("/tmp", "/var/tmp")
+            if not any(
+                normalized != root and normalized.startswith(root + os.sep)
+                for root in temp_roots
+            ):
+                return False
+            continue
+
+        # Repository-local build artefacts are safe only as direct disposable
+        # trees (or descendants), never ".." escapes.
+        if normalized == ".." or normalized.startswith(".." + os.sep):
+            return False
+        first = normalized.removeprefix("." + os.sep).split(os.sep, 1)[0]
+        if first not in _ADAPTIVE_DISPOSABLE_RELATIVE:
+            return False
+    return True
 
 
 def _adaptive_requires_approval(
@@ -1960,6 +2057,7 @@ def _adaptive_requires_approval(
     if not calls:
         return False
     user_authorized = explicitly_authorized or _explicit_high_impact_authorization(messages)
+    workflow_authorized = _adaptive_workflow_authorized(messages)
     for call in calls:
         kind = _high_impact_call_kind(call, argument_regex=argument_regex)
         if kind is None:
@@ -1972,12 +2070,18 @@ def _adaptive_requires_approval(
         # Financial/order execution always keeps a human in the loop.
         if name in {"place_trade", "submit_order"}:
             return True
-        if name in _SHELL_TOOL_NAMES and _ADAPTIVE_CRITICAL_SHELL_RE.search(argument_text):
-            return True
-        # Generic/browser/computer tools are too ambiguous to auto-authorize:
-        # the broad argument regex may have matched an instrument token or
-        # side-effect hidden inside a nested payload. Keep approval unless the
-        # classifier has a narrow deterministic rule for this tool family.
+        if name in _SHELL_TOOL_NAMES:
+            if _ADAPTIVE_CRITICAL_SHELL_RE.search(argument_text):
+                return True
+            if _ADAPTIVE_RM_RF_RE.search(argument_text):
+                # Build/deploy/test implicitly authorizes housekeeping only
+                # inside provably disposable paths.
+                if workflow_authorized and _adaptive_safe_cleanup(argument_text):
+                    continue
+                if user_authorized and _adaptive_safe_cleanup(argument_text):
+                    continue
+                return True
+        # Generic/browser/computer tools are too ambiguous to auto-authorize.
         if name not in _SHELL_TOOL_NAMES and name != "send_message":
             return True
         if not user_authorized:
