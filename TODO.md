@@ -81,8 +81,21 @@ Evidence: a pre-fix tree exported from `f651a5e` crashes on an unreachable state
 store with the production traceback, while the fixed tree boots, serves
 `/health` 200 and reports `state_store` `{backend: degraded, degraded: true}`;
 the new test fails before the fix and passes after; offline suite 1488 passed,
-8 skipped. Not yet deployed - production still runs the pre-fix image, so the
-crash-loop remains until the next deploy.
+8 skipped.
+
+Trigger, from the node's own journal: this was not a hardware flap. `wytch`
+logged `systemd-logind: The system will reboot now!` at 16:38:09 from a login
+session of user `tusker`, followed by an orderly shutdown (services stopped,
+DHCP released, link down at 16:38:44) and a return at 16:54:10. An operator or
+automation session requested that reboot; the gateway deploy finished at ~16:37
+and touched nothing on `wytch`.
+
+Deployed as `481f868` the same day (`sha256:bc856ed53a6c448296322f42a4daa9b21d2815d04787837d698e1067ca28f935`,
+tag guard clean, gateway and kilo-worker digests verified, smoke health/ready
+200, `/health` commit `481f868`, provenance chain OK after the pin). The
+rollout's pod landed back on `wytch` with 0 restarts and `/health` now reports
+`state_store` `{backend: postgres, degraded: false}`, so the next state-store
+outage degrades instead of crash-looping.
 
 ## Metrics scrape auth wired end to end (2026-09-29)
 
