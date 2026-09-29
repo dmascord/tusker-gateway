@@ -3116,6 +3116,13 @@ async def _prepare_stream_result(
                     messages=messages,
                     audit=audit,
                 )
+                _enforce_deterministic_tool_denial(
+                    assembled_calls,
+                    provider=provider,
+                    model=model,
+                    request_id=request_id,
+                    audit=audit,
+                )
                 native_authorized = question_authorized(
                     messages,
                     assembled_calls,
