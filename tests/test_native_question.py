@@ -906,6 +906,62 @@ def _set_caller(fingerprint: str) -> None:
     native_question.set_caller_context(fingerprint)
 
 
+class TestConversationScoping:
+    def test_identical_calls_get_distinct_approvals_per_conversation(self):
+        _set_caller("caller-A")
+        native_question.set_conversation_context("conversation-A")
+        first = question_response_for_calls(_trade_call(qty=7), model="model")
+        first_call = first["choices"][0]["message"]["tool_calls"][0]
+
+        native_question.set_conversation_context("conversation-B")
+        second = question_response_for_calls(_trade_call(qty=7), model="model")
+        second_call = second["choices"][0]["message"]["tool_calls"][0]
+
+        assert first_call["id"] != second_call["id"]
+
+    def test_other_conversation_cannot_replay_approval(self):
+        _set_caller("caller-A")
+        native_question.set_conversation_context("conversation-A")
+        question = question_response_for_calls(_trade_call(), model="model")
+        ask_message = question["choices"][0]["message"]
+
+        native_question.set_conversation_context("conversation-B")
+        assert replay_approved_tool_response([
+            ask_message,
+            {"role": "user", "content": "Allow once"},
+        ]) is None
+
+    def test_same_conversation_reuses_identical_approval(self):
+        _set_caller("caller-A")
+        native_question.set_conversation_context("conversation-A")
+        first = question_response_for_calls(_trade_call(qty=8), model="model")
+        second = question_response_for_calls(_trade_call(qty=8), model="model")
+        assert (
+            first["choices"][0]["message"]["tool_calls"][0]["id"]
+            == second["choices"][0]["message"]["tool_calls"][0]["id"]
+        )
+
+    def test_legacy_unscoped_context_remains_compatible(self):
+        _set_caller("caller-A")
+        native_question.set_conversation_context(None)
+        first = question_response_for_calls(_trade_call(qty=9), model="model")
+        second = question_response_for_calls(_trade_call(qty=9), model="model")
+        assert (
+            first["choices"][0]["message"]["tool_calls"][0]["id"]
+            == second["choices"][0]["message"]["tool_calls"][0]["id"]
+        )
+
+
+def test_pending_approval_has_absolute_expiry():
+    native_question.set_caller_context(None)
+    native_question.set_conversation_context(None)
+    question = question_response_for_calls(_trade_call(qty=11), model="model")
+    approval_id = question["choices"][0]["message"]["tool_calls"][0]["id"]
+    pending = native_question._PENDING[approval_id]
+    assert pending["absolute_expires_at"] > pending["created_at"]
+    assert pending["absolute_expires_at"] - pending["created_at"] <= 901
+
+
 class TestCallerScoping:
     """Approvals must be scoped to the authenticated key that proposed them."""
 
