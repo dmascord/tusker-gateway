@@ -99,6 +99,16 @@ spec:
             secretKeyRef:
               name: tusker-env-vault
               key: API_KEYS
+        # Authenticates Prometheus scrapes of /metrics (and /dashboard).
+        # The ServiceMonitor presents this same token as a bearer credential;
+        # without it both endpoints fail closed. Kept in its own secret rather
+        # than tusker-env-vault so the operator can never mount the whole
+        # provider-key vault into the Prometheus pod.
+        - name: TUSKER_METRICS_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: tusker-gateway-metrics
+              key: token
         - name: TUSKER_SEMANTIC_CACHE_ENABLED
           # Keep the production switch explicit. The image contains the
           # pinned model and the safety gates below are ready for a canary.

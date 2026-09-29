@@ -17,3 +17,13 @@ spec:
       path: /metrics
       interval: 30s
       scrapeTimeout: 10s
+      # /metrics and /dashboard fail closed unless TUSKER_METRICS_TOKEN is
+      # configured, so the scraper must present the same credential the
+      # gateway reads. The token lives in its own secret rather than
+      # tusker-env-vault: the operator may mount a referenced secret into
+      # the Prometheus pod, which must not expose every provider key.
+      authorization:
+        type: Bearer
+        credentials:
+          name: tusker-gateway-metrics
+          key: token

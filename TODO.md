@@ -1,5 +1,96 @@
 # Project TODOs
 
+## Metrics scrape auth wired end to end (2026-09-29)
+
+Prometheus had been getting `500 configuration_required` from every
+`/metrics` scrape: `TUSKER_METRICS_TOKEN` was never set on the
+deployment, so the endpoint failed closed by design while the
+ServiceMonitor presented no credential at all. Both halves are now wired
+and live-verified.
+
+- Credential: dedicated secret `tusker-gateway-metrics` (namespace
+  `hermes`, key `token`, 32-byte url-safe; created out of band like the
+  vault). Deliberately **not** `hermes-env-vault` / `tusker-env-vault`:
+  a secret referenced by the `monitoring` ServiceMonitor can be mounted
+  into the Prometheus pod, which must not expose the ~28 provider keys.
+  `k8s/split-secret.sh` is untouched.
+- `k8s/deployment.yaml`: explicit `TUSKER_METRICS_TOKEN` via
+  `secretKeyRef` (the `envFrom: tusker-env-vault` block stays as is).
+- `k8s/servicemonitor-tusker.yaml`: `endpoints[].authorization` with
+  `type: Bearer` and `credentials: tusker-gateway-metrics/token`.
+  prometheus-operator v0.94.0 **inlines** the credential into the
+  generated `prometheus.yaml` (`authorization: {type: Bearer,
+  credentials: <token>}`), so no `Prometheus.spec.secrets` mount and no
+  extra RBAC are required.
+- `k8s/networkpolicy.yaml`: the `monitoring` namespace was allowed in the
+  live policy but missing from the repo copy; the repo file now matches
+  live so a re-apply cannot break scrapes.
+- Live evidence (pod `tusker-gateway-68c85dd598-6dx2f`, revision
+  `1ca0a6e8`): `Authorization: Bearer <token>` → 200 with the metrics
+  body; missing or wrong token → 401 `invalid_api_key`; token unset on
+  the deployment → 500 `configuration_required`. `/dashboard` behaves
+  identically; `/health` + `/ready` stay unauthenticated for probes.
+- Rotation: update the secret value; the operator re-renders the scrape
+  config automatically, but the gateway reads the token from the
+  environment, so it needs a rollout to pick up a new value (a mismatch
+  window returns 401 until then).
+
+**Scrape target verified healthy, after a storage-side recovery.** The
+first attempt at this half found Prometheus itself down for an unrelated
+reason: its TSDB volume `pvc-528b560c-8307-4fcc-8f8c-579c2b70069f`
+(20Gi, `monitoring`, class `longhorn`) was `detached` with
+`robustness=faulted`, longhorn-manager looping on "All replicas are
+failed, auto-salvaging volume" with 0 replicas brought up, and the
+container exiting 1 on `/prometheus/queries.active: input/output error`
+(CrashLoopBackOff; `Available=False, reason=NoPodReady` from
+2026-09-29T00:10Z). Root cause: that volume's only replica had lived on
+node `wytch` since 2026-09-16, and `wytch` has been unreachable since
+2026-09-23T15:44:45Z (`Ready=Unknown`; SSH and ICMP both time out).
+Longhorn's auto-salvage only starts *existing* replicas, so a
+`numberOfReplicas=1` volume whose replica is on a dead node cannot
+recover by itself.
+
+Resolution (operator decision; TSDB history accepted as lost): pod and
+PVC deleted, the StatefulSet reprovisioned
+`pvc-89f2e2a2-805a-4ad7-b7e0-60fa2a8369d8`, and Prometheus returned
+Running/Ready with 0 restarts in ~40s. End-to-end scrape proof from
+`/api/v1/targets` on that pod: `up{job="tusker-gateway"} = 1`,
+`instance="192.168.21.8:8642"`, empty `lastError`, and real samples in the
+TSDB (`tusker_requests_total{pool="code", provider="alibaba",
+model="deepseek-v4.1-flash", status="ok"}`).
+
+**Resolved 2026-09-29, once `wytch`/`wyzard` came back with their
+Longhorn data intact.** Every volume whose only replica was on `wytch`
+auto-salvaged onto a live node. Verified: `td-postgres` 1/1 with data
+preserved (Flyway: `td_core` at version 14, up to date),
+`prometheus-grafana` 3/3 (its PVC was never deleted, so the dashboard DB
+came back as-is), `dev-aia/postgres` and `code-audit/sonarqube` 1/1
+(sonarqube reindexed itself), `embed/mcp-embed-data` and
+`hindsight/hindsight-data` attached and their workloads Ready.
+`td-sync` recovered unattended; `td-crypto` needed one
+`rollout restart`: its five-day-old sandbox kept failing `connect` with
+`SocketException: Operation not permitted` against a DB that was
+demonstrably reachable from the same node, i.e. stale pod network state
+from the outage, not a policy (neither `NetworkPolicy` nor a Calico
+global policy covers `trust-directory`). It came back on a fresh
+sandbox and connected normally.
+
+`pvc-528b560c` (the faulted Prometheus claim's leftover: PV `Released`
+with reclaim `Retain`, plus its still-present Longhorn volume) was
+deleted, which freed that replica's space on `wytch`. Longhorn now
+holds 25 volumes: 17 attached/healthy, 8 detached/unknown behind claims
+with no running workload (`hermes/tusker-home`,
+`pr-agent/openwrt-{ccache,baselines,dl,images}`, `pr-agent/postgres-data`)
+- idle-claim cleanup candidates.
+
+Scrape health is 26/35 up. All 9 down targets are
+`kube-proxy` (6), `kube-etcd`, `kube-scheduler` and
+`kube-controller-manager`: control-plane components that bind their
+metrics to localhost, a pre-existing config gap, unrelated to the node
+loss. Still open from that incident: `wynk`'s `usb-longhorn` disk is
+gone (`storageMaximum 0`, `longhorn-disk.cfg` missing) and
+`disk-health-check` jobs keep failing.
+
 ## Strength probe (shipped 2026-09-28, commit c53baef)
 `tusker_gateway.tools.probe_strength` measures llm-stats-unknown pool
 models with a coding/tool-calling question bank and calibrates them
@@ -211,7 +302,10 @@ suite passes (~1397 passed, 8 skipped).
   `model` carries the advertised alias (`hermes-code`), prompt-injection
   directive blocked with `guardrail_blocked`, idempotent replay accepted,
   SSE chat completed, `/metrics` without token fails closed (500
-  `configuration_required`, by design per app.py middleware).
+  `configuration_required`, by design per `app.py` middleware). Note
+  (2026-09-29): that fail-closed 500 was reaching Prometheus on **every**
+  scrape because no scrape credential existed; see the metrics section at
+  the top of this file.
 
 ## 2026-09-26 live audit + remediation
 

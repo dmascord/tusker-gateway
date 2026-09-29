@@ -15,6 +15,12 @@ spec:
       podSelector:
         matchLabels:
           app: hindsight
+    # Prometheus scrapes /metrics directly on the pod IP; the credential is
+    # the only thing separating an arbitrary pod in this namespace from the
+    # endpoint, so the rule stays namespace-scoped.
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: monitoring
     ports:
     - port: 8642
       protocol: TCP
