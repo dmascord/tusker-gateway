@@ -69,6 +69,64 @@ def test_adaptive_policy_allows_explicit_noncritical_action(monkeypatch):
     ) is False
 
 
+def test_adaptive_policy_allows_tmp_cleanup_for_build_workflow(monkeypatch):
+    monkeypatch.setenv("TUSKER_HIGH_IMPACT_MODE", "adaptive")
+    assert _adaptive_requires_approval(
+        _bash_call("rm -rf /tmp/tusker-build-123"),
+        messages=[{"role": "user", "content": "Build, deploy and test end to end."}],
+    ) is False
+
+
+def test_adaptive_policy_allows_relative_build_cleanup_for_workflow(monkeypatch):
+    monkeypatch.setenv("TUSKER_HIGH_IMPACT_MODE", "adaptive")
+    assert _adaptive_requires_approval(
+        _bash_call("rm -rf ./build"),
+        messages=[{"role": "user", "content": "Rebuild and run the end-to-end tests."}],
+    ) is False
+
+
+def test_adaptive_policy_allows_resolved_tmp_variable_for_workflow(monkeypatch):
+    monkeypatch.setenv("TUSKER_HIGH_IMPACT_MODE", "adaptive")
+    monkeypatch.setenv("TUSKER_BUILD_TMP", "/tmp/tusker-build-variable")
+    assert _adaptive_requires_approval(
+        _bash_call("rm -rf $TUSKER_BUILD_TMP"),
+        messages=[{"role": "user", "content": "Build, deploy and test end to end."}],
+    ) is False
+
+
+def test_adaptive_policy_questions_unresolved_cleanup_variable(monkeypatch):
+    monkeypatch.setenv("TUSKER_HIGH_IMPACT_MODE", "adaptive")
+    monkeypatch.delenv("UNKNOWN_BUILD_DIR", raising=False)
+    assert _adaptive_requires_approval(
+        _bash_call("rm -rf $UNKNOWN_BUILD_DIR"),
+        messages=[{"role": "user", "content": "Build, deploy and test end to end."}],
+    ) is True
+
+
+def test_adaptive_policy_questions_tmp_root_cleanup(monkeypatch):
+    monkeypatch.setenv("TUSKER_HIGH_IMPACT_MODE", "adaptive")
+    assert _adaptive_requires_approval(
+        _bash_call("rm -rf /tmp"),
+        messages=[{"role": "user", "content": "Build, deploy and test end to end."}],
+    ) is True
+
+
+def test_adaptive_policy_questions_non_disposable_absolute_cleanup(monkeypatch):
+    monkeypatch.setenv("TUSKER_HIGH_IMPACT_MODE", "adaptive")
+    assert _adaptive_requires_approval(
+        _bash_call("rm -rf /srv/tusker"),
+        messages=[{"role": "user", "content": "Build, deploy and test end to end."}],
+    ) is True
+
+
+def test_adaptive_policy_questions_home_cleanup(monkeypatch):
+    monkeypatch.setenv("TUSKER_HIGH_IMPACT_MODE", "adaptive")
+    assert _adaptive_requires_approval(
+        _bash_call('rm -rf "$HOME"'),
+        messages=[{"role": "user", "content": "Build, deploy and test end to end."}],
+    ) is True
+
+
 def test_adaptive_policy_requires_approval_for_autonomous_action(monkeypatch):
     monkeypatch.setenv("TUSKER_HIGH_IMPACT_MODE", "adaptive")
     assert _adaptive_requires_approval(
