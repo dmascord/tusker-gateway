@@ -1,5 +1,34 @@
 # Project TODOs
 
+## Deploy provenance: digest pinning and drift check (2026-09-29)
+
+`k8s/deploy.sh` pins the image by digest instead of the mutable tag, annotates
+both Deployments with `tusker.net.au/{commit,image-tag,image-digest}`, refuses to
+overwrite an existing tag (`FORCE_TAG=1` overrides), verifies the kilo worker's
+imageID as well as the gateway's, and prints the `k8s/deployment.yaml` pin for the
+operator to commit (`TUSKER_PIN_MANIFEST=1` writes it in place). New helpers:
+`k8s/lib-provenance.sh` (registry lookups, with an `ssh visor` fallback because
+the registry name resolves only inside the cluster), `k8s/pin-manifest.py` (diff
+or write the pin) and `k8s/verify-provenance.sh` (drift check across tracked
+manifest, live Deployment, pod imageID, `/health`, registry tag and git HEAD;
+exit 1 on any disagreement).
+
+Why: the tracked manifest pinned `sha256:0b496866...` while production ran
+`sha256:05bf11d7...`, and nothing in the flow could update it - `deploy.sh`
+renders with `--local` and applies the tag, and with `imagePullPolicy: Always` a
+re-push of that tag would have silently changed what a restarted pod executes
+while `/health` still reported the same commit.
+
+Evidence (production deploy deliberately not re-run): `/health`, git HEAD and the
+Deployment annotation all report `1ca0a6e8...`; the tag
+`swarm-alpine-1ca0a6e8...` resolves to `sha256:05bf11d7...`, equal to the running
+imageID of the gateway and of the kilo worker; `verify-provenance.sh` failed on
+the stale pin before the fix and reports OK after it; the digest render was proven
+with `kubectl set image --local`, the tag guard against the real registry (fires,
+`FORCE_TAG=1` overrides) and `verify_image_digest` - extracted from `deploy.sh` -
+against the live cluster (passes on the correct digest, fails closed on a wrong
+digest and on an empty selector).
+
 ## Metrics scrape auth wired end to end (2026-09-29)
 
 Prometheus had been getting `500 configuration_required` from every

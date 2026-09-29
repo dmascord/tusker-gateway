@@ -41,6 +41,35 @@ config manifests requires operator authorization. The script verifies the
 running ready pod's image digest against the pushed digest and checks the public
 `/health` revision before reporting success.
 
+### Provenance: digest pinning and drift checks
+
+Every deploy pins the image by digest, not by tag: `kubectl set image` renders
+`repo@sha256:...` into the temporary manifest, and both Deployments are annotated
+with `tusker.net.au/commit`, `tusker.net.au/image-tag` and
+`tusker.net.au/image-digest`. A tag is mutable, so a re-push of the same tag makes
+a restarted pod run a different binary while `/health` still reports the same
+commit. `k8s/deploy.sh` refuses to overwrite a tag that already exists in the
+registry (`FORCE_TAG=1` overrides), verifies that the running pod's imageID equals
+the digest it pushed, and checks `/health` against `TUSKER_COMMIT`.
+
+The tracked manifest is the durable record of what production runs, so the digest
+must land in git. The build host has no usable `.git`, so `k8s/deploy.sh` prints
+the exact pin from `k8s/pin-manifest.py` (digest plus the `tusker.net.au/*`
+annotations) for the operator to commit, or applies it in place with
+`TUSKER_PIN_MANIFEST=1`. Commit that one-file change from the workstation after a
+successful deploy, then confirm all four links agree:
+
+```bash
+k8s/verify-provenance.sh
+```
+
+`k8s/verify-provenance.sh` exits 1 on any mismatch: a stale manifest pin, a live
+spec that still references a tag, a pod whose imageID differs from the recorded
+digest, a `tusker.net.au/commit` annotation that disagrees with `/health` or git
+HEAD, or a recorded tag whose registry digest has moved. Run it after each deploy
+and whenever a pod is restarted out of band; `--allow-unresolved` downgrades
+unverifiable links (registry or `/health` unreachable) to warnings.
+
 ## 3. Smoke test
 
 The gateway is fronted by `ai.tusker.net.au` (same edge as Hermes). The deployment

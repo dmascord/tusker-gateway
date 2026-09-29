@@ -10,6 +10,11 @@ set -euo pipefail
 # Source identity must be supplied by the source-sync caller; a build host's
 # .git may be stale or absent. TUSKER_COMMIT must be the intended full SHA.
 #
+# Env:  FORCE_TAG=1 replaces an existing image tag (default: refuse, because a
+#       tag must name exactly one binary).
+#       TUSKER_PIN_MANIFEST=1 writes the built digest into k8s/deployment.yaml
+#       (default: print the pin so the workstation can commit it).
+#
 # Requires:
 #   - source tree at /srv/opencode/tusker-ai-gateway/
 #   - buildah installed and configured to push to registry.tusker.net.au:5000
@@ -25,8 +30,14 @@ REGISTRY=registry.tusker.net.au:5000
 SRC_DIR=${SRC_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
+# Registry provenance helpers, shared with k8s/verify-provenance.sh.
+PROV_REGISTRY="${REGISTRY}"
+# shellcheck source=k8s/lib-provenance.sh
+source "${SCRIPT_DIR}/lib-provenance.sh"
+
 TAG=${1:-$(date +%Y%m%d%H%M%S)}
-IMAGE="${REGISTRY}/tusker-gateway:swarm-alpine-${TAG}"
+IMAGE_TAG="swarm-alpine-${TAG}"
+IMAGE="${REGISTRY}/tusker-gateway:${IMAGE_TAG}"
 
 # Never infer identity from remote .git, including on an rsync build host.
 if [[ ! "${TUSKER_COMMIT:-}" =~ ^[0-9a-f]{40}$ ]]; then
@@ -39,6 +50,18 @@ echo "=== Deploying Tusker AI Gateway ==="
 echo "SRC:     ${SRC_DIR}"
 echo "IMAGE:   ${IMAGE}"
 echo "COMMIT:  ${COMMIT}"
+
+# A tag must name exactly one binary: refuse to overwrite a published tag. The
+# deploy pins the digest it built, so replacing a tag cannot change what the
+# running spec executes - but a moving tag stops being a usable reference.
+if existing_digest=$(prov_registry_digest "${IMAGE_TAG}"); then
+    if [[ "${FORCE_TAG:-0}" != "1" ]]; then
+        echo "ERROR: ${IMAGE} already exists (digest ${existing_digest})" >&2
+        echo "       Re-run with FORCE_TAG=1 to replace it." >&2
+        exit 1
+    fi
+    echo "WARNING: replacing existing tag ${IMAGE_TAG} (was ${existing_digest})"
+fi
 
 # --- Build ---
 echo "--- Build ---"
@@ -54,20 +77,22 @@ if [[ ! "${IMAGE_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
     echo "ERROR: push did not provide a valid manifest digest" >&2
     exit 1
 fi
-echo "Image pushed: ${IMAGE} (digest ${IMAGE_DIGEST})"
+IMAGE_REF="${REGISTRY}/tusker-gateway@${IMAGE_DIGEST}"
+echo "Image pushed: ${IMAGE} -> ${IMAGE_REF}"
 
 # Render the manifest locally without connecting to the cluster (--local).
-# Preserves the manifest's environment; the image's baked revision stays
-# authoritative. Local rendering never mutates the tracked manifest.
+# The spec is pinned to the immutable digest, so a re-push of a tag can never
+# change what a restarted pod runs. Local rendering never mutates the tracked
+# manifest; k8s/pin-manifest.py prints the pin for the operator to commit.
 RENDERED="${WORK_DIR}/deployment.json"
 kubectl set image -f k8s/deployment.yaml \
-    "${DEPLOY}=${IMAGE}" \
+    "${DEPLOY}=${IMAGE_REF}" \
     --local -o json > "${RENDERED}"
 
 # The Kilo CLI runs in a separate, resource-limited pod on wynk. Render the
 # exact same immutable-by-tag build into its manifest before applying it.
 KILO_WORKER_RENDERED="${WORK_DIR}/kilo-worker.yaml"
-sed "s|${REGISTRY}/tusker-gateway:latest|${IMAGE}|g" \
+sed "s|${REGISTRY}/tusker-gateway:latest|${IMAGE_REF}|g" \
     k8s/kilo-worker.yaml > "${KILO_WORKER_RENDERED}"
 
 echo "--- Apply manifests ---"
@@ -84,15 +109,27 @@ kubectl -n "${NAMESPACE}" apply -f k8s/ingressroute.yaml
 echo "--- Rollout ---"
 kubectl -n "${NAMESPACE}" rollout status deployment/"${DEPLOY}" --timeout=300s
 
+# Record the build identity on the live objects so a drift check can compare them
+# against git without guessing.
+for target in "${DEPLOY}" tusker-kilo-worker; do
+    kubectl -n "${NAMESPACE}" annotate deployment/"${target}" \
+        "tusker.net.au/commit=${COMMIT}" \
+        "tusker.net.au/image-tag=${IMAGE_TAG}" \
+        "tusker.net.au/image-digest=${IMAGE_DIGEST}" \
+        --overwrite > /dev/null
+done
+
 # Ignore terminating old pods left during rollout, but verify every Ready
-# replacement matching the intended image, not an arbitrary items[0] pod.
-echo "--- Running image digest verification ---"
-kubectl -n "${NAMESPACE}" get pods -l app=tusker-gateway -o json \
-    | python3 -c '
+# replacement matching the intended image, not an arbitrary items[0] pod. The
+# same check runs for the kilo worker, which runs the same image.
+verify_image_digest() {
+    local selector=$1 container=$2
+    kubectl -n "${NAMESPACE}" get pods -l "${selector}" -o json \
+        | python3 -c '
 import json
 import sys
 
-image, digest, container_name = sys.argv[1:]
+digest, image_ref, container_name = sys.argv[1:]
 verified = 0
 for pod in json.load(sys.stdin)["items"]:
     if pod["metadata"].get("deletionTimestamp"):
@@ -104,7 +141,7 @@ for pod in json.load(sys.stdin)["items"]:
                for c in status.get("conditions", [])):
         continue
     containers = pod.get("spec", {}).get("containers", [])
-    if not any(c.get("name") == container_name and c.get("image") == image
+    if not any(c.get("name") == container_name and c.get("image") == image_ref
                for c in containers):
         continue
     current = next((c for c in status.get("containerStatuses", [])
@@ -117,8 +154,13 @@ for pod in json.load(sys.stdin)["items"]:
     verified += 1
 if not verified:
     raise SystemExit("ERROR: no Ready nonterminating pod matches the intended image")
-print(f"IMAGE DIGEST OK: {digest} ({verified} Ready pod(s))")
-' "${IMAGE}" "${IMAGE_DIGEST}" "${DEPLOY}"
+print("{}: IMAGE DIGEST OK ({} Ready pod(s), {})".format(container_name, verified, digest))
+' "${IMAGE_DIGEST}" "${IMAGE_REF}" "${container}"
+}
+
+echo "--- Running image digest verification ---"
+verify_image_digest app=tusker-gateway "${DEPLOY}"
+verify_image_digest app=tusker-kilo-worker kilo-worker
 
 # /health must report the revision baked into the verified image.
 echo "--- Commit verification ---"
@@ -184,5 +226,18 @@ SMOKE_API_KEY="${chat_key}" python3 "${SMOKE_HELPER}" \
     --url "https://ai.tusker.net.au/v1/chat/completions" \
     --model hermes-code
 
+# The tracked manifest is the durable record of what production runs. The build
+# host has no usable git, so print the pin for the workstation to commit, or
+# apply it in place when TUSKER_PIN_MANIFEST=1.
+echo "--- Manifest pin ---"
+PIN_ARGS=(--digest "${IMAGE_DIGEST}" --commit "${COMMIT}" --tag "${IMAGE_TAG}")
+if [[ "${TUSKER_PIN_MANIFEST:-0}" == "1" ]]; then
+    python3 "${SCRIPT_DIR}/pin-manifest.py" k8s/deployment.yaml "${PIN_ARGS[@]}" --write
+    [[ -d .git ]] && git diff --stat -- k8s/deployment.yaml || true
+else
+    python3 "${SCRIPT_DIR}/pin-manifest.py" k8s/deployment.yaml "${PIN_ARGS[@]}"
+    echo "Commit k8s/deployment.yaml from the workstation so git records what runs,"
+    echo "then run k8s/verify-provenance.sh."
+fi
 
 echo "=== Done ==="
