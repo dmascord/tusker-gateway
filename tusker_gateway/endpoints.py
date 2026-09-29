@@ -48,6 +48,7 @@ from tusker_gateway.errors import (
     RateLimitError,
     RequiredToolCallError,
     ToolCallContractError,
+    ToolPolicyDeniedError,
     UnusableToolResponseError,
     openai_error,
 )
@@ -2044,6 +2045,110 @@ def _adaptive_safe_cleanup(command: str) -> bool:
     return True
 
 
+
+_POLICY_PROTECTED_SECRET_RE = re.compile(
+    r"(?:~|\$HOME|/home/[^/]+|/root)/(?:\.ssh|\.aws|\.gnupg|\.config/gcloud)(?:/|\b)|"
+    r"/(?:etc/(?:shadow|sudoers)|var/run/secrets/kubernetes\.io)(?:/|\b)|"
+    r"\b(?:id_rsa|id_ed25519|credentials|service[-_]?account\.json)\b",
+    re.IGNORECASE,
+)
+_POLICY_EXFIL_RE = re.compile(
+    r"\b(?:curl|wget|nc|ncat|netcat|scp|rsync)\b[^;&|\n]*(?:"
+    r"@(?:/etc/|~?/\.ssh|\$HOME/\.ssh)|"
+    r"(?:shadow|id_rsa|id_ed25519|credentials|service[-_]?account))",
+    re.IGNORECASE,
+)
+_POLICY_SECURITY_TAMPER_RE = re.compile(
+    r"\b(?:setenforce\s+0|ufw\s+disable|systemctl\s+(?:stop|disable)\s+"
+    r"(?:auditd|falco|apparmor|firewalld)|iptables\s+-F\b)\b",
+    re.IGNORECASE,
+)
+_POLICY_CATASTROPHIC_RE = re.compile(
+    r"\brm\s+-[a-z]*r[a-z]*f?\s+(?:--\s+)?(?:/|~|\$HOME)\s*(?:[;&|]|$)|"
+    r"\bchmod\s+-R\s+777\s+/\s*(?:[;&|]|$)",
+    re.IGNORECASE,
+)
+
+
+def _deterministic_tool_denial(
+    calls: list[dict[str, Any]],
+) -> tuple[str, int] | None:
+    """Return a non-overridable deny rule and suspicion weight, if matched."""
+    for call in calls:
+        function = call.get("function") or {}
+        name = str(function.get("name") or "").strip().lower()
+        if name not in _SHELL_TOOL_NAMES:
+            continue
+        argument_text = _tool_argument_text(function.get("arguments"))
+        if _POLICY_EXFIL_RE.search(argument_text):
+            return "secret_exfiltration", 3
+        if _POLICY_SECURITY_TAMPER_RE.search(argument_text):
+            return "security_control_tampering", 3
+        if _POLICY_CATASTROPHIC_RE.search(argument_text):
+            return "catastrophic_destructive_operation", 3
+        if _POLICY_PROTECTED_SECRET_RE.search(argument_text):
+            return "protected_credentials", 2
+    return None
+
+
+def _enforce_deterministic_tool_denial(
+    calls: list[dict[str, Any]],
+    *,
+    provider: str,
+    model: str,
+    request_id: str | None,
+    audit: Any = None,
+) -> None:
+    denied = _deterministic_tool_denial(calls)
+    if denied is None:
+        return
+    rule, weight = denied
+    from tusker_gateway.safety import record_suspicious_behavior
+
+    score, newly_blacklisted = record_suspicious_behavior(
+        provider,
+        model,
+        weight=weight,
+    )
+    event = {
+        "event_type": "tool.policy.denied",
+        "decision": "deny",
+        "request_id": request_id or "unknown",
+        "provider": provider,
+        "model": model,
+        "rule": rule,
+        "risk": "critical",
+        "suspicion_delta": weight,
+        "suspicion_score": score,
+        "newly_blacklisted": newly_blacklisted,
+        "tool_names": [
+            str((call.get("function") or {}).get("name") or "unknown")[:80]
+            for call in calls[:8]
+        ],
+        "tool_call_signature": _tool_call_integrity_signature(calls),
+    }
+    writer = getattr(audit, "write_sync", None)
+    if callable(writer):
+        writer(event)
+    logger.warning(
+        "tool policy denied provider=%s model=%s request_id=%s rule=%s "
+        "suspicion_delta=%d suspicion_score=%d newly_blacklisted=%s",
+        provider,
+        model,
+        request_id or "unknown",
+        rule,
+        weight,
+        score,
+        newly_blacklisted,
+    )
+    raise ToolPolicyDeniedError(
+        provider=provider,
+        model=model,
+        rule=rule,
+        newly_blacklisted=newly_blacklisted,
+    )
+
+
 def _adaptive_requires_approval(
     calls: list[dict[str, Any]],
     *,
@@ -2733,6 +2838,15 @@ def _validate_complete_tool_response(
             messages=messages,
             audit=audit,
         )
+    # Non-overridable policy denials run before native ask/question so an
+    # obviously malicious proposal cannot social-engineer the user into granting it.
+    _enforce_deterministic_tool_denial(
+        calls,
+        provider=provider,
+        model=model,
+        request_id=request_id,
+        audit=audit,
+    )
     content_action = _high_impact_content_kind(messages, content_regex=content_regex)
     native_authorized = (
         question_authorized(messages, calls, request_id=request_id, audit=audit)
@@ -4222,6 +4336,10 @@ async def _call_with_pool_fallback(
         except HighImpactApprovalRequiredError:
             # Never retry a consequential action with another model.
             raise
+        except ToolPolicyDeniedError:
+            # Direct routes have no pool fallback. The model receives only the
+            # generic operation_not_permitted error.
+            raise
         except Exception as exc:
             _quarantine_tool_response_failure(config, provider, model, exc)
             _quarantine_stream_loop(config, provider, model, exc)
@@ -4586,6 +4704,28 @@ async def _call_with_pool_fallback(
         except HighImpactApprovalRequiredError:
             # Never retry a consequential action with another model.
             raise
+        except ToolPolicyDeniedError as exc:
+            # A denied candidate never gets another tool attempt in this request.
+            # Exclude it immediately and let the pool select a different model.
+            last_error = exc
+            excluded.add(selected)
+            if request is not None:
+                set_access_log_context(
+                    request,
+                    failure_class=exc.code or "tool_policy_denied",
+                    error_detail="operation_not_permitted",
+                    candidate_attempts=attempts,
+                )
+            logger.warning(
+                "pool candidate rejected by tool policy rid=%s pool=%s "
+                "candidate=%s/%s blacklisted=%s",
+                request_id or "unknown",
+                active_pool,
+                provider,
+                model,
+                exc.newly_blacklisted,
+            )
+            continue
         except Exception as exc:
             _quarantine_tool_response_failure(config, provider, model, exc)
             _quarantine_stream_loop(config, provider, model, exc)
