@@ -81,7 +81,7 @@ DEFAULT_HIGH_IMPACT_CONTENT_PATTERNS = (
 # ``TUSKER_HIGH_IMPACT_GREYLIST_FORCE_DENY`` (default "true": greylist forces
 # the gate to require explicit approval regardless of authorization text).
 HIGH_IMPACT_GREYLIST_FORCE_DENY = True
-HIGH_IMPACT_MODES = frozenset({"approval", "audit"})
+HIGH_IMPACT_MODES = frozenset({"approval", "adaptive", "audit"})
 
 
 def high_impact_mode() -> str:
