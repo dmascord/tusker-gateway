@@ -1906,6 +1906,48 @@ def _tool_argument_text(value: Any) -> str:
         return str(value)
 
 
+def _flatten_argument_strings(value: Any, depth: int = 0) -> list[str]:
+    """Collect leaf strings from a decoded tool-argument structure."""
+    if depth > 4:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        parts: list[str] = []
+        for item in value.values():
+            parts.extend(_flatten_argument_strings(item, depth + 1))
+        return parts
+    if isinstance(value, (list, tuple)):
+        parts = []
+        for item in value:
+            parts.extend(_flatten_argument_strings(item, depth + 1))
+        return parts
+    return []
+
+
+def _shell_command_text(value: Any) -> str:
+    """Return policy text for a shell tool's arguments, decoding the envelope.
+
+    Shell policy regexes are written against the literal command, so the JSON
+    argument envelope has to be decoded before matching. Evaluating the escaped
+    JSON instead lets quoting defeat the ``^``/``$`` anchors that gate recursive
+    deletes, which silently disables both the disposable-path check and the
+    catastrophic-delete denial. String leaves are joined with newlines and the
+    policy regexes run with ``re.MULTILINE`` so each leaf matches on its own line.
+    """
+    if not isinstance(value, str):
+        return _tool_argument_text(value)
+    text = value.strip()
+    if not text.startswith(("{", "[", '"')):
+        return value
+    try:
+        decoded = json.loads(text)
+    except (TypeError, ValueError):
+        return value
+    parts = [part for part in _flatten_argument_strings(decoded) if part.strip()]
+    return "\n".join(parts)
+
+
 _HIGH_IMPACT_ARGUMENT_RE = re.compile(
     r"\b(?:buy|sell|purchase|place[_ -]?trade|trade[_ -]?order|"
     r"submit[_ -]?order|wire|transfer|withdraw|delete|destroy|"
@@ -1943,17 +1985,30 @@ _ADAPTIVE_CRITICAL_SHELL_RE = re.compile(
     r"(?:drop|truncate)\s+(?:database|schema)\b|"
     r"(?:mkfs|shutdown|reboot|poweroff)\b|"
     r"dd\s+if=)",
-    re.IGNORECASE,
+    re.IGNORECASE | re.MULTILINE,
 )
 
-_ADAPTIVE_RM_RF_RE = re.compile(
-    r"(?:^|[;&|]\s*)\s*(?:sudo\s+)?rm\s+-[a-z]*r[a-z]*f?\s+"
-    r"(?P<target>(?:\"[^\"]+\"|'[^']+'|[^;&|\s]+))",
-    re.IGNORECASE,
+# Every `rm` in the command must be parsed and every operand examined.
+# `rm -rf /tmp/x /etc` is only disposable when `/etc` is checked too.
+_ADAPTIVE_ANY_RM_RE = re.compile(
+    r"(?:^|[;&|]\s*)\s*(?:sudo\s+)?rm\b",
+    re.IGNORECASE | re.MULTILINE,
 )
+_ADAPTIVE_RM_INVOCATION_RE = re.compile(
+    r"(?:^|[;&|]\s*)\s*(?:sudo\s+)?rm\s+"
+    r"(?P<flags>(?:-[a-zA-Z-]+\s+)+)"
+    r"(?P<operands>[^;&|]*)",
+    re.IGNORECASE | re.MULTILINE,
+)
+_ADAPTIVE_OPERAND_RE = re.compile(r"\"[^\"]*\"|'[^']*'|[^\s]+")
+# The workflow must be *requested*, not merely mentioned: "Inspect the build
+# and fix anything needed" is exploratory, so the cleanup gate stays armed.
 _ADAPTIVE_WORKFLOW_INTENT_RE = re.compile(
-    r"\b(?:build|rebuild|compile|package|deploy|redeploy|test|testing|"
-    r"integration\s+test|end[- ]to[- ]end|e2e|release)\b",
+    r"^\s*(?:please\s+|now\s+|then\s+|also\s+|and\s+|go\s+ahead\s+and\s+)?(?:"
+    r"build|rebuild|compile|package|deploy|redeploy|test|testing|release|"
+    r"integration\s+test|end[- ]to[- ]end|e2e|"
+    r"run\s+(?:the\s+)?(?:integration\s+)?tests?"
+    r")\b",
     re.IGNORECASE,
 )
 _ADAPTIVE_DISPOSABLE_RELATIVE = frozenset({
@@ -1970,7 +2025,12 @@ _ADAPTIVE_DISPOSABLE_RELATIVE = frozenset({
 
 
 def _adaptive_workflow_authorized(messages: Any) -> bool:
-    """Recognize an explicit build/deploy/test workflow in the latest user turn."""
+    """Recognize a build/deploy/test workflow the user actually requested.
+
+    The workflow verb must open the latest user turn; merely mentioning a build
+    ("Inspect the build and fix anything needed") is exploratory and keeps the
+    cleanup gate armed.
+    """
     if not isinstance(messages, list):
         return False
     latest = next(
@@ -2013,37 +2073,59 @@ def _adaptive_expand_cleanup_target(target: str) -> str | None:
     return os.path.expanduser(value)
 
 
+def _adaptive_disposable_cleanup_target(target: str) -> bool:
+    """Return True only for a path the gateway can prove is disposable."""
+    resolved = _adaptive_expand_cleanup_target(target)
+    if not resolved:
+        return False
+    normalized = os.path.normpath(resolved)
+
+    # Absolute cleanup is allowed only below OS temp roots, never the root
+    # itself. /tmp/foo is disposable; /tmp, /, $HOME and /srv are not.
+    if os.path.isabs(normalized):
+        return any(
+            normalized != root and normalized.startswith(root + os.sep)
+            for root in ("/tmp", "/var/tmp")
+        )
+
+    # Repository-local build artefacts are safe only as direct disposable
+    # trees (or descendants), never ".." escapes.
+    if normalized == ".." or normalized.startswith(".." + os.sep):
+        return False
+    first = normalized.removeprefix("." + os.sep).split(os.sep, 1)[0]
+    return first in _ADAPTIVE_DISPOSABLE_RELATIVE
+
+
+def _adaptive_cleanup_operands(operands: str) -> list[str]:
+    """Return the non-option operands of a single ``rm`` invocation."""
+    targets: list[str] = []
+    for token in _ADAPTIVE_OPERAND_RE.findall(operands):
+        if token.startswith("-"):
+            continue
+        value = token.strip().strip("\"'")
+        if value:
+            targets.append(value)
+    return targets
+
+
 def _adaptive_safe_cleanup(command: str) -> bool:
     """Return True only when every recursive-delete target is disposable."""
-    matches = list(_ADAPTIVE_RM_RF_RE.finditer(command))
-    if not matches:
+    invocations = list(_ADAPTIVE_RM_INVOCATION_RE.finditer(command))
+    if not invocations:
         return False
-    for match in matches:
-        resolved = _adaptive_expand_cleanup_target(match.group("target"))
-        if not resolved:
+    # Fail closed on an `rm` form the parser did not recognize: an unfamiliar
+    # invocation could otherwise hide destructive operands from the checks below.
+    if len(invocations) != len(_ADAPTIVE_ANY_RM_RE.findall(command)):
+        return False
+    for invocation in invocations:
+        if "r" not in invocation.group("flags").lower():
             return False
-        normalized = os.path.normpath(resolved)
-
-        # Absolute cleanup is allowed only below OS temp roots, never the root
-        # itself. /tmp/foo is disposable; /tmp, /, $HOME and /srv are not.
-        if os.path.isabs(normalized):
-            temp_roots = ("/tmp", "/var/tmp")
-            if not any(
-                normalized != root and normalized.startswith(root + os.sep)
-                for root in temp_roots
-            ):
-                return False
-            continue
-
-        # Repository-local build artefacts are safe only as direct disposable
-        # trees (or descendants), never ".." escapes.
-        if normalized == ".." or normalized.startswith(".." + os.sep):
+        targets = _adaptive_cleanup_operands(invocation.group("operands"))
+        if not targets:
             return False
-        first = normalized.removeprefix("." + os.sep).split(os.sep, 1)[0]
-        if first not in _ADAPTIVE_DISPOSABLE_RELATIVE:
+        if not all(_adaptive_disposable_cleanup_target(target) for target in targets):
             return False
     return True
-
 
 
 _POLICY_PROTECTED_SECRET_RE = re.compile(
@@ -2064,9 +2146,9 @@ _POLICY_SECURITY_TAMPER_RE = re.compile(
     re.IGNORECASE,
 )
 _POLICY_CATASTROPHIC_RE = re.compile(
-    r"\brm\s+-[a-z]*r[a-z]*f?\s+(?:--\s+)?(?:/|~|\$HOME)\s*(?:[;&|]|$)|"
-    r"\bchmod\s+-R\s+777\s+/\s*(?:[;&|]|$)",
-    re.IGNORECASE,
+    r"\brm\s+-[a-z]*r[a-z]*f?\s+(?:--\s+)?(?:/|~|\$HOME)\s*(?=[*;&|\s\"')]|$)|"
+    r"\bchmod\s+-R\s+777\s+/\s*(?=[*;&|\s\"')]|$)",
+    re.IGNORECASE | re.MULTILINE,
 )
 
 
@@ -2079,7 +2161,7 @@ def _deterministic_tool_denial(
         name = str(function.get("name") or "").strip().lower()
         if name not in _SHELL_TOOL_NAMES:
             continue
-        argument_text = _tool_argument_text(function.get("arguments"))
+        argument_text = _shell_command_text(function.get("arguments"))
         if _POLICY_EXFIL_RE.search(argument_text):
             return "secret_exfiltration", 3
         if _POLICY_SECURITY_TAMPER_RE.search(argument_text):
@@ -2169,7 +2251,7 @@ def _adaptive_requires_approval(
             continue
         function = call.get("function") or {}
         name = str(function.get("name") or "").strip().lower()
-        argument_text = _tool_argument_text(function.get("arguments"))
+        argument_text = _shell_command_text(function.get("arguments"))
         if greylisted and force_deny:
             return True
         # Financial/order execution always keeps a human in the loop.
@@ -2178,7 +2260,7 @@ def _adaptive_requires_approval(
         if name in _SHELL_TOOL_NAMES:
             if _ADAPTIVE_CRITICAL_SHELL_RE.search(argument_text):
                 return True
-            if _ADAPTIVE_RM_RF_RE.search(argument_text):
+            if _ADAPTIVE_ANY_RM_RE.search(argument_text):
                 # Build/deploy/test implicitly authorizes housekeeping only
                 # inside provably disposable paths.
                 if workflow_authorized and _adaptive_safe_cleanup(argument_text):

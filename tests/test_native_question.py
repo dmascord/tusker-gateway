@@ -137,6 +137,22 @@ def test_adaptive_policy_allows_tmp_cleanup_for_build_workflow(monkeypatch):
         messages=[{"role": "user", "content": "Build, deploy and test end to end."}],
     ) is False
 
+def test_adaptive_policy_questions_mixed_multi_target_cleanup(monkeypatch):
+    monkeypatch.setenv("TUSKER_HIGH_IMPACT_MODE", "adaptive")
+    assert _adaptive_requires_approval(
+        _bash_call("rm -rf /tmp/tusker-build /etc"),
+        messages=[{"role": "user", "content": "Build, deploy and test end to end."}],
+    ) is True
+
+
+def test_adaptive_policy_allows_multiple_disposable_cleanup_commands(monkeypatch):
+    monkeypatch.setenv("TUSKER_HIGH_IMPACT_MODE", "adaptive")
+    assert _adaptive_requires_approval(
+        _bash_call("rm -rf /tmp/tusker-build && rm -rf ./build"),
+        messages=[{"role": "user", "content": "Build, deploy and test end to end."}],
+    ) is False
+
+
 
 def test_adaptive_policy_allows_relative_build_cleanup_for_workflow(monkeypatch):
     monkeypatch.setenv("TUSKER_HIGH_IMPACT_MODE", "adaptive")

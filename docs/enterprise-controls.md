@@ -95,13 +95,14 @@ Three high-impact modes are available:
 - `adaptive` waits for the concrete proposed tool call instead of interrupting
   on user text alone. An explicitly requested, non-critical action can proceed
   without a second confirmation and is recorded as `high_impact.adaptive`.
-  Autonomous high-impact actions still ask. Build/deploy/test workflows may
-  clean provably disposable paths such as a child of `/tmp`, `/var/tmp`, or
-  repository-local build/cache directories without another prompt; unresolved
-  shell variables, temp roots themselves, path escapes, and other absolute
-  paths remain gated. Financial/order execution, destructive infrastructure/
-  storage/database operations, force pushes, and greylisted-model actions
-  always ask even when the user's wording is explicit.
+  Autonomous high-impact actions still ask. An explicitly requested
+  build/deploy/test workflow may clean provably disposable paths such as a
+  child of `/tmp`, `/var/tmp`, or repository-local build/cache directories
+  without another prompt; unresolved shell variables, temp roots themselves,
+  path escapes, and other absolute paths remain gated. Financial/order
+  execution, configured critical shell patterns, force pushes, and
+  force-denied greylisted-model actions always ask even when the user's
+  wording is explicit.
 - `audit` keeps the classifier active but records `high_impact.audit` and
   allows the request to continue without an interactive question. Use this for
   temporary investigation rather than as the normal safety posture.
