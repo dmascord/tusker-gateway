@@ -133,6 +133,13 @@ execution outcomes can be correlated through `POST /admin/audit/execution`;
 the gateway otherwise records execution as `not_observed`. Review and
 execution events are append-only audit records and require admin access.
 
+For operational validation, run `python -m tusker_gateway.tools.verify_audit
+/home/tusker/.hermes/audit.jsonl`. The command verifies every hash link and
+reports bounded event, policy-decision, request-correlation, and execution
+outcome counts. Production SHOULD set `TUSKER_AUDIT_HMAC_KEY` from the vault;
+without it, the chain detects accidental or partial tampering but does not
+authenticate the log against an attacker who can rewrite the file.
+
 Audit events contain bounded metadata and hashes, not raw prompts, tool
 arguments, or secrets. Pending native approvals are scoped to the authenticated
 caller and stable conversation when available. Their exact replay payload is

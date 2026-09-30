@@ -3265,6 +3265,14 @@ async def _prepare_stream_result(
                     messages=messages,
                     audit=audit,
                 )
+                _policy_evaluation_event(
+                    assembled_calls,
+                    request_id=request_id,
+                    provider=provider,
+                    model=model,
+                    mode=high_impact_mode(),
+                    audit=audit,
+                )
                 _enforce_deterministic_tool_denial(
                     assembled_calls,
                     provider=provider,
