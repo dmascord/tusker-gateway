@@ -2183,6 +2183,38 @@ def _deterministic_tool_denial(
     return None
 
 
+def _policy_event(audit: Any, event: dict[str, Any]) -> None:
+    writer = getattr(audit, "write_sync", None)
+    if callable(writer):
+        writer(event)
+
+
+def _policy_evaluation_event(
+    calls: list[dict[str, Any]],
+    *,
+    request_id: str | None,
+    provider: str,
+    model: str,
+    mode: str,
+    audit: Any = None,
+) -> None:
+    matches = []
+    for call in calls[:8]:
+        function = call.get("function") or {}
+        name = str(function.get("name") or "unknown")[:80]
+        kind = _high_impact_call_kind(call)
+        matches.append({"tool_name": name, "action": kind, "matched": bool(kind)})
+    _policy_event(audit, {
+        "event_type": "tool.policy.evaluation",
+        "request_id": request_id or "unknown",
+        "provider": provider,
+        "model": model,
+        "mode": mode,
+        "tool_count": len(calls),
+        "evaluations": matches,
+    })
+
+
 def _enforce_deterministic_tool_denial(
     calls: list[dict[str, Any]],
     *,
@@ -2191,10 +2223,26 @@ def _enforce_deterministic_tool_denial(
     request_id: str | None,
     audit: Any = None,
 ) -> None:
-    # Audit mode observes classified calls without enforcing deterministic policy.
-    if high_impact_mode() == "audit":
-        return
     denied = _deterministic_tool_denial(calls)
+    if high_impact_mode() == "audit":
+        if denied is not None:
+            rule, weight = denied
+            _policy_event(audit, {
+                "event_type": "tool.policy.shadow_match",
+                "decision": "would_deny",
+                "request_id": request_id or "unknown",
+                "provider": provider,
+                "model": model,
+                "mode": "audit",
+                "rule": rule,
+                "suspicion_delta": weight,
+                "tool_names": [
+                    str((call.get("function") or {}).get("name") or "unknown")[:80]
+                    for call in calls[:8]
+                ],
+                "tool_call_signature": _tool_call_integrity_signature(calls),
+            })
+        return
     if denied is None:
         return
     rule, weight = denied
@@ -2927,6 +2975,16 @@ def _validate_complete_tool_response(
             model=model,
             request_id=request_id,
             messages=messages,
+            audit=audit,
+        )
+    mode = high_impact_mode()
+    if calls:
+        _policy_evaluation_event(
+            calls,
+            request_id=request_id,
+            provider=provider,
+            model=model,
+            mode=mode,
             audit=audit,
         )
     # Non-overridable policy denials run before native ask/question so an

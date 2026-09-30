@@ -109,6 +109,7 @@ def _admin_app(api_key: str, identities=None):
     )
     store = IdentityStore(identity_cfg)
     app["identity_store"] = store
+    app["audit"] = type("Audit", (), {"events": [], "write_sync": lambda self, event: self.events.append(event)})()
     app.middlewares.append(_auth_middleware(store))
     attach_authorization_middleware(app)
     attach_admin_access_middleware(app)

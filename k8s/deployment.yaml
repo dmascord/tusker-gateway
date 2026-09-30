@@ -213,6 +213,8 @@ spec:
         # requests without emitting an interactive OMP approval question.
         - name: TUSKER_HIGH_IMPACT_MODE
           value: audit
+        - name: TUSKER_POLICY_VERSION
+          value: telemetry-v1
         # LLM Stats ranking enforcement. `prefer` keeps out-of-cutoff
         # models selectable and orders them behind better-ranked ones
         # instead of dropping them from every pool (the `drop` default).

@@ -1525,6 +1525,48 @@ async def admin_pools_delete(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "pool": pool})
 
 
+@_admin_error_guard
+async def admin_audit_review(request: web.Request) -> web.Response:
+    body = await _json_body(request)
+    subject = str(body.get("request_id") or body.get("signature") or "").strip()
+    label = str(body.get("label") or "").strip().lower()
+    if not subject or label not in {"legitimate", "malicious", "false_positive", "false_negative", "uncertain"}:
+        return web.json_response(openai_error_shape("request_id or signature and valid label required", "malformed_payload"), status=400)
+    audit = request.app.get("audit")
+    writer = getattr(audit, "write_sync", None)
+    if callable(writer):
+        writer({
+            "event_type": "policy.review.label",
+            "request_id": str(body.get("request_id") or "unknown"),
+            "subject": subject,
+            "label": label,
+            "notes": str(body.get("notes") or "")[:500],
+            "reviewer": getattr(request.get("identity"), "principal", "unknown"),
+        })
+    return web.json_response({"ok": True, "request_id": subject, "label": label})
+
+
+@_admin_error_guard
+async def admin_audit_execution(request: web.Request) -> web.Response:
+    body = await _json_body(request)
+    subject = str(body.get("request_id") or body.get("approval_id") or "").strip()
+    result = str(body.get("result") or "").strip().lower()
+    if not subject or result not in {"success", "failure", "not_observed"}:
+        return web.json_response(openai_error_shape("request_id or approval_id and valid result required", "malformed_payload"), status=400)
+    audit = request.app.get("audit")
+    writer = getattr(audit, "write_sync", None)
+    if callable(writer):
+        writer({
+            "event_type": "tool.execution.result",
+            "request_id": str(body.get("request_id") or "unknown"),
+            "approval_id": str(body.get("approval_id") or "unknown"),
+            "tool_call_signature": str(body.get("tool_call_signature") or "")[:128],
+            "execution_result": result,
+            "error_class": str(body.get("error_class") or "")[:128],
+        })
+    return web.json_response({"ok": True, "subject": subject, "execution_result": result})
+
+
 def register_admin_config_routes(app: web.Application) -> None:
     """Register the read/write admin config endpoints on ``app``.
 
@@ -1532,6 +1574,8 @@ def register_admin_config_routes(app: web.Application) -> None:
     so every route is protected by session/Bearer auth.  The caller's
     identity is re-resolved on every request (see the middleware).
     """
+    app.router.add_post("/admin/audit/review", admin_audit_review)
+    app.router.add_post("/admin/audit/execution", admin_audit_execution)
     app.router.add_get("/admin/config", admin_config)
     app.router.add_post("/admin/keys", admin_keys_create)
     app.router.add_put("/admin/keys/{fingerprint}", admin_keys_update)

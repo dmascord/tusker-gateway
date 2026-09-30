@@ -119,6 +119,19 @@ a weighted suspicion score. A denied pool candidate is excluded immediately
 so fallback can select another model; repeated/severe behavior can also place
 the model on the runtime blacklist. `audit` mode is observation-only: it
 records the classified call and allows the provider response to continue.
+Policy telemetry includes a timestamp and deployed policy version on every
+record. Each proposed tool call emits a bounded `tool.policy.evaluation` event;
+audit mode additionally emits `tool.policy.shadow_match` when an enforcement
+rule would have denied the call, without blocking it. These events contain tool
+names, classifications, rule names, and call signatures, but never raw
+arguments or secrets.
+
+Operators can append authenticated review labels through `POST
+/admin/audit/review` with `label` set to `legitimate`, `malicious`,
+`false_positive`, `false_negative`, or `uncertain`. Verified client-side tool
+execution outcomes can be correlated through `POST /admin/audit/execution`;
+the gateway otherwise records execution as `not_observed`. Review and
+execution events are append-only audit records and require admin access.
 
 Audit events contain bounded metadata and hashes, not raw prompts, tool
 arguments, or secrets. Pending native approvals are scoped to the authenticated

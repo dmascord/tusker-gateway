@@ -150,6 +150,7 @@ def test_audit_mode_allows_protected_call_without_denying(monkeypatch):
         audit=audit,
     )
     assert result is response
+    assert any(event["event_type"] == "tool.policy.shadow_match" for event in audit.events)
     assert not any(event["event_type"] == "tool.policy.denied" for event in audit.events)
 
 

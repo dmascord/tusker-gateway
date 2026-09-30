@@ -164,11 +164,15 @@ class AuditLogger:
                     str(key)[:128]: self._bounded_value(value)
                     for key, value in list(event.items())[:_MAX_AUDIT_COLLECTION_ITEMS]
                 }
-                payload["chain_version"] = 1
-                payload["previous_hash"] = previous_hash
-                payload["integrity"] = (
-                    "hmac-sha256" if self.config.hmac_key else "sha256"
+                payload.setdefault("timestamp", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+                payload.setdefault(
+                    "policy_version",
+                    os.environ.get("TUSKER_POLICY_VERSION")
+                    or os.environ.get("TUSKER_COMMIT")
+                    or "unknown",
                 )
+                payload["previous_hash"] = previous_hash
+                payload["chain_version"] = 1
                 canonical = json.dumps(
                     payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
                 ).encode("utf-8")
