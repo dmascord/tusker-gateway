@@ -2191,6 +2191,9 @@ def _enforce_deterministic_tool_denial(
     request_id: str | None,
     audit: Any = None,
 ) -> None:
+    # Audit mode observes classified calls without enforcing deterministic policy.
+    if high_impact_mode() == "audit":
+        return
     denied = _deterministic_tool_denial(calls)
     if denied is None:
         return

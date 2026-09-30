@@ -110,13 +110,15 @@ Three high-impact modes are available:
   allows the request to continue without an interactive question. Use this for
   temporary investigation rather than as the normal safety posture.
 
-Before approval handling, a non-overridable deterministic deny layer rejects
-obvious credential/private-key access, secret exfiltration, security-control
-tampering, and catastrophic root-level destruction. These calls never become
-an `ask/question`; the model-facing error is only `operation_not_permitted`.
-Internally the denial records the matched rule and a weighted suspicion score.
-A denied pool candidate is excluded immediately so fallback can select another
-model; repeated/severe behavior can also place the model on the runtime blacklist.
+In `approval` and `adaptive` modes, a non-overridable deterministic deny layer
+rejects obvious credential/private-key access, secret exfiltration,
+security-control tampering, and catastrophic root-level destruction. These
+calls never become an `ask/question`; the model-facing error is only
+`operation_not_permitted`. Internally the denial records the matched rule and
+a weighted suspicion score. A denied pool candidate is excluded immediately
+so fallback can select another model; repeated/severe behavior can also place
+the model on the runtime blacklist. `audit` mode is observation-only: it
+records the classified call and allows the provider response to continue.
 
 Audit events contain bounded metadata and hashes, not raw prompts, tool
 arguments, or secrets. Pending native approvals are scoped to the authenticated

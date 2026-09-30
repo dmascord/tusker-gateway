@@ -129,6 +129,29 @@ def test_denied_call_never_becomes_native_question(monkeypatch):
     assert denied.value.code == "tool_policy_denied"
     assert denied.value.message == "operation_not_permitted"
 
+def test_audit_mode_allows_protected_call_without_denying(monkeypatch):
+    monkeypatch.setenv("TUSKER_HIGH_IMPACT_MODE", "audit")
+    audit = _Audit()
+    response = {
+        "choices": [{"message": {"role": "assistant", "tool_calls": _bash_call(
+            "cat ~/.ssh/id_rsa"
+        )}}]
+    }
+    result = _validate_complete_tool_response(
+        response,
+        [{"type": "function", "function": {"name": "bash"}}],
+        provider="provider",
+        model="model",
+        request_id="req-audit-protected-call",
+        require_tool_call=False,
+        reject_empty=False,
+        messages=[{"role": "user", "content": "Inspect the environment."}],
+        native_questions=True,
+        audit=audit,
+    )
+    assert result is response
+    assert not any(event["event_type"] == "tool.policy.denied" for event in audit.events)
+
 
 def test_adaptive_policy_allows_explicit_noncritical_action(monkeypatch):
     monkeypatch.setenv("TUSKER_HIGH_IMPACT_MODE", "adaptive")
