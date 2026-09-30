@@ -172,7 +172,8 @@ class AuditLogger:
                     or "unknown",
                 )
                 payload["previous_hash"] = previous_hash
-                payload["chain_version"] = 1
+                payload["chain_version"] = 2 if self.config.hmac_key else 1
+                payload["chain_mode"] = "hmac" if self.config.hmac_key else "sha256"
                 canonical = json.dumps(
                     payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
                 ).encode("utf-8")
@@ -266,7 +267,11 @@ class AuditLogger:
                     canonical = json.dumps(
                         record, sort_keys=True, separators=(",", ":"), ensure_ascii=False
                     ).encode("utf-8")
-                    if not hmac.compare_digest(claimed, verifier._digest(previous, canonical)):
+                    mode = record.get("chain_mode", "sha256")
+                    if mode not in {"sha256", "hmac"}:
+                        return False, count
+                    digest = verifier._digest(previous, canonical) if mode == "hmac" else hashlib.sha256(previous.encode("ascii") + b"." + canonical).hexdigest()
+                    if not hmac.compare_digest(claimed, digest):
                         return False, count
                     previous = claimed
                     count += 1

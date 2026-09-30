@@ -20,6 +20,15 @@ def test_verify_audit_reports_valid_chain_and_counts(tmp_path, capsys, monkeypat
     assert output["policy_outcomes"]["deny"] == 1
 
 
+
+def test_verify_audit_accepts_legacy_then_hmac_records(tmp_path, monkeypatch):
+    path = tmp_path / "audit.jsonl"
+    legacy = AuditLogger(AuditConfig(path=str(path)))
+    legacy._append({"event_type": "gateway.request"})
+    monkeypatch.setenv("TUSKER_AUDIT_HMAC_KEY", "test-key")
+    signed = AuditLogger(AuditConfig(path=str(path), hmac_key="test-key"))
+    signed._append({"event_type": "tool.policy.evaluation"})
+    assert AuditLogger.verify_file(AuditConfig(path=str(path), hmac_key="test-key")) == (True, 2)
 def test_verify_audit_returns_failure_for_tampered_chain(tmp_path, capsys):
     path = tmp_path / "audit.jsonl"
     audit = AuditLogger(AuditConfig(path=str(path)))

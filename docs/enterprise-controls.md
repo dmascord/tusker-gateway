@@ -140,6 +140,13 @@ outcome counts. Production SHOULD set `TUSKER_AUDIT_HMAC_KEY` from the vault;
 without it, the chain detects accidental or partial tampering but does not
 authenticate the log against an attacker who can rewrite the file.
 
+HMAC migration is chain-compatible: existing `chain_mode=sha256` records remain
+valid, and records written after `TUSKER_AUDIT_HMAC_KEY` is installed use
+`chain_mode=hmac` while linking from the prior tail. Operators MUST verify the
+full mixed chain before and after the rollout. The HMAC key MUST be generated
+randomly and stored only in `tusker-env-vault`; it MUST NOT be committed or
+printed in deployment logs.
+
 Audit events contain bounded metadata and hashes, not raw prompts, tool
 arguments, or secrets. Pending native approvals are scoped to the authenticated
 caller and stable conversation when available. Their exact replay payload is
