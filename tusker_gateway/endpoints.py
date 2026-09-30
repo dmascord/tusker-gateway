@@ -48,6 +48,7 @@ from tusker_gateway.errors import (
     RateLimitError,
     RequiredToolCallError,
     ToolCallContractError,
+    ToolPolicyDeniedError,
     UnusableToolResponseError,
     openai_error,
 )
@@ -1905,6 +1906,48 @@ def _tool_argument_text(value: Any) -> str:
         return str(value)
 
 
+def _flatten_argument_strings(value: Any, depth: int = 0) -> list[str]:
+    """Collect leaf strings from a decoded tool-argument structure."""
+    if depth > 4:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        parts: list[str] = []
+        for item in value.values():
+            parts.extend(_flatten_argument_strings(item, depth + 1))
+        return parts
+    if isinstance(value, (list, tuple)):
+        parts = []
+        for item in value:
+            parts.extend(_flatten_argument_strings(item, depth + 1))
+        return parts
+    return []
+
+
+def _shell_command_text(value: Any) -> str:
+    """Return policy text for a shell tool's arguments, decoding the envelope.
+
+    Shell policy regexes are written against the literal command, so the JSON
+    argument envelope has to be decoded before matching. Evaluating the escaped
+    JSON instead lets quoting defeat the ``^``/``$`` anchors that gate recursive
+    deletes, which silently disables both the disposable-path check and the
+    catastrophic-delete denial. String leaves are joined with newlines and the
+    policy regexes run with ``re.MULTILINE`` so each leaf matches on its own line.
+    """
+    if not isinstance(value, str):
+        return _tool_argument_text(value)
+    text = value.strip()
+    if not text.startswith(("{", "[", '"')):
+        return value
+    try:
+        decoded = json.loads(text)
+    except (TypeError, ValueError):
+        return value
+    parts = [part for part in _flatten_argument_strings(decoded) if part.strip()]
+    return "\n".join(parts)
+
+
 _HIGH_IMPACT_ARGUMENT_RE = re.compile(
     r"\b(?:buy|sell|purchase|place[_ -]?trade|trade[_ -]?order|"
     r"submit[_ -]?order|wire|transfer|withdraw|delete|destroy|"
@@ -1930,6 +1973,307 @@ _SHELL_HIGH_IMPACT_RE = re.compile(
     r"|\b(?:place[_ -]?trade|submit[_ -]?order|wire\s+funds|withdraw)\b",
     re.IGNORECASE,
 )
+
+
+# Adaptive mode keeps confirmation for actions whose blast radius is difficult
+# to recover from even when the latest user turn explicitly requests them.
+_ADAPTIVE_CRITICAL_SHELL_RE = re.compile(
+    r"(?:^|[;&|]\s*|[\"'])\s*(?:sudo\s+)?(?:"
+    r"kubectl\s+drain\b|"
+    r"kubectl\s+delete\s+(?:namespace|node|persistentvolume(?:claim)?|pv|pvc|crd)\b|"
+    r"git\s+push\b[^;&|]*--force(?:-with-lease)?\b|"
+    r"(?:drop|truncate)\s+(?:database|schema)\b|"
+    r"(?:mkfs|shutdown|reboot|poweroff)\b|"
+    r"dd\s+if=)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# Every `rm` in the command must be parsed and every operand examined.
+# `rm -rf /tmp/x /etc` is only disposable when `/etc` is checked too.
+_ADAPTIVE_ANY_RM_RE = re.compile(
+    r"(?:^|[;&|]\s*)\s*(?:sudo\s+)?rm\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+_ADAPTIVE_RM_INVOCATION_RE = re.compile(
+    r"(?:^|[;&|]\s*)\s*(?:sudo\s+)?rm\s+"
+    r"(?P<flags>(?:-[a-zA-Z-]+\s+)+)"
+    r"(?P<operands>[^;&|]*)",
+    re.IGNORECASE | re.MULTILINE,
+)
+_ADAPTIVE_OPERAND_RE = re.compile(r"\"[^\"]*\"|'[^']*'|[^\s]+")
+# The workflow must be *requested*, not merely mentioned: "Inspect the build
+# and fix anything needed" is exploratory, so the cleanup gate stays armed.
+_ADAPTIVE_WORKFLOW_INTENT_RE = re.compile(
+    r"^\s*(?:please\s+|now\s+|then\s+|also\s+|and\s+|go\s+ahead\s+and\s+)?(?:"
+    r"build|rebuild|compile|package|deploy|redeploy|test|testing|release|"
+    r"integration\s+test|end[- ]to[- ]end|e2e|"
+    r"run\s+(?:the\s+)?(?:integration\s+)?tests?"
+    r")\b",
+    re.IGNORECASE,
+)
+_ADAPTIVE_DISPOSABLE_RELATIVE = frozenset({
+    "build",
+    "dist",
+    "out",
+    "target",
+    ".cache",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".tox",
+})
+
+
+def _adaptive_workflow_authorized(messages: Any) -> bool:
+    """Recognize a build/deploy/test workflow the user actually requested.
+
+    The workflow verb must open the latest user turn; merely mentioning a build
+    ("Inspect the build and fix anything needed") is exploratory and keeps the
+    cleanup gate armed.
+    """
+    if not isinstance(messages, list):
+        return False
+    latest = next(
+        (
+            message
+            for message in reversed(messages)
+            if isinstance(message, dict) and message.get("role") == "user"
+        ),
+        None,
+    )
+    if not isinstance(latest, dict):
+        return False
+    content = latest.get("content")
+    if isinstance(content, list):
+        content = " ".join(
+            str(item.get("text", ""))
+            for item in content
+            if isinstance(item, dict) and item.get("type") == "text"
+        )
+    return isinstance(content, str) and bool(_ADAPTIVE_WORKFLOW_INTENT_RE.search(content))
+
+
+def _adaptive_expand_cleanup_target(target: str) -> str | None:
+    """Resolve a cleanup target only when expansion is deterministic here.
+
+    Unknown shell variables fail closed rather than being guessed. This keeps
+    `rm -rf $SOMETHING` gated unless the gateway can prove where it points.
+    """
+    value = target.strip().strip("\"'")
+    if not value:
+        return None
+    # Reject shell substitutions/globs: their runtime meaning is not known to
+    # the gateway policy engine.
+    if any(token in value for token in ("$(", "`", "*", "?", "[", "]", "{", "}")):
+        return None
+    variable = re.fullmatch(r"\$([A-Za-z_][A-Za-z0-9_]*)", value)
+    if variable:
+        resolved = os.environ.get(variable.group(1))
+        return resolved.strip() if isinstance(resolved, str) and resolved.strip() else None
+    return os.path.expanduser(value)
+
+
+def _adaptive_disposable_cleanup_target(target: str) -> bool:
+    """Return True only for a path the gateway can prove is disposable."""
+    resolved = _adaptive_expand_cleanup_target(target)
+    if not resolved:
+        return False
+    normalized = os.path.normpath(resolved)
+
+    # Absolute cleanup is allowed only below OS temp roots, never the root
+    # itself. /tmp/foo is disposable; /tmp, /, $HOME and /srv are not.
+    if os.path.isabs(normalized):
+        return any(
+            normalized != root and normalized.startswith(root + os.sep)
+            for root in ("/tmp", "/var/tmp")
+        )
+
+    # Repository-local build artefacts are safe only as direct disposable
+    # trees (or descendants), never ".." escapes.
+    if normalized == ".." or normalized.startswith(".." + os.sep):
+        return False
+    first = normalized.removeprefix("." + os.sep).split(os.sep, 1)[0]
+    return first in _ADAPTIVE_DISPOSABLE_RELATIVE
+
+
+def _adaptive_cleanup_operands(operands: str) -> list[str]:
+    """Return the non-option operands of a single ``rm`` invocation."""
+    targets: list[str] = []
+    for token in _ADAPTIVE_OPERAND_RE.findall(operands):
+        if token.startswith("-"):
+            continue
+        value = token.strip().strip("\"'")
+        if value:
+            targets.append(value)
+    return targets
+
+
+def _adaptive_safe_cleanup(command: str) -> bool:
+    """Return True only when every recursive-delete target is disposable."""
+    invocations = list(_ADAPTIVE_RM_INVOCATION_RE.finditer(command))
+    if not invocations:
+        return False
+    # Fail closed on an `rm` form the parser did not recognize: an unfamiliar
+    # invocation could otherwise hide destructive operands from the checks below.
+    if len(invocations) != len(_ADAPTIVE_ANY_RM_RE.findall(command)):
+        return False
+    for invocation in invocations:
+        if "r" not in invocation.group("flags").lower():
+            return False
+        targets = _adaptive_cleanup_operands(invocation.group("operands"))
+        if not targets:
+            return False
+        if not all(_adaptive_disposable_cleanup_target(target) for target in targets):
+            return False
+    return True
+
+
+_POLICY_PROTECTED_SECRET_RE = re.compile(
+    r"(?:~|\$HOME|/home/[^/]+|/root)/(?:\.ssh|\.aws|\.gnupg|\.config/gcloud)(?:/|\b)|"
+    r"/(?:etc/(?:shadow|sudoers)|var/run/secrets/kubernetes\.io)(?:/|\b)|"
+    r"\b(?:id_rsa|id_ed25519|credentials|service[-_]?account\.json)\b",
+    re.IGNORECASE,
+)
+_POLICY_EXFIL_RE = re.compile(
+    r"\b(?:curl|wget|nc|ncat|netcat|scp|rsync)\b[^;&|\n]*(?:"
+    r"@(?:/etc/|~?/\.ssh|\$HOME/\.ssh)|"
+    r"(?:shadow|id_rsa|id_ed25519|credentials|service[-_]?account))",
+    re.IGNORECASE,
+)
+_POLICY_SECURITY_TAMPER_RE = re.compile(
+    r"\b(?:setenforce\s+0|ufw\s+disable|systemctl\s+(?:stop|disable)\s+"
+    r"(?:auditd|falco|apparmor|firewalld)|iptables\s+-F\b)\b",
+    re.IGNORECASE,
+)
+_POLICY_CATASTROPHIC_RE = re.compile(
+    r"\brm\s+-[a-z]*r[a-z]*f?\s+(?:--\s+)?(?:/|~|\$HOME)\s*(?=[*;&|\s\"')]|$)|"
+    r"\bchmod\s+-R\s+777\s+/\s*(?=[*;&|\s\"')]|$)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _deterministic_tool_denial(
+    calls: list[dict[str, Any]],
+) -> tuple[str, int] | None:
+    """Return a non-overridable deny rule and suspicion weight, if matched."""
+    for call in calls:
+        function = call.get("function") or {}
+        name = str(function.get("name") or "").strip().lower()
+        if name not in _SHELL_TOOL_NAMES:
+            continue
+        argument_text = _shell_command_text(function.get("arguments"))
+        if _POLICY_EXFIL_RE.search(argument_text):
+            return "secret_exfiltration", 3
+        if _POLICY_SECURITY_TAMPER_RE.search(argument_text):
+            return "security_control_tampering", 3
+        if _POLICY_CATASTROPHIC_RE.search(argument_text):
+            return "catastrophic_destructive_operation", 3
+        if _POLICY_PROTECTED_SECRET_RE.search(argument_text):
+            return "protected_credentials", 2
+    return None
+
+
+def _enforce_deterministic_tool_denial(
+    calls: list[dict[str, Any]],
+    *,
+    provider: str,
+    model: str,
+    request_id: str | None,
+    audit: Any = None,
+) -> None:
+    denied = _deterministic_tool_denial(calls)
+    if denied is None:
+        return
+    rule, weight = denied
+    from tusker_gateway.safety import record_suspicious_behavior
+
+    score, newly_blacklisted = record_suspicious_behavior(
+        provider,
+        model,
+        weight=weight,
+    )
+    event = {
+        "event_type": "tool.policy.denied",
+        "decision": "deny",
+        "request_id": request_id or "unknown",
+        "provider": provider,
+        "model": model,
+        "rule": rule,
+        "risk": "critical",
+        "suspicion_delta": weight,
+        "suspicion_score": score,
+        "newly_blacklisted": newly_blacklisted,
+        "tool_names": [
+            str((call.get("function") or {}).get("name") or "unknown")[:80]
+            for call in calls[:8]
+        ],
+        "tool_call_signature": _tool_call_integrity_signature(calls),
+    }
+    writer = getattr(audit, "write_sync", None)
+    if callable(writer):
+        writer(event)
+    logger.warning(
+        "tool policy denied provider=%s model=%s request_id=%s rule=%s "
+        "suspicion_delta=%d suspicion_score=%d newly_blacklisted=%s",
+        provider,
+        model,
+        request_id or "unknown",
+        rule,
+        weight,
+        score,
+        newly_blacklisted,
+    )
+    raise ToolPolicyDeniedError(
+        provider=provider,
+        model=model,
+        rule=rule,
+        newly_blacklisted=newly_blacklisted,
+    )
+
+
+def _adaptive_requires_approval(
+    calls: list[dict[str, Any]],
+    *,
+    messages: Any = None,
+    explicitly_authorized: bool = False,
+    greylisted: bool = False,
+    force_deny: bool = False,
+    argument_regex: re.Pattern[str] | None = None,
+) -> bool:
+    """Return whether adaptive mode must interrupt for native approval."""
+    if not calls:
+        return False
+    user_authorized = explicitly_authorized or _explicit_high_impact_authorization(messages)
+    workflow_authorized = _adaptive_workflow_authorized(messages)
+    for call in calls:
+        kind = _high_impact_call_kind(call, argument_regex=argument_regex)
+        if kind is None:
+            continue
+        function = call.get("function") or {}
+        name = str(function.get("name") or "").strip().lower()
+        argument_text = _shell_command_text(function.get("arguments"))
+        if greylisted and force_deny:
+            return True
+        # Financial/order execution always keeps a human in the loop.
+        if name in {"place_trade", "submit_order"}:
+            return True
+        if name in _SHELL_TOOL_NAMES:
+            if _ADAPTIVE_CRITICAL_SHELL_RE.search(argument_text):
+                return True
+            if _ADAPTIVE_ANY_RM_RE.search(argument_text):
+                # Build/deploy/test implicitly authorizes housekeeping only
+                # inside provably disposable paths.
+                if workflow_authorized and _adaptive_safe_cleanup(argument_text):
+                    continue
+                if user_authorized and _adaptive_safe_cleanup(argument_text):
+                    continue
+                return True
+        # Generic/browser/computer tools are too ambiguous to auto-authorize.
+        if name not in _SHELL_TOOL_NAMES and name != "send_message":
+            return True
+        if not user_authorized:
+            return True
+    return False
 
 
 def _compiled_argument_regex(config: dict[str, Any]) -> re.Pattern[str]:
@@ -2074,7 +2418,10 @@ def _native_content_question_if_needed(
     out of the approval protocol and guarantees a single OMP ask call.
     """
     action = _high_impact_content_kind(messages, content_regex=content_regex)
-    if high_impact_mode() == "audit":
+    # In adaptive mode, user text is a signal rather than an approval trigger.
+    # Wait for the concrete proposed tool call so deterministic policy can
+    # evaluate the actual operation and arguments.
+    if high_impact_mode() in {"audit", "adaptive"}:
         return None
     if not action or question_authorized_for_content(
         messages, action, request_id=request_id, audit=audit
@@ -2118,7 +2465,8 @@ def _enforce_high_impact_approval(
         risky = _high_impact_content_kind(messages, content_regex=content_regex)
     if risky is None:
         return
-    if high_impact_mode() == "audit":
+    mode = high_impact_mode()
+    if mode == "audit":
         source_role = None
         source_message_index = None
         source_content_sha256 = None
@@ -2201,6 +2549,41 @@ def _enforce_high_impact_approval(
             source_message_index, call_signature,
         )
         return
+    if mode == "adaptive" and not _adaptive_requires_approval(
+        calls,
+        messages=messages,
+        explicitly_authorized=explicitly_authorized,
+        greylisted=greylisted,
+        force_deny=force_deny,
+        argument_regex=argument_regex,
+    ):
+        event = {
+            "event_type": "high_impact.adaptive",
+            "decision": "allowed_by_deterministic_policy",
+            "mode": "adaptive",
+            "request_id": request_id or "unknown",
+            "provider": provider,
+            "model": model,
+            "action": risky,
+            "tool_names": [
+                str((call.get("function") or {}).get("name") or "unknown")[:80]
+                for call in calls[:8]
+            ],
+            "tool_call_signature": _tool_call_signature(calls),
+            "greylisted": greylisted,
+            "explicitly_authorized": explicitly_authorized
+            or _explicit_high_impact_authorization(messages),
+        }
+        writer = getattr(audit, "write_sync", None)
+        if callable(writer):
+            writer(event)
+        logger.info(
+            "high-impact action allowed by adaptive policy provider=%s model=%s "
+            "request_id=%s action=%s",
+            provider, model, request_id or "unknown", risky,
+        )
+        return
+
     # A greylisted model never gets the "explicitly authorized" shortcut when
     # the operator hasn't opted out. This is the safe default: a goal-injected
     # harness must still trip the gate even when the user turn happens to
@@ -2259,13 +2642,21 @@ def _explicit_high_impact_authorization(messages: Any) -> bool:
         )
     if not isinstance(content, str):
         return False
-    if re.search(r"\b(?:do not|don't|dont|never|not authorized|unauthorized)\b", content, re.I):
+    if re.search(
+        r"\b(?:do not|don't|dont|never|not authorized|unauthorized|"
+        r"without\s+(?:sending|executing|running|deploying|deleting|removing|"
+        r"pushing|merging|transferring|buying|selling))\b",
+        content,
+        re.I,
+    ):
         return False
     return bool(
         re.search(
             r"\b(?:i\s+(?:explicitly\s+)?(?:approve|authorize)|"
             r"go\s+ahead\s+and|proceed\s+with|place\s+the\s+order|"
-            r"make\s+the\s+purchase)\b",
+            r"make\s+the\s+purchase)\b|"
+            r"^\s*(?:please\s+)?(?:send|delete|remove|deploy|restart|reboot|"
+            r"merge|push|publish|transfer|wire|buy|sell|place|submit|execute|run)\b",
             content,
             re.I,
         )
@@ -2529,6 +2920,15 @@ def _validate_complete_tool_response(
             messages=messages,
             audit=audit,
         )
+    # Non-overridable policy denials run before native ask/question so an
+    # obviously malicious proposal cannot social-engineer the user into granting it.
+    _enforce_deterministic_tool_denial(
+        calls,
+        provider=provider,
+        model=model,
+        request_id=request_id,
+        audit=audit,
+    )
     content_action = _high_impact_content_kind(messages, content_regex=content_regex)
     native_authorized = (
         question_authorized(messages, calls, request_id=request_id, audit=audit)
@@ -2542,7 +2942,24 @@ def _validate_complete_tool_response(
         if content_action
         else False
     )
-    if calls and native_questions and high_impact_mode() != "audit" and not native_authorized:
+    mode = high_impact_mode()
+    adaptive_call_approval = (
+        mode == "adaptive"
+        and _adaptive_requires_approval(
+            calls,
+            messages=messages,
+            explicitly_authorized=explicitly_authorized,
+            greylisted=greylisted,
+            force_deny=force_deny,
+            argument_regex=argument_regex,
+        )
+    )
+    if (
+        calls
+        and native_questions
+        and (mode == "approval" or adaptive_call_approval)
+        and not native_authorized
+    ):
         question_response = question_response_for_calls(
             calls,
             model=model,
@@ -2552,7 +2969,7 @@ def _validate_complete_tool_response(
         )
         if question_response is not None:
             return question_response
-    if content_action and high_impact_mode() != "audit" and not native_authorized:
+    if content_action and mode == "approval" and not native_authorized:
         return question_response_for_content(
             messages,
             content_action,
@@ -2693,7 +3110,10 @@ async def _prepare_stream_result(
     # call can leak before the native approval question replaces it.
     buffer_before_client = (
         tools_may_produce_high_impact(tools)
-        or _high_impact_content_kind(messages, content_regex=content_regex) is not None
+        or (
+            high_impact_mode() == "approval"
+            and _high_impact_content_kind(messages, content_regex=content_regex) is not None
+        )
     )
 
     async def _early_stream(
@@ -2745,7 +3165,7 @@ async def _prepare_stream_result(
             )
             if (
                 content_action
-                and high_impact_mode() != "audit"
+                and high_impact_mode() == "approval"
                 and not native_content_authorized
                 and not assembled_calls
             ):
@@ -2778,13 +3198,35 @@ async def _prepare_stream_result(
                     messages=messages,
                     audit=audit,
                 )
+                _enforce_deterministic_tool_denial(
+                    assembled_calls,
+                    provider=provider,
+                    model=model,
+                    request_id=request_id,
+                    audit=audit,
+                )
                 native_authorized = question_authorized(
                     messages,
                     assembled_calls,
                     request_id=request_id,
                     audit=audit,
                 )
-                if high_impact_mode() != "audit" and not native_authorized:
+                stream_mode = high_impact_mode()
+                adaptive_call_approval = (
+                    stream_mode == "adaptive"
+                    and _adaptive_requires_approval(
+                        assembled_calls,
+                        messages=messages,
+                        explicitly_authorized=explicitly_authorized,
+                        greylisted=greylisted,
+                        force_deny=force_deny,
+                        argument_regex=argument_regex,
+                    )
+                )
+                if (
+                    (stream_mode == "approval" or adaptive_call_approval)
+                    and not native_authorized
+                ):
                     question_response = question_response_for_calls(
                         assembled_calls,
                         model=model,
@@ -2805,7 +3247,7 @@ async def _prepare_stream_result(
                             request_id or "unknown",
                         )
                         return
-                if content_action and high_impact_mode() != "audit" and not native_content_authorized:
+                if content_action and stream_mode == "approval" and not native_content_authorized:
                     question_response = question_response_for_content(
                         messages,
                         content_action,
@@ -2839,7 +3281,7 @@ async def _prepare_stream_result(
                     native_authorized=native_authorized,
                     audit=audit,
                 )
-            if content_action and high_impact_mode() != "audit" and not native_content_authorized:
+            if content_action and high_impact_mode() == "approval" and not native_content_authorized:
                 question_response = question_response_for_content(
                     messages,
                     content_action,
@@ -3983,6 +4425,10 @@ async def _call_with_pool_fallback(
         except HighImpactApprovalRequiredError:
             # Never retry a consequential action with another model.
             raise
+        except ToolPolicyDeniedError:
+            # Direct routes have no pool fallback. The model receives only the
+            # generic operation_not_permitted error.
+            raise
         except Exception as exc:
             _quarantine_tool_response_failure(config, provider, model, exc)
             _quarantine_stream_loop(config, provider, model, exc)
@@ -4347,6 +4793,28 @@ async def _call_with_pool_fallback(
         except HighImpactApprovalRequiredError:
             # Never retry a consequential action with another model.
             raise
+        except ToolPolicyDeniedError as exc:
+            # A denied candidate never gets another tool attempt in this request.
+            # Exclude it immediately and let the pool select a different model.
+            last_error = exc
+            excluded.add(selected)
+            if request is not None:
+                set_access_log_context(
+                    request,
+                    failure_class=exc.code or "tool_policy_denied",
+                    error_detail="operation_not_permitted",
+                    candidate_attempts=attempts,
+                )
+            logger.warning(
+                "pool candidate rejected by tool policy rid=%s pool=%s "
+                "candidate=%s/%s blacklisted=%s",
+                request_id or "unknown",
+                active_pool,
+                provider,
+                model,
+                exc.newly_blacklisted,
+            )
+            continue
         except Exception as exc:
             _quarantine_tool_response_failure(config, provider, model, exc)
             _quarantine_stream_loop(config, provider, model, exc)
@@ -5739,6 +6207,8 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                     )
             pool_name = _pool_name(body) or "passthrough"
             conversation_id = _request_conversation_id(request, body, api_key)
+            from tusker_gateway.native_question import set_conversation_context
+            set_conversation_context(conversation_id)
             set_access_log_context(request, pool=pool_name)
 
             # Model id clients must see: the requested virtual alias for
@@ -6710,6 +7180,8 @@ async def _responses_handler_impl(request: web.Request) -> web.Response | web.St
             {**body, "messages": messages},
             _resolve_api_key(request),
         )
+        from tusker_gateway.native_question import set_conversation_context
+        set_conversation_context(conversation_id)
         cache: ResponseCache | None = request.app.get("cache")
         sem_cache = request.app.get("semantic_cache")
         breaker: CircuitBreaker | None = request.app.get("breaker")

@@ -88,15 +88,41 @@ behavior into automatic authorization. Keep the audit file on immutable or
 access-controlled storage and apply the same retention policy as other
 security records.
 
-For temporary investigation, set `TUSKER_HIGH_IMPACT_MODE=audit`. This keeps
-the classifier active but records `high_impact.audit` events and allows the
-request to continue without emitting an interactive OMP question. Events
-record the trigger category, provider/model, request ID, source role and
-message index, a hash of source user content, the matched policy phrase when
-available, tool names, and a hash/signature of the normalized tool call. Raw
-prompts, tool arguments, and secrets are not recorded. The default is
-`approval`; return to that mode after the investigation. Audit persistence
-continues to follow `TUSKER_AUDIT_FAIL_CLOSED`.
+Three high-impact modes are available:
+
+- `approval` is the conservative mode: every classified high-impact action
+  requires the native question approval.
+- `adaptive` waits for the concrete proposed tool call instead of interrupting
+  on user text alone. An explicitly requested, non-critical action can proceed
+  without a second confirmation and is recorded as `high_impact.adaptive`.
+  Autonomous high-impact actions still ask. An explicitly requested
+  build/deploy/test workflow may clean provably disposable paths such as a
+  child of `/tmp`, `/var/tmp`, or repository-local build/cache directories
+  without another prompt; unresolved shell variables, temp roots themselves,
+  path escapes, and other absolute paths remain gated. Financial/order
+  execution, configured critical shell patterns, force pushes, and
+  force-denied greylisted-model actions always ask even when the user's
+  wording is explicit.
+- `audit` keeps the classifier active but records `high_impact.audit` and
+  allows the request to continue without an interactive question. Use this for
+  temporary investigation rather than as the normal safety posture.
+
+Before approval handling, a non-overridable deterministic deny layer rejects
+obvious credential/private-key access, secret exfiltration, security-control
+tampering, and catastrophic root-level destruction. These calls never become
+an `ask/question`; the model-facing error is only `operation_not_permitted`.
+Internally the denial records the matched rule and a weighted suspicion score.
+A denied pool candidate is excluded immediately so fallback can select another
+model; repeated/severe behavior can also place the model on the runtime blacklist.
+
+Audit events contain bounded metadata and hashes, not raw prompts, tool
+arguments, or secrets. Pending native approvals are scoped to the authenticated
+caller and stable conversation when available. Their exact replay payload is
+encrypted at rest in the shared PostgreSQL approval store using
+`TUSKER_KEY_ENCRYPTION_KEY` (or `ENCRYPTION_KEY`), and approvals have both a
+5-minute idle expiry and a 15-minute absolute lifetime. SQLite remains a
+development/test-only fallback. Audit persistence continues to follow
+`TUSKER_AUDIT_FAIL_CLOSED`.
 
 Operational knobs:
 

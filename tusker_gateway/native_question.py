@@ -42,6 +42,7 @@ def _is_question_tool_name(value: Any) -> bool:
 
 _PENDING: dict[str, dict[str, Any]] = {}
 _TTL_SECS = 300
+_ABSOLUTE_TTL_SECS = 900
 _APPROVAL_STORE_UNSET = object()
 _approval_store: Any = _APPROVAL_STORE_UNSET
 
@@ -54,11 +55,22 @@ _approval_store: Any = _APPROVAL_STORE_UNSET
 _CALLER_FINGERPRINT: ContextVar[str | None] = ContextVar(
     "tusker_approval_caller", default=None
 )
+_CONVERSATION_ID: ContextVar[str | None] = ContextVar(
+    "tusker_approval_conversation", default=None
+)
 
 
 def set_caller_context(fingerprint: str | None) -> None:
     """Bind the current request's authenticated caller for approval scoping."""
     _CALLER_FINGERPRINT.set(fingerprint)
+
+
+def set_conversation_context(conversation_id: str | None) -> None:
+    """Bind approvals to the stable conversation when available."""
+    _CONVERSATION_ID.set(
+        conversation_id.strip() if isinstance(conversation_id, str) and conversation_id.strip()
+        else None
+    )
 
 
 def _caller_matches(pending: dict[str, Any]) -> bool:
@@ -73,6 +85,18 @@ def _caller_matches(pending: dict[str, Any]) -> bool:
         return True
     recorded = pending.get("caller")
     return recorded is None or recorded == current
+
+
+def _conversation_matches(pending: dict[str, Any]) -> bool:
+    current = _CONVERSATION_ID.get()
+    recorded = pending.get("conversation")
+    if current is None or recorded is None:
+        return True
+    return recorded == current
+
+
+def _approval_scope_matches(pending: dict[str, Any]) -> bool:
+    return _caller_matches(pending) and _conversation_matches(pending)
 
 
 def _store() -> Any:
@@ -385,7 +409,10 @@ def _prune() -> None:
     _hydrate_pending()
     now = time.time()
     for call_id, pending in list(_PENDING.items()):
-        if float(pending.get("expires_at", 0)) <= now:
+        if (
+            float(pending.get("expires_at", 0)) <= now
+            or float(pending.get("absolute_expires_at", float("inf"))) <= now
+        ):
             _audit(pending.get("audit"), {
                 "event_type": "tool.approval.decision",
                 "approval_id": call_id,
@@ -433,7 +460,7 @@ def question_response_for_calls(
             if pending.get("scope", "calls") == "calls"
             and pending.get("signature") == signature
             and pending.get("action") == action
-            and _caller_matches(pending)
+            and _approval_scope_matches(pending)
         ),
         None,
     )
@@ -442,7 +469,9 @@ def question_response_for_calls(
         _PENDING[call_id] = {
             "calls": json.loads(json.dumps(calls, ensure_ascii=False)),
             "signature": signature,
+            "created_at": time.time(),
             "expires_at": time.time() + _TTL_SECS,
+            "absolute_expires_at": time.time() + _ABSOLUTE_TTL_SECS,
             "request_id": request_id or "unknown",
             "provider": provider or "unknown",
             "model": model or "unknown",
@@ -450,6 +479,7 @@ def question_response_for_calls(
             "adapter": adapter.key,
             "audit": audit,
             "caller": _CALLER_FINGERPRINT.get(),
+            "conversation": _CONVERSATION_ID.get(),
         }
         _persist_pending(call_id, _PENDING[call_id])
         _audit(audit, {
@@ -478,7 +508,10 @@ def question_response_for_calls(
         )
     else:
         pending = _PENDING[call_id]
-        pending["expires_at"] = time.time() + _TTL_SECS
+        pending["expires_at"] = min(
+            time.time() + _TTL_SECS,
+            float(pending.get("absolute_expires_at", time.time() + _ABSOLUTE_TTL_SECS)),
+        )
         _persist_pending(call_id, pending)
         logger.info(
             "native approval reused request_id=%s approval_id=%s action=%s "
@@ -547,7 +580,7 @@ def replay_approved_tool_response(
         call_id
         for call_id, pending in _PENDING.items()
         if pending.get("scope", "calls") == "calls"
-        and _caller_matches(pending)
+        and _approval_scope_matches(pending)
     ]
     for message in messages:
         if not isinstance(message, dict):
@@ -607,7 +640,7 @@ def replay_approved_tool_response(
         if (
             pending.get("scope", "calls") != "calls"
             or call_id not in questions
-            or not _caller_matches(pending)
+            or not _approval_scope_matches(pending)
         ):
             continue
         found, approved = _extract_answer(results.get(call_id))
@@ -682,7 +715,7 @@ def question_response_for_content(
             and pending.get("action") == action
             and pending.get("signature") == signature
             and isinstance(pending.get("response"), dict)
-            and _caller_matches(pending)
+            and _approval_scope_matches(pending)
         ):
             response = pending["response"]
             if pending.get("adapter", "omp") != adapter.key:
@@ -736,7 +769,9 @@ def question_response_for_content(
         "approval_id": call_id,
         "signature": signature,
         "scope": "content",
+        "created_at": time.time(),
         "expires_at": time.time() + _TTL_SECS,
+        "absolute_expires_at": time.time() + _ABSOLUTE_TTL_SECS,
         "request_id": request_id or "unknown",
         "provider": provider or "unknown",
         "model": model or "unknown",
@@ -744,6 +779,7 @@ def question_response_for_content(
         "adapter": adapter.key,
         "audit": audit,
         "caller": _CALLER_FINGERPRINT.get(),
+        "conversation": _CONVERSATION_ID.get(),
     }
     _audit(audit, {
         "event_type": "tool.approval.proposed",
@@ -833,7 +869,7 @@ def question_authorized(
         if (
             pending.get("signature") != expected_signature
             or call_id not in questions
-            or not _caller_matches(pending)
+            or not _approval_scope_matches(pending)
         ):
             continue
         found, approved = _extract_answer(results.get(call_id))
@@ -953,7 +989,7 @@ def question_authorized_for_content(
             pending.get("scope") != "content"
             or pending.get("action") != action
             or pending.get("signature") not in accepted_signatures
-            or not _caller_matches(pending)
+            or not _approval_scope_matches(pending)
             or (
                 call_id not in questions
                 and call_id not in result_ids
