@@ -1964,7 +1964,7 @@ _HIGH_IMPACT_ARGUMENT_RE = re.compile(
 # the literal command rather than the escaped JSON envelope.
 _SHELL_TOOL_NAMES = frozenset({"bash", "shell", "exec", "run_command", "terminal"})
 _SHELL_HIGH_IMPACT_RE = re.compile(
-    r"(?:^|[;&|]\s*|[\"'])\s*(?:sudo\s+)?(?:"
+    r"(?:^|[;&|({!`]\s*|[\"'])\s*(?:sudo\s+)?(?:"
     # Plain and recursive deletes: a non-recursive `rm` destroys data just as
     # irreversibly as `rm -rf`, so both must reach the gate.
     r"rm\b|"

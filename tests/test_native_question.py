@@ -210,10 +210,30 @@ def test_adaptive_policy_questions_destructive_shell_commands(monkeypatch, comma
         "rm -rf /tmp/tusker-build; rm -rf /etc",
     ],
 )
+
+
 def test_adaptive_policy_questions_cleanup_smuggling_another_operation(
     monkeypatch, command
 ):
     """A proven disposable delete must not launder a second operation."""
+    monkeypatch.setenv("TUSKER_HIGH_IMPACT_MODE", "adaptive")
+    assert _adaptive_requires_approval(
+        _bash_call(command),
+        messages=[{"role": "user", "content": "Build, deploy and test end to end."}],
+    ) is True
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo $(rm -rf /etc)",
+        "`rm -rf /etc`",
+        "{ rm -rf /etc; }",
+        "if ! rm -rf /etc; then echo gone; fi",
+    ],
+)
+def test_adaptive_policy_questions_boundary_shell_deletes(monkeypatch, command):
+    """Command-substitution and grouping boundaries must not hide a delete."""
     monkeypatch.setenv("TUSKER_HIGH_IMPACT_MODE", "adaptive")
     assert _adaptive_requires_approval(
         _bash_call(command),
