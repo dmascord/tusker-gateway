@@ -1960,47 +1960,52 @@ _HIGH_IMPACT_ARGUMENT_RE = re.compile(
 # they merely mentioned words such as "delete" in a path, comment, or output.
 # Keep a separate command-shaped detector for genuinely destructive shell
 # operations; financial/order verbs remain covered when used by explicit
-# action tools below.
+# action tools below. Commands reach this detector decoded, so the anchors see
+# the literal command rather than the escaped JSON envelope.
 _SHELL_TOOL_NAMES = frozenset({"bash", "shell", "exec", "run_command", "terminal"})
 _SHELL_HIGH_IMPACT_RE = re.compile(
     r"(?:^|[;&|]\s*|[\"'])\s*(?:sudo\s+)?(?:"
-    r"rm\s+-[a-z]*r[a-z]*f?\b|"
+    # Plain and recursive deletes: a non-recursive `rm` destroys data just as
+    # irreversibly as `rm -rf`, so both must reach the gate.
+    r"rm\b|"
+    r"shred\b|"
+    r"find\b[^;&|]*-delete\b|"
+    r"truncate\s+-s\b|"
+    # Cluster and infrastructure destruction.
     r"kubectl\s+(?:delete|drain)\b|"
+    r"terraform\s+(?:destroy|apply\s+-destroy)\b|"
+    r"docker\s+(?:rm|rmi|volume\s+rm|system\s+prune|volume\s+prune|image\s+prune)\b|"
+    r"aws\s+s3\s+(?:rm|rb)\b|"
+    # Repository history and uncommitted work.
     r"git\s+push\b[^;&|]*--force(?:-with-lease)?\b|"
+    r"git\s+reset\s+--hard\b|"
+    r"git\s+clean\s+-[a-z]*[dfx]|"
+    # Data stores and hosts.
     r"(?:drop|truncate)\s+(?:database|table|schema)\b|"
     r"(?:mkfs|shutdown|reboot|poweroff)\b|"
     r"dd\s+if=)"
     r"|\b(?:place[_ -]?trade|submit[_ -]?order|wire\s+funds|withdraw)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+# Recursive deletes are the only shell operation adaptive mode can positively
+# prove bounded, so that check is total: every segment of the command must be
+# an `rm` invocation and every operand must resolve to a disposable path. A
+# proven disposable delete therefore cannot launder a second unchecked
+# operation into the same command string.
+_ADAPTIVE_RM_INVOCATION_RE = re.compile(
+    r"\s*(?:sudo\s+)?rm\s+"
+    r"(?P<flags>(?:-[a-zA-Z-]+\s+)+)"
+    r"(?P<operands>\S+(?:\s+\S+)*)\s*",
     re.IGNORECASE,
 )
-
-
-# Adaptive mode keeps confirmation for actions whose blast radius is difficult
-# to recover from even when the latest user turn explicitly requests them.
-_ADAPTIVE_CRITICAL_SHELL_RE = re.compile(
-    r"(?:^|[;&|]\s*|[\"'])\s*(?:sudo\s+)?(?:"
-    r"kubectl\s+drain\b|"
-    r"kubectl\s+delete\s+(?:namespace|node|persistentvolume(?:claim)?|pv|pvc|crd)\b|"
-    r"git\s+push\b[^;&|]*--force(?:-with-lease)?\b|"
-    r"(?:drop|truncate)\s+(?:database|schema)\b|"
-    r"(?:mkfs|shutdown|reboot|poweroff)\b|"
-    r"dd\s+if=)",
-    re.IGNORECASE | re.MULTILINE,
-)
-
-# Every `rm` in the command must be parsed and every operand examined.
-# `rm -rf /tmp/x /etc` is only disposable when `/etc` is checked too.
-_ADAPTIVE_ANY_RM_RE = re.compile(
-    r"(?:^|[;&|]\s*)\s*(?:sudo\s+)?rm\b",
-    re.IGNORECASE | re.MULTILINE,
-)
-_ADAPTIVE_RM_INVOCATION_RE = re.compile(
-    r"(?:^|[;&|]\s*)\s*(?:sudo\s+)?rm\s+"
-    r"(?P<flags>(?:-[a-zA-Z-]+\s+)+)"
-    r"(?P<operands>[^;&|]*)",
-    re.IGNORECASE | re.MULTILINE,
-)
 _ADAPTIVE_OPERAND_RE = re.compile(r"\"[^\"]*\"|'[^']*'|[^\s]+")
+_ADAPTIVE_COMMAND_SEPARATOR_RE = re.compile(r";|&&|\|\||\n")
+# Redirection and substitution change what the shell executes in ways the
+# operand checks below cannot see, so such a command is never auto-allowed.
+_ADAPTIVE_FORBIDDEN_CLEANUP_RE = re.compile(r"[<>`]|\$\(|\$\{|\(|\)|\\")
+
 # The workflow must be *requested*, not merely mentioned: "Inspect the build
 # and fix anything needed" is exploratory, so the cleanup gate stays armed.
 _ADAPTIVE_WORKFLOW_INTENT_RE = re.compile(
@@ -2109,15 +2114,20 @@ def _adaptive_cleanup_operands(operands: str) -> list[str]:
 
 
 def _adaptive_safe_cleanup(command: str) -> bool:
-    """Return True only when every recursive-delete target is disposable."""
-    invocations = list(_ADAPTIVE_RM_INVOCATION_RE.finditer(command))
-    if not invocations:
+    """Return True only when the whole command is disposable recursive deletes."""
+    if _ADAPTIVE_FORBIDDEN_CLEANUP_RE.search(command):
         return False
-    # Fail closed on an `rm` form the parser did not recognize: an unfamiliar
-    # invocation could otherwise hide destructive operands from the checks below.
-    if len(invocations) != len(_ADAPTIVE_ANY_RM_RE.findall(command)):
+    segments = [
+        segment.strip()
+        for segment in _ADAPTIVE_COMMAND_SEPARATOR_RE.split(command)
+        if segment.strip()
+    ]
+    if not segments:
         return False
-    for invocation in invocations:
+    for segment in segments:
+        invocation = _ADAPTIVE_RM_INVOCATION_RE.fullmatch(segment)
+        if invocation is None:
+            return False
         if "r" not in invocation.group("flags").lower():
             return False
         targets = _adaptive_cleanup_operands(invocation.group("operands"))
@@ -2240,39 +2250,34 @@ def _adaptive_requires_approval(
     force_deny: bool = False,
     argument_regex: re.Pattern[str] | None = None,
 ) -> bool:
-    """Return whether adaptive mode must interrupt for native approval."""
+    """Return whether adaptive mode must interrupt for native approval.
+
+    User wording is a signal, never a waiver. The one high-impact operation
+    adaptive mode lets through is a recursive delete whose every operand the
+    gateway can independently prove disposable and that the user asked for.
+    Everything else asks -- including actions the user worded explicitly --
+    because the policy cannot prove the proposed target is the one meant.
+    """
     if not calls:
         return False
     user_authorized = explicitly_authorized or _explicit_high_impact_authorization(messages)
     workflow_authorized = _adaptive_workflow_authorized(messages)
     for call in calls:
-        kind = _high_impact_call_kind(call, argument_regex=argument_regex)
-        if kind is None:
+        if _high_impact_call_kind(call, argument_regex=argument_regex) is None:
             continue
-        function = call.get("function") or {}
-        name = str(function.get("name") or "").strip().lower()
-        argument_text = _shell_command_text(function.get("arguments"))
         if greylisted and force_deny:
             return True
-        # Financial/order execution always keeps a human in the loop.
-        if name in {"place_trade", "submit_order"}:
-            return True
+        function = call.get("function") or {}
+        name = str(function.get("name") or "").strip().lower()
         if name in _SHELL_TOOL_NAMES:
-            if _ADAPTIVE_CRITICAL_SHELL_RE.search(argument_text):
-                return True
-            if _ADAPTIVE_ANY_RM_RE.search(argument_text):
-                # Build/deploy/test implicitly authorizes housekeeping only
-                # inside provably disposable paths.
-                if workflow_authorized and _adaptive_safe_cleanup(argument_text):
-                    continue
-                if user_authorized and _adaptive_safe_cleanup(argument_text):
-                    continue
-                return True
-        # Generic/browser/computer tools are too ambiguous to auto-authorize.
-        if name not in _SHELL_TOOL_NAMES and name != "send_message":
-            return True
-        if not user_authorized:
-            return True
+            argument_text = _shell_command_text(function.get("arguments"))
+            cleanup_authorized = workflow_authorized or user_authorized
+            if cleanup_authorized and _adaptive_safe_cleanup(argument_text):
+                continue
+        # Everything else stays gated. Financial/order execution, irreversible
+        # sends, and browser/computer tools all carry effects the policy cannot
+        # bound, so user wording never substitutes for that proof.
+        return True
     return False
 
 
@@ -2315,7 +2320,8 @@ def _high_impact_call_kind(
     if name in {"place_trade", "submit_order", "send_message"}:
         return name
     if name in _SHELL_TOOL_NAMES:
-        return name if _SHELL_HIGH_IMPACT_RE.search(argument_text) else None
+        command_text = _shell_command_text(function.get("arguments"))
+        return name if _SHELL_HIGH_IMPACT_RE.search(command_text) else None
     if name in {"task", "browser", "computer", "playwright"} and regex.search(argument_text):
         return name
     if regex.search(argument_text):

@@ -93,16 +93,19 @@ Three high-impact modes are available:
 - `approval` is the conservative mode: every classified high-impact action
   requires the native question approval.
 - `adaptive` waits for the concrete proposed tool call instead of interrupting
-  on user text alone. An explicitly requested, non-critical action can proceed
-  without a second confirmation and is recorded as `high_impact.adaptive`.
-  Autonomous high-impact actions still ask. An explicitly requested
-  build/deploy/test workflow may clean provably disposable paths such as a
-  child of `/tmp`, `/var/tmp`, or repository-local build/cache directories
-  without another prompt; unresolved shell variables, temp roots themselves,
-  path escapes, and other absolute paths remain gated. Financial/order
-  execution, configured critical shell patterns, force pushes, and
-  force-denied greylisted-model actions always ask even when the user's
-  wording is explicit.
+  on user text alone, and records what it lets through as
+  `high_impact.adaptive`. User wording is a signal, never a waiver: the only
+  action that proceeds without a confirmation is a recursive delete whose every
+  operand the gateway can independently resolve to a disposable path (a child
+  of `/tmp` or `/var/tmp`, or a repository-local build/cache directory), and
+  only when the latest user turn asked for it or opened with a build/deploy/test
+  workflow. The whole command must be accounted for, so an approved disposable
+  delete cannot carry a second unchecked operation. Everything else the
+  high-impact classifier recognizes asks -- including actions the user worded
+  explicitly, because the gateway cannot prove the proposed target is the one
+  meant. Unresolved shell variables, temp roots themselves, path escapes,
+  other absolute paths, redirection/substitution, and force-denied
+  greylisted-model actions all keep the gate armed.
 - `audit` keeps the classifier active but records `high_impact.audit` and
   allows the request to continue without an interactive question. Use this for
   temporary investigation rather than as the normal safety posture.
