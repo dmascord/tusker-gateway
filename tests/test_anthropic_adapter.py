@@ -540,7 +540,11 @@ async def test_messages_streaming_converts_complete_provider_response(client):
     assert b'"id": "call_read"' in content
     assert b"README.md" in content
     assert b"event: message_stop" in content
-    events = [frame for frame in content.split(b"\n\n") if frame.strip()]
+    events = [
+        frame
+        for frame in content.split(b"\n\n")
+        if frame.strip() and not frame.startswith(b":")
+    ]
     assert len(events) >= 5
     assert all(frame.startswith(b"event: ") for frame in events)
 
@@ -623,6 +627,48 @@ async def test_messages_required_tool_stream_streams_early_content(app, client):
     assert mock_chat.call_count == 1
 
 
+
+@pytest.mark.asyncio
+async def test_messages_stream_starts_before_provider_dispatch_finishes(client):
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def delayed_chat(*args, **kwargs):
+        started.set()
+        await release.wait()
+
+        async def upstream():
+            yield b'data: {"choices":[{"delta":{"content":"ready"},"finish_reason":null}]}\n\n'
+            yield b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+            yield b'data: [DONE]\n\n'
+
+        return upstream()
+
+    with patch("tusker_gateway.anthropic_adapter.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
+        mock_chat.side_effect = delayed_chat
+        request_task = asyncio.create_task(
+            client.post(
+                "/v1/messages",
+                json={
+                    "model": "claude-3-opus-20240229",
+                    "max_tokens": 100,
+                    "messages": [{"role": "user", "content": "Hi"}],
+                    "stream": True,
+                },
+                headers=HEADERS_AUTH,
+            )
+        )
+        await started.wait()
+        resp = await request_task
+        first = await resp.content.readany()
+        assert resp.status == 200
+        assert b": keepalive" in first
+        assert not release.is_set()
+        release.set()
+        content = first + await resp.read()
+
+    assert b"event: message_stop" in content
+    assert mock_chat.await_count == 1
 @pytest.mark.asyncio
 async def test_messages_forwards_client_session_to_provider_call(client):
     openai_response = {

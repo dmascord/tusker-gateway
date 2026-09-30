@@ -61,7 +61,7 @@ from tusker_gateway.pools import PoolManager
 from tusker_gateway.quality import QualityDB
 from tusker_gateway.rate_limit import RateLimiter
 from tusker_gateway.routing import resolve_route
-from tusker_gateway.sse import sse_heartbeat_loop
+from tusker_gateway.sse import sse_comment, sse_heartbeat_loop
 from tusker_gateway.storage import StorageUnavailableError
 from tusker_gateway.tool_formats import normalize_response_tool_calls
 from tusker_gateway.tracing import Tracer
@@ -545,6 +545,19 @@ async def anthropic_messages_handler(request: web.Request) -> web.Response | web
     body: dict[str, Any] | None = None
     budget_recorded = False
     budget_charged = 0
+    stream_resp: web.StreamResponse | None = None
+    stream_stop: asyncio.Event | None = None
+    stream_hb_task: asyncio.Task[None] | None = None
+    stream_hb_interval = 0.0
+    async def _stop_stream_heartbeat() -> None:
+        if stream_stop is None or stream_hb_task is None:
+            return
+        stream_stop.set()
+        try:
+            await asyncio.wait_for(stream_hb_task, timeout=stream_hb_interval + 1.0)
+        except asyncio.TimeoutError:
+            stream_hb_task.cancel()
+
     openai_body: dict[str, Any] = {}
     api_key = _resolve_api_key(request)
     original_model = ""
@@ -660,6 +673,32 @@ async def anthropic_messages_handler(request: web.Request) -> web.Response | web
                         status=429,
                     )
 
+            if body.get("stream"):
+                stream_resp = web.StreamResponse(
+                    status=200,
+                    headers={
+                        "Content-Type": "text/event-stream",
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                        "X-Request-ID": request.get("_request_id", ""),
+                        "X-Accel-Buffering": "no",
+                    },
+                )
+                await stream_resp.prepare(request)
+                await stream_resp.write(sse_comment("keepalive"))
+                stream_stop = asyncio.Event()
+                stream_hb_interval = _sse_heartbeat_secs()
+                stream_hb_task = asyncio.create_task(
+                    sse_heartbeat_loop(
+                        stream_resp.write,
+                        stream_stop,
+                        interval_secs=stream_hb_interval,
+                        comment="keepalive",
+                    ),
+                    name="anthropic-sse-heartbeat",
+                )
+                await asyncio.sleep(0)
+
             # Dispatch to backend.
             provider, target_model, result = await _call_with_pool_fallback_anthropic(
                 config, openai_body, client, tools, breaker=breaker, request=request,
@@ -692,33 +731,10 @@ async def anthropic_messages_handler(request: web.Request) -> web.Response | web
                     )
                     budget_recorded = True
                     budget_charged = _estimated_tokens(openai_body.get("messages", []))
-                resp = web.StreamResponse(
-                    status=200,
-                    headers={
-                        "Content-Type": "text/event-stream",
-                        "Cache-Control": "no-cache",
-                        "Connection": "keep-alive",
-                        "X-Request-ID": request.get("_request_id", ""),
-                        "X-Accel-Buffering": "no",
-                    },
-                )
-                await resp.prepare(request)
-
-                stop = asyncio.Event()
-                hb_interval = _sse_heartbeat_secs()
-                hb_task = asyncio.create_task(
-                    sse_heartbeat_loop(
-                        resp.write,
-                        stop,
-                        interval_secs=hb_interval,
-                        comment="keepalive",
-                    ),
-                    name="sse-heartbeat",
-                )
                 stream_ok = True
                 try:
                     async for chunk in result:
-                        await resp.write(chunk)
+                        await stream_resp.write(chunk)
                 except (ConnectionResetError, ConnectionError, BrokenPipeError) as exc:
                     stream_ok = False
                     status = "client_disconnected"
@@ -752,14 +768,9 @@ async def anthropic_messages_handler(request: web.Request) -> web.Response | web
                         budget_recorded = False
                 finally:
                     await _close_async_iterator(result)
-                    stop.set()
-                    try:
-                        await asyncio.wait_for(hb_task, timeout=hb_interval + 1.0)
-                    except asyncio.TimeoutError:
-                        hb_task.cancel()
+                    await _stop_stream_heartbeat()
                 status = "ok" if stream_ok else status
-                _emit(status)
-                return resp
+                return stream_resp
 
             # Non-streaming: convert OpenAI → Anthropic format.
             anthropic_resp = _openai_to_anthropic(result, original_model)
@@ -775,6 +786,15 @@ async def anthropic_messages_handler(request: web.Request) -> web.Response | web
         except BadRequestError as exc:
             status = exc.code or "bad_request"
             _emit(status)
+            if stream_resp is not None:
+                await _stop_stream_heartbeat()
+                try:
+                    await stream_resp.write(
+                        f"event: error\ndata: {json.dumps(_anthropic_error(exc.message, type=exc.error_type), ensure_ascii=False)}\n\n".encode()
+                    )
+                except (ConnectionResetError, ConnectionError, BrokenPipeError):
+                    pass
+                return stream_resp
             return web.json_response(
                 _anthropic_error(exc.message, type=exc.error_type),
                 status=exc.status,
@@ -786,6 +806,15 @@ async def anthropic_messages_handler(request: web.Request) -> web.Response | web
             _emit(status)
             if budget_recorded and budget is not None and api_key and body is not None:
                 await asyncio.to_thread(budget.refund, api_key, pool_name, budget_charged)
+            if stream_resp is not None:
+                await _stop_stream_heartbeat()
+                try:
+                    await stream_resp.write(
+                        f"event: error\ndata: {json.dumps(_anthropic_error(str(exc), type='api_error'), ensure_ascii=False)}\n\n".encode()
+                    )
+                except (ConnectionResetError, ConnectionError, BrokenPipeError):
+                    pass
+                return stream_resp
             return web.json_response(
                 _anthropic_error(str(exc), type="api_error"),
                 status=502,

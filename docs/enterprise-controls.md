@@ -182,6 +182,13 @@ Clients may request a shorter or longer bounded deadline with
 gateway cancels provider work and closes the stream; it cannot safely send a
 second HTTP status line.
 
+Streaming `/v1/chat/completions`, `/v1/responses`, and `/v1/messages` requests
+prepare SSE before provider dispatch. The gateway sends an immediate SSE
+keepalive comment and repeats it every 15 seconds by default; operators can set
+`TUSKER_SSE_HEARTBEAT_SECS` to change the interval or `0` to disable it. This
+keeps an established connection active but cannot prevent Cloudflare 521/522
+errors that occur before the origin connection is established.
+
 ## 4. Persistent idempotency
 
 Enable duplicate suppression with `TUSKER_IDEMPOTENCY_ENABLED=true`. A caller

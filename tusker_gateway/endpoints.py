@@ -106,6 +106,7 @@ from tusker_gateway.sse import (
     sse_data_payload,
     sse_done,
     sse_frame,
+    sse_comment,
     sse_heartbeat_loop,
 )
 from tusker_gateway.tracing import Tracer
@@ -5533,6 +5534,8 @@ def _responses_stream_from_chat(
     *,
     model: str,
     complete_result: dict[str, Any] | None = None,
+    response_id: str | None = None,
+    emit_created: bool = True,
 ) -> AsyncIterator[bytes]:
     """Adapt canonical Chat Completions SSE to Responses SSE.
 
@@ -5543,17 +5546,18 @@ def _responses_stream_from_chat(
     """
 
     async def generate() -> AsyncIterator[bytes]:
-        response_id = f"resp_{uuid.uuid4().hex}"
+        stream_response_id = response_id or f"resp_{uuid.uuid4().hex}"
         created_at = int(time.time())
         response: dict[str, Any] = {
-            "id": response_id,
+            "id": stream_response_id,
             "object": "response",
             "created_at": created_at,
             "model": model,
             "output": [],
             "status": "in_progress",
         }
-        yield _responses_sse_frame("response.created", {"response": dict(response)})
+        if emit_created:
+            yield _responses_sse_frame("response.created", {"response": dict(response)})
 
         output_items: list[dict[str, Any]] = []
         message_items: dict[int, tuple[int, dict[str, Any]]] = {}
@@ -7178,6 +7182,39 @@ async def responses_handler(request: web.Request) -> web.Response | web.StreamRe
 
 
 async def _responses_handler_impl(request: web.Request) -> web.Response | web.StreamResponse:
+    stream_resp: web.StreamResponse | None = None
+    stream_stop: asyncio.Event | None = None
+    stream_hb_task: asyncio.Task[None] | None = None
+    stream_hb_interval = 0.0
+    async def _stop_stream_heartbeat() -> None:
+        if stream_stop is None or stream_hb_task is None:
+            return
+        stream_stop.set()
+        try:
+            await asyncio.wait_for(stream_hb_task, timeout=stream_hb_interval + 1.0)
+        except asyncio.TimeoutError:
+            stream_hb_task.cancel()
+
+    async def _write_stream_failure(message: str, code: str) -> None:
+        if stream_resp is None:
+            return
+        await _stop_stream_heartbeat()
+        try:
+            await stream_resp.write(
+                _responses_sse_frame(
+                    "response.failed",
+                    {
+                        "response": {
+                            "object": "response",
+                            "model": str(body.get("model") or "tusker-gateway") if isinstance(body, dict) else "tusker-gateway",
+                            "status": "failed",
+                        },
+                        "error": {"code": code, "message": message},
+                    },
+                )
+            )
+        except (ConnectionResetError, ConnectionError, BrokenPipeError):
+            pass
     budget_recorded = False
     budget_charged = 0
     budget_units = 0
@@ -7343,6 +7380,48 @@ async def _responses_handler_impl(request: web.Request) -> web.Response | web.St
                         )
                     )
 
+        if body.get("stream"):
+            stream_resp = web.StreamResponse(
+                status=200,
+                headers={
+                    "Content-Type": "text/event-stream",
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Request-ID": request.get("_request_id", ""),
+                    "X-Accel-Buffering": "no",
+                },
+            )
+            await stream_resp.prepare(request)
+            await stream_resp.write(sse_comment("keepalive"))
+            stream_stop = asyncio.Event()
+            stream_hb_interval = _sse_heartbeat_secs()
+            stream_hb_task = asyncio.create_task(
+                sse_heartbeat_loop(
+                    stream_resp.write,
+                    stream_stop,
+                    interval_secs=stream_hb_interval,
+                    comment="keepalive",
+                ),
+                name="responses-sse-heartbeat",
+            )
+            response_id = f"resp_{uuid.uuid4().hex}"
+            await stream_resp.write(
+                _responses_sse_frame(
+                    "response.created",
+                    {
+                        "response": {
+                            "id": response_id,
+                            "object": "response",
+                            "created_at": int(time.time()),
+                            "model": body.get("model") or config["model_name"],
+                            "output": [],
+                            "status": "in_progress",
+                        }
+                    },
+                )
+            )
+            await asyncio.sleep(0)
+
         provider, target_model, result = await _call_with_pool_fallback(
             config,
             chat_body,
@@ -7389,6 +7468,8 @@ async def _responses_handler_impl(request: web.Request) -> web.Response | web.St
                     None,
                     model=body.get("model") or config["model_name"],
                     complete_result=result,
+                    response_id=response_id,
+                    emit_created=False,
                 )
             else:
                 raw_stream = result.iterator if isinstance(result, _PreparedStream) else result
@@ -7400,33 +7481,13 @@ async def _responses_handler_impl(request: web.Request) -> web.Response | web.St
                 response_stream = _responses_stream_from_chat(
                     raw_stream,
                     model=body.get("model") or config["model_name"],
+                    response_id=response_id,
+                    emit_created=False,
                 )
 
-            resp = web.StreamResponse(
-                status=200,
-                headers={
-                    "Content-Type": "text/event-stream",
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                    "X-Request-ID": request.get("_request_id", ""),
-                    "X-Accel-Buffering": "no",
-                },
-            )
-            await resp.prepare(request)
-            stop = asyncio.Event()
-            hb_interval = _sse_heartbeat_secs()
-            hb_task = asyncio.create_task(
-                sse_heartbeat_loop(
-                    resp.write,
-                    stop,
-                    interval_secs=hb_interval,
-                    comment="keepalive",
-                ),
-                name="responses-sse-heartbeat",
-            )
             try:
                 async for chunk in response_stream:
-                    await resp.write(chunk)
+                    await stream_resp.write(chunk)
             except (ConnectionResetError, ConnectionError, BrokenPipeError):
                 logger.info("responses stream client disconnected")
                 request["_stream_error"] = "client_disconnected"
@@ -7445,12 +7506,8 @@ async def _responses_handler_impl(request: web.Request) -> web.Response | web.St
                     await asyncio.to_thread(budget.refund, api_key, pool_name, budget_charged)
             finally:
                 await _close_async_iterator(response_stream)
-                stop.set()
-                try:
-                    await asyncio.wait_for(hb_task, timeout=hb_interval + 1.0)
-                except asyncio.TimeoutError:
-                    hb_task.cancel()
-            return resp
+                await _stop_stream_heartbeat()
+            return stream_resp
         if isinstance(result, dict):
             from tusker_gateway.tool_formats import normalize_response_tool_calls
 
@@ -7498,6 +7555,9 @@ async def _responses_handler_impl(request: web.Request) -> web.Response | web.St
             code="unsupported_streaming",
         )
     except BadRequestError as exc:
+        if stream_resp is not None:
+            await _write_stream_failure(exc.message, exc.code)
+            return stream_resp
         return web.json_response(
             openai_error(exc.message, code=exc.code, error_type=exc.error_type),
             status=exc.status,
@@ -7512,6 +7572,9 @@ async def _responses_handler_impl(request: web.Request) -> web.Response | web.St
             budget = request.app.get("budget")
             if budget is not None and api_key:
                 await asyncio.to_thread(budget.refund, api_key, budget_pool, budget_charged)
+        if stream_resp is not None:
+            await _write_stream_failure(str(exc), "provider_error")
+            return stream_resp
         return _public_provider_failure_response(exc)
 
 

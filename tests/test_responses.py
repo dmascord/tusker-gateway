@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -276,6 +277,43 @@ async def test_responses_streaming_does_not_return_non_stream_json(client):
     assert b"chat.completion.chunk" not in content
 
 
+
+@pytest.mark.asyncio
+async def test_responses_stream_starts_before_provider_dispatch_finishes(client):
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def delayed_chat(*args, **kwargs):
+        started.set()
+        await release.wait()
+
+        async def upstream():
+            yield b'data: {"choices":[{"delta":{"content":"ready"},"finish_reason":null}]}\n\n'
+            yield b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+            yield b'data: [DONE]\n\n'
+
+        return upstream()
+
+    with patch("tusker_gateway.endpoints.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
+        mock_chat.side_effect = delayed_chat
+        request_task = asyncio.create_task(
+            client.post(
+                "/v1/responses",
+                json={"model": "openai::gpt-4o", "input": "hello", "stream": True},
+                headers=HEADERS_AUTH,
+            )
+        )
+        await started.wait()
+        resp = await request_task
+        first = await resp.content.readany()
+        assert resp.status == 200
+        assert b"event: response.created" in first
+        assert not release.is_set()
+        release.set()
+        content = first + await resp.read()
+
+    assert b"event: response.completed" in content
+    assert mock_chat.await_count == 1
 @pytest.mark.asyncio
 async def test_responses_streaming_preserves_native_tool_call_deltas(client):
     async def upstream():

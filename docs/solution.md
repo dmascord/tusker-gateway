@@ -176,8 +176,13 @@ than a readiness request side effect.
 - 429: cooldown calculation, in-memory marking, persistent recording, then
   propagate the rate-limit error to the caller/fallback layer.
 - 5xx and transport errors: provider error and quality failure event.
-- Streaming responses: response remains open for the async iterator and is
-  released when iteration completes or the client disconnects.
+- Streaming responses prepare the SSE connection before provider dispatch and emit
+  keepalive comments every 15 seconds by default, so long provider thinking waits
+  remain visible to intermediaries and clients. The heartbeat applies only after
+  the origin connection is established; it cannot prevent Cloudflare 521/522
+  origin-connectivity failures.
+- Streaming responses remain open for the async iterator and are released when
+  iteration completes or the client disconnects.
 
 ## Operational requirements
 
