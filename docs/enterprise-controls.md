@@ -60,15 +60,29 @@ requires `memory:read` or `memory:write`, checks `allowed_memory_banks`, and
 forwards the compatible `/v1/default/banks/{bank}/*` API to cluster-internal
 Hindsight. The compatibility surface also proxies `/version`.
 
-Use a dedicated hostname such as `memory.tusker.net.au`; do not expose the
-Hindsight service directly. Example:
+Use the shared hostname and bank below for Don's OpenCode project and the
+Ready-to-Fly API OMP project:
+
+```yaml
+hindsight:
+  apiUrl: https://memory.tusker.net.au
+  bankId: shared-code
+```
+
+Each caller needs its own gateway API key. The key's identity profile MUST
+include `memory:read` and `memory:write` plus `allowed_memory_banks: [shared-code]`.
+Do not commit `apiToken` or place it in a repository config file; supply it
+through the client's secret/environment mechanism. Separate keys preserve
+revocation and audit attribution while the bank remains shared.
+
+Example identity profile:
 
 ```json
 {
-  "serverMode": "self-hosted",
-  "apiUrl": "https://memory.tusker.net.au",
-  "apiToken": "<gateway-api-key>",
-  "bankId": "tusker-shared-memory"
+  "principal": "don-opencode",
+  "tenant": "shared-memory",
+  "scopes": ["memory:read", "memory:write"],
+  "allowed_memory_banks": ["shared-code"]
 }
 ```
 
@@ -79,14 +93,31 @@ and authorization remain application responsibilities. Clients can call this
 proxy with ordinary authenticated HTTP, but OpenAI SDKs do not discover these
 routes automatically.
 
+## Native streamed tool-call compatibility
 
-Client usage should treat a bank as a durable namespace selected by the
+The chat streaming normalizer gives OpenAI-compatible tool-call deltas stable
+per-choice indexes and ensures every emitted delta has an id. This is required
+for OpenCode's bundled OpenAI provider parser, which rejects deltas that contain
+neither `id` nor `function.name` as `OpenAI Chat tool call delta is missing id
+or name`. The parser treats later argument-only fragments as continuations of
+the same call; the gateway therefore keeps the synthesized id stable for a call
+and preserves a provider-supplied id when present.
+
+The deployed compatibility surface is exercised with:
+
+```bash
+opencode run "Call hindsight_search_knowledge_pages with query shared-code bank, then reply exactly SMOKE_OK."
+```
+
+The request must return `SMOKE_OK` after the Hindsight tool call completes.
+Client usage should treat `shared-code` as a durable namespace selected by the
 application, not as an OpenAI `conversation` ID. Use `retain` for explicit
 facts or conversation summaries, `recall` before generation, and pass only the
 small relevant result into the model request. Keep raw conversation history
 and long-term facts separate; do not persist every prompt by default. Define
 retention, deletion, tenant ownership, consent, and prompt-injection handling
 before enabling write access for general callers.
+
 Available scopes are:
 
 | Scope | Routes |
