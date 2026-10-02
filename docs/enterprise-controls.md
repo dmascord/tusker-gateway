@@ -51,6 +51,27 @@ Example identity profile:
 
 The proxy forwards only the allowlisted operation and strips `bank` from the upstream query string before constructing Hindsight's bank URL. Hindsight remains cluster-internal; the gateway's `TUSKER_MEMORY_BASE_URL` selects its internal base URL and defaults to `http://hindsight.hindsight.svc.cluster.local:8888`.
 
+### Hindsight-compatible agent endpoint
+
+OMP and OpenCode can use the gateway as their Hindsight endpoint without a
+plugin change. Configure their Hindsight `apiUrl` to the gateway hostname and
+use a gateway API key as `apiToken`. The gateway authenticates that key,
+requires `memory:read` or `memory:write`, checks `allowed_memory_banks`, and
+forwards the compatible `/v1/default/banks/{bank}/*` API to cluster-internal
+Hindsight. The compatibility surface also proxies `/version`.
+
+Use a dedicated hostname such as `memory.tusker.net.au`; do not expose the
+Hindsight service directly. Example:
+
+```json
+{
+  "serverMode": "self-hosted",
+  "apiUrl": "https://memory.tusker.net.au",
+  "apiToken": "<gateway-api-key>",
+  "bankId": "tusker-shared-memory"
+}
+```
+
 This is a Tusker extension, not an OpenAI-standard client feature. OpenAI's
 official state mechanisms are manually supplied input, the Conversations API,
 and `previous_response_id`; durable semantic memory, bank sharing, retention,

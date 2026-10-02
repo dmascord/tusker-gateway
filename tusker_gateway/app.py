@@ -41,7 +41,7 @@ from tusker_gateway.mcp_guard import mcp_handler
 
 from tusker_gateway.errors import GatewayError, openai_error
 from tusker_gateway.health import health_handler, ready_handler, status_handler
-from tusker_gateway.memory import memory_handler
+from tusker_gateway.memory import hindsight_compat_handler, hindsight_version_handler, memory_handler
 from tusker_gateway.admin import (
     admin_breakers,
     admin_catalog,
@@ -660,6 +660,9 @@ def create_app() -> web.Application:
     app.router.add_post("/v1/chat/completions", chat_completions_handler)
     app.router.add_post("/v1/responses", responses_handler)
     app.router.add_post("/v1/messages", anthropic_messages_handler)
+    app.router.add_get("/version", hindsight_version_handler)
+    app.router.add_route("*", "/v1/default/banks/{bank}/{tail:.*}", hindsight_compat_handler)
+    app.router.add_route("*", "/v1/default/banks/{bank}", hindsight_compat_handler)
     app.router.add_post("/v1/memory/retain", memory_handler)
     app.router.add_post("/v1/memory/recall", memory_handler)
     app.router.add_get("/v1/memory/list", memory_handler)

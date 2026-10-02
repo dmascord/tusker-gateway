@@ -12,5 +12,10 @@ spec:
     services:
     - name: tusker-gateway
       port: 8642
+  - match: Host(`memory.tusker.net.au`)
+    kind: Rule
+    services:
+    - name: tusker-gateway
+      port: 8642
   tls:
     secretName: tusker-gateway-tls

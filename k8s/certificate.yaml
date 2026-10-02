@@ -10,3 +10,4 @@ spec:
     kind: ClusterIssuer
   dnsNames:
   - ai.tusker.net.au
+  - memory.tusker.net.au
