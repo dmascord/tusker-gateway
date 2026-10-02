@@ -944,9 +944,14 @@ def _normalize_native_stream_tool_calls(
         index = known_index
         if index is None and explicit_index is not None:
             owner = index_owners.get((choice_index, explicit_index))
-            # A provider that reuses index=0 for a new call must not make the
-            # client append the new arguments to the old call.
-            if explicit_index not in used_in_frame and (not owner or owner == call_id):
+            if explicit_index not in used_in_frame and (
+                not owner
+                or owner == call_id
+                or (
+                    owner.startswith("call_stream_")
+                    and (not call_name or index_names.get((choice_index, explicit_index)) == call_name)
+                )
+            ):
                 index = explicit_index
 
         if index is None and call_id:
@@ -966,11 +971,18 @@ def _normalize_native_stream_tool_calls(
             else:
                 index = allocate()
 
+        effective_call_id = call_id
+        if not effective_call_id:
+            # Some OpenAI-compatible providers omit ids and names on the
+            # first native delta. OMP requires an id or name on every delta;
+            # keep the synthesized id stable by stream index.
+            effective_call_id = f"call_stream_{choice_index}_{index}"
+            call["id"] = effective_call_id
+
         used_in_frame.add(index)
         position_indices[(choice_index, position)] = index
-        index_owners.setdefault((choice_index, index), call_id)
-        if call_id:
-            call_indices[(choice_index, call_id)] = index
+        index_owners.setdefault((choice_index, index), effective_call_id)
+        call_indices[(choice_index, effective_call_id)] = index
         if call_name:
             index_names[(choice_index, index)] = call_name
         next_indices[choice_index] = max(next_indices.get(choice_index, 0), index + 1)

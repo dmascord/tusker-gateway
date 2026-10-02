@@ -215,6 +215,42 @@ async def test_stream_normalizer_assigns_indexes_to_native_calls_without_indexes
 
 
 @pytest.mark.asyncio
+async def test_stream_normalizer_synthesizes_id_for_idless_native_deltas():
+    """Every native delta must satisfy OpenCode's id-or-name contract."""
+    from tusker_gateway.endpoints import _assemble_stream_tool_calls, _normalize_stream
+
+    def make_frame(function):
+        payload = {
+            "choices": [{
+                "index": 0,
+                "delta": {"tool_calls": [{"type": "function", "function": function}]},
+                "finish_reason": None,
+            }],
+        }
+        return f"data: {json.dumps(payload)}\n\n".encode()
+
+    async def native_stream():
+        yield make_frame({"arguments": '{"path":"/tmp"}'})
+        yield b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    frames = [
+        frame
+        async for frame in _normalize_stream(native_stream(), provider="test", model="test")
+    ]
+    calls = []
+    for frame in frames:
+        if not frame.startswith(b"data: {"):
+            continue
+        payload = json.loads(frame[len(b"data: "):])
+        for choice in payload.get("choices", []):
+            calls.extend((choice.get("delta") or {}).get("tool_calls") or [])
+
+    assert calls[0]["id"] == "call_stream_0_0"
+    assert calls[0]["index"] == 0
+    assert _assemble_stream_tool_calls(frames)[0]["id"] == "call_stream_0_0"
+
+@pytest.mark.asyncio
 async def test_stream_normalizer_keeps_separate_rescued_calls_to_same_function():
     """Text rescue must not merge two independent same-name invocations."""
     from tusker_gateway.endpoints import _assemble_stream_tool_calls, _normalize_stream
