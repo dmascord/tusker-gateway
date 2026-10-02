@@ -33,7 +33,7 @@ from tusker_gateway.identity import (
     load_identity_config_from_env,
 )
 from tusker_gateway.observability import attach_request_id_middleware
-from tusker_gateway.memory import memory_handler
+from tusker_gateway.memory import hindsight_compat_handler, memory_handler
 
 
 def _auth_middleware(store: IdentityStore):
@@ -1049,5 +1049,59 @@ async def test_memory_health_uses_read_route_and_upstream_path():
         assert response.status == 200
         assert calls[0][0] == "GET"
         assert calls[0][1].endswith("/v1/default/banks/engineering/health")
+    finally:
+        await client.close()
+
+@pytest.mark.asyncio
+async def test_hindsight_compat_forwards_bank_path_and_body():
+    api_key = "sk-hindsight-compat"
+    cfg = load_identity_config_from_env({
+        "TUSKER_IDENTITIES_JSON": json.dumps({
+            fingerprint_api_key(api_key): {
+                "principal": "omp",
+                "tenant": "engineering",
+                "scopes": ["memory:read", "memory:write"],
+                "allowed_memory_banks": ["shared-code"],
+            }
+        })
+    })
+    calls = []
+
+    class Response:
+        status = 200
+        headers = {"Content-Type": "application/json"}
+
+        async def read(self):
+            return b'{"memories": []}'
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc_info):
+            return False
+
+    class Session:
+        def request(self, method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            return Response()
+
+    app = web.Application()
+    app["config"] = {"api_keys": [api_key]}
+    app.middlewares.append(_auth_middleware(IdentityStore(cfg)))
+    app["http_session"] = Session()
+    app.router.add_route("*", "/v1/default/banks/{bank}/{tail:.*}", hindsight_compat_handler)
+    client = await _client(app)
+    try:
+        response = await client.post(
+            "/v1/default/banks/shared-code/memories/recall",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={"query": "shared bank"},
+        )
+        assert response.status == 200
+        assert calls == [(
+            "POST",
+            "http://hindsight.hindsight.svc.cluster.local:8888/v1/default/banks/shared-code/memories/recall",
+            {"json": {"query": "shared bank"}, "headers": {"Accept": "application/json", "Content-Type": "application/json"}},
+        )]
     finally:
         await client.close()

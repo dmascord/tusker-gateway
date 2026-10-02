@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+from typing import Any
 from urllib.parse import quote, urlencode
 
 from aiohttp import ClientError, web
@@ -103,6 +104,7 @@ async def hindsight_compat_handler(request: web.Request) -> web.Response:
     """Proxy the Hindsight API shape used by OMP/OpenCode."""
     bank = request.match_info.get("bank", "")
     tail = request.match_info.get("tail", "")
+    suffix = f"/{tail}" if tail else ""
     if not bank or len(bank) > 128 or any(ch in bank for ch in "/\\\x00"):
         raise web.HTTPBadRequest(text="invalid memory bank")
     try:
