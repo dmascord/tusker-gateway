@@ -1001,3 +1001,53 @@ async def test_memory_proxy_forwards_scoped_operation_to_hindsight():
         )]
     finally:
         await client.close()
+
+
+async def test_memory_health_uses_read_route_and_upstream_path():
+    api_key = "sk-memory-health"
+    cfg = load_identity_config_from_env({
+        "TUSKER_IDENTITIES_JSON": json.dumps({
+            fingerprint_api_key(api_key): {
+                "principal": "svc-memory",
+                "tenant": "engineering",
+                "scopes": ["memory:read"],
+                "allowed_memory_banks": ["engineering"],
+            }
+        })
+    })
+    calls = []
+
+    class Response:
+        status = 200
+        headers = {"Content-Type": "application/json"}
+
+        async def read(self):
+            return b'{"status":"healthy"}'
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc_info):
+            return False
+
+    class Session:
+        def request(self, method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            return Response()
+
+    app = web.Application()
+    app["config"] = {"api_keys": [api_key]}
+    app.middlewares.append(_auth_middleware(IdentityStore(cfg)))
+    app["http_session"] = Session()
+    app.router.add_get("/v1/memory/health", memory_handler)
+    client = await _client(app)
+    try:
+        response = await client.get(
+            "/v1/memory/health?bank=engineering",
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        assert response.status == 200
+        assert calls[0][0] == "GET"
+        assert calls[0][1].endswith("/v1/default/banks/engineering/health")
+    finally:
+        await client.close()

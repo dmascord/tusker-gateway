@@ -22,7 +22,7 @@ _ROUTES = {
     ("POST", "/v1/memory/reflect"): ("POST", "/reflect"),
     ("POST", "/v1/memory/consolidate"): ("POST", "/consolidate"),
     ("GET", "/v1/memory/stats"): ("GET", "/stats"),
-    ("POST", "/v1/memory/health"): ("POST", "/health/llm"),
+    ("GET", "/v1/memory/health"): ("GET", "/health"),
 }
 
 
