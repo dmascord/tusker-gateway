@@ -21,6 +21,7 @@ pools.py       — PoolManager: candidate lists, selection, session stickiness
 routing.py     — role-alias routing + passthrough detection
 passthrough.py — provider HTTP client + Codex OAuth token rotation
 endpoints.py   — OpenAI chat, responses, rerank, image, TTS, and video handlers
+memory.py     — authenticated Hindsight shared-memory proxy
 app.py         — aiohttp application factory + entry point
 __main__.py    — python -m tusker_gateway
 ```

@@ -41,6 +41,7 @@ from tusker_gateway.mcp_guard import mcp_handler
 
 from tusker_gateway.errors import GatewayError, openai_error
 from tusker_gateway.health import health_handler, ready_handler, status_handler
+from tusker_gateway.memory import memory_handler
 from tusker_gateway.admin import (
     admin_breakers,
     admin_catalog,
@@ -659,6 +660,18 @@ def create_app() -> web.Application:
     app.router.add_post("/v1/chat/completions", chat_completions_handler)
     app.router.add_post("/v1/responses", responses_handler)
     app.router.add_post("/v1/messages", anthropic_messages_handler)
+    app.router.add_post("/v1/memory/retain", memory_handler)
+    app.router.add_post("/v1/memory/recall", memory_handler)
+    app.router.add_get("/v1/memory/list", memory_handler)
+    app.router.add_get("/v1/memory/profile", memory_handler)
+    app.router.add_put("/v1/memory/profile", memory_handler)
+    app.router.add_patch("/v1/memory/bank", memory_handler)
+    app.router.add_delete("/v1/memory/memories", memory_handler)
+    app.router.add_delete("/v1/memory/bank", memory_handler)
+    app.router.add_post("/v1/memory/reflect", memory_handler)
+    app.router.add_post("/v1/memory/consolidate", memory_handler)
+    app.router.add_get("/v1/memory/stats", memory_handler)
+    app.router.add_get("/v1/memory/health", memory_handler)
     app.router.add_post("/mcp", mcp_handler)
 
     app.on_cleanup.append(on_cleanup)

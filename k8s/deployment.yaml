@@ -113,6 +113,8 @@ spec:
             secretKeyRef:
               name: tusker-gateway-metrics
               key: token
+        - name: TUSKER_MEMORY_BASE_URL
+          value: http://hindsight.hindsight.svc.cluster.local:8888
         - name: TUSKER_SEMANTIC_CACHE_ENABLED
           # Keep the production switch explicit. The image contains the
           # pinned model and the safety gates below are ready for a canary.

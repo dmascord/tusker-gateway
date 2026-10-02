@@ -9,17 +9,17 @@ Request deadlines default to the gateway's existing 120-second upstream limit.
 ## 1. Tenant identities and least privilege
 
 `TUSKER_IDENTITIES_JSON` maps a SHA-256 API-key fingerprint to a principal,
-tenant, and optional allowlists:
+tenant, and optional allowlists. `allowed_memory_banks` is required for the
+shared memory proxy and is intentionally separate from model routing policy:
 
 ```json
 {
   "<64-character-sha256>": {
     "principal": "svc-build",
     "tenant": "engineering",
-    "scopes": ["inference:chat", "models:read"],
-    "allowed_pools": ["code", "privacy"],
-    "allowed_models": ["hermes-code", "openrouter/*"],
-    "allowed_providers": ["openrouter"]
+    "scopes": ["inference:chat", "memory:read"],
+    "allowed_pools": ["code"],
+    "allowed_memory_banks": ["engineering", "shared-code"]
   }
 }
 ```
@@ -30,6 +30,42 @@ Generate a fingerprint without putting the key in shell history:
 python -c 'import getpass,hashlib; print(hashlib.sha256(getpass.getpass("API key: ").encode()).hexdigest())'
 ```
 
+## Shared memory proxy
+
+The gateway exposes selected Hindsight operations under `/v1/memory/*`; callers never connect to Hindsight directly. Every request requires:
+
+- an authenticated gateway API key;
+- `memory:read` or `memory:write` scope matching the operation;
+- `allowed_memory_banks` matching the `bank` query parameter.
+
+Example identity profile:
+
+```json
+{
+  "principal": "svc-build",
+  "tenant": "engineering",
+  "scopes": ["memory:read", "memory:write"],
+  "allowed_memory_banks": ["engineering", "shared-code"]
+}
+```
+
+The proxy forwards only the allowlisted operation and strips `bank` from the upstream query string before constructing Hindsight's bank URL. Hindsight remains cluster-internal; the gateway's `TUSKER_MEMORY_BASE_URL` selects its internal base URL and defaults to `http://hindsight.hindsight.svc.cluster.local:8888`.
+
+This is a Tusker extension, not an OpenAI-standard client feature. OpenAI's
+official state mechanisms are manually supplied input, the Conversations API,
+and `previous_response_id`; durable semantic memory, bank sharing, retention,
+and authorization remain application responsibilities. Clients can call this
+proxy with ordinary authenticated HTTP, but OpenAI SDKs do not discover these
+routes automatically.
+
+
+Client usage should treat a bank as a durable namespace selected by the
+application, not as an OpenAI `conversation` ID. Use `retain` for explicit
+facts or conversation summaries, `recall` before generation, and pass only the
+small relevant result into the model request. Keep raw conversation history
+and long-term facts separate; do not persist every prompt by default. Define
+retention, deletion, tenant ownership, consent, and prompt-injection handling
+before enabling write access for general callers.
 Available scopes are:
 
 | Scope | Routes |

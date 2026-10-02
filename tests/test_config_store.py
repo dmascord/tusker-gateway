@@ -194,3 +194,19 @@ def test_embed_path_column_is_added_to_a_legacy_database(tmp_path):
     })
 
     assert store.snapshot()["providers"]["voyage"]["embed_path"] == "/v1/embeddings"
+
+
+def test_client_key_memory_banks_round_trip(tmp_path):
+    store = ConfigStore(database=tmp_path / "config.db")
+    created = store.upsert_client_key({
+        "principal": "svc-memory",
+        "tenant": "engineering",
+        "scopes": ["memory:read"],
+        "allowed_memory_banks": ["engineering", "shared-*"],
+    })
+    identity = store.resolve(created["api_key"])
+    assert identity is not None
+    assert identity.allowed_memory_banks == ("engineering", "shared-*")
+    assert store.snapshot()["client_keys"][0]["allowed_memory_banks"] == [
+        "engineering", "shared-*"
+    ]

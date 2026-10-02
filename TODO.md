@@ -175,18 +175,27 @@ sandbox and connected normally.
 `pvc-528b560c` (the faulted Prometheus claim's leftover: PV `Released`
 with reclaim `Retain`, plus its still-present Longhorn volume) was
 deleted, which freed that replica's space on `wytch`. Longhorn now
-holds 25 volumes: 17 attached/healthy, 8 detached/unknown behind claims
-with no running workload (`hermes/tusker-home`,
-`pr-agent/openwrt-{ccache,baselines,dl,images}`, `pr-agent/postgres-data`)
-- idle-claim cleanup candidates.
+holds 25 volumes: 16 attached/healthy, 9 detached/unknown:
+`hermes/tusker-home`, `hermes/hermes-home-v2`, and seven released claims
+from the deleted `pr-agent` namespace. `hermes/hermes-home-v2` is mounted by
+the live Hermes Deployment; `hermes/tusker-home` is retained for gateway
+state jobs and is still Bound. The seven `pr-agent` claims have no namespace
+or workloads. Completed Longhorn backups exist for `postgres-data`,
+`openwrt-mirror`, and `qdrant-data`; the other four released claims have no
+completed backup object. No claim or Longhorn volume was deleted: cleanup is
+destructive and remains blocked pending explicit owner approval, especially
+for the four claims without completed backups.
 
-Scrape health is 26/35 up. All 9 down targets are
-`kube-proxy` (6), `kube-etcd`, `kube-scheduler` and
-`kube-controller-manager`: control-plane components that bind their
-metrics to localhost, a pre-existing config gap, unrelated to the node
-loss. Still open from that incident: `wynk`'s `usb-longhorn` disk is
-gone (`storageMaximum 0`, `longhorn-disk.cfg` missing) and
-`disk-health-check` jobs keep failing.
+Before the monitor change, scrape health was 26/35 up; all nine down targets
+were `kube-proxy` (6), `kube-etcd`, `kube-scheduler` and
+`kube-controller-manager`: control-plane components that bind their metrics
+to localhost, a pre-existing config gap unrelated to the node loss. The
+tracked `k8s/prometheus-values.yaml` now disables only those four generated
+ServiceMonitors. Helm release `prometheus` revision 3 applied the tracked
+values; the live Prometheus API converged to 26 active targets with 0 down.
+Still open from that incident: `wynk`'s `usb-longhorn` disk is gone
+(`storageMaximum 0`, `longhorn-disk.cfg` missing) and `disk-health-check`
+jobs keep failing.
 
 ## Strength probe (shipped 2026-09-28, commit c53baef)
 `tusker_gateway.tools.probe_strength` measures llm-stats-unknown pool

@@ -44,7 +44,19 @@ _ROUTE_SCOPES = {
     ("GET", "/admin/breakers"): "admin:read",
     ("GET", "/admin/keys"): "admin:read",
     ("GET", "/admin/usage"): "admin:read",
+    ("POST", "/v1/memory/retain"): "memory:write",
+    ("POST", "/v1/memory/recall"): "memory:read",
+    ("GET", "/v1/memory/list"): "memory:read",
+    ("GET", "/v1/memory/profile"): "memory:read",
+    ("PUT", "/v1/memory/profile"): "memory:write",
+    ("DELETE", "/v1/memory/memories"): "memory:write",
+    ("PATCH", "/v1/memory/bank"): "memory:write",
+    ("POST", "/v1/memory/reflect"): "memory:read",
+    ("POST", "/v1/memory/consolidate"): "memory:write",
+    ("GET", "/v1/memory/stats"): "memory:read",
+    ("GET", "/v1/memory/health"): "memory:read",
 }
+
 _CHAT_ROUTES = frozenset({
     "/v1/chat/completions",
     "/v1/responses",
@@ -89,6 +101,7 @@ class CallerIdentity:
     allowed_pools: tuple[str, ...] = _WILDCARD
     allowed_models: tuple[str, ...] = _WILDCARD
     allowed_providers: tuple[str, ...] = _WILDCARD
+    allowed_memory_banks: tuple[str, ...] = ()
     managed: bool = True
 
     @classmethod
@@ -107,6 +120,7 @@ class CallerIdentity:
             allowed_pools=_patterns(raw.get("allowed_pools")),
             allowed_models=_patterns(raw.get("allowed_models")),
             allowed_providers=_patterns(raw.get("allowed_providers")),
+            allowed_memory_banks=_patterns(raw.get("allowed_memory_banks"), default=()),
         )
 
     @classmethod
@@ -133,6 +147,11 @@ class CallerIdentity:
 
     def allows_provider(self, provider: str) -> bool:
         return self._allows(self.allowed_providers, provider)
+
+    def allows_memory_bank(self, bank: str) -> bool:
+        """Return whether this caller may use the named shared memory bank."""
+        return bool(self.allowed_memory_banks) and self._allows(self.allowed_memory_banks, bank)
+
 
 
 @dataclass(frozen=True)
@@ -380,7 +399,6 @@ __all__ = [
     "authorize_request",
     "extract_api_key",
     "fingerprint_api_key",
-    "load_identity_config_from_env",
     "model_allowed_for_request",
     "model_patterns_for_request",
     "pool_allowed_for_request",

@@ -5,6 +5,25 @@
 alertmanager:
   enabled: false
 
+# The control-plane and kube-proxy metrics endpoints are not bound in this
+# cluster. Keep their ServiceMonitors disabled so Prometheus does not report
+# nine permanent connection-refused targets as outages.
+kubeControllerManager:
+  serviceMonitor:
+    enabled: false
+
+kubeEtcd:
+  serviceMonitor:
+    enabled: false
+
+kubeProxy:
+  serviceMonitor:
+    enabled: false
+
+kubeScheduler:
+  serviceMonitor:
+    enabled: false
+
 nodeExporter:
   enabled: false
 

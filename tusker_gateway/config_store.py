@@ -152,6 +152,14 @@ class ConfigStore:
                 is_pg=is_pg,
             )
 
+            self._ensure_column(
+                conn,
+                table="tusker_config_client_keys",
+                column="allowed_memory_banks",
+                definition="TEXT NOT NULL DEFAULT '[]'",
+                is_pg=is_pg,
+            )
+
             if is_pg:
                 conn.execute(
                     "INSERT INTO tusker_config_meta (id, generation) VALUES (1, 0) "
@@ -475,17 +483,17 @@ class ConfigStore:
             identities: dict[str, CallerIdentity] = {}
             cursor = conn.execute(
                 "SELECT fingerprint, principal, tenant, scopes, allowed_pools, "
-                "allowed_models, allowed_providers, revoked, api_key_encrypted, "
-                "api_key_last4 FROM tusker_config_client_keys"
+                "allowed_models, allowed_providers, allowed_memory_banks, revoked, "
+                "api_key_encrypted, api_key_last4 FROM tusker_config_client_keys"
             )
             for (fingerprint, principal, tenant, scopes_raw, allowed_pools_raw,
-                 allowed_models_raw, allowed_providers_raw, revoked,
-                 api_key_encrypted, api_key_last4) in cursor:
-                fp = str(fingerprint).lower()
+                 allowed_models_raw, allowed_providers_raw, allowed_memory_banks_raw,
+                 revoked, api_key_encrypted, api_key_last4) in cursor:
                 scopes = _parse_json_array(scopes_raw)
-                allowed_pools = _parse_json_array(allowed_pools_raw) or ("*",)
-                allowed_models = _parse_json_array(allowed_models_raw) or ("*",)
-                allowed_providers = _parse_json_array(allowed_providers_raw) or ("*",)
+                allowed_pools = _parse_json_array(allowed_pools_raw) or ["*"]
+                allowed_models = _parse_json_array(allowed_models_raw) or ["*"]
+                allowed_providers = _parse_json_array(allowed_providers_raw) or ["*"]
+                allowed_memory_banks = _parse_json_array(allowed_memory_banks_raw)
                 if not revoked and api_key_encrypted:
                     try:
                         managed_keys.append(self._decrypt(conn, api_key_encrypted))
@@ -493,14 +501,15 @@ class ConfigStore:
                         pass
                 if principal and tenant:
                     try:
-                        identities[fp] = CallerIdentity(
-                            key_fingerprint=fp,
+                        identities[fingerprint] = CallerIdentity(
+                            key_fingerprint=str(fingerprint),
                             principal=str(principal),
                             tenant=str(tenant),
                             scopes=tuple(scopes) if scopes else ("*",),
                             allowed_pools=tuple(allowed_pools),
                             allowed_models=tuple(allowed_models),
                             allowed_providers=tuple(allowed_providers),
+                            allowed_memory_banks=tuple(allowed_memory_banks),
                         )
                     except Exception:
                         pass
@@ -646,7 +655,7 @@ class ConfigStore:
             # client_keys (redacted)
             cursor = conn.execute(
                 "SELECT fingerprint, principal, tenant, scopes, allowed_pools, "
-                "allowed_models, allowed_providers, revoked, api_key_last4, "
+                "allowed_models, allowed_providers, allowed_memory_banks, revoked, api_key_last4, "
                 "created_at, updated_at FROM tusker_config_client_keys"
             )
             for row in cursor:
@@ -658,10 +667,11 @@ class ConfigStore:
                     "allowed_pools": _try_json(row[4]) or ["*"],
                     "allowed_models": _try_json(row[5]) or ["*"],
                     "allowed_providers": _try_json(row[6]) or ["*"],
-                    "revoked": bool(row[7]),
-                    "api_key_last4": str(row[8]),
-                    "created_at": str(row[9]) if row[9] else None,
-                    "updated_at": str(row[10]) if row[10] else None,
+                    "allowed_memory_banks": _try_json(row[7]) or [],
+                    "revoked": bool(row[8]),
+                    "api_key_last4": str(row[9]),
+                    "created_at": str(row[10]) if row[10] else None,
+                    "updated_at": str(row[11]) if row[11] else None,
                 })
 
             # oauth_credentials (count only)
@@ -1060,6 +1070,7 @@ class ConfigStore:
             providers_raw = json.dumps(
                 _normalise_patterns(body.get("allowed_providers", ["*"]))
             )
+            memory_banks_raw = json.dumps(_normalise_patterns(body.get("allowed_memory_banks", [])))
             revoked = int(bool(body.get("revoked")))
             last4 = raw_key[-4:] if raw_key else None
 
@@ -1069,21 +1080,22 @@ class ConfigStore:
                     conn.execute(
                         "INSERT INTO tusker_config_client_keys "
                         "(fingerprint, principal, tenant, scopes, allowed_pools, "
-                        "allowed_models, allowed_providers, revoked, api_key_encrypted, "
+                        "allowed_models, allowed_providers, allowed_memory_banks, revoked, api_key_encrypted, "
                         "api_key_last4) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                         "ON CONFLICT (fingerprint) DO UPDATE SET "
                         "principal=excluded.principal, tenant=excluded.tenant, "
                         "scopes=excluded.scopes, allowed_pools=excluded.allowed_pools, "
                         "allowed_models=excluded.allowed_models, "
                         "allowed_providers=excluded.allowed_providers, "
+                        "allowed_memory_banks=excluded.allowed_memory_banks, "
                         "revoked=excluded.revoked, "
                         "api_key_encrypted=excluded.api_key_encrypted, "
                         "api_key_last4=excluded.api_key_last4, "
                         "updated_at=CURRENT_TIMESTAMP",
                         (
                             fp, principal, tenant, scopes_raw, pools_raw,
-                            models_raw, providers_raw, revoked,
+                            models_raw, providers_raw, memory_banks_raw, revoked,
                             encrypted, last4,
                         ),
                     )
@@ -1100,19 +1112,20 @@ class ConfigStore:
                     conn.execute(
                         "INSERT INTO tusker_config_client_keys "
                         "(fingerprint, principal, tenant, scopes, allowed_pools, "
-                        "allowed_models, allowed_providers, revoked, api_key_encrypted, "
+                        "allowed_models, allowed_providers, allowed_memory_banks, revoked, api_key_encrypted, "
                         "api_key_last4) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                         "ON CONFLICT (fingerprint) DO UPDATE SET "
                         "principal=excluded.principal, tenant=excluded.tenant, "
                         "scopes=excluded.scopes, allowed_pools=excluded.allowed_pools, "
                         "allowed_models=excluded.allowed_models, "
                         "allowed_providers=excluded.allowed_providers, "
+                        "allowed_memory_banks=excluded.allowed_memory_banks, "
                         "revoked=excluded.revoked, "
                         "updated_at=CURRENT_TIMESTAMP",
                         (
                             fp, principal, tenant, scopes_raw, pools_raw,
-                            models_raw, providers_raw, revoked,
+                            models_raw, providers_raw, memory_banks_raw, revoked,
                             encrypted, last4,
                         ),
                     )
@@ -1173,14 +1186,14 @@ class ConfigStore:
                 # Fetch existing profile
                 cur = conn.execute(
                     "SELECT principal, tenant, scopes, allowed_pools, "
-                    "allowed_models, allowed_providers FROM tusker_config_client_keys "
-                    "WHERE fingerprint = ?",
+                    "allowed_models, allowed_providers, allowed_memory_banks "
+                    "FROM tusker_config_client_keys WHERE fingerprint = ?",
                     (fp,),
                 )
                 row = cur.fetchone()
                 if row is None:
                     raise KeyError(f"key not found: {fp}")
-                principal, tenant, scopes_raw, pools_raw, models_raw, providers_raw = row
+                principal, tenant, scopes_raw, pools_raw, models_raw, providers_raw, memory_banks_raw = row
 
                 # Generate new key
                 new_key = "sk-" + secrets.token_hex(24)
@@ -1192,12 +1205,12 @@ class ConfigStore:
                 conn.execute(
                     "INSERT INTO tusker_config_client_keys "
                     "(fingerprint, principal, tenant, scopes, allowed_pools, "
-                    "allowed_models, allowed_providers, revoked, api_key_encrypted, "
+                    "allowed_models, allowed_providers, allowed_memory_banks, revoked, api_key_encrypted, "
                     "api_key_last4) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
                     (
                         new_fp, str(principal), str(tenant),
-                        scopes_raw, pools_raw, models_raw, providers_raw,
+                        scopes_raw, pools_raw, models_raw, providers_raw, memory_banks_raw,
                         new_encrypted, new_last4,
                     ),
                 )
@@ -1232,14 +1245,14 @@ class ConfigStore:
             with self._conn as conn:
                 cur = conn.execute(
                     "SELECT principal, tenant, scopes, allowed_pools, "
-                    "allowed_models, allowed_providers, revoked "
+                    "allowed_models, allowed_providers, allowed_memory_banks, revoked "
                     "FROM tusker_config_client_keys WHERE fingerprint = ?",
                     (fp,),
                 )
                 row = cur.fetchone()
                 if row is None:
                     return None
-                principal, tenant, scopes_raw, pools_raw, models_raw, providers_raw, revoked = row
+                principal, tenant, scopes_raw, pools_raw, models_raw, providers_raw, memory_banks_raw, revoked = row
                 if revoked:
                     return None
                 return CallerIdentity(
@@ -1250,6 +1263,7 @@ class ConfigStore:
                     allowed_pools=tuple(_parse_json_array(pools_raw) or ("*",)),
                     allowed_models=tuple(_parse_json_array(models_raw) or ("*",)),
                     allowed_providers=tuple(_parse_json_array(providers_raw) or ("*",)),
+                    allowed_memory_banks=tuple(_parse_json_array(memory_banks_raw)),
                 )
         except Exception:
             return None
@@ -1475,6 +1489,7 @@ _TABLE_SCHEMAS: dict[str, tuple[str, str]] = {
         "allowed_pools TEXT NOT NULL DEFAULT '[\"*\"]', "
         "allowed_models TEXT NOT NULL DEFAULT '[\"*\"]', "
         "allowed_providers TEXT NOT NULL DEFAULT '[\"*\"]', "
+        "allowed_memory_banks TEXT NOT NULL DEFAULT '[]', "
         "revoked INTEGER NOT NULL DEFAULT 0, "
         "api_key_encrypted TEXT NOT NULL, "
         "api_key_last4 TEXT NOT NULL, "

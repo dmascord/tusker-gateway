@@ -411,6 +411,7 @@ async def admin_keys(request: web.Request) -> web.Response:
             "allowed_pools": list(identity.allowed_pools),
             "allowed_models": list(identity.allowed_models),
             "allowed_providers": list(identity.allowed_providers),
+            "allowed_memory_banks": list(identity.allowed_memory_banks),
             "managed": identity.managed,
         }
 
@@ -1097,7 +1098,7 @@ _POOL_FIELDS = frozenset({
 _IDENTITY_PROFILE_FIELDS = frozenset({
     "api_key", "name", "principal", "tenant", "scopes",
     "allowed_pools", "allowed_models", "allowed_providers",
-    "revoked", "fingerprint",
+    "allowed_memory_banks", "revoked", "fingerprint",
 })
 
 

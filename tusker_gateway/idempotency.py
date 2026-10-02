@@ -25,6 +25,8 @@ from tusker_gateway.storage import (
 
 logger = logging.getLogger(__name__)
 
+_STORAGE_ERRORS = storage_error_types()
+
 
 @dataclass(frozen=True)
 class IdempotencyConfig:
@@ -318,7 +320,7 @@ async def _abandon_safely(
         await asyncio.shield(
             asyncio.to_thread(store.abandon, record_key, request_hash, lease_token)
         )
-    except (OSError, storage_error_types()):
+    except _STORAGE_ERRORS:
         logger.exception("could not release idempotency reservation")
 
 
@@ -365,7 +367,7 @@ def attach_idempotency_middleware(
         request_hash = _canonical_request_hash(request, body)
         try:
             claim = await asyncio.to_thread(store.claim, record_key, request_hash)
-        except (OSError, storage_error_types()):
+        except _STORAGE_ERRORS:
             return web.json_response(
                 openai_error(
                     "Idempotency persistence is unavailable",
@@ -433,7 +435,7 @@ def attach_idempotency_middleware(
                     renewed = await asyncio.to_thread(
                         store.renew, record_key, request_hash, lease_token
                     )
-                except (OSError, storage_error_types()):
+                except _STORAGE_ERRORS:
                     logger.exception("could not renew idempotency lease")
                     renewed = False
                 if not renewed:
@@ -483,7 +485,7 @@ def attach_idempotency_middleware(
                     body_bytes,
                     response.headers.get("Content-Type"),
                 )
-            except (OSError, storage_error_types()):
+            except _STORAGE_ERRORS:
                 return web.json_response(
                     openai_error(
                         "The operation completed but its idempotency record could not be persisted",

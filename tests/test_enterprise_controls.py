@@ -33,6 +33,7 @@ from tusker_gateway.identity import (
     load_identity_config_from_env,
 )
 from tusker_gateway.observability import attach_request_id_middleware
+from tusker_gateway.memory import memory_handler
 
 
 def _auth_middleware(store: IdentityStore):
@@ -908,3 +909,95 @@ class TestAppFactoryEnterpriseWiring:
             assert body["error"]["code"] == "invalid_idempotency_key"
         finally:
             await client.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_proxy_requires_scoped_shared_bank():
+    api_key = "sk-memory"
+    cfg = load_identity_config_from_env({
+        "TUSKER_IDENTITIES_JSON": json.dumps({
+            fingerprint_api_key(api_key): {
+                "principal": "svc-memory",
+                "tenant": "engineering",
+                "scopes": ["memory:read"],
+                "allowed_memory_banks": ["engineering"],
+            }
+        })
+    })
+    app = web.Application()
+    app["config"] = {"api_keys": [api_key]}
+    app.middlewares.append(_auth_middleware(IdentityStore(cfg)))
+    class Session:
+        def request(self, *args, **kwargs):
+            raise RuntimeError("upstream unavailable")
+    app["http_session"] = Session()
+    app.router.add_get("/v1/memory/list", memory_handler)
+    client = await _client(app)
+    try:
+        allowed = await client.get(
+            "/v1/memory/list?bank=engineering",
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        assert allowed.status == 503
+        denied = await client.get(
+            "/v1/memory/list?bank=personal",
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        assert denied.status == 403
+        assert (await denied.json())["error"]["code"] == "memory_bank_not_allowed"
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_proxy_forwards_scoped_operation_to_hindsight():
+    api_key = "sk-memory-forward"
+    cfg = load_identity_config_from_env({
+        "TUSKER_IDENTITIES_JSON": json.dumps({
+            fingerprint_api_key(api_key): {
+                "principal": "svc-memory",
+                "tenant": "engineering",
+                "scopes": ["memory:read"],
+                "allowed_memory_banks": ["shared-*"],
+            }
+        })
+    })
+    calls = []
+
+    class Response:
+        status = 200
+        headers = {"Content-Type": "application/json"}
+
+        async def read(self):
+            return b'{"memories": []}'
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc_info):
+            return False
+
+    class Session:
+        def request(self, method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            return Response()
+
+    app = web.Application()
+    app["config"] = {"api_keys": [api_key]}
+    app.middlewares.append(_auth_middleware(IdentityStore(cfg)))
+    app["http_session"] = Session()
+    app.router.add_get("/v1/memory/list", memory_handler)
+    client = await _client(app)
+    try:
+        response = await client.get(
+            "/v1/memory/list?bank=shared-code&limit=10",
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        assert response.status == 200
+        assert calls == [(
+            "GET",
+            "http://hindsight.hindsight.svc.cluster.local:8888/v1/default/banks/shared-code/memories/list?limit=10",
+            {"json": None, "headers": {"Accept": "application/json"}},
+        )]
+    finally:
+        await client.close()
