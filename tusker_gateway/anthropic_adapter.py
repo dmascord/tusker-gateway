@@ -51,11 +51,11 @@ from tusker_gateway.endpoints import (
 )
 from tusker_gateway.metrics import MetricsRegistry
 from tusker_gateway.identity import (
+    extract_api_key,
     model_patterns_for_request,
     pool_allowed_for_request,
     provider_patterns_for_request,
 )
-from tusker_gateway.observability import set_access_log_context
 from tusker_gateway.passthrough import PassthroughClient
 from tusker_gateway.pools import PoolManager
 from tusker_gateway.quality import QualityDB
@@ -210,14 +210,9 @@ AnthropicSSEStreamTranslator = _AnthropicSSEStreamAdapter
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-
 def _resolve_api_key(request: web.Request) -> str:
-    """Return the raw API key from Authorization or x-api-key header."""
-    auth = request.headers.get("Authorization", "")
-    if auth.startswith("Bearer "):
-        return auth[len("Bearer "):].strip()
-    x_api_key = request.headers.get("x-api-key", "")
-    return x_api_key.strip()
+    """Return the single validated client credential."""
+    return extract_api_key(request)
 
 
 def _anthropic_error(message: str, *, type: str = "error") -> dict[str, Any]:

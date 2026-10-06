@@ -8,7 +8,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from aiohttp import web
-from aiohttp.test_utils import TestClient, TestServer
+from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
 
 from tusker_gateway.audit import AuditConfig, AuditLogger, attach_audit_middleware
 from tusker_gateway.auth import AuthMiddleware
@@ -19,7 +19,7 @@ from tusker_gateway.endpoints import (
     tts_handler,
     video_handler,
 )
-from tusker_gateway.errors import GatewayError, NoHealthyModelsError, openai_error
+from tusker_gateway.errors import AuthenticationError, GatewayError, NoHealthyModelsError, openai_error
 from tusker_gateway.idempotency import (
     IdempotencyConfig,
     IdempotencyStore,
@@ -29,6 +29,7 @@ from tusker_gateway.identity import (
     IdentityStore,
     attach_authorization_middleware,
     authorize_request_body,
+    extract_api_key,
     fingerprint_api_key,
     load_identity_config_from_env,
 )
@@ -82,6 +83,32 @@ class TestEnterpriseIdentity:
         assert identity.tenant == "engineering"
         assert identity.allows_scope("inference:chat")
         assert not identity.allows_scope("inference:images")
+    def test_rejects_ambiguous_authentication_headers(self):
+        request = make_mocked_request(
+            "GET",
+            "/",
+            headers={"Authorization": "Basic not-bearer", "x-api-key": "sk-key"},
+        )
+        with pytest.raises(AuthenticationError, match="Bearer scheme"):
+            extract_api_key(request)
+
+    def test_rejects_conflicting_authentication_headers(self):
+        request = make_mocked_request(
+            "GET",
+            "/",
+            headers={"Authorization": "Bearer sk-one", "x-api-key": "sk-two"},
+        )
+        with pytest.raises(AuthenticationError, match="Conflicting"):
+            extract_api_key(request)
+
+    def test_accepts_matching_dual_authentication_headers(self):
+        request = make_mocked_request(
+            "GET",
+            "/",
+            headers={"Authorization": "Bearer sk-key", "x-api-key": "sk-key"},
+        )
+        assert extract_api_key(request) == "sk-key"
+
 
     def test_required_identity_config_fails_closed(self):
         with pytest.raises(ValueError, match="IDENTITIES_JSON is empty"):

@@ -16,7 +16,7 @@ from typing import Any, Mapping
 
 from aiohttp import web
 
-from tusker_gateway.errors import AuthorizationError, BadRequestError
+from tusker_gateway.errors import AuthenticationError, AuthorizationError, BadRequestError
 from tusker_gateway.routing import resolve_route
 
 logger = logging.getLogger(__name__)
@@ -70,11 +70,20 @@ def fingerprint_api_key(api_key: str) -> str:
 
 
 def extract_api_key(request: web.Request) -> str:
-    """Extract OpenAI or Anthropic client authentication from a request."""
-    auth = request.headers.get("Authorization", "")
-    if auth.startswith("Bearer "):
-        return auth[len("Bearer ") :].strip()
-    return request.headers.get("x-api-key", "").strip()
+    """Extract one unambiguous OpenAI or Anthropic client credential."""
+    auth = request.headers.get("Authorization", "").strip()
+    x_api_key = request.headers.get("x-api-key", "").strip()
+
+    if auth:
+        if not auth.lower().startswith("bearer "):
+            raise AuthenticationError("Authorization header must use the Bearer scheme")
+        bearer = auth[len("Bearer ") :].strip()
+        if not bearer:
+            raise AuthenticationError("Bearer token required")
+        if x_api_key and x_api_key != bearer:
+            raise AuthenticationError("Conflicting authentication credentials")
+        return bearer
+    return x_api_key
 
 
 def _patterns(value: Any, *, default: tuple[str, ...] = _WILDCARD) -> tuple[str, ...]:

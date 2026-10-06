@@ -140,10 +140,12 @@ Pool aliases and concrete routes are both enforced: every configured fallback
 pool must be allowed, and the selected model must match its bare model ID,
 `provider/model`, or `provider::model`. When restricting a virtual alias, list
 both the permitted alias and the permitted concrete-model patterns.
-In strict mode, startup fails if the identity JSON is absent or malformed, and
-a valid key without a profile is denied with HTTP 403. Access logs include
-principal, tenant, and the key fingerprint. Anthropic `x-api-key` requests use
-the same identity and quota path.
+Authentication is fail-closed when multiple credential headers are present: `Authorization`
+must use the Bearer scheme, and `x-api-key` may accompany it only when both
+values are identical. In strict mode, startup fails if the identity JSON is
+absent or malformed, and a valid key without a profile is denied with HTTP 403.
+Access logs include principal, tenant, and the key fingerprint. Anthropic
+`x-api-key` requests use the same identity and quota path.
 
 ## 2. Integrity-chained audit log
 
