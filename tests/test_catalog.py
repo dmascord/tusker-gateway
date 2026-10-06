@@ -377,6 +377,42 @@ def test_registry_default_honors_custom_provider_model_endpoint():
     assert isinstance(client, ProviderModelsCatalog)
     assert client.endpoint == "https://provider.example.test/v1/models"
 
+
+@pytest.mark.asyncio
+async def test_provider_catalog_allowlist_keeps_only_provisioned_models():
+    session = _CapturingSession(FakeResponse(200, {
+        "data": [
+            {"id": "gpt-5.6-luna"},
+            {"id": "gpt-6-luna"},
+            {"id": "retired-deployment"},
+        ],
+    }))
+    catalog = ProviderModelsCatalog(
+        provider="apim",
+        endpoint="https://apim.example.test/models",
+        model_allowlist=("gpt-5.6-luna", "gpt-6-luna"),
+    )
+
+    await catalog.refresh(session)
+
+    assert {entry.model for entry in catalog._entries} == {
+        "gpt-5.6-luna",
+        "gpt-6-luna",
+    }
+
+
+def test_registry_default_passes_provider_catalog_allowlist():
+    registry = CatalogRegistry.default({
+        "apim": {
+            "base_url": "https://apim.example.test/v1",
+            "models_path": "/models",
+            "catalog_models": ["gpt-5.6-luna", "gpt-6-luna"],
+        },
+    })
+
+    client = registry.get_client("apim")
+    assert isinstance(client, ProviderModelsCatalog)
+    assert client.model_allowlist == {"gpt-5.6-luna", "gpt-6-luna"}
 class _CapturingSession:
     """Minimal aiohttp-like session that records the headers of each GET."""
 

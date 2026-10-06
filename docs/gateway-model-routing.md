@@ -22,6 +22,14 @@ requests that do not contain tools. This keeps catalog metadata, stale manual
 entries, and models that merely claim tool support from entering the privacy
 pool.
 
+### Provider deployment allowlists
+
+Provider-native catalogs may expose more model names than the account actually
+provisions. The registry supports `catalog_models` to constrain discovery
+before candidates enter a pool. APIM is intentionally limited to its deployed
+Luna models (`gpt-5.6-luna` and `gpt-6-luna`); retired or unrelated `/models`
+entries are ignored and cannot pollute the privacy pool.
+
 The tier is the source of truth — `PoolManager.pool_keeps_heavyweight()` returns
 `True` for `premium`/`swarm` and `False` for `code`/`privacy`. Callers can override
 per-request by passing `heavyweight_ok=True/False` to `PoolManager.select()`.

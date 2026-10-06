@@ -686,6 +686,7 @@ class ProviderModelsCatalog(CatalogClient):
         default_input_modalities: frozenset[str] | None = None,
         default_output_modalities: frozenset[str] | None = None,
         pricing_overrides: dict[str, tuple[float, float]] | None = None,
+        model_allowlist: Iterable[str] | None = None,
     ) -> None:
         super().__init__()
         self.provider = provider
@@ -693,6 +694,9 @@ class ProviderModelsCatalog(CatalogClient):
         self.ttl_secs = ttl_secs
         self.default_input_modalities = default_input_modalities
         self.default_output_modalities = default_output_modalities
+        self.model_allowlist = frozenset(
+            str(model).strip() for model in (model_allowlist or ()) if str(model).strip()
+        )
         # Slug → (cost_input, cost_output) per 1M tokens for providers whose
         # model list carries no pricing (e.g. Ollama Cloud). Only fills
         # entries the payload itself doesn't price.
@@ -745,8 +749,8 @@ class ProviderModelsCatalog(CatalogClient):
                 continue
             if not slug:
                 continue
-            if slug.startswith("models/"):
-                slug = slug[len("models/") :]
+            if self.model_allowlist and slug not in self.model_allowlist:
+                continue
             cost_input, cost_output = _extract_catalog_pricing(raw)
             if cost_input is None and cost_output is None and self.pricing_overrides:
                 pricing = self.pricing_overrides.get(slug)
@@ -1360,9 +1364,11 @@ class CatalogRegistry:
                 continue
             if isinstance(config, dict):
                 models_path = config.get("models_path", config.get("catalog_path"))
+                model_allowlist = config.get("catalog_models", ())
                 base_url = str(config.get("base_url", "")).strip()
             else:
                 models_path = getattr(config, "models_path", None)
+                model_allowlist = getattr(config, "catalog_models", ())
                 base_url = str(getattr(config, "base_url", "")).strip()
             if not models_path:
                 continue
@@ -1387,6 +1393,7 @@ class CatalogRegistry:
                         if provider in {"ollama-cloud", "cerebras"}
                         else None
                     ),
+                    model_allowlist=model_allowlist,
                     pricing_overrides=(
                         OLLAMA_CLOUD_PRICING if provider == "ollama-cloud" else None
                     ),

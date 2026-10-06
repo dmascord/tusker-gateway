@@ -107,6 +107,9 @@ class ProviderConfig:
     auth_type: str = "bearer"
     zdr_ok: bool = False
     heavyweight: bool = False
+    # Optional provider model allowlist applied to native catalog discovery.
+    # This constrains endpoints that expose aliases beyond provisioned models.
+    catalog_models: tuple[str, ...] = ()
     # Optional provider-native model-list endpoint. Absolute URLs are allowed
     # for providers whose catalog lives outside the chat API base URL.
     models_path: str | None = None
@@ -909,7 +912,11 @@ def _provider_registry_from_env() -> dict[str, ProviderConfig]:
                     "api_key_header": value.get("api_key_header"),
                     "auth_type": value.get("auth_type", value.get("kind", "bearer")),
                     "zdr_ok": bool(value.get("zdr_ok", False)),
-                    "heavyweight": bool(value.get("heavyweight", False)),
+                    "catalog_models": tuple(
+                        str(model).strip()
+                        for model in value.get("catalog_models", ())
+                        if str(model).strip()
+                    ),
                     "models_path": expand_env_placeholders(
                         value.get("models_path", value.get("catalog_path"))
                     )
