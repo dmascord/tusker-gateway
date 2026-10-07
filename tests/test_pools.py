@@ -634,6 +634,57 @@ def test_cooldown_parsing():
     assert _cooldown_seconds_for_429({"body": "rate limited"}) == 60
 
 
+def test_cooldown_parsing_absolute_reset_dates():
+    """A stated reset timestamp cools the route exactly until it.
+
+    Regression: Alibaba's monthly quota 429 ("quota will reset at 10-10
+    16:00:00 UTC") fell through to the fixed 3600s quota default, so the
+    gateway retried the dead route every hour for three days.
+    """
+    import calendar
+    import time as _time
+
+    from tusker_gateway.cooldown import _seconds_until_absolute_reset
+
+    now = _time.time()
+    reset_epoch = calendar.timegm(_time.strptime("2026-10-10 16:00:00", "%Y-%m-%d %H:%M:%S"))
+    expected = max(60.0, reset_epoch - now)
+
+    # Production Alibaba body: compact date + named timezone.
+    alibaba = (
+        '{"error":{"message":"Your token-plan 1-month quota has been exhausted. '
+        'The quota will reset at 10-10 16:00:00 UTC.","type":"insufficient_quota",'
+        '"code":"insufficient_quota"}}'
+    )
+    got = _cooldown_seconds_for_429({"body": alibaba, "headers": {}})
+    assert abs(got - expected) < 5, got
+
+    # ISO full date with Z suffix.
+    iso = "quota exceeded, resets 2026-10-10T16:00:00Z"
+    assert abs(_seconds_until_absolute_reset(iso, now=now) - expected) < 5
+
+    # Full date with explicit UTC name.
+    assert abs(_seconds_until_absolute_reset("resets at 2026-10-10 16:00 UTC", now=now) - expected) < 5
+
+    # Numeric timezone offset: 15:00 at -0100 == 16:00 UTC.
+    got_offset = _seconds_until_absolute_reset("resets at 2026-10-10 15:00 -0100", now=now)
+    assert abs(got_offset - expected) < 5, got_offset
+
+    # Stated date already in the past → short floor, never negative/huge.
+    assert _seconds_until_absolute_reset("reset at 2020-01-01 00:00:00 UTC", now=now) == 60.0
+
+    # No date present → None (heuristic chain continues).
+    assert _seconds_until_absolute_reset("quota exceeded") is None
+
+    # A reset date outranks the fixed quota default.
+    assert abs(_cooldown_seconds_for_429(
+        {"body": "Your quota has been exhausted. The quota will reset at 10-10 16:00:00 UTC.", "headers": {}},
+    ) - expected) < 5
+
+    # The plain quota default is unchanged when no date is stated.
+    assert _cooldown_seconds_for_429({"body": "quota exceeded", "headers": {}}) == 3600.0
+
+
 def test_cooldown_tracker():
     tracker = CooldownTracker()
     assert not tracker.is_cooldown("p1", "m1")

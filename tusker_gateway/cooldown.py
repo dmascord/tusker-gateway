@@ -397,6 +397,14 @@ def _cooldown_seconds_for_429(exc: dict[str, Any]) -> float:
         if m:
             return float(m.group(1))
 
+    # Absolute reset timestamps: "quota will reset at 10-10 16:00:00 UTC",
+    # "resets 2026-10-10T16:00:00Z", "resets at 2026-10-10 16:00 UTC".
+    # A stated reset date is the strongest signal available — cooldown exactly
+    # until it (bounded by MAX_COOLDOWN_SECS downstream), then quota default.
+    reset_secs = _seconds_until_absolute_reset(body_for_hints)
+    if reset_secs is not None:
+        return max(60.0, reset_secs)
+
     # Explicit "try again in N seconds/minutes/hours/days"
     m = re.search(
         r"(?:try again in|wait|after|cooldown|retry)[^.]*?(\d+)\s*(seconds?|minutes?|hours?|days?|weeks?)",
@@ -409,7 +417,6 @@ def _cooldown_seconds_for_429(exc: dict[str, Any]) -> float:
         if unit.startswith("hour"): return n * 3600.0
         if unit.startswith("day"): return n * 86400.0
         if unit.startswith("week"): return n * 7 * 86400.0
-
     # Quota / usage-limit exhaustion is a long-lived state (the window won't
     # reset for hours or days), not a transient rate-limit blip. Backing off
     # for only 60s would hammer the upstream with pointless probes until the
@@ -434,6 +441,64 @@ def _cooldown_seconds_for_429(exc: dict[str, Any]) -> float:
 
     logger.info('429 cooldown: 60.0s for %s', 'unknown')
     return 60.0
+
+
+_RESET_AT_RE = re.compile(
+    r"\b(?:resets?|reset)\s+(?:at\s+|on\s+)?"
+    r"(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2}))?)?"
+    r"(?:\s*(UTC|GMT|Z|[+-]\d{2}:?\d{2}))?"
+)
+# Compact fallback: "reset at 10-10 16:00:00" — ambiguous year-less date.
+_RESET_AT_COMPACT_RE = re.compile(
+    r"\b(?:resets?|reset)\s+(?:at\s+|on\s+)?"
+    r"(\d{2})-(\d{2})\s+(\d{2}):(\d{2})(?::(\d{2}))?"
+    r"(?:\s*(UTC|GMT|Z|[+-]\d{2}:?\d{2}))?"
+)
+
+
+def _seconds_until_absolute_reset(body: str, *, now: float | None = None) -> float | None:
+    """Return seconds until an absolute reset timestamp found in a 429 body.
+
+    Providers state quota windows as dates ("quota will reset at 10-10
+    16:00:00 UTC"). Cooldown until that instant instead of a fixed default.
+    Timezone defaults to UTC when the body omits one. Returns ``None`` when no
+    parseable reset date is present; a stated date in the past returns a
+    short 60s floor so one backoff pass happens rather than an immediate retry.
+    """
+    reference = time.time() if now is None else now
+    full_match = _RESET_AT_RE.search(body)
+    compact_match = None if full_match else _RESET_AT_COMPACT_RE.search(body)
+    match = full_match or compact_match
+    if match is None:
+        return None
+    groups = match.groups()
+    try:
+        if full_match:
+            year, month, day = int(groups[0]), int(groups[1]), int(groups[2])
+            hour = int(groups[3] or 0)
+            minute = int(groups[4] or 0)
+            second = int(groups[5] or 0)
+        else:
+            year = time.gmtime(reference).tm_year
+            month, day = int(groups[0]), int(groups[1])
+            hour = int(groups[2] or 0)
+            minute = int(groups[3] or 0)
+            second = int(groups[4] or 0)
+        tz_text = groups[-1]
+        offset_seconds = 0.0
+        if tz_text and tz_text not in ("UTC", "GMT", "Z"):
+            sign = 1 if tz_text[0] == "+" else -1
+            digits = tz_text[1:].replace(":", "")
+            offset_seconds = sign * (int(digits[:2]) * 3600 + int(digits[2:4]) * 60)
+        import calendar
+
+        reset_epoch = float(calendar.timegm((year, month, day, hour, minute, second, 0, 0, 0))) - offset_seconds
+    except (ValueError, OverflowError, IndexError):
+        return None
+    delta = reset_epoch - reference
+    if delta <= 0:
+        return 60.0
+    return delta
 
 
 
