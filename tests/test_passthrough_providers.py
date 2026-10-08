@@ -1559,7 +1559,7 @@ class TestApimToolReasoningCompatibility:
         _adapt_apim_tool_reasoning(body, "apim")
         assert body["reasoning_effort"] == "high"
 
-    def test_apim_gpt6_without_reasoning_setting_is_unchanged(self):
+    def test_apim_gpt6_without_reasoning_setting_defaults_to_none(self):
         from tusker_gateway.passthrough import _adapt_apim_tool_reasoning
 
         body = {
@@ -1567,7 +1567,7 @@ class TestApimToolReasoningCompatibility:
             "tools": [{"type": "function", "function": {"name": "bash"}}],
         }
         _adapt_apim_tool_reasoning(body, "apim")
-        assert "reasoning_effort" not in body
+        assert body["reasoning_effort"] == "none"
 
     def test_apim_gpt6_explicit_none_is_preserved(self):
         from tusker_gateway.passthrough import _adapt_apim_tool_reasoning
