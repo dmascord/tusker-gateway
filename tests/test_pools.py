@@ -666,6 +666,19 @@ def test_cooldown_parsing_absolute_reset_dates():
     # Full date with explicit UTC name.
     assert abs(_seconds_until_absolute_reset("resets at 2026-10-10 16:00 UTC", now=now) - expected) < 5
 
+    # A stated reset date outranks a short Retry-After header (Alibaba caps
+    # its header at 3600s even for multi-day quota windows).
+    alibaba_with_header = {
+        "body": alibaba,
+        "headers": {"Retry-After": "3600"},
+    }
+    assert abs(_cooldown_seconds_for_429(alibaba_with_header) - expected) < 5
+
+    # Without a body date, the Retry-After header still wins as before.
+    assert _cooldown_seconds_for_429(
+        {"body": "rate limited", "headers": {"Retry-After": "10"}}
+    ) == 10
+
     # Numeric timezone offset: 15:00 at -0100 == 16:00 UTC.
     got_offset = _seconds_until_absolute_reset("resets at 2026-10-10 15:00 -0100", now=now)
     assert abs(got_offset - expected) < 5, got_offset

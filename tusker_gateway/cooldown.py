@@ -374,10 +374,18 @@ def _cooldown_seconds_for_429(exc: dict[str, Any]) -> float:
         body = str(exc)
         headers = {}
 
-    # Header-based cooldown. Retry-After wins (it's the authoritative hint
+    # A stated absolute reset date in the body outranks headers: providers
+    # cap Retry-After at ~1h even for multi-day quota windows (Alibaba sends
+    # Retry-After: 3600 alongside "quota will reset at 10-10 16:00:00 UTC").
+    # Without a body date, Retry-After wins (it's the authoritative hint
     # from the upstream); the x-ratelimit-* family is consulted when
     # Retry-After is absent because some providers (Synthetic and others)
     # document those instead.
+    body_for_hints = _strip_urls(body).lower()
+    reset_secs = _seconds_until_absolute_reset(body_for_hints)
+    if reset_secs is not None:
+        return max(60.0, reset_secs)
+
     ra_seconds = _header_to_seconds(headers.get("Retry-After"))
     if ra_seconds is None:
         for hdr in ("x-ratelimit-reset", "x-ratelimit-reset-after"):
@@ -387,23 +395,12 @@ def _cooldown_seconds_for_429(exc: dict[str, Any]) -> float:
     if ra_seconds is not None:
         return min(ra_seconds, MAX_RETRY_AFTER_SECS)
 
+
     # Strip URLs so words like "billing" / "usage" inside a link don't trip
     # the quota-hint matcher. Keep the original body for the "try again in"
     # regex (URLs don't carry useful timing info there anyway).
     body_for_hints = _strip_urls(body).lower()
 
-    if "retry-after" in body_for_hints:
-        m = re.search(r"retry[- ]after[:\s]+(\d+)", body_for_hints)
-        if m:
-            return float(m.group(1))
-
-    # Absolute reset timestamps: "quota will reset at 10-10 16:00:00 UTC",
-    # "resets 2026-10-10T16:00:00Z", "resets at 2026-10-10 16:00 UTC".
-    # A stated reset date is the strongest signal available — cooldown exactly
-    # until it (bounded by MAX_COOLDOWN_SECS downstream), then quota default.
-    reset_secs = _seconds_until_absolute_reset(body_for_hints)
-    if reset_secs is not None:
-        return max(60.0, reset_secs)
 
     # Explicit "try again in N seconds/minutes/hours/days"
     m = re.search(
