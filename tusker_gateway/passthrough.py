@@ -106,15 +106,16 @@ _COMPLETION_TOKENS_PROVIDERS = frozenset({"apim"})
 def _adapt_apim_tool_reasoning(body: dict[str, Any], provider: str) -> None:
     """Apply APIM's gpt-6-luna chat-completions tool constraint.
 
-    This deployment rejects function tools when ``reasoning_effort`` is
-    present and not ``none`` — and it also rejects function tools with no
-    ``reasoning_effort`` at all (upstream 400: "Function tools with
-    reasoning_effort are not supported for gpt-6-luna").  Function-tool
-    requests therefore always carry ``reasoning_effort: "none"``; keep the
-    client's setting for other routes/models and for requests without
-    function tools.
+    APIM serves the whole ``gpt-*-luna`` cheap tier from the gpt-6-luna
+    family, and that family rejects function tools unless
+    ``reasoning_effort`` is ``none`` — including requests that omit the
+    field entirely (upstream 400: "Function tools with reasoning_effort
+    are not supported for gpt-6-luna").  Function-tool requests therefore
+    always carry ``reasoning_effort: "none"``; keep the client's setting
+    for other routes/models and for requests without function tools.
     """
-    if provider.lower() != "apim" or str(body.get("model", "")).lower() != "gpt-6-luna":
+    model = str(body.get("model", "")).lower()
+    if provider.lower() != "apim" or not model.startswith(("gpt-6-luna", "gpt-5.6-luna")):
         return
     tools = body.get("tools")
     has_function_tools = isinstance(tools, list) and any(

@@ -1580,12 +1580,28 @@ class TestApimToolReasoningCompatibility:
         _adapt_apim_tool_reasoning(body, "apim")
         assert body["reasoning_effort"] == "none"
 
-    def test_other_provider_and_apim_models_are_unchanged(self):
+    def test_other_provider_and_unmapped_apim_models_are_unchanged(self):
         from tusker_gateway.passthrough import _adapt_apim_tool_reasoning
 
         tool = [{"type": "function", "function": {"name": "bash"}}]
         other_provider = {"model": "gpt-6-luna", "reasoning_effort": "high", "tools": tool}
-        other_model = {"model": "gpt-5.6-luna", "reasoning_effort": "high", "tools": tool}
+        other_model = {"model": "gpt-5.4-mini", "reasoning_effort": "high", "tools": tool}
         _adapt_apim_tool_reasoning(other_provider, "openai")
         _adapt_apim_tool_reasoning(other_model, "apim")
         assert other_provider["reasoning_effort"] == other_model["reasoning_effort"] == "high"
+
+    def test_apim_luna_alias_tools_default_to_none(self):
+        from tusker_gateway.passthrough import _adapt_apim_tool_reasoning
+
+        tool = [{"type": "function", "function": {"name": "bash"}}]
+        body = {"model": "gpt-5.6-luna", "tools": tool}
+        _adapt_apim_tool_reasoning(body, "apim")
+        assert body["reasoning_effort"] == "none"
+
+    def test_apim_luna_alias_dated_variant_covered(self):
+        from tusker_gateway.passthrough import _adapt_apim_tool_reasoning
+
+        tool = [{"type": "function", "function": {"name": "bash"}}]
+        body = {"model": "gpt-5.6-luna-2026-07-09", "reasoning_effort": "high", "tools": tool}
+        _adapt_apim_tool_reasoning(body, "apim")
+        assert body["reasoning_effort"] == "none"
