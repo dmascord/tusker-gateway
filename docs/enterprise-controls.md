@@ -51,6 +51,13 @@ Example identity profile:
 
 The proxy forwards only the allowlisted operation and strips `bank` from the upstream query string before constructing Hindsight's bank URL. Hindsight remains cluster-internal; the gateway's `TUSKER_MEMORY_BASE_URL` selects its internal base URL and defaults to `http://hindsight.hindsight.svc.cluster.local:8888`.
 
+Operation scopes follow the central policy table in `tusker_gateway/identity.py`
+(`_ROUTE_SCOPES`): `recall` and `reflect` are POST endpoints but only require
+`memory:read`; `retain`, `consolidate`, profile updates, and deletions require
+`memory:write`. `GET /v1/memory/health` reports the Hindsight service health
+(upstream `GET /health`); it still authenticates the caller and validates the
+`bank` parameter, but the response is not bank-specific.
+
 ### Hindsight-compatible agent endpoint
 
 OMP and OpenCode can use the gateway as their Hindsight endpoint without a

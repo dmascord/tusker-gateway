@@ -62,6 +62,7 @@ _CHAT_ROUTES = frozenset({
     "/v1/responses",
     "/v1/messages",
 })
+_MEMORY_PROXY_PREFIXES = ("/v1/memory/", "/v1/default/banks/")
 
 
 def fingerprint_api_key(api_key: str) -> str:
@@ -230,6 +231,8 @@ def authorize_request_body(request: web.Request, body: Mapping[str, Any]) -> Non
     identity = request.get("identity")
     if not isinstance(identity, CallerIdentity):
         return
+    if any(request.path.startswith(prefix) for prefix in _MEMORY_PROXY_PREFIXES):
+        return
 
     requested_model = body.get("model")
     model = str(requested_model).strip() if requested_model is not None else ""
@@ -293,6 +296,9 @@ async def authorize_request(request: web.Request) -> None:
             identity.allowed_providers,
         )
     ):
+        return
+
+    if any(request.path.startswith(prefix) for prefix in _MEMORY_PROXY_PREFIXES):
         return
 
     if request.path not in _CHAT_ROUTES:

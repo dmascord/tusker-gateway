@@ -1075,7 +1075,62 @@ async def test_memory_health_uses_read_route_and_upstream_path():
         )
         assert response.status == 200
         assert calls[0][0] == "GET"
-        assert calls[0][1].endswith("/v1/default/banks/engineering/health")
+        assert calls[0][1] == "http://hindsight.hindsight.svc.cluster.local:8888/health"
+    finally:
+        await client.close()
+
+@pytest.mark.asyncio
+async def test_memory_post_is_allowed_for_pool_restricted_memory_identity():
+    api_key = "sk-memory-write"
+    cfg = load_identity_config_from_env({
+        "TUSKER_IDENTITIES_JSON": json.dumps({
+            fingerprint_api_key(api_key): {
+                "principal": "svc-memory",
+                "tenant": "engineering",
+                "scopes": ["memory:read"],
+                "allowed_pools": ["code"],
+                "allowed_memory_banks": ["shared-code"],
+            }
+        })
+    })
+    calls = []
+
+    class Response:
+        status = 200
+        headers = {"Content-Type": "application/json"}
+
+        async def read(self):
+            return b'{"items": []}'
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc_info):
+            return False
+
+    class Session:
+        def request(self, method, url, **kwargs):
+            calls.append((method, url))
+            return Response()
+
+    app = web.Application()
+    app["config"] = {"api_keys": [api_key]}
+    app.middlewares.append(_auth_middleware(IdentityStore(cfg)))
+    attach_authorization_middleware(app)
+    app["http_session"] = Session()
+    app.router.add_post("/v1/memory/recall", memory_handler)
+    client = await _client(app)
+    try:
+        response = await client.post(
+            "/v1/memory/recall?bank=shared-code",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={"query": "smoke", "limit": 2},
+        )
+        assert response.status == 200
+        assert calls == [(
+            "POST",
+            "http://hindsight.hindsight.svc.cluster.local:8888/v1/default/banks/shared-code/memories/recall",
+        )]
     finally:
         await client.close()
 

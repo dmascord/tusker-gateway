@@ -12,17 +12,20 @@ from tusker_gateway.identity import CallerIdentity
 
 _DEFAULT_BASE_URL = "http://hindsight.hindsight.svc.cluster.local:8888"
 _ROUTES = {
-    ("POST", "/v1/memory/retain"): ("POST", "/memories"),
-    ("POST", "/v1/memory/recall"): ("POST", "/memories/recall"),
-    ("GET", "/v1/memory/list"): ("GET", "/memories/list"),
-    ("GET", "/v1/memory/profile"): ("GET", "/profile"),
-    ("PUT", "/v1/memory/profile"): ("PUT", "/profile"),
-    ("DELETE", "/v1/memory/memories"): ("DELETE", "/memories"),
-    ("DELETE", "/v1/memory/bank"): ("DELETE", ""),
-    ("POST", "/v1/memory/reflect"): ("POST", "/reflect"),
-    ("POST", "/v1/memory/consolidate"): ("POST", "/consolidate"),
-    ("GET", "/v1/memory/stats"): ("GET", "/stats"),
-    ("GET", "/v1/memory/health"): ("GET", "/health"),
+    # (method, upstream suffix, requires memory:write). Write flags mirror the
+    # _ROUTE_SCOPES policy in tusker_gateway.identity so recall and reflect
+    # stay readable by memory:read callers even though they are POSTs.
+    ("POST", "/v1/memory/retain"): ("POST", "/memories", True),
+    ("POST", "/v1/memory/recall"): ("POST", "/memories/recall", False),
+    ("GET", "/v1/memory/list"): ("GET", "/memories/list", False),
+    ("GET", "/v1/memory/profile"): ("GET", "/profile", False),
+    ("PUT", "/v1/memory/profile"): ("PUT", "/profile", True),
+    ("DELETE", "/v1/memory/memories"): ("DELETE", "/memories", True),
+    ("DELETE", "/v1/memory/bank"): ("DELETE", "", True),
+    ("POST", "/v1/memory/reflect"): ("POST", "/reflect", False),
+    ("POST", "/v1/memory/consolidate"): ("POST", "/consolidate", True),
+    ("GET", "/v1/memory/stats"): ("GET", "/stats", False),
+    ("GET", "/v1/memory/health"): ("GET", "/health", False),
 }
 
 _READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
@@ -91,13 +94,14 @@ async def memory_handler(request: web.Request) -> web.Response:
         raise web.HTTPNotFound()
     try:
         bank = _request_bank(request)
-        _authorize_bank(request, bank, write=request.method not in _READ_METHODS)
+        _authorize_bank(request, bank, write=route[2])
     except ValueError as exc:
         return web.json_response({"error": {"message": str(exc), "code": "invalid_memory_bank"}}, status=400)
     except PermissionError as exc:
         return web.json_response({"error": {"message": str(exc), "code": "memory_bank_not_allowed"}}, status=403)
-    upstream_method, suffix = route
-    return await _forward(request, upstream_method, f"{_base_url()}{_bank_path(bank, suffix)}", await _read_body(request))
+    upstream_method, suffix, _write = route
+    upstream_url = f"{_base_url()}/health" if request.path == "/v1/memory/health" else f"{_base_url()}{_bank_path(bank, suffix)}"
+    return await _forward(request, upstream_method, upstream_url, await _read_body(request))
 
 
 async def hindsight_compat_handler(request: web.Request) -> web.Response:
