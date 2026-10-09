@@ -56,6 +56,7 @@ from tusker_gateway.identity import (
     pool_allowed_for_request,
     provider_patterns_for_request,
 )
+from tusker_gateway.observability import set_access_log_context
 from tusker_gateway.passthrough import PassthroughClient
 from tusker_gateway.pools import PoolManager
 from tusker_gateway.quality import QualityDB
