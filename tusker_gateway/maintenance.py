@@ -15,6 +15,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+import aiohttp
+
 from tusker_gateway.config import load_config
 from tusker_gateway.persistent_cooldown import PersistentCooldownStore
 from tusker_gateway.structured_qualification import (
@@ -201,14 +203,47 @@ async def run_structured_maintenance_cycle(
     from tusker_gateway.pools import PoolManager
 
     manager = PoolManager(load_config())
+    minimum_required = 2
+    try:
+        max_rounds = max(
+            1,
+            int(os.environ.get("TUSKER_STRUCTURED_QUALIFICATION_MAX_ROUNDS", "3")),
+        )
+    except (TypeError, ValueError):
+        max_rounds = 3
+    # Build and refresh the catalog registry once per cycle; every probing
+    # round below reuses it so a degraded pool costs one catalog refresh,
+    # not one per round.
+    registry = None
+    try:
+        from tusker_gateway.tool_qualification import _catalog_registry
+
+        async with aiohttp.ClientSession() as refresh_session:
+            registry = _catalog_registry(
+                manager.config,
+                http_client=refresh_session,
+                credential_rotators=credential_rotators,
+            )
+            try:
+                await registry.refresh_all(refresh_session)
+            except Exception:
+                # The registry may have received a valid provider snapshot
+                # before a non-critical postprocess failed. Keep and reuse it
+                # rather than rebuilding and refreshing the catalog again.
+                logger.warning("structured qualification catalog postprocess failed")
+    except Exception as exc:
+        logger.warning(
+            "structured qualification catalog setup failed error_class=%s",
+            type(exc).__name__,
+        )
     results = await run_structured_qualification(
         pool_name=pool_name,
         base_url=base_url,
         max_concurrency=1,
         timeout_secs=timeout_secs,
         max_age_secs=max_age_secs,
-        limit=limit,
         ignore_cooldowns=False,
+        catalog_registry=registry,
         manager=manager,
         credential_rotators=credential_rotators,
     )
@@ -217,14 +252,40 @@ async def run_structured_maintenance_cycle(
         pool_name=pool_name,
         max_age_secs=max_age_secs,
     )
+    # A degraded result means live structured-output requests are one model
+    # loss away from "no eligible candidates". Don't wait for the next
+    # multi-hour cycle: keep probing stale candidates in this cycle until the
+    # pool clears the minimum or the candidate list is exhausted.
+    rounds = 1
+    while qualified < minimum_required and rounds < max_rounds and results:
+        more = await run_structured_qualification(
+            pool_name=pool_name,
+            base_url=base_url,
+            max_concurrency=1,
+            timeout_secs=timeout_secs,
+            max_age_secs=max_age_secs,
+            ignore_cooldowns=False,
+            catalog_registry=registry,
+            manager=manager,
+            credential_rotators=credential_rotators,
+        )
+        if not more:
+            break
+        results.extend(more)
+        rounds += 1
+        qualified = qualified_count(
+            manager=manager,
+            pool_name=pool_name,
+            max_age_secs=max_age_secs,
+        )
     summary = {
         "pool": pool_name,
         "tested": len(results),
         "passed": sum(1 for result in results if result.get("status") == "passed"),
         "failed": sum(1 for result in results if result.get("status") != "passed"),
         "qualified": qualified,
-        "minimum_required": 2,
-        "degraded": qualified < 2,
+        "minimum_required": minimum_required,
+        "degraded": qualified < minimum_required,
     }
     if summary["degraded"]:
         logger.warning(

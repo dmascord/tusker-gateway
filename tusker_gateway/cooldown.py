@@ -32,6 +32,8 @@ MODEL_SCOPED_COOLDOWN_PROVIDERS = frozenset({
     "google",       # Gemini API
     "groq",
     "anthropic",    # supported by custom provider registries
+    "cohere",       # rerank quota is per-model; a rerank exhaustion must not
+                    # also quarantine future cohere chat/embedding routes
 })
 # Bodies that indicate a long-lived quota / usage-limit window (hours or
 # days), not a transient rate-limit blip. Backing off 60s for these would
@@ -106,6 +108,27 @@ def is_permanently_failed(provider: str, model: str) -> bool:
         PERMANENTLY_FAILED_MODELS.pop(key, None)
         return False
     return True
+
+
+# The upstream serves a model listed in its catalog but rejects it at
+# inference time because this credential tier/integration lost access
+# (GitHub Copilot Enterprise: "The requested model is not available for
+# integrator \"copilot-developer-cli\""). The 400 status alone is treated as
+# request-level, but this body describes the MODEL, not the request: every
+# caller sending that model hits it forever. Match conservatively — the
+# phrase must indicate integration-wide unavailability, not a typo'd name.
+_MODEL_UNAVAILABLE_PATTERNS = (
+    "requested model is not available for integrator",
+    "model is not available for your",
+)
+
+
+def is_model_unavailable_error(body: str | None) -> bool:
+    """Return whether an error body marks the model permanently unavailable."""
+    if not body:
+        return False
+    lowered = _strip_urls(body).lower()
+    return any(pattern in lowered for pattern in _MODEL_UNAVAILABLE_PATTERNS)
 
 
 
@@ -345,6 +368,44 @@ def _header_to_seconds(value: str | None) -> float | None:
         return None
 
 
+_COMPOUND_DURATION_RE = re.compile(
+    r"\b("
+    r"\d+(?:\.\d+)?ms"
+    r"|\d+(?:\.\d+)?h(?:\d+(?:\.\d+)?m)?(?:\d+(?:\.\d+)?s(?:\d+ms)?)?"
+    r"|\d+(?:\.\d+)?m(?:\d+(?:\.\d+)?s(?:\d+ms)?)?"
+    r"|\d+(?:\.\d+)?s(?:\d+ms)?"
+    r")\b",
+    re.IGNORECASE,
+)
+_DURATION_PART_RE = re.compile(r"(\d+(?:\.\d+)?)(h|ms|m|s)", re.IGNORECASE)
+
+
+def _compound_duration_seconds(text: str) -> float | None:
+    """Convert a compound duration like ``15h45m48.711411753s`` to seconds.
+
+    Providers emit Go/ISO-style durations in quota-exhaustion bodies:
+    ``26s`` (per-minute quota), ``2m5s``, ``15h45m48.7s`` (per-day quota),
+    ``250ms``. Returns ``None`` when no duration component parses.
+    """
+    total = 0.0
+    matched = False
+    for value, unit in _DURATION_PART_RE.findall(text):
+        try:
+            amount = float(value)
+        except ValueError:
+            return None
+        matched = True
+        if unit.lower() == "h":
+            total += amount * 3600.0
+        elif unit.lower() == "m":
+            total += amount * 60.0
+        elif unit.lower() == "ms":
+            total += amount / 1000.0
+        else:
+            total += amount
+    return total if matched else None
+
+
 def _cooldown_seconds_for_429(exc: dict[str, Any]) -> float:
     """Parse a 429 response and return the cooldown seconds.
 
@@ -357,6 +418,8 @@ def _cooldown_seconds_for_429(exc: dict[str, Any]) -> float:
 
     Body heuristics:
       - JSON-style ``retry-after`` field
+      - Compound Go/ISO durations ("Please retry in 15h45m48.7s", "26s") —
+        uncapped, treated like the absolute-reset date
       - Explicit "try again in N seconds/minutes/hours/days" prose
       - Quota-hint word-boundary match (with URLs stripped) → quota cooldown
       - Generic ``week`` / ``month`` / ``hour`` / ``N/day`` keywords
@@ -395,6 +458,17 @@ def _cooldown_seconds_for_429(exc: dict[str, Any]) -> float:
     if ra_seconds is not None:
         return min(ra_seconds, MAX_RETRY_AFTER_SECS)
 
+    # Google states exact Go/ISO-style compound durations ("Please retry in
+    # 15h45m48.711411753s", "26s", "2m5s"). The prose regex below cannot read
+    # those, so parse them first — the provider-stated reset outranks every
+    # static default, whether the window is 26s (per-minute quota) or 15h
+    # (per-day quota). Uncapped like the absolute-reset date above: a daily
+    # quota must not be re-probed every hour until it actually resets.
+    m = re.search(_COMPOUND_DURATION_RE, body_for_hints)
+    if m:
+        seconds = _compound_duration_seconds(m.group(1))
+        if seconds is not None:
+            return max(30.0, seconds)
 
     # Strip URLs so words like "billing" / "usage" inside a link don't trip
     # the quota-hint matcher. Keep the original body for the "try again in"

@@ -348,3 +348,27 @@ def test_provider_health_failure_still_cools_and_records(tmp_path):
         tracker.clear("cohere", "rerank-v3.5")
         tracker.clear_failures("cohere")
         tracker._provider_default.pop("cohere", None)
+
+@pytest.mark.asyncio
+async def test_pinned_rerank_reports_active_cooldown(tmp_path):
+    from tusker_gateway.errors import NoHealthyModelsError
+
+    handler = RerankHandler(_config(tmp_path, ("cohere",)))
+    tracker = global_tracker()
+    tracker.cooldown("cohere", "rerank-v3.5", 3600)
+    try:
+        with pytest.raises(NoHealthyModelsError) as excinfo:
+            await handler.rerank(
+                {
+                    "model": "cohere::rerank-v3.5",
+                    "query": "query",
+                    "documents": ["document"],
+                }
+            )
+        assert "cohere/rerank-v3.5" in str(excinfo.value)
+        assert "cooldown" in str(excinfo.value)
+        assert int(excinfo.value.headers["Retry-After"]) > 3000
+    finally:
+        tracker.clear("cohere", "rerank-v3.5")
+        tracker.clear_failures("cohere")
+        tracker._provider_default.pop("cohere", None)

@@ -742,6 +742,30 @@ class RerankHandler:
         if last_error is not None:
             raise last_error
         if not attempted:
+            cooldown_snapshot = global_tracker().snapshot()
+            active = {
+                (entry["provider"], entry["model"]): entry["seconds_remaining"]
+                for entry in cooldown_snapshot.get("models", [])
+            }
+            skipped: list[str] = []
+            longest = 0.0
+            for backend in backends:
+                remaining = active.get((backend.provider, backend.model), 0.0)
+                if remaining > 0:
+                    skipped.append(
+                        f"{backend.provider}/{backend.model} (cooldown {remaining:.0f}s)"
+                    )
+                    longest = max(longest, remaining)
+            if skipped:
+                raise NoHealthyModelsError(
+                    pool="rerank",
+                    detail=(
+                        "All matching rerank backends are in cooldown: "
+                        + "; ".join(skipped)
+                        + ". Unpinned requests fall back to other providers."
+                    ),
+                    retry_after_secs=max(1, int(longest)),
+                )
             raise NoHealthyModelsError(pool="rerank")
         raise RerankerUnavailableError(
             "All reranker providers are temporarily unavailable; retry shortly",

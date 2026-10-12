@@ -3758,19 +3758,16 @@ def _candidate_extra_body(
 
 
 def _provider_attempt_timeout_overrides() -> dict[str, float]:
-    """Per-provider override map from ``TUSKER_PROVIDER_ATTEMPT_TIMEOUT_OVERRIDES_JSON``.
-
-    Local backends (Jetson Ollama, MLX Mac) regularly exceed the 30s default
-    idle budget during cold model loads. Operators can extend those specific
-    providers without slowing every other candidate down.
-    """
+    """Load provider and provider/model idle-budget overrides."""
     raw = os.environ.get("TUSKER_PROVIDER_ATTEMPT_TIMEOUT_OVERRIDES_JSON", "").strip()
     if not raw:
         return {}
     try:
         data = json.loads(raw)
     except (TypeError, ValueError):
-        logger.warning("ignoring TUSKER_PROVIDER_ATTEMPT_TIMEOUT_OVERRIDES_JSON: invalid JSON")
+        logger.warning(
+            "ignoring TUSKER_PROVIDER_ATTEMPT_TIMEOUT_OVERRIDES_JSON: invalid JSON"
+        )
         return {}
     if not isinstance(data, dict):
         return {}
@@ -3780,33 +3777,35 @@ def _provider_attempt_timeout_overrides() -> dict[str, float]:
             seconds = float(value)
         except (TypeError, ValueError):
             continue
-        if seconds <= 0:
-            continue
-        parsed[str(provider).lower()] = seconds
+        if seconds > 0:
+            parsed[str(provider).lower()] = seconds
     return parsed
 
 
 def _provider_attempt_timeout_secs(
     request: web.Request | None,
     provider: str | None = None,
+    model: str | None = None,
 ) -> float:
-    """Return the bounded budget for one pool candidate.
+    """Return the bounded idle budget for one pool candidate.
 
-    ``provider`` may extend the global ``TUSKER_PROVIDER_ATTEMPT_TIMEOUT_SECS``
-    by overriding per upstream — used for cold-start local model backends
-    that need >30s before the first byte. The override map is read from
-    ``TUSKER_PROVIDER_ATTEMPT_TIMEOUT_OVERRIDES_JSON`` on each call so
-    config-runtime updates take effect without a restart.
+    A ``provider/model`` override takes precedence over a provider override;
+    both are capped by the request deadline when one is present.
     """
     try:
         configured = max(
             0.1,
-            float(os.environ.get("TUSKER_PROVIDER_ATTEMPT_TIMEOUT_SECS", "30")),
+            float(os.environ.get("TUSKER_PROVIDER_ATTEMPT_TIMEOUT_SECS", "45")),
         )
     except (TypeError, ValueError):
-        configured = 30.0
+        configured = 45.0
     if provider:
-        override = _provider_attempt_timeout_overrides().get(provider.lower())
+        overrides = _provider_attempt_timeout_overrides()
+        provider_key = provider.lower()
+        model_key = f"{provider_key}/{model.lower()}" if model else None
+        override = overrides.get(model_key) if model_key else None
+        if override is None:
+            override = overrides.get(provider_key)
         if override is not None:
             configured = max(configured, override)
     if request is None or not hasattr(request, "get"):
@@ -3816,6 +3815,8 @@ def _provider_attempt_timeout_secs(
         return configured
     remaining = max(0.0, deadline_at - asyncio.get_running_loop().time())
     return max(0.0, min(configured, remaining - 0.25))
+
+
 
 
 class _AttemptActivity:
@@ -4293,11 +4294,19 @@ def _mark_permanently_failed(
     /v1beta/openai/models). Marking them permanently failed prunes them from
     auto_catalog on the next refresh instead of letting them trip the breaker
     every minute forever.
+
+    A 400 whose body says the model is not available to this integration
+    (GitHub Copilot Enterprise tier changes) is also permanent for this
+    credential: without the mark, the catalog keeps routing to it and every
+    request pays the 400 round trip.
     """
     status = getattr(exc, "upstream_status", None)
-    if status in (401, 403, 404, 410):
-        from tusker_gateway.cooldown import mark_permanently_failed
+    from tusker_gateway.cooldown import is_model_unavailable_error, mark_permanently_failed
 
+    if status in (401, 403, 404, 410) or (
+        status == 400
+        and is_model_unavailable_error(str(getattr(exc, "upstream_body", "") or ""))
+    ):
         mark_permanently_failed(provider, model)
 
 
@@ -4448,7 +4457,9 @@ async def _call_with_pool_fallback(
 
             result = await _await_attempt(
                 asyncio.create_task(call_direct()),
-                budget=_provider_attempt_timeout_secs(request, provider=provider),
+                budget=_provider_attempt_timeout_secs(
+                    request, provider=provider, model=model
+                ),
                 deadline_at=_request_deadline_at(request),
                 activity=activity,
             )
@@ -4779,7 +4790,9 @@ async def _call_with_pool_fallback(
 
             result = await _await_attempt(
                 asyncio.create_task(call_candidate()),
-                budget=_provider_attempt_timeout_secs(request, provider=provider),
+                budget=_provider_attempt_timeout_secs(
+                    request, provider=provider, model=model
+                ),
                 deadline_at=_request_deadline_at(request),
                 activity=activity,
             )
@@ -4823,7 +4836,9 @@ async def _call_with_pool_fallback(
                 model,
                 attempts,
                 max_attempts,
-                _provider_attempt_timeout_secs(request, provider=provider),
+                _provider_attempt_timeout_secs(
+                    request, provider=provider, model=model
+                ),
             )
         except asyncio.CancelledError:
             if breaker is not None and decision.state == BreakerState.HALF_OPEN:

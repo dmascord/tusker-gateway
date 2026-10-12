@@ -2571,6 +2571,23 @@ async def test_provider_attempt_timeout_helper_uses_per_provider_override():
         os.environ.pop("TUSKER_PROVIDER_ATTEMPT_TIMEOUT_SECS", None)
         os.environ.pop("TUSKER_PROVIDER_ATTEMPT_TIMEOUT_OVERRIDES_JSON", None)
 
+@pytest.mark.asyncio
+async def test_provider_attempt_timeout_helper_supports_model_override(monkeypatch):
+    from tusker_gateway.endpoints import _provider_attempt_timeout_secs
+
+    monkeypatch.setenv("TUSKER_PROVIDER_ATTEMPT_TIMEOUT_SECS", "45")
+    monkeypatch.setenv(
+        "TUSKER_PROVIDER_ATTEMPT_TIMEOUT_OVERRIDES_JSON",
+        '{"alibaba/qwen3.8-max": 120}',
+    )
+    request = SimpleNamespace(get=lambda key, default=None: None)
+
+    assert _provider_attempt_timeout_secs(
+        request,
+        provider="alibaba",
+        model="qwen3.8-max",
+    ) == 120.0
+
 
 @pytest.mark.asyncio
 async def test_provider_attempt_timeout_helper_ignores_invalid_override_json():

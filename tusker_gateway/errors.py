@@ -67,20 +67,30 @@ class NoHealthyModelsError(BadRequestError):
     status = 503
     error_type = "server_error"
 
-    def __init__(self, *, pool: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        pool: str | None = None,
+        detail: str | None = None,
+        retry_after_secs: int | None = None,
+    ) -> None:
+        message = detail or (
+            "No healthy upstream model is currently available; retry shortly."
+        )
         super().__init__(
-            "No healthy upstream model is currently available; retry shortly.",
+            message,
             code="no_healthy_models",
         )
         self.pool = pool
-        try:
-            retry_after = max(
-                1,
-                int(float(os.environ.get("TUSKER_PROVIDER_RETRY_AFTER_SECS", "5"))),
-            )
-        except (TypeError, ValueError):
-            retry_after = 5
-        self.headers = {"Retry-After": str(retry_after)}
+        if retry_after_secs is None:
+            try:
+                retry_after_secs = max(
+                    1,
+                    int(float(os.environ.get("TUSKER_PROVIDER_RETRY_AFTER_SECS", "5"))),
+                )
+            except (TypeError, ValueError):
+                retry_after_secs = 5
+        self.headers = {"Retry-After": str(max(1, int(retry_after_secs)))}
 
 
 class ProviderRouteDisabledError(BadRequestError):

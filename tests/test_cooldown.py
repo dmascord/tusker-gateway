@@ -28,13 +28,23 @@ def test_provider_scoped_cooldown_still_blocks_provider():
     assert tracker.is_cooldown("openrouter", "model-b")
 
 
-def test_unlisted_provider_keeps_provider_wide_behavior():
+def test_cohere_model_scoped_cooldown_does_not_block_sibling_models():
     tracker = CooldownTracker()
 
-    tracker.cooldown("cohere", "command-r-plus", 60)
+    tracker.cooldown("cohere", "rerank-v3.5", 60)
 
-    assert tracker.is_cooldown("cohere", "command-r-plus")
-    assert tracker.is_cooldown("cohere", "another-model")
+    assert tracker.is_cooldown("cohere", "rerank-v3.5")
+    assert not tracker.is_cooldown("cohere", "another-model")
+
+
+def test_model_unavailable_for_integrator_is_detected():
+    from tusker_gateway.cooldown import is_model_unavailable_error
+
+    assert is_model_unavailable_error(
+        '{"error":{"message":"The requested model is not available for '
+        'integrator \\\"copilot-developer-cli\\\"."}}'
+    )
+    assert not is_model_unavailable_error("model not found")
 
 def test_permanent_failure_marker_covers_404_and_410():
     """404/410 are permanent for this key/account even when the upstream

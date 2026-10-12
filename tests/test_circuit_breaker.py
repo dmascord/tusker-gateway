@@ -223,6 +223,42 @@ def test_retry_after_is_capped_at_one_hour():
     ) == 3600.0
 
 
+def test_google_compound_duration_cooldown_is_honoured():
+    """Google states exact Go-style durations ("Please retry in 15h45m48.7s").
+
+    The cooldown must track the provider-stated reset instead of the static
+    3600s quota default — a per-minute quota ("Please retry in 26s") must not
+    quarantine the model for an hour, and a per-day quota must not be
+    re-probed hourly for 15h.
+    """
+    from tusker_gateway.cooldown import _cooldown_seconds_for_429
+
+    body = (
+        'You exceeded your current quota, please check your plan and billing'
+        ' details. For more information on this error, head to:'
+        ' https://ai.google.dev/gemini-api/docs/rate-limits.'
+        ' Quota exceeded for metric:'
+        ' generativelanguage.googleapis.com/generate_content_free_tier_requests,'
+        ' limit: 20, model: gemini-3.6-flash. Please retry in 15h45m48.711411753s.'
+    )
+    seconds = _cooldown_seconds_for_429({"body": body, "headers": {}})
+    assert 15 * 3600 + 45 * 60 + 48 <= seconds <= 15 * 3600 + 45 * 60 + 49
+
+    per_minute = _cooldown_seconds_for_429(
+        {"body": "Quota exceeded for metric: requests. Please retry in 26s.", "headers": {}}
+    )
+    assert per_minute == 30.0  # 26s stated, 30s floor applied
+
+    compound = _cooldown_seconds_for_429(
+        {"body": "wait 2m5s and try again", "headers": {}}
+    )
+    assert compound == 125.0
+
+    fractional = _cooldown_seconds_for_429(
+        {"body": "retry after 250ms", "headers": {}}
+    )
+    assert fractional == 30.0  # sub-second stated, floor applied
+
 def test_payment_required_non429_returns_long_cooldown():
     """Payment-required responses must quarantine the route like quota errors."""
     from types import SimpleNamespace

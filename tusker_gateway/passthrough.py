@@ -20,7 +20,11 @@ from typing import Any, AsyncIterator, Callable
 
 import aiohttp
 
-from tusker_gateway.cooldown import _QUOTA_HINTS, global_tracker
+from tusker_gateway.cooldown import (
+    _QUOTA_HINTS,
+    global_tracker,
+    is_model_unavailable_error,
+)
 from tusker_gateway.errors import (
     GatewayError,
     ProviderCapacityError,
@@ -1987,7 +1991,11 @@ class PassthroughClient:
             group=capacity_group,
         )
 
-        if getattr(exc, "upstream_status", None) in (404, 410):
+        status = getattr(exc, "upstream_status", None)
+        if status in (404, 410) or (
+            status == 400
+            and is_model_unavailable_error(str(getattr(exc, "upstream_body", "") or ""))
+        ):
             from tusker_gateway.cooldown import mark_permanently_failed
 
             mark_permanently_failed(provider, model)
@@ -2324,7 +2332,10 @@ class PassthroughClient:
                     pass
             # Model unavailable: exclude from rotation until explicitly cleared.
             status_code = getattr(exc, "upstream_status", None)
-            if status_code in (404, 410):
+            if status_code in (404, 410) or (
+                status_code == 400
+                and is_model_unavailable_error(str(getattr(exc, "upstream_body", "") or ""))
+            ):
                 from tusker_gateway.cooldown import mark_permanently_failed
 
                 mark_permanently_failed(provider, model)
