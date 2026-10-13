@@ -121,7 +121,7 @@ class ProviderModelRetiredError(ProviderError):
     """The upstream deterministically rejected the model itself.
 
     Deprecated or delisted models answer identically on every request
-    (e.g. the OpenCode CLI refusing with "has been deprecated"). Carrying
+    (e.g. the OpenCode CLI refusing with "Invalid model reference"). Carrying
     upstream status 410 lets the permanent-failure marker prune the route
     from pool rotation instead of every caller paying a 502 round trip;
     the client-visible status stays 502 so pool retry semantics are

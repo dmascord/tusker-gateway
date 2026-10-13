@@ -233,6 +233,7 @@ async def test_deprecated_model_exit_marks_route_retired(monkeypatch):
     cases = [
         (b"Error: Model exo-free has been deprecated.\n", True),
         (b"Error: Upstream request failed: Model is unavailable.\n", True),
+        (b"Error: Invalid model reference: exo-free\n", True),
         (b"opencode: transient network failure\n", False),
     ]
     for stderr, retired in cases:

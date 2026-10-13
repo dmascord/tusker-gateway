@@ -136,7 +136,7 @@ async def _run_cli_tool(
 # retired-model error lets the gateway's permanent-failure marker prune the
 # route from pool rotation; anything else stays a generic provider failure.
 _MODEL_REJECTION_RE = re.compile(
-    r"has been deprecated|model is unavailable",
+    r"has been deprecated|model is unavailable|invalid model reference",
     re.IGNORECASE,
 )
 
