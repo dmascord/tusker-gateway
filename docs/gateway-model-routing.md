@@ -286,6 +286,7 @@ surface eligible models without requiring a config edit:
 | OpenAI-compatible providers | Provider-configured `models_path` (for example `/v1/models`) | 60 min |
 | models.dev | `https://models.dev/api.json` (pricing DB) | 60 min |
 | Xiaomi MiMo | `https://token-plan-sgp.xiaomimimo.com/v1/models` | 60 min |
+| OpenCode CLI | `opencode models` subprocess (pinned CLI; `opencode/` namespace is the free Zen set) | 60 min |
 
 Static `TUSKER_POOL_*` entries remain operator-curated baselines. Pools with
 `auto_catalog: true` also receive eligible catalog entries at startup and on each
@@ -345,12 +346,19 @@ free into the pool's allowlist. Discovery differs per upstream:
 | `opencode-go` | All entries returned by `/zen/go/v1/models` (same key-filter) |
 | `xiaomi` | Authenticated Token Plan catalog; proven chat models only, cheap non-ZDR pools only, heavyweight entries excluded |
 | provider-native catalogs | Both catalog/model.dev prices must resolve to exactly zero; unpriced or paid models stay out of free pools |
+| `opencode-cli` | Every model in the `opencode/` namespace of the pinned CLI's `opencode models` output — the CLI's own eligibility list. The key-filtered HTTP `/zen/v1/models` catalog omits CLI-exclusive free models, so it is not used as a filter |
 
 Providers listed in `auto_catalog_providers` use their authenticated catalog
 as the account's allowlist rather than the zero-price test. This is the
 explicit path for Codex, Copilot, OpenCode Go, Z.AI, Synthetic, MiniMax,
 Ollama Cloud, Groq, Google, or Cerebras when their credentials provide model
 access.
+
+`opencode-cli` is registered only when `TUSKER_OPENCODE_CLI_ENABLED` is set;
+the code pool opts in through `auto_catalog_providers`, so new free CLI
+models enter rotation and get tool-qualified without a manifest change. The
+static `opencode-cli` entries in `TUSKER_POOL_CODE` remain as the cold-start
+floor (they survive a missing CLI binary; auto entries do not).
 
 `TUSKER_AUTO_CATALOG_EXCLUDED_PROVIDERS` can block a provider from dynamic
 catalog discovery while leaving explicitly configured models untouched. The
