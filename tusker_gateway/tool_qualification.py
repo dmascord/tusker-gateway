@@ -360,7 +360,7 @@ async def probe_image_tool_model(
         "tool_choice": "required",
         "stream": True,
         "temperature": 0,
-        "max_tokens": 192,
+        "max_tokens": 2048,
     }
     result: dict[str, Any] = {
         "provider": provider,

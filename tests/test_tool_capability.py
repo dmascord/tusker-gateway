@@ -129,6 +129,19 @@ async def test_composite_probe_passes_image_and_exact_tool_call():
     assert session.payload["messages"][1]["content"][1]["type"] == "image_url"
     assert session.payload["tools"]
 
+@pytest.mark.asyncio
+async def test_composite_probe_allows_reasoning_budget_for_multimodal_models():
+    response = _CompositeResponse([
+        _sse({"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"name": PROBE_TOOL_NAME, "arguments": '{"path":"/tmp/tusker-tool-capability-probe"}'}}]}, "finish_reason": "tool_calls"}]}),
+    ])
+    session = _CompositeSession(response)
+    result = await probe_image_tool_model(
+        session, base_url="http://gateway.test", api_key="key",
+        provider="ollama-cloud", model="glm-5.3-flash",
+    )
+    assert result["status"] == "passed"
+    assert session.payload["max_tokens"] == 2048
+
 
 @pytest.mark.asyncio
 async def test_composite_probe_classifies_missing_tool_result_as_unsupported():
