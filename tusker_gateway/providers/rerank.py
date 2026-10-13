@@ -29,6 +29,7 @@ from tusker_gateway.errors import (
     ProviderError,
     RateLimitError,
 )
+from tusker_gateway.media_health import RERANK_CAPABILITY, media_capability_allowed
 from tusker_gateway.passthrough import _persist_cooldown
 from tusker_gateway.providers._base_url import (
     _provider_value,
@@ -116,8 +117,13 @@ def _optional_bool(value: Any, field: str) -> bool | None:
 class RerankHandler:
     """Round-robin reranker with per-provider fallback and cooldowns."""
 
-    def __init__(self, config: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        config: dict[str, Any],
+        capability_db: Any | None = None,
+    ) -> None:
         self.config = config
+        self.capability_db = capability_db
         self._cursor = 0
         self._lock = threading.Lock()
 
@@ -700,6 +706,13 @@ class RerankHandler:
         last_error: GatewayError | None = None
         attempted = False
         for position, backend in enumerate(ordered):
+            if not media_capability_allowed(
+                self.capability_db,
+                provider=backend.provider,
+                model=backend.model,
+                capability=RERANK_CAPABILITY,
+            ):
+                continue
             if global_tracker().is_cooldown(backend.provider, backend.model):
                 continue
             if breaker is not None and not breaker.check(

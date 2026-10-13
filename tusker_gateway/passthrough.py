@@ -105,6 +105,7 @@ def _normalize_reasoning_effort(value: Any) -> Any:
 # ``max_tokens`` chat-completions parameter and require the modern
 # ``max_completion_tokens`` name (Azure APIM / Azure OpenAI gpt-5.x).
 _COMPLETION_TOKENS_PROVIDERS = frozenset({"apim"})
+_APIM_LUNA_PREFIXES = ("gpt-6-luna", "gpt-5.6-luna")
 
 
 def _adapt_apim_tool_reasoning(body: dict[str, Any], provider: str) -> None:
@@ -143,6 +144,12 @@ def _rename_max_tokens_for_provider(body: dict[str, Any], provider: str) -> None
     if provider.lower() in _COMPLETION_TOKENS_PROVIDERS:
         if "max_tokens" in body and "max_completion_tokens" not in body:
             body["max_completion_tokens"] = body.pop("max_tokens")
+
+def _strip_apim_luna_temperature(body: dict[str, Any], provider: str) -> None:
+    """Drop unsupported ``temperature`` from APIM Luna requests."""
+    model = str(body.get("model", "")).lower()
+    if provider.lower() == "apim" and model.startswith(_APIM_LUNA_PREFIXES):
+        body.pop("temperature", None)
 
 
 def _sanitize_opencode_session_id(value: Any) -> str | None:
@@ -2500,6 +2507,7 @@ class PassthroughClient:
                 body["reasoning_effort"] = _normalize_reasoning_effort(effort)
         _adapt_apim_tool_reasoning(body, provider)
         _rename_max_tokens_for_provider(body, provider)
+        _strip_apim_luna_temperature(body, provider)
         return headers, body
 
     async def _chat_codex(

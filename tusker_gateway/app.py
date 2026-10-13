@@ -281,8 +281,12 @@ def create_app() -> web.Application:
     app["video_handler"] = VideoHandler(
         app["config"], capability_registry=capability_registry
     )
-    app["rerank_handler"] = RerankHandler(app["config"])
-    app["embed_handler"] = EmbedHandler(app["config"])
+    app["rerank_handler"] = RerankHandler(
+        app["config"], capability_db=app["model_capabilities"]
+    )
+    app["embed_handler"] = EmbedHandler(
+        app["config"], capability_db=app["model_capabilities"]
+    )
 
     async def on_startup(app):
         startup_log = logging.getLogger("tusker_gateway.startup")

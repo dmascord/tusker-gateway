@@ -1539,6 +1539,24 @@ class TestCompletionTokensParam:
         _rename_max_tokens_for_provider(body, "openrouter")
         assert body == {"max_tokens": 128}
 
+class TestApimLunaTemperatureCompatibility:
+    @pytest.mark.parametrize("temperature", [0, 0.2, 1])
+    def test_apim_luna_temperature_is_stripped(self, temperature):
+        from tusker_gateway.passthrough import _strip_apim_luna_temperature
+
+        body = {"model": "gpt-5.6-luna-2026-07-09", "temperature": temperature}
+        _strip_apim_luna_temperature(body, "apim")
+        assert "temperature" not in body
+
+    def test_other_routes_keep_temperature(self):
+        from tusker_gateway.passthrough import _strip_apim_luna_temperature
+
+        same_model = {"model": "gpt-5.6-luna", "temperature": 0.2}
+        other_model = {"model": "gpt-5.4-mini", "temperature": 0.2}
+        _strip_apim_luna_temperature(same_model, "openrouter")
+        _strip_apim_luna_temperature(other_model, "apim")
+        assert same_model["temperature"] == other_model["temperature"] == 0.2
+
 
 class TestApimToolReasoningCompatibility:
     def test_gpt6_function_tools_disable_unsupported_reasoning_effort(self):

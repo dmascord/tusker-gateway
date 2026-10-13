@@ -5,6 +5,7 @@ import json
 
 import pytest
 
+from tusker_gateway.media_health import media_capability_allowed
 from tusker_gateway.media_qualification import probe_media_route
 
 
@@ -80,3 +81,28 @@ async def test_media_probe_classifies_unsupported_gateway_route():
     )
     assert result["status"] == "unsupported"
     assert result["failure_class"] == "no_reranker_providers"
+
+def test_media_capability_gate_rejects_fresh_unsupported_record(tmp_path, monkeypatch):
+    from tusker_gateway.media_qualification import (
+        EMBEDDING_CAPABILITY,
+        MEDIA_CAPABILITY_PROBE_VERSION,
+    )
+    from tusker_gateway.model_capability import ModelCapabilityDB
+
+    monkeypatch.setenv("TUSKER_MEDIA_CAPABILITY_GATE_ENABLED", "true")
+    db = ModelCapabilityDB(str(tmp_path / "capabilities.db"))
+    db.record(
+        provider="synthetic",
+        model="hf:nomic-ai/nomic-embed-text-v1.5",
+        capability=EMBEDDING_CAPABILITY,
+        status="unsupported",
+        source="media_probe",
+        probe_version=MEDIA_CAPABILITY_PROBE_VERSION,
+    )
+
+    assert not media_capability_allowed(
+        db,
+        provider="synthetic",
+        model="hf:nomic-ai/nomic-embed-text-v1.5",
+        capability=EMBEDDING_CAPABILITY,
+    )

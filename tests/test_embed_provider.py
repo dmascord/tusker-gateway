@@ -5,6 +5,14 @@ import json
 from typing import Any
 
 import pytest
+import time
+
+from tusker_gateway.errors import NoHealthyModelsError
+from tusker_gateway.media_qualification import (
+    EMBEDDING_CAPABILITY,
+    MEDIA_CAPABILITY_PROBE_VERSION,
+)
+from tusker_gateway.model_capability import ModelCapabilityDB
 
 from tusker_gateway.cooldown import global_tracker
 from tusker_gateway.errors import BadRequestError, ProviderError
@@ -113,6 +121,66 @@ async def test_priority_strategy_falls_back_if_jetson_is_unavailable(monkeypatch
         "https://synthetic.test/v1/embeddings",
     ]
 
+
+@pytest.mark.asyncio
+async def test_fresh_unsupported_embedding_backend_is_skipped(tmp_path, monkeypatch):
+    monkeypatch.setenv("TUSKER_EMBED_PROVIDERS", "local-llm,synthetic")
+    monkeypatch.setenv("TUSKER_EMBED_STRATEGY", "priority")
+    monkeypatch.setenv("TUSKER_MEDIA_CAPABILITY_GATE_ENABLED", "true")
+    config = _config()
+    db = ModelCapabilityDB(str(tmp_path / "model-capability.db"))
+    db.record(
+        provider="local-llm",
+        model="nomic-embed-text",
+        capability=EMBEDDING_CAPABILITY,
+        status="unsupported",
+        source="media_probe",
+        probe_version=MEDIA_CAPABILITY_PROBE_VERSION,
+        checked_at=time.time(),
+    )
+    session = _FakeSession([_FakeResponse(_embedding_response("remote-embed-model"))])
+    handler = EmbedHandler(config, capability_db=db)
+
+    provider, model, _ = await handler.embed(
+        {"model": "hermes-embed", "input": "fresh unsupported test"},
+        session=session,
+    )
+
+    assert (provider, model) == ("synthetic", "hf:nomic-ai/nomic-embed-text-v1.5")
+    assert [call["url"] for call in session.calls] == [
+        "https://synthetic.test/v1/embeddings",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_all_fresh_unsupported_embedding_backends_raise_no_healthy_models(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("TUSKER_EMBED_PROVIDERS", "local-llm,synthetic")
+    monkeypatch.setenv("TUSKER_MEDIA_CAPABILITY_GATE_ENABLED", "true")
+    config = _config()
+    db = ModelCapabilityDB(str(tmp_path / "model-capability.db"))
+    for provider, model in (
+        ("local-llm", "nomic-embed-text"),
+        ("synthetic", "hf:nomic-ai/nomic-embed-text-v1.5"),
+    ):
+        db.record(
+            provider=provider,
+            model=model,
+            capability=EMBEDDING_CAPABILITY,
+            status="unsupported",
+            source="media_probe",
+            probe_version=MEDIA_CAPABILITY_PROBE_VERSION,
+            checked_at=time.time(),
+        )
+    session = _FakeSession([])
+    handler = EmbedHandler(config, capability_db=db)
+
+    with pytest.raises(NoHealthyModelsError) as excinfo:
+        await handler.embed({"model": "hermes-embed", "input": "blocked"}, session=session)
+
+    assert excinfo.value.code == "no_healthy_models"
+    assert session.calls == []
 
 def test_bare_nomic_model_pins_to_local_ollama(monkeypatch):
     monkeypatch.setenv("TUSKER_EMBED_PROVIDERS", "local-llm,synthetic")

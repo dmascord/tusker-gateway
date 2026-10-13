@@ -508,6 +508,9 @@ spec:
         # Media routes are qualified out of band; no cold probe is added to requests.
         - name: TUSKER_MEDIA_QUALIFICATION_ENABLED
           value: 'true'
+        # Enforce fresh explicit media qualification failures during routing.
+        - name: TUSKER_MEDIA_CAPABILITY_GATE_ENABLED
+          value: 'true'
         - name: TUSKER_MEDIA_QUALIFICATION_LIMIT
           value: '8'
         - name: TUSKER_MEDIA_QUALIFICATION_TIMEOUT_SECS

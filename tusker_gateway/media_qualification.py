@@ -18,15 +18,16 @@ from typing import Any
 import aiohttp
 
 from tusker_gateway.config import load_config
+from tusker_gateway.media_health import (
+    EMBEDDING_CAPABILITY,
+    MEDIA_CAPABILITY_PROBE_VERSION,
+    RERANK_CAPABILITY,
+)
 from tusker_gateway.model_capability import ModelCapabilityDB
 from tusker_gateway.providers.embed import EmbedHandler
 from tusker_gateway.providers.rerank import RerankHandler
 
 logger = logging.getLogger(__name__)
-
-MEDIA_CAPABILITY_PROBE_VERSION = "media-capability-v1"
-EMBEDDING_CAPABILITY = "embedding"
-RERANK_CAPABILITY = "rerank"
 
 
 def _status_from_response(status: int, payload: Any, capability: str) -> tuple[str, str | None]:

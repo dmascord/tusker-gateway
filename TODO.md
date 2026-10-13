@@ -612,22 +612,20 @@ cool a backend.
   silently ignore DB provider/key edits until a restart, and would lose
   embedding support entirely if repointed at the DB registry.
 
-### Gap C: `/v1/embeddings` requires no scope
+### Gap C: `/v1/embeddings` scope
 
-`identity.py:252` resolves the required scope from `_ROUTE_SCOPES`. `/v1/rerank`
-is listed as `inference:rerank` but `/v1/embeddings` is not, so
-`required_scope` is `None` and the scope check is skipped entirely for
-embeddings. Pool gating still applies (`identity.py:268-270`: `/v1/rerank` →
-`rerank`, everything else → `media`), as do caller model/provider allowlists
-(`identity.py:256-266`). Effect: a caller deliberately denied rerank scope
-retains embeddings access, so least-privilege granularity is inconsistent
-between the two media surfaces.
+**Fixed.** `identity.py` maps `/v1/embeddings` to `inference:embeddings`,
+alongside the existing `inference:rerank` mapping. The enterprise-controls
+scope table is authoritative; this section remains historical audit context.
 
-### Gap D: no media capability qualification
+### Gap D: media capability qualification
 
-Chat has capability qualification and permanent-failure gating (`pools.py` and
-the qualification modules); embeddings and rerank have neither, so cooldown and
-breaker state is the only health signal.
+**Fixed as an opt-in enforcement gate.** Background media qualification records
+embedding/rerank evidence in `ModelCapabilityDB`. When
+`TUSKER_MEDIA_CAPABILITY_GATE_ENABLED=true`, a fresh current-version
+`unsupported` record excludes that provider/model from request routing.
+Missing, stale, old-version, passed, and unavailable evidence remains eligible
+so transient provider outages can recover through normal cooldown and fallback.
 
 ### Incident note (self-inflicted, resolved)
 
@@ -666,5 +664,5 @@ legacy-database column upgrade). Full suite:
 provider fingerprint preserves the handler instances, an endpoint edit rebuilds
 both, and the rebuilt embed handler reads the new provider config.
 
-Not in this pass: Gap C (`/v1/embeddings` requires no scope) and Gap D (no
-capability qualification for media routes).
+Historical note: Gap C and Gap D are implemented. Capability enforcement
+remains disabled unless `TUSKER_MEDIA_CAPABILITY_GATE_ENABLED=true`.

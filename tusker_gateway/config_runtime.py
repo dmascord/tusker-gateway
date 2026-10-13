@@ -496,8 +496,12 @@ class ConfigRuntime:
         image_handler = ImageGenerationHandler(config, capability_registry=reg)
         tts_handler = TTSHandler(config, capability_registry=reg)
         video_handler = VideoHandler(config, capability_registry=reg)
-        rerank_handler = RerankHandler(config)
-        embed_handler = EmbedHandler(config)
+        rerank_handler = RerankHandler(
+            config, capability_db=self._app.get("model_capabilities")
+        )
+        embed_handler = EmbedHandler(
+            config, capability_db=self._app.get("model_capabilities")
+        )
         self._app["image_handler"] = image_handler
         self._app["tts_handler"] = tts_handler
         self._app["video_handler"] = video_handler

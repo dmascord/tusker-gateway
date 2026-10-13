@@ -479,5 +479,10 @@ cleanup; provider-specific 403 classification remains a follow-up.
 - A warning log when a media handler is rebuilt with zero backends would surface
   the same misconfiguration in logs.
 
-Not in this pass: Gap C (`/v1/embeddings` requires no API scope) and Gap D (no
-capability qualification for media routes).
+### Previously open gaps — subsequently fixed
+
+- `/v1/embeddings` now requires `inference:embeddings`, matching the scope table.
+- Media qualification now has an opt-in request-time gate. With
+  `TUSKER_MEDIA_CAPABILITY_GATE_ENABLED=true`, fresh current-version
+  `unsupported` evidence excludes that backend; transient or stale evidence
+  remains eligible for recovery.

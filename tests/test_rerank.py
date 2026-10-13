@@ -6,9 +6,16 @@ from typing import Any
 
 import pytest
 
+import time
+
+from tusker_gateway.media_qualification import (
+    MEDIA_CAPABILITY_PROBE_VERSION,
+    RERANK_CAPABILITY,
+)
+from tusker_gateway.model_capability import ModelCapabilityDB
 from tusker_gateway.config import DEFAULT_PROVIDER_REGISTRY
 from tusker_gateway.cooldown import global_tracker
-from tusker_gateway.errors import BadRequestError, ProviderError
+from tusker_gateway.errors import BadRequestError, NoHealthyModelsError, ProviderError
 from tusker_gateway.providers.rerank import RerankBackend, RerankHandler
 
 
@@ -162,6 +169,67 @@ async def test_provider_fallback_cools_failed_backend(tmp_path, monkeypatch):
         "https://api.cohere.com/v2/rerank",
         "https://api.voyageai.com/v1/rerank",
     ]
+
+@pytest.mark.asyncio
+async def test_fresh_unsupported_rerank_backend_is_skipped(tmp_path, monkeypatch):
+    monkeypatch.setenv("TUSKER_RERANKER_PROVIDERS", "cohere,voyage")
+    monkeypatch.setenv("TUSKER_MEDIA_CAPABILITY_GATE_ENABLED", "true")
+    config = _config(tmp_path, ("cohere", "voyage"))
+    db = ModelCapabilityDB(str(tmp_path / "model-capability.db"))
+    db.record(
+        provider="cohere",
+        model="rerank-v3.5",
+        capability=RERANK_CAPABILITY,
+        status="unsupported",
+        source="media_probe",
+        probe_version=MEDIA_CAPABILITY_PROBE_VERSION,
+        checked_at=time.time(),
+    )
+    session = _FakeSession(
+        [_FakeResponse({"results": [{"index": 0, "relevance_score": 0.5}]})]
+    )
+    handler = RerankHandler(config, capability_db=db)
+
+    provider, model, result = await handler.rerank(
+        {"query": "query", "documents": ["document"]},
+        session=session,
+    )
+
+    assert (provider, model) == ("voyage", "rerank-2")
+    assert result["results"][0]["relevance_score"] == 0.5
+    assert [call["url"] for call in session.calls] == [
+        "https://api.voyageai.com/v1/rerank",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_all_fresh_unsupported_rerank_backends_raise_no_healthy_models(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("TUSKER_RERANKER_PROVIDERS", "cohere,voyage")
+    monkeypatch.setenv("TUSKER_MEDIA_CAPABILITY_GATE_ENABLED", "true")
+    config = _config(tmp_path, ("cohere", "voyage"))
+    db = ModelCapabilityDB(str(tmp_path / "model-capability.db"))
+    for provider, model in (("cohere", "rerank-v3.5"), ("voyage", "rerank-2")):
+        db.record(
+            provider=provider,
+            model=model,
+            capability=RERANK_CAPABILITY,
+            status="unsupported",
+            source="media_probe",
+            probe_version=MEDIA_CAPABILITY_PROBE_VERSION,
+            checked_at=time.time(),
+        )
+    session = _FakeSession([])
+    handler = RerankHandler(config, capability_db=db)
+
+    with pytest.raises(NoHealthyModelsError) as excinfo:
+        await handler.rerank(
+            {"query": "query", "documents": ["document"]}, session=session
+        )
+
+    assert excinfo.value.code == "no_healthy_models"
+    assert session.calls == []
 
 
 @pytest.mark.asyncio
