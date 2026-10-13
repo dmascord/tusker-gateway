@@ -46,3 +46,17 @@ def test_opencode_and_kilo_routes_are_code_only_and_explicitly_enabled():
         env["TUSKER_PROVIDER_ATTEMPT_TIMEOUT_OVERRIDES_JSON"]["value"]
     )
     assert attempt_timeouts["kilo-cli"] == 120
+
+
+def test_code_pool_opts_into_opencode_cli_auto_catalog():
+    """New free CLI models must enter the code pool without yaml edits;
+    the CLI route stays out of ZDR/paid pools."""
+    env = _deployment_env()
+    code = json.loads(env["TUSKER_POOL_CODE"]["value"])
+    privacy = json.loads(env["TUSKER_POOL_PRIVACY"]["value"])
+    premium = json.loads(env["TUSKER_POOL_PREMIUM"]["value"])
+
+    assert code["auto_catalog"] is True
+    assert "opencode-cli" in code["auto_catalog_providers"]
+    assert "opencode-cli" not in privacy["auto_catalog_providers"]
+    assert "opencode-cli" not in premium["auto_catalog_providers"]

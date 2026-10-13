@@ -11,6 +11,7 @@ Architecture:
         ├── CopilotCatalog    (api.githubcopilot.com/models)
         ├── OpenRouterCatalog (openrouter.ai/api/v1/models)
         ├── ProviderModelsCatalog (provider-native OpenAI-compatible /models)
+        ├── OpenCodeCLICatalog (opencode models subprocess, CLI free set)
         ├── XiaomiCatalog     (token-plan-sgp.xiaomimimo.com/v1/models)
         └── ModelsDevCatalog  (models.dev/api.json, pricing DB)
 
@@ -39,6 +40,7 @@ import asyncio
 import logging
 import os
 import re
+import shutil
 import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Iterable
@@ -74,6 +76,7 @@ DEFAULT_TTLS: dict[str, float] = {
     "openrouter": 3600.0,          # OpenRouter: 60 min
     "opencode-zen": 3600.0,       # OpenCode: 60 min (key-filtered)
     "opencode-go": 3600.0,
+    "opencode-cli": 3600.0,      # CLI free set: 60 min
     "models.dev": 3600.0,          # models.dev: 60 min
     "xiaomi": 3600.0,             # Xiaomi Token Plan: 60 min
 }
@@ -844,6 +847,88 @@ class OpenCodeGoCatalog(OpenCodeCatalog):
 
 
 # ---------------------------------------------------------------------------
+# OpenCode CLI (free models served through the local CLI adapter)
+# ---------------------------------------------------------------------------
+
+
+class OpenCodeCLICatalog(CatalogClient):
+    """Free OpenCode models routable through the local ``opencode`` CLI.
+
+    The gateway's HTTP zen route is gated by OpenCode's free tier
+    (403 FreeTierError), but the pinned CLI passes that gate with the
+    same key. ``opencode models`` lists exactly what the CLI can
+    route: its ``opencode/`` namespace is the free Zen set, while
+    paid Go-subscription models live in the separate ``opencode-go/``
+    namespace the gateway already serves over HTTP. The CLI list is
+    therefore the authoritative eligibility source for this route --
+    the key-filtered HTTP catalog omits CLI-only free models, so it
+    cannot act as an intersection filter.
+
+    The adapter is text-only, so entries advertise text modalities
+    explicitly. Any failure raises so the base class keeps the
+    last-good snapshot; an empty list is treated as a glitch, not as
+    every free model being retired at once.
+    """
+
+    provider = "opencode-cli"
+    ttl_secs = DEFAULT_TTLS["opencode-cli"]
+
+    NAMESPACE = "opencode/"
+    timeout_secs = 30.0
+
+    async def fetch(self, session: aiohttp.ClientSession) -> list[CatalogEntry]:
+        del session  # subprocess-backed catalog; no HTTP involved
+        executable = shutil.which(
+            os.environ.get("TUSKER_OPENCODE_CLI_PATH") or "opencode"
+        )
+        if not executable:
+            raise CatalogError("opencode CLI is not installed in this runtime")
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                executable,
+                "models",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+        except OSError as exc:
+            raise CatalogError(f"could not run '{executable} models': {exc}") from exc
+        try:
+            stdout, _ = await asyncio.wait_for(
+                proc.communicate(), timeout=self.timeout_secs
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            raise CatalogError(
+                f"'{executable} models' timed out after {self.timeout_secs:.0f}s"
+            ) from None
+        if proc.returncode != 0:
+            raise CatalogError(
+                f"'{executable} models' exited with code {proc.returncode}"
+            )
+        entries: list[CatalogEntry] = []
+        for line in stdout.decode("utf-8", errors="replace").splitlines():
+            name = line.strip()
+            if not name.startswith(self.NAMESPACE):
+                continue
+            model = name[len(self.NAMESPACE) :].strip()
+            if not model:
+                continue
+            entries.append(
+                CatalogEntry(
+                    provider=self.provider,
+                    model=model,
+                    raw={"source": "opencode models"},
+                    input_modalities=frozenset({"text"}),
+                    output_modalities=frozenset({"text"}),
+                )
+            )
+        if not entries:
+            raise CatalogError("'opencode models' listed no opencode/ models")
+        return entries
+
+
+# ---------------------------------------------------------------------------
 # Xiaomi MiMo Token Plan
 # ---------------------------------------------------------------------------
 
@@ -1342,6 +1427,12 @@ class CatalogRegistry:
             reg.register("opencode-zen", OpenCodeCatalog())
         if "opencode-go" in provider_registry:
             reg.register("opencode-go", OpenCodeGoCatalog())
+        if (
+            "opencode-cli" in provider_registry
+            and os.environ.get("TUSKER_OPENCODE_CLI_ENABLED", "").strip().lower()
+            in {"1", "on", "yes", "true"}
+        ):
+            reg.register("opencode-cli", OpenCodeCLICatalog())
         if "xiaomi" in provider_registry:
             reg.register("xiaomi", XiaomiCatalog())
         if "workers-ai" in provider_registry:
@@ -1354,6 +1445,7 @@ class CatalogRegistry:
             "openrouter",
             "opencode-zen",
             "opencode-go",
+            "opencode-cli",
             "xiaomi",
             "workers-ai",
             "models.dev",

@@ -23,6 +23,7 @@ from tusker_gateway.catalog import (
     CopilotCatalog,
     ModelsDevCatalog,
     OpenCodeCatalog,
+    OpenCodeCLICatalog,
     OpenCodeGoCatalog,
     OpenRouterCatalog,
     ProviderModelsCatalog,
@@ -576,6 +577,133 @@ async def test_opencode_go_catalog_parses_models():
 
 
 # ---------------------------------------------------------------------------
+# OpenCodeCLICatalog.fetch (fake subprocess)
+# ---------------------------------------------------------------------------
+
+
+class _FakeCLIProc:
+    def __init__(self, stdout: bytes, returncode: int = 0):
+        self._stdout = stdout
+        self.returncode = returncode
+        self.killed = False
+
+    async def communicate(self):
+        return self._stdout, b""
+
+    def kill(self):
+        self.killed = True
+
+    async def wait(self):
+        return self.returncode
+
+
+class _HangingCLIProc(_FakeCLIProc):
+    async def communicate(self):
+        await asyncio.sleep(30)
+        return b"", b""
+
+
+def _patch_cli(monkeypatch, *, which="/usr/bin/opencode", stdout=b"", returncode=0):
+    calls = []
+
+    async def _exec(*args, **kwargs):
+        calls.append(args)
+        return _FakeCLIProc(stdout, returncode)
+
+    monkeypatch.setattr("tusker_gateway.catalog.shutil.which", lambda name: which)
+    monkeypatch.setattr(
+        "tusker_gateway.catalog.asyncio.create_subprocess_exec", _exec
+    )
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_opencode_cli_catalog_parses_free_namespace(monkeypatch):
+    stdout = (
+        b"opencode-go/kimi-k3\n"
+        b"opencode-go/claude-haiku-5-5\n"
+        b"opencode/big-pickle\n"
+        b"opencode/cat-jam-free\n"
+        b"opencode/exo-free\n"
+    )
+    calls = _patch_cli(monkeypatch, stdout=stdout)
+    entries = await OpenCodeCLICatalog().fetch(None)
+    assert calls == [("/usr/bin/opencode", "models")]
+    assert [e.model for e in entries] == ["big-pickle", "cat-jam-free", "exo-free"]
+    assert all(e.provider == "opencode-cli" for e in entries)
+    # The CLI adapter is text-only; entries must not advertise images.
+    assert all(e.input_modalities == frozenset({"text"}) for e in entries)
+    assert all(e.output_modalities == frozenset({"text"}) for e in entries)
+
+
+@pytest.mark.asyncio
+async def test_opencode_cli_catalog_requires_installed_binary(monkeypatch):
+    _patch_cli(monkeypatch, which=None)
+    with pytest.raises(CatalogError, match="not installed"):
+        await OpenCodeCLICatalog().fetch(None)
+
+
+@pytest.mark.asyncio
+async def test_opencode_cli_catalog_nonzero_exit_raises(monkeypatch):
+    _patch_cli(monkeypatch, stdout=b"boom\n", returncode=1)
+    with pytest.raises(CatalogError, match="exited with code 1"):
+        await OpenCodeCLICatalog().fetch(None)
+
+
+@pytest.mark.asyncio
+async def test_opencode_cli_catalog_empty_free_list_is_error(monkeypatch):
+    """No opencode/ entries is treated as a glitch, not a retirement."""
+    _patch_cli(monkeypatch, stdout=b"opencode-go/kimi-k3\n")
+    with pytest.raises(CatalogError, match="no opencode/ models"):
+        await OpenCodeCLICatalog().fetch(None)
+
+
+@pytest.mark.asyncio
+async def test_opencode_cli_catalog_timeout_kills_process(monkeypatch):
+    procs: list[_HangingCLIProc] = []
+
+    async def _exec(*args, **kwargs):
+        proc = _HangingCLIProc(b"")
+        procs.append(proc)
+        return proc
+
+    monkeypatch.setattr(
+        "tusker_gateway.catalog.shutil.which", lambda name: "/usr/bin/opencode"
+    )
+    monkeypatch.setattr(
+        "tusker_gateway.catalog.asyncio.create_subprocess_exec", _exec
+    )
+    client = OpenCodeCLICatalog()
+    client.timeout_secs = 0.05
+    with pytest.raises(CatalogError, match="timed out"):
+        await client.fetch(None)
+    assert procs and procs[0].killed
+
+
+@pytest.mark.asyncio
+async def test_opencode_cli_refresh_failure_keeps_last_good(monkeypatch):
+    state = {"stdout": b"opencode/cat-jam-free\n", "returncode": 0}
+
+    async def _exec(*args, **kwargs):
+        return _FakeCLIProc(state["stdout"], state["returncode"])
+
+    monkeypatch.setattr(
+        "tusker_gateway.catalog.shutil.which", lambda name: "/usr/bin/opencode"
+    )
+    monkeypatch.setattr(
+        "tusker_gateway.catalog.asyncio.create_subprocess_exec", _exec
+    )
+    client = OpenCodeCLICatalog()
+    await client.refresh(None)
+    assert [e.model for e in client._entries] == ["cat-jam-free"]
+
+    state["returncode"] = 1
+    await client.refresh(None)
+    assert [e.model for e in client._entries] == ["cat-jam-free"]
+    assert client._last_error is not None
+
+
+# ---------------------------------------------------------------------------
 # XiaomiCatalog.fetch
 
 
@@ -910,6 +1038,66 @@ def test_registry_default_includes_all_providers():
         "openrouter", "opencode-zen", "opencode-go", "xiaomi", "models.dev",
     ):
         assert reg.get_client(prov) is not None
+
+
+def test_registry_registers_opencode_cli_only_when_enabled(monkeypatch):
+    monkeypatch.setenv("TUSKER_OPENCODE_CLI_ENABLED", "true")
+    registry = CatalogRegistry.default({"opencode-cli": {}})
+    assert isinstance(registry.get_client("opencode-cli"), OpenCodeCLICatalog)
+
+    monkeypatch.setenv("TUSKER_OPENCODE_CLI_ENABLED", "false")
+    registry = CatalogRegistry.default({"opencode-cli": {}})
+    assert registry.get_client("opencode-cli") is None
+
+
+def test_poolmanager_auto_catalog_adds_opted_in_opencode_cli_models():
+    """The CLI catalog opts into the code pool without price filtering;
+    static entries dedupe against auto entries."""
+    from tusker_gateway.config import PoolConfig
+    from tusker_gateway.pools import PoolManager
+
+    cfg = {
+        "pools": {
+            "code": PoolConfig(
+                name="code",
+                models=[{"provider": "opencode-cli", "model": "big-pickle"}],
+                auto_catalog=True,
+                auto_catalog_providers=["opencode-cli"],
+            ),
+        },
+        "excluded_providers": [],
+        "provider_api_keys": {},
+        "quality_db_path": "/tmp/_unused.db",
+    }
+    pm = PoolManager(cfg)
+    registry = CatalogRegistry()
+    client = OpenCodeCLICatalog()
+    client._entries = [
+        CatalogEntry(
+            provider="opencode-cli",
+            model="big-pickle",
+            input_modalities=frozenset({"text"}),
+            output_modalities=frozenset({"text"}),
+        ),
+        CatalogEntry(
+            provider="opencode-cli",
+            model="exo-free",
+            input_modalities=frozenset({"text"}),
+            output_modalities=frozenset({"text"}),
+        ),
+    ]
+    registry.register("opencode-cli", client)
+    pm.catalog_registry = registry
+
+    pm.extend_pools_with_auto_catalog()
+
+    pairs = {(m["provider"], m["model"]) for m in pm.pools["code"].models}
+    assert ("opencode-cli", "big-pickle") in pairs  # static kept
+    assert ("opencode-cli", "exo-free") in pairs  # auto-added
+    # Static pairs are not duplicated into the auto set.
+    assert pm.auto_added["code"] == {("opencode-cli", "exo-free")}
+    runtime = {(s.provider, s.model) for s in pm.models["code"]}
+    assert ("opencode-cli", "exo-free") in runtime
 
 
 def test_registry_known_models_returns_set_for_provider():
