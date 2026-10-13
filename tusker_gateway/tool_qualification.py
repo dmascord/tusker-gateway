@@ -141,12 +141,82 @@ def _catalog_registry(
     return registry
 
 
+# Inline SSE error frames the chat-completions stream writes onto an
+# already-started HTTP 200 response (a disabled provider route, an open
+# circuit, or a mid-stream provider failure). None of these describe the
+# model's tool-calling behavior, so a probe that sees one and captures no
+# tool call must record transient availability, not a permanent capability
+# failure that would exclude the model from the tool pool indefinitely.
+_TRANSIENT_STREAM_ERROR_CODES = {
+    "circuit_open": "circuit_open",
+    "provider_route_disabled": "route_disabled",
+    "provider_error": "provider_error",
+    "upstream_error": "upstream_error",
+    "service_unavailable": "service_unavailable",
+    "rate_limit_error": "rate_limited",
+    "rate_limit_exceeded": "rate_limited",
+    "state_store_unavailable": "state_store_unavailable",
+    "guardrail_blocked": "guardrail_blocked",
+    "budget_exceeded": "budget_exceeded",
+}
+
+
+def _inline_error_code(event: dict[str, Any]) -> str | None:
+    """Return the gateway error code carried by an inline SSE error frame.
+
+    The chat stream wraps ``openai_error`` as ``{"error": {"error": {...}}}``;
+    the single-nested ``{"error": {...}}`` shape is accepted too so a future
+    change to the frame builder cannot silently re-introduce the mislabel.
+    """
+    outer = event.get("error")
+    if not isinstance(outer, dict):
+        return None
+    inner = outer.get("error")
+    candidate = inner if isinstance(inner, dict) else outer
+    code = candidate.get("code")
+    if isinstance(code, str) and code:
+        return code
+    return None
+
+
+def _stream_error_result(
+    *,
+    provider: str,
+    model: str,
+    codes: list[str],
+    latency_ms: float,
+) -> dict[str, Any]:
+    """Build a transient-availability record for an inline stream error."""
+    code = codes[-1] if codes else ""
+    return {
+        "provider": provider,
+        "model": model,
+        "level": ToolCapabilityLevel.UNAVAILABLE,
+        "status": "unavailable",
+        "http_status": 200,
+        "tool_call_count": 0,
+        "structured_stream": False,
+        "arguments_valid": False,
+        "arguments_match": False,
+        "finish_reason": None,
+        "unexpected_text": False,
+        "latency_ms": round(latency_ms, 1),
+        "failure_class": _TRANSIENT_STREAM_ERROR_CODES.get(code, "stream_error"),
+    }
+
+
 def _parse_sse_line(
     line: str,
     calls: dict[int, dict[str, str]],
     text_parts: list[str],
+    errors: list[str] | None = None,
 ) -> str | None:
-    """Consume one SSE data line and return its terminal finish reason."""
+    """Consume one SSE data line and return its terminal finish reason.
+
+    When ``errors`` is supplied, the code from an inline gateway error frame is
+    appended to it; such a frame carries no completion data, so parsing stops
+    there.
+    """
     if not line.startswith("data:"):
         return None
     data = line[5:].lstrip()
@@ -158,6 +228,12 @@ def _parse_sse_line(
         return None
     if not isinstance(event, dict):
         return None
+
+    if errors is not None:
+        code = _inline_error_code(event)
+        if code is not None:
+            errors.append(code)
+            return None
 
     finish_reason: str | None = None
     for choice in event.get("choices") or []:
@@ -376,6 +452,7 @@ async def probe_image_tool_model(
     calls: dict[int, dict[str, str]] = {}
     text_parts: list[str] = []
     finish_reason: str | None = None
+    stream_errors: list[str] = []
     url = f"{base_url.rstrip('/')}/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -396,7 +473,10 @@ async def probe_image_tool_model(
                 return _finish_composite_result(result, started)
             async for raw_line in response.content:
                 reason = _parse_sse_line(
-                    raw_line.decode("utf-8", "replace").strip(), calls, text_parts
+                    raw_line.decode("utf-8", "replace").strip(),
+                    calls,
+                    text_parts,
+                    stream_errors,
                 )
                 if reason is not None:
                     finish_reason = reason
@@ -407,6 +487,15 @@ async def probe_image_tool_model(
         result["failure_class"] = type(exc).__name__
         return _finish_composite_result(result, started)
 
+    if not calls and stream_errors:
+        result["status"] = "unavailable"
+        result["failure_class"] = _stream_error_result(
+            provider=provider,
+            model=model,
+            codes=stream_errors,
+            latency_ms=(time.monotonic() - started) * 1000,
+        )["failure_class"]
+        return _finish_composite_result(result, started)
     parsed = _result_from_stream(
         provider=provider,
         model=model,
@@ -468,6 +557,7 @@ async def probe_model(
     calls: dict[int, dict[str, str]] = {}
     text_parts: list[str] = []
     finish_reason: str | None = None
+    stream_errors: list[str] = []
     url = f"{base_url.rstrip('/')}/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -508,6 +598,7 @@ async def probe_model(
                     raw_line.decode("utf-8", "replace").strip(),
                     calls,
                     text_parts,
+                    stream_errors,
                 )
                 if reason is not None:
                     finish_reason = reason
@@ -544,6 +635,18 @@ async def probe_model(
             "latency_ms": round((time.monotonic() - started) * 1000, 1),
             "failure_class": type(exc).__name__,
         }
+
+    # An inline gateway error frame (disabled route, open circuit, mid-stream
+    # provider failure) with no tool call is an availability condition, not a
+    # capability verdict. Recording it as a permanent ``no_tool_call`` failure
+    # would exclude the model from the tool pool even after the route recovers.
+    if not calls and stream_errors:
+        return _stream_error_result(
+            provider=provider,
+            model=model,
+            codes=stream_errors,
+            latency_ms=(time.monotonic() - started) * 1000,
+        )
 
     return _result_from_stream(
         provider=provider,

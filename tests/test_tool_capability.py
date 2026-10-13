@@ -164,6 +164,101 @@ async def test_composite_probe_classifies_malformed_tool_result_as_unsupported()
     assert result["failure_class"] == "non_strict_tool_contract"
 
 
+def _stream_error_frame(code: str) -> bytes:
+    return _sse({"error": {"error": {
+        "type": "invalid_request_error",
+        "message": f"gateway {code}",
+        "code": code,
+    }}})
+
+
+@pytest.mark.asyncio
+async def test_probe_model_treats_disabled_route_as_transient():
+    # github-copilot is disabled: the gateway answers HTTP 200 with an inline
+    # provider_route_disabled frame and no tool call. That is an availability
+    # state, not a capability verdict, so it must not become a permanent
+    # no_tool_call failure.
+    response = _CompositeResponse([
+        _stream_error_frame("provider_route_disabled"),
+        b"data: [DONE]\n\n",
+    ])
+    result = await probe_model(
+        _CompositeSession(response),
+        base_url="http://gateway.test", api_key="key",
+        provider="github-copilot", model="gpt-4o",
+    )
+    assert result["status"] == "unavailable"
+    assert result["level"] == ToolCapabilityLevel.UNAVAILABLE
+    assert result["failure_class"] == "route_disabled"
+    assert result["tool_call_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_probe_model_treats_circuit_open_as_transient():
+    response = _CompositeResponse([
+        _stream_error_frame("circuit_open"),
+        b"data: [DONE]\n\n",
+    ])
+    result = await probe_model(
+        _CompositeSession(response),
+        base_url="http://gateway.test", api_key="key",
+        provider="github-copilot-enterprise", model="gpt-5.6-luna",
+    )
+    assert result["status"] == "unavailable"
+    assert result["level"] == ToolCapabilityLevel.UNAVAILABLE
+    assert result["failure_class"] == "circuit_open"
+
+
+@pytest.mark.asyncio
+async def test_probe_model_keeps_genuine_no_tool_call_as_permanent():
+    # A real completion that simply declines to call the tool (finish_reason
+    # stop, no error frame) is a behavioral failure and stays permanent.
+    response = _CompositeResponse([
+        _sse({"choices": [{"delta": {"content": "I cannot."}, "finish_reason": "stop"}]}),
+        b"data: [DONE]\n\n",
+    ])
+    result = await probe_model(
+        _CompositeSession(response),
+        base_url="http://gateway.test", api_key="key",
+        provider="openrouter", model="prose-only",
+    )
+    assert result["status"] == "failed"
+    assert result["level"] == ToolCapabilityLevel.UNSUPPORTED
+    assert result["failure_class"] == "no_tool_call"
+
+
+@pytest.mark.asyncio
+async def test_composite_probe_treats_circuit_open_as_transient():
+    response = _CompositeResponse([
+        _stream_error_frame("circuit_open"),
+        b"data: [DONE]\n\n",
+    ])
+    result = await probe_image_tool_model(
+        _CompositeSession(response), base_url="http://gateway.test", api_key="key",
+        provider="github-copilot-enterprise", model="gpt-5.6-luna",
+    )
+    assert result["status"] == "unavailable"
+    assert result["failure_class"] == "circuit_open"
+
+
+@pytest.mark.asyncio
+async def test_probe_model_prefers_tool_call_over_trailing_error():
+    # A valid tool call followed by an error frame is still a passing probe:
+    # the transient downgrade only applies when no tool call was captured.
+    response = _CompositeResponse([
+        _sse({"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"name": PROBE_TOOL_NAME, "arguments": '{"path":"/tmp/tusker-tool-capability-probe"}'}}]}, "finish_reason": "tool_calls"}]}),
+        _stream_error_frame("provider_error"),
+        b"data: [DONE]\n\n",
+    ])
+    result = await probe_model(
+        _CompositeSession(response),
+        base_url="http://gateway.test", api_key="key",
+        provider="openrouter", model="good",
+    )
+    assert result["status"] == "passed"
+    assert result["failure_class"] is None
+
+
 def test_opencode_probe_sends_isolated_session_header():
     session = _ProbeSession()
 
