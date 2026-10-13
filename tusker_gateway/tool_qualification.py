@@ -142,11 +142,14 @@ def _catalog_registry(
 
 
 # Inline SSE error frames the chat-completions stream writes onto an
-# already-started HTTP 200 response (a disabled provider route, an open
-# circuit, or a mid-stream provider failure). None of these describe the
-# model's tool-calling behavior, so a probe that sees one and captures no
-# tool call must record transient availability, not a permanent capability
-# failure that would exclude the model from the tool pool indefinitely.
+# already-started HTTP 200 response, and the probe-only ``x_tusker_stream_error``
+# marker on a post-commit synthesized error chunk: a disabled or blacklisted
+# route, an open circuit, a mid-stream provider failure, an approval stop, an
+# empty stream, or a stream rejected by tool-call validation. None of these
+# describe the model's tool-calling behavior, so a probe that sees one and
+# captures no tool call must record transient availability, not a permanent
+# capability failure that would exclude the model from the tool pool
+# indefinitely.
 _TRANSIENT_STREAM_ERROR_CODES = {
     "circuit_open": "circuit_open",
     "provider_route_disabled": "route_disabled",
@@ -158,6 +161,10 @@ _TRANSIENT_STREAM_ERROR_CODES = {
     "state_store_unavailable": "state_store_unavailable",
     "guardrail_blocked": "guardrail_blocked",
     "budget_exceeded": "budget_exceeded",
+    "model_blacklisted": "route_blacklisted",
+    "provider_empty_stream": "provider_empty_stream",
+    "stream_validation_error": "stream_validation_error",
+    "approval_required": "approval_required",
 }
 
 

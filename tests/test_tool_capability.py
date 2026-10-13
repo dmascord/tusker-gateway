@@ -210,6 +210,31 @@ async def test_probe_model_treats_circuit_open_as_transient():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("code", "failure_class"),
+    [
+        ("model_blacklisted", "route_blacklisted"),
+        ("provider_empty_stream", "provider_empty_stream"),
+        ("stream_validation_error", "stream_validation_error"),
+        ("approval_required", "approval_required"),
+    ],
+)
+async def test_probe_model_maps_remaining_gateway_error_codes(code, failure_class):
+    response = _CompositeResponse([
+        _stream_error_frame(code),
+        b"data: [DONE]\n\n",
+    ])
+    result = await probe_model(
+        _CompositeSession(response),
+        base_url="http://gateway.test", api_key="key",
+        provider="ollama-cloud", model="kimi-k3",
+    )
+    assert result["status"] == "unavailable"
+    assert result["level"] == ToolCapabilityLevel.UNAVAILABLE
+    assert result["failure_class"] == failure_class
+
+
+@pytest.mark.asyncio
 async def test_probe_model_keeps_genuine_no_tool_call_as_permanent():
     # A real completion that simply declines to call the tool (finish_reason
     # stop, no error frame) is a behavioral failure and stays permanent.
