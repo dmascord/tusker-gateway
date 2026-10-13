@@ -141,9 +141,14 @@ _MODEL_REJECTION_RE = re.compile(
 )
 
 
-def _cli_failure_error(stderr: bytes) -> ProviderError:
-    """Map a non-zero CLI exit to a generic or model-retired provider error."""
-    if _MODEL_REJECTION_RE.search(stderr.decode("utf-8", errors="replace")):
+def _cli_failure_error(diagnostics: bytes) -> ProviderError:
+    """Map a non-zero CLI exit to a generic or model-retired provider error.
+
+    ``diagnostics`` combines stderr with the raw stdout tail: in
+    ``--format json`` mode the CLI reports model-level rejections as a
+    stdout error event and leaves stderr empty.
+    """
+    if _MODEL_REJECTION_RE.search(diagnostics.decode("utf-8", errors="replace")):
         return ProviderModelRetiredError(
             "OpenCode CLI rejected the model as deprecated or unavailable"
         )
@@ -297,6 +302,7 @@ async def _warm_events(
             stderr_task = asyncio.create_task(proc.stderr.read())
             deadline = asyncio.get_running_loop().time() + timeout
             chunks: list[str] = []
+            raw_tail: list[bytes] = []
             while True:
                 remaining = deadline - asyncio.get_running_loop().time()
                 if remaining <= 0:
@@ -326,6 +332,8 @@ async def _warm_events(
                     continue
                 if not raw_line:
                     break
+                if len(raw_tail) < 64:
+                    raw_tail.append(raw_line)
                 try:
                     event = json.loads(raw_line)
                 except (json.JSONDecodeError, UnicodeDecodeError):
@@ -353,7 +361,7 @@ async def _warm_events(
                     proc.returncode, len(stderr),
                     stderr.decode("utf-8", errors="replace")[:512],
                 )
-                raise _cli_failure_error(stderr)
+                raise _cli_failure_error(stderr + b"\n" + b"\n".join(raw_tail))
             text = "".join(chunks)
             if not text:
                 raise ProviderError(
@@ -592,7 +600,7 @@ class OpenCodeCLIAdapter:
                 "opencode-cli exited rc=%s stderr_bytes=%d stderr=%r",
                 proc.returncode, len(stderr), stderr_preview,
             )
-            raise _cli_failure_error(stderr)
+            raise _cli_failure_error(stderr + b"\n" + stdout[:8192])
         text = self._extract_text(stdout)
         if text is None:
             raise ProviderError("OpenCode CLI returned no assistant response", code="invalid_upstream_response")

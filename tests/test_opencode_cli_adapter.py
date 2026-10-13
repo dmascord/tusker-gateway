@@ -231,15 +231,18 @@ async def test_deprecated_model_exit_marks_route_retired(monkeypatch):
     permanent-failure marker prunes the route; other exits stay generic."""
     monkeypatch.setenv("TUSKER_OPENCODE_CLI_ENABLED", "true")
     cases = [
-        (b"Error: Model exo-free has been deprecated.\n", True),
-        (b"Error: Upstream request failed: Model is unavailable.\n", True),
-        (b"Error: Invalid model reference: exo-free\n", True),
-        (b"opencode: transient network failure\n", False),
+        # Legacy text-mode rejections land on stderr.
+        (b"", b"Error: Model exo-free has been deprecated.\n", True),
+        (b"", b"Error: Upstream request failed: Model is unavailable.\n", True),
+        # --format json reports model-level rejections as a stdout event.
+        (b'{"type":"error","error":{"type":"unknown",'
+         b'"message":"Invalid model reference: exo-free"}}\n', b"", True),
+        (b"opencode: transient network failure\n", b"", False),
     ]
-    for stderr, retired in cases:
+    for stdout, stderr, retired in cases:
         with patch("tusker_gateway.provider_adapters.opencode_cli.shutil.which", return_value="opencode"), \
              patch("tusker_gateway.provider_adapters.opencode_cli.asyncio.create_subprocess_exec",
-                   new=AsyncMock(return_value=_FakeProcess(b"", stderr=stderr, returncode=1))):
+                   new=AsyncMock(return_value=_FakeProcess(stdout, stderr=stderr, returncode=1))):
             with pytest.raises(ProviderError) as exc:
                 await OpenCodeCLIAdapter().chat(
                     provider="opencode-cli", model="exo-free", messages=[]

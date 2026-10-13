@@ -90,6 +90,7 @@ def mark_permanently_failed(provider: str, model: str, *, seconds: float | None 
     PERMANENTLY_FAILED_MODELS[(provider, model)] = (
         time.monotonic() + min(seconds, MAX_COOLDOWN_SECS) if seconds is not None else None
     )
+    logger.info("permanently failed marked %s/%s", provider, model)
 
 
 def clear_permanently_failed(provider: str, model: str) -> None:
