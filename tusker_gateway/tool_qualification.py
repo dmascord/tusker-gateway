@@ -349,7 +349,10 @@ async def probe_image_tool_model(
         "messages": [
             {
                 "role": "system",
-                "content": "You are being tested for strict tool-call compliance. Do not emit prose.",
+                "content": (
+                    "Call tusker_capability_probe exactly once with path "
+                    f"{PROBE_PATH}. Do not emit prose or call any other function."
+                ),
             },
             {"role": "user", "content": _messages_for_modality("image")[0]["content"]},
         ],
