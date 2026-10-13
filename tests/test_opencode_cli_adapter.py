@@ -225,6 +225,32 @@ async def test_nonzero_exit_logs_bounded_stderr_preview(monkeypatch):
     assert len(preview) == 512
 
 
+@pytest.mark.asyncio
+async def test_deprecated_model_exit_marks_route_retired(monkeypatch):
+    """Deterministic CLI model rejections carry upstream 410 so the
+    permanent-failure marker prunes the route; other exits stay generic."""
+    monkeypatch.setenv("TUSKER_OPENCODE_CLI_ENABLED", "true")
+    cases = [
+        (b"Error: Model exo-free has been deprecated.\n", True),
+        (b"Error: Upstream request failed: Model is unavailable.\n", True),
+        (b"opencode: transient network failure\n", False),
+    ]
+    for stderr, retired in cases:
+        with patch("tusker_gateway.provider_adapters.opencode_cli.shutil.which", return_value="opencode"), \
+             patch("tusker_gateway.provider_adapters.opencode_cli.asyncio.create_subprocess_exec",
+                   new=AsyncMock(return_value=_FakeProcess(b"", stderr=stderr, returncode=1))):
+            with pytest.raises(ProviderError) as exc:
+                await OpenCodeCLIAdapter().chat(
+                    provider="opencode-cli", model="exo-free", messages=[]
+                )
+        assert exc.value.status == 502  # client-visible status unchanged
+        if retired:
+            assert exc.value.code == "model_retired"
+            assert exc.value.upstream_status == 410
+        else:
+            assert exc.value.code == "opencode_cli_failed"
+            assert getattr(exc.value, "upstream_status", None) is None
+
 
 @pytest.mark.asyncio
 async def test_opencode_rejects_image_content_naming_opencode(monkeypatch):

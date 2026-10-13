@@ -21,7 +21,12 @@ from collections.abc import AsyncGenerator, AsyncIterator
 from pathlib import Path
 from typing import Any
 
-from tusker_gateway.errors import BadRequestError, ProviderError, ProviderRouteDisabledError
+from tusker_gateway.errors import (
+    BadRequestError,
+    ProviderError,
+    ProviderModelRetiredError,
+    ProviderRouteDisabledError,
+)
 from tusker_gateway.provider_adapters.claude_code import (
     _normalise_tools,
     _prompt,
@@ -124,6 +129,25 @@ async def _run_cli_tool(
         await _stop_process(proc)
         return 124, b"", b""
     return proc.returncode if proc.returncode is not None else 0, stdout, stderr
+
+
+# Deterministic model-level rejections: the CLI (or its upstream) says the
+# model itself is gone, identically on every request. Mapping these to a
+# retired-model error lets the gateway's permanent-failure marker prune the
+# route from pool rotation; anything else stays a generic provider failure.
+_MODEL_REJECTION_RE = re.compile(
+    r"has been deprecated|model is unavailable",
+    re.IGNORECASE,
+)
+
+
+def _cli_failure_error(stderr: bytes) -> ProviderError:
+    """Map a non-zero CLI exit to a generic or model-retired provider error."""
+    if _MODEL_REJECTION_RE.search(stderr.decode("utf-8", errors="replace")):
+        return ProviderModelRetiredError(
+            "OpenCode CLI rejected the model as deprecated or unavailable"
+        )
+    return ProviderError("OpenCode CLI request failed", code="opencode_cli_failed")
 
 
 async def _ensure_warm_service(binary: str, env: dict[str, str]) -> str | None:
@@ -329,7 +353,7 @@ async def _warm_events(
                     proc.returncode, len(stderr),
                     stderr.decode("utf-8", errors="replace")[:512],
                 )
-                raise ProviderError("OpenCode CLI request failed", code="opencode_cli_failed")
+                raise _cli_failure_error(stderr)
             text = "".join(chunks)
             if not text:
                 raise ProviderError(
@@ -568,7 +592,7 @@ class OpenCodeCLIAdapter:
                 "opencode-cli exited rc=%s stderr_bytes=%d stderr=%r",
                 proc.returncode, len(stderr), stderr_preview,
             )
-            raise ProviderError("OpenCode CLI request failed", code="opencode_cli_failed")
+            raise _cli_failure_error(stderr)
         text = self._extract_text(stdout)
         if text is None:
             raise ProviderError("OpenCode CLI returned no assistant response", code="invalid_upstream_response")

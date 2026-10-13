@@ -117,6 +117,23 @@ class ProviderError(GatewayError):
     error_type = "provider_error"
 
 
+class ProviderModelRetiredError(ProviderError):
+    """The upstream deterministically rejected the model itself.
+
+    Deprecated or delisted models answer identically on every request
+    (e.g. the OpenCode CLI refusing with "has been deprecated"). Carrying
+    upstream status 410 lets the permanent-failure marker prune the route
+    from pool rotation instead of every caller paying a 502 round trip;
+    the client-visible status stays 502 so pool retry semantics are
+    unchanged.
+    """
+
+    def __init__(self, message: str, *, code: str = "model_retired"):
+        super().__init__(message, code=code)
+        self.upstream_status = 410
+        self.upstream_body = "model retired or deprecated upstream"
+
+
 class ToolPolicyDeniedError(ProviderError):
     """A provider proposed a tool action forbidden by deterministic policy."""
 
