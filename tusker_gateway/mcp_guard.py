@@ -70,6 +70,12 @@ def _decode_state(state: Any) -> dict[str, Any] | None:
     encoded, encoded_sig = state.split(".", 1)
     try:
         supplied = base64.urlsafe_b64decode(encoded_sig + "===")
+        # Reject non-canonical encodings: the final base64 character carries
+        # don't-care bits, so a textually different signature string can
+        # decode to identical bytes. Without this check those variants would
+        # each pass the HMAC and slip past the raw-string one-time-use store.
+        if base64.urlsafe_b64encode(supplied).rstrip(b"=").decode() != encoded_sig:
+            return None
         expected = hmac.new(_approval_key(), encoded.encode(), hashlib.sha256).digest()
         if not hmac.compare_digest(supplied, expected):
             return None

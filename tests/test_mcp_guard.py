@@ -185,6 +185,33 @@ async def test_mcp_tampered_state_is_not_accepted(client):
     assert (await response.json())["result"]["resultType"] == "input_required"
 
 
+def test_noncanonical_signature_variant_is_rejected(monkeypatch):
+    """Flipping the base64 don't-care bits of the signature must not replay.
+
+    The final signature character carries padding bits that decode to
+    identical bytes; without canonical-encoding enforcement each textual
+    variant is a fresh string for the one-time-use state store.
+    """
+    from tusker_gateway.mcp_guard import _decode_state, _encode_state
+
+    monkeypatch.setenv("TUSKER_APPROVAL_HMAC_KEY", "unit-test-key")
+    state = _encode_state(
+        tool_name="send_message",
+        arguments={"body": "x"},
+        action="send",
+        request_id="r1",
+    )
+    encoded, signature = state.split(".", 1)
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+    variant = (
+        f"{encoded}.{signature[:-1]}"
+        f"{alphabet[alphabet.index(signature[-1]) ^ 0b11]}"
+    )
+    assert variant != state
+    assert _decode_state(variant) is None
+    assert _decode_state(state) is not None
+
+
 @pytest.mark.asyncio
 async def test_mcp_malformed_approval_does_not_allow(client):
     first = await _post(
