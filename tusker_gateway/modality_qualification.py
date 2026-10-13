@@ -531,7 +531,7 @@ async def run_qualification(
                     provider=pair[0],
                     model=pair[1],
                     capability=result["capability"],
-                    status=result["status"],
+                    status=("unavailable" if result["status"] == "auth_failed" else result["status"]),
                     source="modality_probe",
                     probe_version=MODEL_CAPABILITY_PROBE_VERSION,
                     http_status=result.get("http_status"),
