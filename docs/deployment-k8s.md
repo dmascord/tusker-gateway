@@ -91,6 +91,30 @@ HEAD, or a recorded tag whose registry digest has moved. Run it after each deplo
 and whenever a pod is restarted out of band; `--allow-unresolved` downgrades
 unverifiable links (registry or `/health` unreachable) to warnings.
 
+### Provider CLI pins and the weekly drift check
+
+The image pins three npm CLIs (`ARG CLAUDE_CODE_CLI_VERSION`,
+`ARG OPENCODE_CLI_VERSION`, `ARG KILO_CLI_VERSION` in the `Dockerfile`).
+The OpenCode free models are served *through* the CLI because the HTTP zen
+route is free-tier-gated, so a stale pin means a stale model catalog:
+newer CLIs list new free models (the `opencode-cli` auto-catalog adopts
+them into the code pool without a manifest change) and drop deprecated
+entries. Models a CLI still lists but refuses to serve are pruned at
+request time by the adapter's 410 retired-model mapping.
+
+`k8s/check_cli_version_drift.py` compares the pins against npm `latest`
+and exits 1 on drift. `k8s/cli-drift-cronjob.yaml` runs it weekly in the
+`hermes` namespace (Mondays ~06:17 UTC); a failed Job is the alert
+(`kubectl -n hermes get jobs -l app=tusker-cli-drift`). The CronJob has no
+repo checkout, so it mounts the checker from a ConfigMap and duplicates
+the pins in env - `tests/test_cli_drift_wiring.py` fails if either copy
+diverges from the `Dockerfile`/script.
+
+Upgrades stay deliberate: bump the `Dockerfile` ARG (and the CronJob env
+mirror), rebuild through `k8s/deploy.sh`, and re-verify the CLI adapters
+(`tests/test_opencode_cli_adapter.py` plus a live tool-qualification
+probe) before trusting a new CLI on the routing path.
+
 ## 3. Smoke test
 
 The gateway is fronted by `ai.tusker.net.au` (same edge as Hermes). The deployment
