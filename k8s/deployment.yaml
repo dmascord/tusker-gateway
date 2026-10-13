@@ -182,11 +182,13 @@ spec:
         # provider_route_disabled instead of returning an upstream 502.
         - name: TUSKER_PASSTHROUGH_DISABLED_PROVIDERS
           value: cerebras
-        # Safety deny-list for upstream models that emit unsafe/high-impact
-        # tool plans. The gateway also has a built-in deny-list entry for
-        # xiaomi/mimo-v2.5; this env var is for operator extensions.
+        # Deny-list for upstream models that emit unsafe/high-impact tool
+        # plans (xiaomi/mimo-v2.5 is greylisted for the tool-guard), plus
+        # operator demotions for chronically slow routes. Multi-day p95s
+        # repeatedly reached the 60s candidate-timeout ceiling with no
+        # repeatable hour-of-day relief (2026-10-14 analysis).
         - name: TUSKER_BLACKLISTED_MODELS
-          value: 'synthetic/*Kimi-K3*,*/kimi-k3*'
+          value: 'synthetic/*Kimi-K3*,*/kimi-k3*,alibaba/qwen3.8-flash,alibaba/deepseek-v4-flash-0731,ollama-cloud/glm-5.3-flash,synthetic/hf:zai-org/glm-5.3-flash,xiaomi/mimo-v2.5-pro'
         - name: TUSKER_GREYLISTED_MODELS
           value: ''
         # Comma-separated provider/model globs allowed to emit direct
@@ -268,7 +270,7 @@ spec:
         - name: TUSKER_POOL_CODE
           value: '{"models":[{"provider":"minimax","model":"MiniMax-M3","input_modalities":["text","image"]},{"provider":"minimax","model":"MiniMax-M2.7","input_modalities":["text"]},{"provider":"minimax","model":"MiniMax-M2.7-highspeed","input_modalities":["text"]},{"provider":"minimax","model":"MiniMax-M2.5","input_modalities":["text"]},{"provider":"minimax","model":"MiniMax-M2.5-highspeed","input_modalities":["text"]},{"provider":"minimax","model":"MiniMax-M2.1","input_modalities":["text"]},{"provider":"minimax","model":"MiniMax-M2.1-highspeed","input_modalities":["text"]},{"provider":"minimax","model":"MiniMax-M2","input_modalities":["text"]},{"provider":"synthetic","model":"syn:large:text","input_modalities":["text"]},{"provider":"synthetic","model":"syn:small:text","input_modalities":["text"]},{"provider":"synthetic","model":"syn:small:vision","input_modalities":["text","image"]},{"provider":"groq","model":"openai/gpt-oss-20b","input_modalities":["text"]},{"provider":"groq","model":"qwen/qwen3.6-27b","input_modalities":["text"]},{"provider":"zai","model":"glm-4.7"},{"provider":"openai-codex","model":"gpt-5.6-luna"},{"provider":"openai-codex","model":"gpt-5.4-mini"},{"provider":"github-copilot","model":"gpt-5.6-luna"},{"provider":"github-copilot-enterprise","model":"gpt-5.6-luna"},{"provider":"google","model":"gemini-3.5-flash","input_modalities":["text","image"]},{"provider":"google","model":"gemini-3.1-flash-lite","input_modalities":["text","image"]},{"provider":"google","model":"gemini-3.1-flash-lite-preview","input_modalities":["text","image"]},{"provider":"alibaba","model":"deepseek-v4-flash-0731","input_modalities":["text","image"]},{"provider":"opencode-go","model":"qwen3.6-plus"},{"provider":"zai","model":"glm-5.3-flash"},{"provider":"alibaba","model":"deepseek-v4-pro","input_modalities":["text","image"]},{"provider":"alibaba","model":"deepseek-v4.1-flash","input_modalities":["text","image"]},{"provider":"alibaba","model":"qwen3.6-flash","input_modalities":["text","image"]},{"provider":"alibaba","model":"qwen3.7-plus","input_modalities":["text","image"]},{"provider":"alibaba","model":"qwen3.8-flash","input_modalities":["text","image"]},{"provider":"claude-code-cli","model":"sonnet"},{"provider":"opencode-cli","model":"big-pickle"},{"provider":"opencode-cli","model":"cat-jam-free"},{"provider":"opencode-cli","model":"longcat-2.5-preview-free"},{"provider":"opencode-cli","model":"mimo-v2.6-flash-free"},{"provider":"opencode-cli","model":"muse-spark-1.3-contributor-free"},{"provider":"opencode-cli","model":"nemotron-3.5-lightning-free"},{"provider":"opencode-cli","model":"space-bunny-free"},{"provider":"opencode-cli","model":"step-5-preview-free"},{"provider":"kilo-cli","model":"kilo/kilo-auto/free"}],"fallback_pools":["premium","swarm"],"auto_catalog":true,"auto_catalog_providers":["minimax","synthetic","zai","openai-codex","github-copilot","github-copilot-enterprise","alibaba","opencode-go","workers-ai","ollama-cloud","groq","google","cerebras","opencode-cli"]}'
         - name: TUSKER_POOL_PRIVACY
-          value: '{"models":[{"provider":"mlx-mac","model":"qwen3.8-27b","input_modalities":["text","image"]},{"provider":"apim","model":"gpt-5.6-luna","input_modalities":["text","image"]}],"context_window":128000,"zdr":true,"auto_catalog":true,"require_tool_qualification":true,"auto_catalog_providers":["mlx-mac","apim","openai-codex","github-copilot-enterprise","ollama-cloud"]}'
+          value: '{"models":[{"provider":"mlx-mac","model":"qwen3.8-27b","input_modalities":["text","image"]},{"provider":"apim","model":"gpt-5.6-luna","input_modalities":["text","image"]}],"context_window":128000,"zdr":true,"auto_catalog":true,"require_tool_qualification":true,"auto_catalog_providers":["mlx-mac","openai-codex","github-copilot-enterprise","ollama-cloud"]}'
         - name: TUSKER_POOL_PREMIUM
           value: '{"models":[{"provider":"github-copilot-enterprise","model":"claude-sonnet-4.6"},{"provider":"github-copilot-enterprise","model":"claude-opus-4.6"},{"provider":"openai-codex","model":"gpt-5.6-sol"},{"provider":"openai-codex","model":"gpt-5.6-terra"},{"provider":"openai-codex","model":"gpt-5.5"},{"provider":"openai-codex","model":"gpt-5.4"},{"provider":"github-copilot-enterprise","model":"gpt-5.5"},{"provider":"github-copilot-enterprise","model":"gpt-5.4"},{"provider":"opencode-go","model":"deepseek-v4-pro"},{"provider":"synthetic","model":"syn:large:text","input_modalities":["text"]},{"provider":"synthetic","model":"syn:large:vision","input_modalities":["text","image"]},{"provider":"synthetic","model":"syn:small:vision","input_modalities":["text","image"]},{"provider":"minimax","model":"MiniMax-M2.7-highspeed","input_modalities":["text"]},{"provider":"minimax","model":"MiniMax-M2.7","input_modalities":["text"]},{"provider":"google","model":"gemini-3-pro"},{"provider":"alibaba","model":"glm-5.2","input_modalities":["text","image"]},{"provider":"alibaba","model":"qwen3.8-max","input_modalities":["text","image"]},{"provider":"alibaba","model":"qwen3.7-max","input_modalities":["text"]},{"provider":"alibaba","model":"glm-5.3","input_modalities":["text","image"]}],"context_window":128000,"auto_catalog":true,"auto_catalog_providers":["ollama-cloud"],"heavyweight_only":true}'
         - name: TUSKER_POOL_SWARM
@@ -610,11 +612,10 @@ spec:
             # ephemeral-storage caps stay well within the 2Gi/4Gi defaults
             # (see ValidatingAdmissionPolicy 'ephemeral-storage-limit').
             #
-            # Memory: the gateway process alone measured ~600MiB RSS, and the
-            # warm OpenCode server adds ~160MiB resident plus a transient
-            # ~200MiB `opencode run` client per request. 1Gi left no margin for
-            # that, so an OOMKill was one busy request away.
-            memory: 2Gi
+            # Memory: ~600MiB gateway RSS + warm OpenCode server ~160MiB;
+            # 2Gi was OOM-killed (exit 137, 2026-10-13) during concurrent
+            # 16K-token request bursts. 3Gi gives burst headroom.
+            memory: 3Gi
             ephemeral-storage: 4Gi
       volumes:
       - name: tusker-home
