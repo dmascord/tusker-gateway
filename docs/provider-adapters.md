@@ -115,7 +115,14 @@ operators should also review any global CLI configuration used by the gateway.
 Follow-up tool calls and results are replayed as transcript history. The
 gateway image includes the pinned OpenCode v2 CLI executable (currently
 2.0.15). Production explicitly enables this adapter and includes
-`opencode-cli/big-pickle` in the code pool.
+`opencode-cli/big-pickle` plus the free Zen models (`cat-jam-free`,
+`longcat-2.5-preview-free`, `mimo-v2.6-flash-free`,
+`muse-spark-1.3-contributor-free`, `nemotron-3.5-lightning-free`,
+`space-bunny-free`, `step-5-preview-free`) in the code pool. Zen's free tier
+rejects the gateway's direct HTTP provider path (`opencode-zen`) with
+`FreeTierError` regardless of client headers, so the free models are served
+exclusively through this CLI route; tool qualification for them runs through
+the CLI via the normal `tool_qualification --provider opencode-cli` path.
 
 Set `TUSKER_OPENCODE_CLI_PATH` when an operator-managed installation should
 be used instead. OpenCode Zen may still reject CLI/API use based on account or

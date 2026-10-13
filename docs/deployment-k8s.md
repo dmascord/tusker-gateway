@@ -172,7 +172,8 @@ rolling the gateway, which uses the internal ClusterIP service. The initial
 worker allowlist contains only routes that passed an actual MCP tool-call
 probe. Kilo routes are non-ZDR and are therefore never privacy-pool candidates.
 The code pool additionally includes `claude-code-cli/sonnet`,
-`opencode-cli/big-pickle`, and `kilo-cli/kilo/kilo-auto/free`. OpenCode uses a
+`opencode-cli/big-pickle` plus seven free Zen models served through the same
+CLI route, and `kilo-cli/kilo/kilo-auto/free`. OpenCode uses a
 dedicated `TUSKER_OPENCODE_CLI_API_KEY` secret mapping; Kilo runs on the
 worker. These CLI routes are not ZDR and do not belong in the privacy pool.
 
