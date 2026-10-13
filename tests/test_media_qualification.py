@@ -53,6 +53,43 @@ async def test_embedding_probe_records_safe_success_metadata():
 
 
 @pytest.mark.asyncio
+async def test_embedding_probe_rejects_nonfinite_or_inconsistent_vectors():
+    for body in (
+        {"data": [{"index": 0, "embedding": [float("nan")]}]},
+        {"data": [
+            {"index": 0, "embedding": [0.1, 0.2]},
+            {"index": 1, "embedding": [0.3]},
+        ]},
+    ):
+        result = await probe_media_route(
+            _Session(_Response(200, body)),
+            base_url="http://gateway.test",
+            api_key="gateway-key",
+            provider="openrouter",
+            model="embed-model",
+            capability="embedding",
+        )
+        assert result["status"] == "unavailable"
+        assert result["failure_class"] == "invalid_response"
+
+
+@pytest.mark.asyncio
+async def test_rerank_probe_rejects_duplicate_or_ascending_indices():
+    result = await probe_media_route(
+        _Session(_Response(200, {"results": [
+            {"index": 0, "relevance_score": 0.2},
+            {"index": 0, "relevance_score": 0.1},
+        ]})),
+        base_url="http://gateway.test",
+        api_key="gateway-key",
+        provider="cohere",
+        model="rerank-v3.5",
+        capability="rerank",
+    )
+    assert result["status"] == "unavailable"
+    assert result["failure_class"] == "invalid_response"
+
+@pytest.mark.asyncio
 async def test_rerank_probe_preserves_transient_failure_classification():
     session = _Session(_Response(429, {"error": {"message": "quota"}}))
     result = await probe_media_route(

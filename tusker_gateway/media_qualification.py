@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import aiohttp
+import math
 
 from tusker_gateway.config import load_config
 from tusker_gateway.media_health import (
@@ -30,12 +31,60 @@ from tusker_gateway.providers.rerank import RerankHandler
 logger = logging.getLogger(__name__)
 
 
+def _valid_embedding_payload(payload: Any) -> bool:
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, list) or not data:
+        return False
+    dimensions: int | None = None
+    for index, item in enumerate(data):
+        if not isinstance(item, dict):
+            return False
+        if item.get("index") not in {index, None}:
+            return False
+        vector = item.get("embedding")
+        if not isinstance(vector, list) or not vector:
+            return False
+        if dimensions is None:
+            dimensions = len(vector)
+        if len(vector) != dimensions:
+            return False
+        try:
+            if not all(math.isfinite(float(value)) for value in vector):
+                return False
+        except (TypeError, ValueError):
+            return False
+    return True
+
+
+def _valid_rerank_payload(payload: Any) -> bool:
+    results = payload.get("results") if isinstance(payload, dict) else None
+    if not isinstance(results, list) or not results:
+        return False
+    seen: set[int] = set()
+    previous_score: float | None = None
+    for item in results:
+        if not isinstance(item, dict) or isinstance(item.get("index"), bool):
+            return False
+        index = item.get("index")
+        if not isinstance(index, int) or index < 0 or index >= 2 or index in seen:
+            return False
+        seen.add(index)
+        try:
+            score = float(item.get("relevance_score", item.get("score")))
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(score) or (previous_score is not None and score > previous_score):
+            return False
+        previous_score = score
+    return True
+
+
 def _status_from_response(status: int, payload: Any, capability: str) -> tuple[str, str | None]:
     """Classify a media probe without retaining upstream response data."""
     if 200 <= status < 300:
-        if capability == EMBEDDING_CAPABILITY and isinstance(payload, dict) and isinstance(payload.get("data"), list):
+        if capability == EMBEDDING_CAPABILITY and _valid_embedding_payload(payload):
             return "passed", None
-        if capability == RERANK_CAPABILITY and isinstance(payload, dict) and isinstance(payload.get("results"), list):
+        if capability == RERANK_CAPABILITY and _valid_rerank_payload(payload):
             return "passed", None
         return "unavailable", "invalid_response"
     if status in {401, 403} or status == 429 or status >= 500:

@@ -373,6 +373,33 @@ kubectl -n hermes exec deploy/tusker-gateway -- \
 Qualification results land in the gateway's persistent tool-capability
 database; response bodies and credentials are not retained.
 
+### Media capability evidence and generation probes
+
+Embedding and rerank qualification records only bounded route-level evidence. A
+passing embedding result must contain non-empty finite vectors with consistent
+dimensions; a passing rerank result must contain a non-empty result list with
+finite numeric relevance scores. This proves the configured route's response
+contract, not broad model quality or every supported input shape.
+
+Image-input qualification similarly proves that one small decodable PNG is
+accepted by the selected chat route. It does not prove OCR, multiple images,
+large images, audio/video input, or generation behavior. Results are persisted
+without response bodies or credentials and are versioned, so old evidence is
+not treated as current proof.
+
+The composite image-plus-tool probe is intentionally explicit and bounded:
+
+```bash
+tusker-gateway-qualify-image-tools --model PROVIDER/MODEL
+```
+
+It sends one tiny image and one harmless required tool call, then validates the
+tool arguments and result completion. It never changes pool membership or
+enables a route automatically. Generation probes are likewise opt-in: run
+them only for explicitly selected providers/models because generation requests
+can incur cost or create asynchronous jobs. A passing probe is evidence for
+the tested contract only, not a blanket multimodal capability claim.
+
 
 The privacy pool applies the provider policy before catalog pricing. The
 default registry currently allows local `local-llm`, Ollama Cloud, OpenCode
@@ -437,12 +464,13 @@ of holding the request open while the local backend thrashes.
 
 Per-attempt idle budget for these providers is `240s` (raised via
 `TUSKER_PROVIDER_ATTEMPT_TIMEOUT_OVERRIDES_JSON={"local-llm": 240,
-"mlx-mac": 240}`); `TUSKER_REQUEST_TIMEOUT_MS=240000` covers the local
-cold-load wall-clock on the gateway. Cloud candidates still return in
-well under the default deadline; the longer budget only affects the local
-route. After a capacity failure the route is in capacity cooldown
-(`TUSKER_PROVIDER_CAPACITY_COOLDOWN_SECS=300`) so a hot backend can finish
-its current request and the gateway stops hammering it.
+"mlx-mac": 240}`). Alibaba reasoning requests use a model-specific `120s`
+override for `alibaba/qwen3.8-max`; the request deadline remains the hard cap.
+Cloud candidates still return in well under the default deadline; the longer
+budget only affects the explicitly slow routes. After a capacity failure the
+route is in capacity cooldown (`TUSKER_PROVIDER_CAPACITY_COOLDOWN_SECS=300`)
+so a hot backend can finish its current request and the gateway stops
+hammering it.
 
 #### Declared context windows and max_tokens fitting
 

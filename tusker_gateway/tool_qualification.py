@@ -17,16 +17,19 @@ import asyncio
 import json
 import logging
 import os
-import time
 import uuid
+import time
+import aiohttp
 from pathlib import Path
 from typing import Any
-
-import aiohttp
-
 from tusker_gateway.catalog import CatalogRegistry, advertised_output_modalities
 from tusker_gateway.config import load_config
 from tusker_gateway.cooldown import is_account_quota_exhausted as _is_account_quota_exhausted
+from tusker_gateway.model_capability import (
+    MODEL_CAPABILITY_PROBE_VERSION,
+    ModelCapabilityDB,
+    default_model_capability_db_path,
+)
 from tusker_gateway.pools import PoolManager, is_general_chat_model
 from tusker_gateway.tool_capability import (
     TOOL_CAPABILITY_PROBE_VERSION,
@@ -34,8 +37,10 @@ from tusker_gateway.tool_capability import (
     ToolCapabilityLevel,
     default_tool_capability_db_path,
 )
-
 logger = logging.getLogger(__name__)
+
+COMPOSITE_CAPABILITY = "input_image_tools"
+COMPOSITE_CAPABILITY_PROBE_VERSION = "image-tool-contract-v1"
 
 PROBE_TOOL_NAME = "tusker_capability_probe"
 PROBE_PATH = "/tmp/tusker-tool-capability-probe"
@@ -308,6 +313,117 @@ def _result_from_stream(
         "latency_ms": round(latency_ms, 1),
         "failure_class": failure_class,
     }
+def _classify_composite_http_failure(
+    status: int,
+    body: str,
+    headers: Any | None = None,
+) -> tuple[str, str]:
+    """Classify image-plus-tool transport failures for generic evidence."""
+    lowered = body.lower()
+    if status == 400 and any(
+        marker in lowered
+        for marker in ("image", "vision", "modality", "content type", "tool", "function calling")
+    ):
+        return "unsupported", "composite_request_rejected"
+    level, result_status, failure_class = _classify_http_failure(status, body, headers)
+    if level == ToolCapabilityLevel.AUTH_FAILED:
+        return "auth_failed", failure_class
+    return result_status, failure_class
+
+
+async def probe_image_tool_model(
+    session: aiohttp.ClientSession,
+    *,
+    base_url: str,
+    api_key: str,
+    provider: str,
+    model: str,
+    timeout_secs: float = 45.0,
+) -> dict[str, Any]:
+    """Probe a model with the canonical image payload and required tool."""
+    # Keep the decodable PNG and image message shape in the modality probe.
+    from tusker_gateway.modality_qualification import _messages_for_modality
+
+    payload = {
+        "model": f"{provider}/{model}",
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are being tested for strict tool-call compliance. Do not emit prose.",
+            },
+            {"role": "user", "content": _messages_for_modality("image")[0]["content"]},
+        ],
+        "tools": [PROBE_TOOL],
+        "tool_choice": "required",
+        "stream": True,
+        "temperature": 0,
+        "max_tokens": 192,
+    }
+    result: dict[str, Any] = {
+        "provider": provider,
+        "model": model,
+        "capability": COMPOSITE_CAPABILITY,
+        "source": "composite_probe",
+        "status": "unavailable",
+        "http_status": None,
+        "latency_ms": None,
+        "failure_class": None,
+    }
+    started = time.monotonic()
+    calls: dict[int, dict[str, str]] = {}
+    text_parts: list[str] = []
+    finish_reason: str | None = None
+    url = f"{base_url.rstrip('/')}/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+        "X-Tusker-Cache": "bypass",
+        "X-Tusker-Tool-Qualification": COMPOSITE_CAPABILITY_PROBE_VERSION,
+    }
+    try:
+        timeout = aiohttp.ClientTimeout(total=timeout_secs, sock_read=timeout_secs)
+        async with session.post(url, json=payload, headers=headers, timeout=timeout) as response:
+            result["http_status"] = response.status
+            if response.status != 200:
+                body = (await response.read())[:4096].decode("utf-8", "replace")
+                result["status"], result["failure_class"] = _classify_composite_http_failure(
+                    response.status, body, response.headers
+                )
+                return _finish_composite_result(result, started)
+            async for raw_line in response.content:
+                reason = _parse_sse_line(
+                    raw_line.decode("utf-8", "replace").strip(), calls, text_parts
+                )
+                if reason is not None:
+                    finish_reason = reason
+    except asyncio.TimeoutError:
+        result["failure_class"] = "timeout"
+        return _finish_composite_result(result, started)
+    except (aiohttp.ClientError, OSError) as exc:
+        result["failure_class"] = type(exc).__name__
+        return _finish_composite_result(result, started)
+
+    parsed = _result_from_stream(
+        provider=provider,
+        model=model,
+        status_code=200,
+        latency_ms=(time.monotonic() - started) * 1000,
+        calls=calls,
+        text_parts=text_parts,
+        finish_reason=finish_reason,
+    )
+    result.update(
+        status="passed" if parsed["status"] == "passed" else "unsupported",
+        failure_class=parsed.get("failure_class"),
+    )
+    return _finish_composite_result(result, started)
+
+
+def _finish_composite_result(result: dict[str, Any], started: float) -> dict[str, Any]:
+    result["latency_ms"] = round((time.monotonic() - started) * 1000, 1)
+    return result
+
 
 
 async def probe_model(
@@ -523,6 +639,80 @@ def _record_durable_auth_failure(
         cooldown_store.record_permanent_failure(provider, model)
     except Exception:
         logger.debug("persistent permanent failure marker failed", exc_info=True)
+
+
+async def run_image_tool_qualification(
+    *,
+    base_url: str = "http://127.0.0.1:8642",
+    max_concurrency: int = 1,
+    timeout_secs: float = 45.0,
+    limit: int | None = None,
+    model_pairs: set[tuple[str, str]] | None = None,
+) -> list[dict[str, Any]]:
+    """Run explicit composite probes and persist generic capability evidence."""
+    config = load_config()
+    api_key = os.environ.get("API_KEYS", "").split(",", 1)[0].strip()
+    if not api_key:
+        raise RuntimeError("API_KEYS must contain the gateway caller key")
+    quality_path = config.get("quality_db_path", "data/quality.db")
+    capability_db = ModelCapabilityDB(
+        config.get("model_capability_db_path") or default_model_capability_db_path(quality_path)
+    )
+    pairs = sorted(
+        {
+            (str(provider).strip(), str(model).strip())
+            for provider, model in (model_pairs or set())
+            if str(provider).strip() and str(model).strip()
+        }
+    )
+    if limit is not None:
+        pairs = pairs[: max(0, limit)]
+    semaphore = asyncio.Semaphore(max(1, max_concurrency))
+    timeout = aiohttp.ClientTimeout(total=timeout_secs, sock_read=timeout_secs)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async def one(pair: tuple[str, str]) -> dict[str, Any]:
+            async with semaphore:
+                result = await probe_image_tool_model(
+                    session, base_url=base_url, api_key=api_key,
+                    provider=pair[0], model=pair[1], timeout_secs=timeout_secs,
+                )
+                capability_db.record(
+                    provider=pair[0], model=pair[1], capability=COMPOSITE_CAPABILITY,
+                    status=result["status"], source="composite_probe",
+                    probe_version=COMPOSITE_CAPABILITY_PROBE_VERSION,
+                    http_status=result.get("http_status"), latency_ms=result.get("latency_ms"),
+                    failure_class=result.get("failure_class"),
+                )
+                return result
+        return await asyncio.gather(*(one(pair) for pair in pairs))
+
+
+def composite_main(argv: list[str] | None = None) -> int:
+    """CLI entrypoint for explicit image-plus-tool qualification."""
+    parser = argparse.ArgumentParser(description=probe_image_tool_model.__doc__)
+    parser.add_argument("--model", action="append", required=True, metavar="PROVIDER/MODEL")
+    parser.add_argument("--base-url", default="http://127.0.0.1:8642")
+    parser.add_argument("--max-concurrency", type=int, default=1)
+    parser.add_argument("--timeout-secs", type=float, default=45.0)
+    parser.add_argument("--limit", type=int)
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+    pairs: set[tuple[str, str]] = set()
+    for value in args.model:
+        provider, separator, model = value.partition("/")
+        if not separator or not provider.strip() or not model.strip():
+            parser.error("--model must use PROVIDER/MODEL syntax")
+        pairs.add((provider.strip(), model.strip()))
+    results = asyncio.run(run_image_tool_qualification(
+        base_url=args.base_url, max_concurrency=args.max_concurrency,
+        timeout_secs=args.timeout_secs, limit=args.limit, model_pairs=pairs,
+    ))
+    if args.json:
+        print(json.dumps(results, sort_keys=True))
+    else:
+        for result in results:
+            print(f"{result['provider']}/{result['model']} status={result['status']} failure={result.get('failure_class') or '-'}")
+    return 0
 
 
 async def run_qualification(

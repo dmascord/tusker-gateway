@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import pytest
 
 from tusker_gateway.config import PoolConfig
 from tusker_gateway.pools import PoolManager
@@ -12,6 +13,8 @@ from tusker_gateway.tool_capability import (
     ToolCapabilityLevel,
 )
 from tusker_gateway.tool_qualification import (
+    COMPOSITE_CAPABILITY,
+    COMPOSITE_CAPABILITY_PROBE_VERSION,
     PROBE_PATH,
     PROBE_TOOL_NAME,
     _classify_http_failure,
@@ -19,6 +22,7 @@ from tusker_gateway.tool_qualification import (
     _needs_probe,
     _route_is_quarantined,
     _result_from_stream,
+    probe_image_tool_model,
     probe_model,
 )
 
@@ -85,6 +89,66 @@ class _ProbeSession:
         self.headers = kwargs["headers"]
         self.payload = kwargs["json"]
         return _ProbeResponse()
+class _CompositeResponse(_ProbeResponse):
+    def __init__(self, lines):
+        super().__init__()
+        self._lines = lines
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self._lines:
+            raise StopAsyncIteration
+        return self._lines.pop(0)
+
+
+class _CompositeSession:
+    def __init__(self, response):
+        self.response = response
+        self.payload = None
+
+    def post(self, _url, **kwargs):
+        self.payload = kwargs["json"]
+        return self.response
+
+
+def _sse(event):
+    return ("data: " + __import__("json").dumps(event) + "\n").encode()
+
+
+@pytest.mark.asyncio
+async def test_composite_probe_passes_image_and_exact_tool_call():
+    response = _CompositeResponse([
+        _sse({"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"name": PROBE_TOOL_NAME, "arguments": '{"path":"/tmp/tusker-tool-capability-probe"}'}}]}, "finish_reason": "tool_calls"}]}),
+    ])
+    session = _CompositeSession(response)
+    result = await probe_image_tool_model(session, base_url="http://gateway.test", api_key="key", provider="openrouter", model="vision")
+    assert result["status"] == "passed"
+    assert result["capability"] == COMPOSITE_CAPABILITY
+    assert session.payload["messages"][1]["content"][1]["type"] == "image_url"
+    assert session.payload["tools"]
+
+
+@pytest.mark.asyncio
+async def test_composite_probe_classifies_missing_tool_result_as_unsupported():
+    response = _CompositeResponse([_sse({"choices": [{"delta": {}, "finish_reason": "stop"}]})])
+    result = await probe_image_tool_model(_CompositeSession(response), base_url="http://gateway.test", api_key="key", provider="openrouter", model="vision")
+    assert result["status"] == "unsupported"
+    assert result["failure_class"] == "no_tool_call"
+
+
+@pytest.mark.asyncio
+async def test_composite_probe_classifies_malformed_tool_result_as_unsupported():
+    response = _CompositeResponse([
+        _sse({"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"name": PROBE_TOOL_NAME, "arguments": "not-json"}}]}, "finish_reason": "tool_calls"}]}),
+    ])
+    result = await probe_image_tool_model(
+        _CompositeSession(response), base_url="http://gateway.test", api_key="key",
+        provider="openrouter", model="vision",
+    )
+    assert result["status"] == "unsupported"
+    assert result["failure_class"] == "non_strict_tool_contract"
 
 
 def test_opencode_probe_sends_isolated_session_header():

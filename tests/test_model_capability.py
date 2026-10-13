@@ -196,6 +196,11 @@ def test_probe_payloads_cover_supported_input_shapes():
     assert _messages_for_modality("video")[0]["content"][1]["type"] == "video_url"
     assert MODEL_CAPABILITY_PROBE_VERSION == "model-capability-v2"
 
+def test_known_capabilities_include_image_tools():
+    from tusker_gateway.model_capability import KNOWN_CAPABILITIES
+
+    assert "input_image_tools" in KNOWN_CAPABILITIES
+
 
 def test_probe_image_data_url_is_a_decodable_png():
     """A truncated probe image makes strict decoders reject every image probe.
