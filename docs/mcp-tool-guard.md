@@ -35,6 +35,13 @@ is single-use. A changed tool call, invalid signature, malformed response, or
 replayed state cannot authorize execution. The endpoint only authorizes; the
 client remains responsible for executing the original tool.
 
+Clients must preserve `requestState` verbatim. Signature encoding must be
+canonical, unpadded base64url: alternate encodings of the same HMAC bytes
+(including changes to unused bits in the final character) are rejected and
+produce a fresh `input_required` response, not an approval.
+Without that enforcement, each variant looks like a fresh string to the
+single-use store and a captured approval can be replayed (fixed 2026-10-13).
+
 OMP/OpenCode clients use their native built-in `question` tool for action-
 capable streaming and complete responses. The gateway replaces the risky
 provider call with a question tool call, then validates the returned answer
