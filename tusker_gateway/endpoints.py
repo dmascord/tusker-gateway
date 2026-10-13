@@ -13,7 +13,7 @@ import time
 import uuid
 from typing import Any, AsyncIterator
 
-from aiohttp import ClientError, ContentTypeError, web
+from aiohttp import ClientError, web
 from aiohttp.http_exceptions import TransferEncodingError
 
 from tusker_gateway.cache import ResponseCache, make_cache_key, make_caller_scope
@@ -6143,6 +6143,22 @@ async def metrics_handler(request: web.Request) -> web.Response:
     )
 
 
+async def _json_request_body(request: web.Request) -> Any:
+    """Parse a JSON request body, reporting caller mistakes as 400.
+
+    A body that is neither valid JSON nor UTF-8 text raises ``ValueError``
+    (``json.JSONDecodeError``), ``UnicodeDecodeError`` or ``TypeError``. All are
+    client errors: letting them reach a handler's generic failure path reports
+    an upstream provider failure (502) for a bad request and hides the cause.
+    """
+    try:
+        return await request.json()
+    except (ValueError, UnicodeDecodeError, TypeError) as exc:
+        raise BadRequestError(
+            "Request body must be valid JSON", code="malformed_payload"
+        ) from exc
+
+
 async def chat_completions_handler(request: web.Request) -> web.Response | web.StreamResponse:
     """POST /v1/chat/completions."""
     metrics: MetricsRegistry | None = request.app.get("metrics")
@@ -6212,7 +6228,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
 
     with span_cm as root_span:
         try:
-            body = _validate_chat_body(await request.json())
+            body = _validate_chat_body(await _json_request_body(request))
             if tracer is not None and tracer.enabled and root_span is not None:
                 root_span.attributes["tusker.model"] = str(body.get("model") or "")
             config = request.app["config"]
@@ -7253,7 +7269,7 @@ async def _responses_handler_impl(request: web.Request) -> web.Response | web.St
     budget_pool = "passthrough"
     api_key = _resolve_api_key(request)
     try:
-        body = await request.json()
+        body = await _json_request_body(request)
         logger.info(
             "responses request model=%s", body.get("model") if isinstance(body, dict) else None
         )
@@ -7775,7 +7791,7 @@ async def images_handler(request: web.Request) -> web.Response:
     set_access_log_context(request, pool="media")
     try:
         started = time.monotonic()
-        body = await request.json()
+        body = await _json_request_body(request)
         budget_units = 4096
         blocked = await _media_preflight(request, body, budget_units=budget_units)
         if blocked is not None:
@@ -7843,7 +7859,7 @@ async def tts_handler(request: web.Request) -> web.Response:
     set_access_log_context(request, pool="media")
     try:
         started = time.monotonic()
-        body = await request.json()
+        body = await _json_request_body(request)
         budget_units = 4096
         blocked = await _media_preflight(request, body, budget_units=budget_units)
         if blocked is not None:
@@ -7906,7 +7922,7 @@ async def video_handler(request: web.Request) -> web.Response:
     set_access_log_context(request, pool="media")
     try:
         started = time.monotonic()
-        body = await request.json()
+        body = await _json_request_body(request)
         budget_units = 32768
         blocked = await _media_preflight(request, body, budget_units=budget_units)
         if blocked is not None:
@@ -7984,19 +8000,7 @@ async def rerank_handler(request: web.Request) -> web.Response:
         metrics.request_duration.observe(time.monotonic() - started, labels)
 
     try:
-        try:
-            body = await request.json()
-        except (
-            ContentTypeError,
-            json.JSONDecodeError,
-            UnicodeDecodeError,
-            TypeError,
-            ValueError,
-        ) as exc:
-            raise BadRequestError(
-                "Request body must be valid JSON",
-                code="invalid_request",
-            ) from exc
+        body = await _json_request_body(request)
         if not isinstance(body, dict):
             raise BadRequestError(
                 "Request body must be a JSON object",
@@ -8095,19 +8099,7 @@ async def embeddings_handler(request: web.Request) -> web.Response:
         metrics.request_duration.observe(time.monotonic() - started, labels)
 
     try:
-        try:
-            body = await request.json()
-        except (
-            ContentTypeError,
-            json.JSONDecodeError,
-            UnicodeDecodeError,
-            TypeError,
-            ValueError,
-        ) as exc:
-            raise BadRequestError(
-                "Request body must be valid JSON",
-                code="invalid_request",
-            ) from exc
+        body = await _json_request_body(request)
         if not isinstance(body, dict):
             raise BadRequestError(
                 "Request body must be a JSON object",

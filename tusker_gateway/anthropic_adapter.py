@@ -41,6 +41,7 @@ from tusker_gateway.endpoints import (
     _build_extra_body,
     _close_async_iterator,
     _complete_chat_result_stream,
+    _json_request_body,
     _normalize_stream,
     _prepare_stream_result,
     _quarantine_tool_response_failure,
@@ -579,7 +580,7 @@ async def anthropic_messages_handler(request: web.Request) -> web.Response | web
 
     with span_cm:
         try:
-            body = _validate_anthropic_body(await request.json())
+            body = _validate_anthropic_body(await _json_request_body(request))
             original_model = body.get("model", "")
             logger.info("anthropic request model=%s stream=%s", original_model, body.get("stream"))
 
