@@ -259,6 +259,28 @@ async def test_probe_model_prefers_tool_call_over_trailing_error():
     assert result["failure_class"] is None
 
 
+@pytest.mark.asyncio
+async def test_probe_model_treats_post_commit_marker_as_transient():
+    response = _CompositeResponse([
+        _sse({
+            "choices": [{
+                "delta": {"content": "Upstream provider error: quota exceeded."},
+                "finish_reason": "stop",
+            }],
+            "x_tusker_stream_error": "provider_error",
+        }),
+        b"data: [DONE]\n\n",
+    ])
+    result = await probe_model(
+        _CompositeSession(response),
+        base_url="http://gateway.test", api_key="key",
+        provider="github-copilot-enterprise", model="gpt-5.4",
+    )
+    assert result["status"] == "unavailable"
+    assert result["level"] == ToolCapabilityLevel.UNAVAILABLE
+    assert result["failure_class"] == "provider_error"
+
+
 def test_opencode_probe_sends_isolated_session_header():
     session = _ProbeSession()
 

@@ -2019,7 +2019,36 @@ async def test_chat_stream_provider_error_is_actionable_text_not_in_band_error(c
     assert b"Upstream provider error" in body
     assert b"socket timed out" in body
     assert b'"error"' not in body
+    assert b"x_tusker_stream_error" not in body
     assert b"data: [DONE]" in body
+
+@pytest.mark.asyncio
+async def test_chat_stream_provider_error_marks_qualification_only(client):
+    async def failing_stream(*args, **kwargs):
+        yield b'data: {"choices":[{"delta":{"content":"before failure"}}]}\n\n'
+        raise ProviderError("quota exceeded", code="provider_error")
+
+    with patch("tusker_gateway.endpoints.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
+        mock_chat.return_value = failing_stream()
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-code",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+            },
+            headers={
+                **HEADERS_AUTH,
+                "X-Tusker-Tool-Qualification": "stream-tool-contract-v1",
+            },
+        )
+        body = await response.read()
+
+    assert response.status == 200
+    assert b'"x_tusker_stream_error": "provider_error"' in body
+    assert b"Upstream provider error" in body
+    assert b"data: [DONE]" in body
+
 
 
 @pytest.mark.asyncio

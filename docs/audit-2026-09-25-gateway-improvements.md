@@ -1081,6 +1081,24 @@ def _load_api_keys(self) -> list[str]:
 
 ---
 
+## 2026-10-13 qualification follow-up
+
+Tool and composite qualification initially misclassified two gateway-side
+failure paths as permanent model capability failures:
+
+- Streaming `provider_route_disabled` and `circuit_open` responses arrive as
+  HTTP 200 inline SSE error frames. The probe previously ignored those frames,
+  recording `no_tool_call`/`unsupported` instead of transient unavailable.
+- After a stream is committed, provider failures are intentionally rendered as
+  assistant text for OMP compatibility. Qualification requests now receive a
+  probe-only `x_tusker_stream_error` marker on that synthesized chunk.
+
+Both paths now persist `UNAVAILABLE` evidence and remain eligible for retry;
+genuine tool-less model completions remain permanent `no_tool_call` results.
+The fix is covered by tool, composite, and chat-stream regression tests.
+
+---
+
 ## Summary: Implementation Order
 
 | Priority | Item | Est. Effort |

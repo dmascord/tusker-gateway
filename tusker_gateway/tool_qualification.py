@@ -230,6 +230,10 @@ def _parse_sse_line(
         return None
 
     if errors is not None:
+        marker = event.get("x_tusker_stream_error")
+        if isinstance(marker, str) and marker:
+            errors.append(marker)
+            return None
         code = _inline_error_code(event)
         if code is not None:
             errors.append(code)

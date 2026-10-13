@@ -7034,14 +7034,15 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                             )
                         else:
                             client_message = stream_error_message
-                        await resp.write(
-                            sse_frame(
-                                format_openai_chunk(
-                                    client_message,
-                                    model="tusker-gateway",
-                                )
-                            )
+                        error_chunk = format_openai_chunk(
+                            client_message,
+                            model="tusker-gateway",
                         )
+                        if request.headers.get("X-Tusker-Tool-Qualification"):
+                            error_chunk["x_tusker_stream_error"] = (
+                                stream_error_code or "stream_error"
+                            )
+                        await resp.write(sse_frame(error_chunk))
                         await resp.write(
                             sse_frame(
                                 format_openai_chunk(
@@ -7185,14 +7186,15 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                         )
                     else:
                         client_message = stream_error_message
-                    await stream_resp.write(
-                        sse_frame(
-                            format_openai_chunk(
-                                client_message,
-                                model="tusker-gateway",
-                            )
-                        )
+                    error_chunk = format_openai_chunk(
+                        client_message,
+                        model="tusker-gateway",
                     )
+                    if request.headers.get("X-Tusker-Tool-Qualification"):
+                        error_chunk["x_tusker_stream_error"] = (
+                            stream_error_code or "stream_error"
+                        )
+                    await stream_resp.write(sse_frame(error_chunk))
                     await stream_resp.write(
                         sse_frame(
                             format_openai_chunk(
