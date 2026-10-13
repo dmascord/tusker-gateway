@@ -6,9 +6,9 @@ metadata:
   labels:
     app: tusker-gateway
   annotations:
-    tusker.net.au/commit: c7c8eae7b03c9f9ad07f70e56baf1c09c86d4e53
-    tusker.net.au/image-tag: swarm-alpine-c7c8eae7b03c9f9ad07f70e56baf1c09c86d4e53
-    tusker.net.au/image-digest: sha256:08cc0fd900c30e2dbc4539d38878aab2ff703d38d396468a5acfb2e14d914abf
+    tusker.net.au/commit: d03526ce9c8b92ed37beac6c1d94f7117d59ca4a
+    tusker.net.au/image-tag: swarm-alpine-d03526ce9c8b92ed37beac6c1d94f7117d59ca4a
+    tusker.net.au/image-digest: sha256:1cfd236dd71fc3bcc69796bebbaf9120108db29db491033811723afcc5f7c9ed
 spec:
   replicas: 1
   selector:
@@ -26,13 +26,15 @@ spec:
       labels:
         app: tusker-gateway
     spec:
+      nodeSelector:
+        feature.node.kubernetes.io/cpu-cpuid.AVX2: "true"
       securityContext:
         fsGroup: 65534
         fsGroupChangePolicy: OnRootMismatch
       terminationGracePeriodSeconds: 90
       containers:
       - name: tusker-gateway
-        image: registry.tusker.net.au:5000/tusker-gateway@sha256:08cc0fd900c30e2dbc4539d38878aab2ff703d38d396468a5acfb2e14d914abf
+        image: registry.tusker.net.au:5000/tusker-gateway@sha256:1cfd236dd71fc3bcc69796bebbaf9120108db29db491033811723afcc5f7c9ed
         imagePullPolicy: Always
         envFrom:
         - secretRef:
