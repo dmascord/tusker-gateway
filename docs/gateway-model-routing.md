@@ -25,14 +25,32 @@ pool.
 ### Provider deployment allowlists
 
 Provider-native catalogs may expose more model names than the account actually
-provisions. The registry supports `catalog_models` to constrain discovery
-before candidates enter a pool. APIM is intentionally limited to its deployed
-Luna models (`gpt-5.6-luna` and `gpt-6-luna`); retired or unrelated `/models`
-entries are ignored and cannot pollute the privacy pool.
+provisions. The registry supports `catalog_models` for provider metadata, but a
+pool must opt into catalog discovery separately. APIM's `/models` endpoint is a
+broad Azure Foundry catalog rather than an inventory of this gateway's deployed
+routes, so APIM is not an automatic privacy-pool catalog provider. The privacy
+pool keeps the explicitly configured `apim/gpt-5.6-luna` route; the provider's
+`gpt-6-luna` route remains available through explicit passthrough.
 
 The tier is the source of truth — `PoolManager.pool_keeps_heavyweight()` returns
 `True` for `premium`/`swarm` and `False` for `code`/`privacy`. Callers can override
 per-request by passing `heavyweight_ok=True/False` to `PoolManager.select()`.
+
+### Operator latency deny-list
+
+The deployment's `TUSKER_BLACKLISTED_MODELS` removes routes from every pool,
+including auto-catalog candidates. On 2026-10-14, 14-day Prometheus latency
+data and the retained gateway logs showed no repeatable hour-of-day relief for
+the chronically timing-out candidates, so time-based demotion would not reduce
+timeouts. These routes are therefore denied continuously until upstream health
+is re-established:
+
+- `alibaba/qwen3.8-flash`
+- `alibaba/deepseek-v4-flash-0731`
+- `ollama-cloud/glm-5.3-flash`
+- `synthetic/hf:zai-org/GLM-5.3-Flash`
+- `xiaomi/mimo-v2.5-pro`
+
 
 ## Heavyweight classification
 
@@ -93,6 +111,7 @@ For each request to `hermes-code`/`hermes-privacy`/etc:
    - Behavioral tool qualification for the privacy pool (a passing current
      streaming tool contract is required even for ordinary chat)
    - ZDR + EXCLUDED_PROVIDERS env var (privacy pool only)
+   - Operator model blacklist (`TUSKER_BLACKLISTED_MODELS`)
 3. **Rank by quality score** (descending) from `model_quality.db`. New models
    use an adaptive floor (median - 20.0 clamped to 20.0). Models with an LLM
    Stats rank receive an additional score bonus (see
