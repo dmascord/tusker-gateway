@@ -7114,6 +7114,11 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                 request_id,
                 _pool_failure_summary(exc),
             )
+            set_access_log_context(
+                request,
+                failure_class=str(getattr(exc, "code", None) or type(exc).__name__),
+                error_detail=_pool_failure_summary(exc),
+            )
             status = "provider_unavailable"
             if stream_resp is not None and stream_stop is not None and stream_hb_task is not None:
                 stream_error_message, stream_error_code = _public_stream_error(
@@ -7594,6 +7599,11 @@ async def _responses_handler_impl(request: web.Request) -> web.Response | web.St
         logger.warning(
             "responses request failed summary=%s",
             _pool_failure_summary(exc),
+        )
+        set_access_log_context(
+            request,
+            failure_class=str(getattr(exc, "code", None) or type(exc).__name__),
+            error_detail=_pool_failure_summary(exc),
         )
         if budget_recorded:
             budget = request.app.get("budget")

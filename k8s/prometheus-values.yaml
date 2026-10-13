@@ -24,11 +24,13 @@ kubeScheduler:
   serviceMonitor:
     enabled: false
 
+# Export Kubernetes object state required by the backup and workload alerts.
+# The WildDuck verification alert depends on CronJob success timestamps.
 nodeExporter:
   enabled: false
 
 kubeStateMetrics:
-  enabled: false
+  enabled: true
 
 prometheusOperator:
   resources:
@@ -62,6 +64,14 @@ prometheus:
 grafana:
   enabled: true
   adminPassword: "tusker-grafana"
+  grafana.ini:
+    server:
+      protocol: http
+      domain: ai.tusker.net.au
+      root_url: "https://%(domain)s/grafana/"
+      serve_from_sub_path: true
+  deploymentStrategy:
+    type: Recreate
   persistence:
     enabled: true
     storageClassName: longhorn
@@ -72,7 +82,6 @@ grafana:
       memory: 256Mi
     limits:
       memory: 512Mi
-  # Sidecar discovers ConfigMaps with label grafana_dashboard=1
   sidecar:
     dashboards:
       enabled: true
@@ -80,8 +89,6 @@ grafana:
       searchNamespace: ALL
     datasources:
       enabled: true
-
-# Default dashboards - disable to keep it clean
-defaultDashboardsEnabled: false
+  defaultDashboardsEnabled: false
 defaultRules:
   create: false

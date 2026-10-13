@@ -1,0 +1,97 @@
+# PrometheusRule resources for the cluster checks used by the live monitoring stack.
+# Apply with kubectl in the monitoring namespace after kube-state-metrics is enabled.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: cluster-health
+  namespace: monitoring
+  labels:
+    release: prometheus
+spec:
+  groups:
+    - name: cluster-health
+      rules:
+        - alert: KubernetesNodeKubeletDown
+          annotations:
+            description: Prometheus cannot scrape the kubelet on {{ $labels.node }} for more than 10 minutes.
+            summary: Kubelet is down on {{ $labels.node }}
+          expr: up{job="kubelet",metrics_path="/metrics"} == 0
+          for: 10m
+          labels:
+            severity: critical
+        - alert: KubernetesNodeKubeletMissing
+          annotations:
+            description: Only {{ $value }} of 6 expected kubelet scrape targets are present.
+            summary: Kubelet scrape target is missing
+          expr: count(up{job="kubelet",metrics_path="/metrics"}) < 6
+          for: 10m
+          labels:
+            severity: critical
+        - alert: KubernetesNodeNotReady
+          annotations:
+            description: kube-state-metrics reports node {{ $labels.node }} as NotReady for 5 minutes.
+            summary: Node {{ $labels.node }} is NotReady
+          expr: kube_node_status_condition{condition="Ready",status="true"} == 0
+          for: 5m
+          labels:
+            severity: critical
+        - alert: KubernetesPersistentVolumeAlmostFull
+          annotations:
+            description: Persistent volume has less than 15% free space on {{ $labels.node }}.
+            summary: 'Persistent volume almost full: {{ $labels.namespace }}/{{ $labels.persistentvolumeclaim }}'
+          expr: kubelet_volume_stats_capacity_bytes > 0 and kubelet_volume_stats_available_bytes / kubelet_volume_stats_capacity_bytes < 0.15
+          for: 15m
+          labels:
+            severity: warning
+        - alert: NodeExporterDown
+          annotations:
+            description: Host metrics from {{ $labels.instance }} are missing for 15 minutes.
+            summary: node-exporter is down on {{ $labels.instance }}
+          expr: up{job="node-exporter"} == 0
+          for: 15m
+          labels:
+            severity: warning
+        - alert: KubeJobFailedRecent
+          annotations:
+            description: The disk-health-check job failed within the last hour.
+            summary: 'Disk health check failed: {{ $labels.job_name }}'
+          expr: kube_job_status_failed{namespace="longhorn-system",job_name=~"disk-health-check-.*"} > 0 and (time() - kube_job_status_start_time{namespace="longhorn-system",job_name=~"disk-health-check-.*"}) < 3600
+          for: 15m
+          labels:
+            severity: warning
+        - alert: StorageMonitorCronJobStalled
+          annotations:
+            description: The disk-health-check CronJob has not succeeded for over 30 minutes, so USB disk and Longhorn node problems would go unnoticed.
+            summary: Storage monitor has not completed successfully
+          expr: time() - kube_cronjob_status_last_successful_time{namespace="longhorn-system",cronjob="disk-health-check"} > 1800
+          for: 5m
+          labels:
+            severity: warning
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: wildduck-backup
+  namespace: monitoring
+  labels:
+    release: prometheus
+spec:
+  groups:
+    - name: wildduck-backup
+      rules:
+        - alert: WildduckBackupVerifyStalled
+          annotations:
+            description: The wildduck-backup-verify CronJob has not completed successfully for over 3 hours, so a broken WildDuck backup mirror would go unnoticed.
+            summary: WildDuck backup verification has not passed in over 3 hours
+          expr: time() - kube_cronjob_status_last_successful_time{namespace="longhorn-system",cronjob="wildduck-backup-verify"} > 10800
+          for: 15m
+          labels:
+            severity: critical
+        - alert: WildduckBackupVerifyNeverRan
+          annotations:
+            description: No successful run of the wildduck-backup-verify CronJob is recorded, so the WildDuck mail archive is unverified.
+            summary: WildDuck backup verification has never succeeded
+          expr: absent(kube_cronjob_status_last_successful_time{namespace="longhorn-system",cronjob="wildduck-backup-verify"})
+          for: 30m
+          labels:
+            severity: critical

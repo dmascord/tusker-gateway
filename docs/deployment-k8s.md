@@ -11,18 +11,25 @@ Tusker Gateway runs alongside Hermes in the `hermes` namespace on the `visor` cl
 | Image registry | `registry.tusker.net.au:5000/tusker-gateway` |
 | Manifests | `tusker-ai-gateway/k8s/` |
 
+The build host is `visor`. From networks where the private address is unreachable, use the configured SSH endpoint `tusker@tusker.duckdns.org -p 8022` (the `tusker-duckdns` SSH alias) instead of a direct `ssh visor` connection.
+
+```bash
+ssh -p 8022 tusker@tusker.duckdns.org "hostname; kubectl get nodes"
+```
+
 ## 1. Sync source to visor
 
-The build host is `visor`. Deploy a verified commit, not an rsync overlay of
-uncommitted files. Synchronize an exported tree to a dedicated build directory
-and pass the full local commit explicitly; visor's Git metadata is not authoritative.
+The build flow uses an exported tree, not an rsync overlay of uncommitted files. Synchronize to a dedicated build directory and pass the full local commit explicitly; visor's Git metadata is not authoritative.
 
 ```bash
 REV=$(git rev-parse HEAD)
 EXPORT=$(mktemp -d)
 git archive "$REV" | tar -x -C "$EXPORT"
-rsync -a --delete "$EXPORT/" "visor:/srv/opencode/tusker-ai-gateway-build-$REV/"
+rsync -e 'ssh -p 8022' -a --delete "$EXPORT/" "tusker@tusker.duckdns.org:/srv/opencode/tusker-ai-gateway-build-$REV/"
+rm -r "$EXPORT"
 ```
+
+The commands below use the `visor` alias for brevity when direct access works. Otherwise run the remote command through `ssh -p 8022 tusker@tusker.duckdns.org`.
 
 ## 2. Build and deploy
 
@@ -32,7 +39,11 @@ into a temporary deployment manifest, applies it once, and verifies the rollout.
 the deployment does not override it with an environment value.
 
 ```bash
-ssh visor "cd /srv/opencode/tusker-ai-gateway-build-$REV && TUSKER_COMMIT=$REV ./k8s/deploy.sh $REV"
+if ssh -o BatchMode=yes visor true 2>/dev/null; then
+  ssh visor "cd /srv/opencode/tusker-ai-gateway-build-$REV && TUSKER_COMMIT=$REV ./k8s/deploy.sh $REV"
+else
+  ssh -p 8022 tusker@tusker.duckdns.org "cd /srv/opencode/tusker-ai-gateway-build-$REV && TUSKER_COMMIT=$REV ./k8s/deploy.sh $REV"
+fi
 rm -r "$EXPORT"
 ```
 
@@ -45,9 +56,12 @@ After a deploy is verified, delete its build directory on visor - the trees
 accumulate at roughly 4 MB per revision and are reproducible from git:
 
 ```bash
-ssh visor "rm -rf /srv/opencode/tusker-ai-gateway-build-$REV"
+if ssh -o BatchMode=yes visor true 2>/dev/null; then
+  ssh visor "rm -rf /srv/opencode/tusker-ai-gateway-build-$REV"
+else
+  ssh -p 8022 tusker@tusker.duckdns.org "rm -rf /srv/opencode/tusker-ai-gateway-build-$REV"
+fi
 ```
-
 ### Provenance: digest pinning and drift checks
 
 Every deploy pins the image by digest, not by tag: `kubectl set image` renders
@@ -96,6 +110,21 @@ cadence. The deployment smoke sends one authenticated request to each media
 route and fails only on transport/shape failures or explicit
 `no_embed_providers` / `no_reranker_providers` configuration errors; ordinary
 upstream quota or provider errors remain visible but do not block rollout.
+
+## 3a. Monitoring rule deployment
+
+The tracked `k8s/prometheus-values.yaml` enables kube-state-metrics, which is
+required for the CronJob success metrics used by the storage and WildDuck
+backup alerts. Apply the tracked rules after the Helm values converge:
+
+```bash
+helm upgrade prometheus prometheus-community/kube-prometheus-stack \
+  --namespace monitoring --values k8s/prometheus-values.yaml
+kubectl apply -f k8s/prometheus-rules.yaml
+```
+
+`KubeJobFailedRecent` is intentionally limited to `disk-health-check-*` jobs;
+unrelated CrashLoop or batch failures must not make the storage monitor alert.
 
 ## 4. DNS
 
@@ -166,6 +195,34 @@ Hermes traffic is redirected to the AI hostname. The legacy Hermes deployment
 is scaled to zero after cutover; its PVC, service, and secrets remain intact as
 a rollback target. Changes to this deployment's `TUSKER_POOL_CODE` therefore
 apply to both API hostnames during the compatibility transition.
+
+## 5a. Grafana usage dashboard
+
+Grafana is exposed at `https://ai.tusker.net.au/grafana` and uses the
+Prometheus datasource scraped from the Tusker gateway. The polished
+`Tusker Gateway — Usage` dashboard provides provider/model request volume,
+token throughput, success rate, latency, and filter variables.
+
+The login username and password are stored in the Kubernetes Secret
+`monitoring/monitoring-grafana-admin`; do not commit or print the password.
+Retrieve it securely when required:
+
+```bash
+kubectl -n monitoring get secret monitoring-grafana-admin \
+  -o jsonpath='{.data.admin-user}' | base64 -d
+kubectl -n monitoring get secret monitoring-grafana-admin \
+  -o jsonpath='{.data.admin-password}' | base64 -d
+```
+
+The dashboard manifest is `k8s/grafana-tusker-usage-dashboard.yaml`.
+
+Grafana must retain the `/grafana` prefix when routed through Traefik; the
+Grafana `root_url` and `serve_from_sub_path` settings handle that prefix.
+Do not add a Traefik `stripPrefix` middleware, because stripping the prefix
+causes Grafana to redirect back to `/grafana/` repeatedly.
+
+The dedicated route is `k8s/grafana-ingressroute.yaml`; the obsolete
+gateway-namespace Grafana route and strip-prefix middleware must remain absent.
 
 ## 6. Rollback
 

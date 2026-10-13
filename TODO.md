@@ -193,9 +193,9 @@ to localhost, a pre-existing config gap unrelated to the node loss. The
 tracked `k8s/prometheus-values.yaml` now disables only those four generated
 ServiceMonitors. Helm release `prometheus` revision 3 applied the tracked
 values; the live Prometheus API converged to 26 active targets with 0 down.
-Still open from that incident: `wynk`'s `usb-longhorn` disk is gone
-(`storageMaximum 0`, `longhorn-disk.cfg` missing) and `disk-health-check`
-jobs keep failing.
+The storage monitor and WildDuck verification CronJobs are now completing
+successfully. Remaining monitoring work is tracked in the live Helm/rule
+deployment procedure in `docs/deployment-k8s.md`.
 
 ## Strength probe (shipped 2026-09-28, commit c53baef)
 `tusker_gateway.tools.probe_strength` measures llm-stats-unknown pool
