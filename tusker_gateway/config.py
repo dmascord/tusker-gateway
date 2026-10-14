@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 # pool selection. Keep this small and explicit; operators can extend it with
 # TUSKER_BLACKLISTED_MODELS using provider/model glob patterns.
 BUILTIN_BLACKLISTED_MODELS: tuple[str, ...] = ()
-BUILTIN_GREYLISTED_MODELS = ("xiaomi/mimo-v2.5",)
+BUILTIN_GREYLISTED_MODELS = ()
 DEFAULT_TRUSTED_ACTION_MODELS = (
     "openai-codex/*",
     "github-copilot/*",

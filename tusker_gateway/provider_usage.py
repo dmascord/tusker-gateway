@@ -19,9 +19,13 @@ from tusker_gateway.storage import shared_database
 NVIDIA_CAPACITY_GROUP = "nvidia"
 LOCAL_LLM_CAPACITY_GROUP = "local-llm"
 MLX_MAC_CAPACITY_GROUP = "mlx-mac"
+OLLAMA_CLOUD_CAPACITY_GROUP = "ollama-cloud"
+SYNTHETIC_CAPACITY_GROUP = "synthetic"
 DEFAULT_NVIDIA_MAX_CONCURRENT = 8
 DEFAULT_LOCAL_LLM_MAX_CONCURRENT = 1
 DEFAULT_MLX_MAC_MAX_CONCURRENT = 1
+DEFAULT_OLLAMA_CLOUD_MAX_CONCURRENT = 3
+DEFAULT_SYNTHETIC_MAX_CONCURRENT = 4
 DEFAULT_CAPACITY_COOLDOWN_SECS = 300.0
 DEFAULT_CAPACITY_BUSY_COOLDOWN_SECS = 2.0
 _CAPACITY_HINTS = (
@@ -61,6 +65,10 @@ def capacity_group_for_route(
         return LOCAL_LLM_CAPACITY_GROUP
     if provider_name == MLX_MAC_CAPACITY_GROUP:
         return MLX_MAC_CAPACITY_GROUP
+    if provider_name == OLLAMA_CLOUD_CAPACITY_GROUP:
+        return OLLAMA_CLOUD_CAPACITY_GROUP
+    if provider_name == SYNTHETIC_CAPACITY_GROUP:
+        return SYNTHETIC_CAPACITY_GROUP
     if (
         provider_name == NVIDIA_CAPACITY_GROUP
         or model_name.startswith("nvidia/")
@@ -105,6 +113,12 @@ def capacity_limit(group: str) -> int:
         ),
         MLX_MAC_CAPACITY_GROUP: (
             "TUSKER_MLX_MAC_MAX_CONCURRENT", DEFAULT_MLX_MAC_MAX_CONCURRENT
+        ),
+        OLLAMA_CLOUD_CAPACITY_GROUP: (
+            "TUSKER_OLLAMA_CLOUD_MAX_CONCURRENT", DEFAULT_OLLAMA_CLOUD_MAX_CONCURRENT
+        ),
+        SYNTHETIC_CAPACITY_GROUP: (
+            "TUSKER_SYNTHETIC_MAX_CONCURRENT", DEFAULT_SYNTHETIC_MAX_CONCURRENT
         ),
     }
     setting = settings.get(group)

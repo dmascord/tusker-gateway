@@ -46,7 +46,6 @@ def test_builtin_blacklist_blocks_xiaomi_mimo():
 def test_configured_blacklist_supports_provider_model_globs(monkeypatch):
     monkeypatch.setenv("TUSKER_BLACKLISTED_MODELS", "openrouter/*:free, ZAI/GLM-5.3-FLASH")
     config = load_config()
-    assert "xiaomi/mimo-v2.5" in config["greylisted_models"]
     assert model_is_blacklisted(config, "openrouter", "cohere/north-mini-code:free")
     assert model_is_blacklisted(config, "zai", "glm-5.3-flash")
 
