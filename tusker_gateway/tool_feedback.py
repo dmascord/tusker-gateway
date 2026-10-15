@@ -33,17 +33,6 @@ def _expire(now: float) -> None:
 def register_generated_calls(call_ids: list[str], *, request_id: str | None = None) -> int:
     """Register emitted IDs after normalization; never persist raw IDs."""
     return tool_feedback_store.register(call_ids, request_id)
-    now = time.monotonic()
-    with _LOCK:
-        _expire(now)
-        for call_id in call_ids[:128]:
-            if isinstance(call_id, str) and call_id:
-                digest = _digest(call_id)
-                _PENDING[digest] = (now, request_id or "")
-                _PENDING.move_to_end(digest)
-        _expire(now)
-    return min(len(call_ids), 128)
-
 
 def correlate_chat_messages(messages: Any) -> dict[str, int]:
     """Observe standard role=tool feedback in an incoming chat request.
@@ -62,18 +51,16 @@ def correlate_chat_messages(messages: Any) -> dict[str, int]:
                 ids.append(call_id)
     matched = untracked = duplicate = 0
     seen: set[str] = set()
-    with _LOCK:
-        _expire(time.monotonic())
-        for call_id in ids:
-            digest = _digest(call_id)
-            if digest in seen:
-                duplicate += 1
-                continue
-            seen.add(digest)
-            if tool_feedback_store.consume(call_id):
-                matched += 1
-            else:
-                untracked += 1
+    for call_id in ids:
+        digest = _digest(call_id)
+        if digest in seen:
+            duplicate += 1
+            continue
+        seen.add(digest)
+        if tool_feedback_store.consume(call_id):
+            matched += 1
+        else:
+            untracked += 1
     return {"result_messages": len(ids), "matched_results": matched,
             "untracked_results": untracked, "duplicate_results": duplicate}
 
