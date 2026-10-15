@@ -214,6 +214,32 @@ async def test_stream_normalizer_assigns_indexes_to_native_calls_without_indexes
     ]
 
 
+def test_assemble_stream_tool_calls_handles_fragmented_and_cumulative_names():
+    """Provider name deltas may be suffixes or repeated cumulative snapshots."""
+    from tusker_gateway.endpoints import _assemble_stream_tool_calls
+
+    def frame(name):
+        payload = {
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call-fragmented-name",
+                        "function": {"name": name},
+                    }],
+                },
+            }],
+        }
+        return f"data: {json.dumps(payload)}\n\n".encode()
+
+    frames = [frame("re"), frame("read"), frame("read"), frame("er")]
+
+    calls = _assemble_stream_tool_calls(frames)
+
+    assert calls[0]["function"]["name"] == "reader"
+
+
 @pytest.mark.asyncio
 async def test_stream_normalizer_synthesizes_id_for_idless_native_deltas():
     """Every native delta must satisfy OpenCode's id-or-name contract."""

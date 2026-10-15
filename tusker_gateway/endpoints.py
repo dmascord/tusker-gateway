@@ -2968,7 +2968,18 @@ def _assemble_stream_tool_calls(frames: list[bytes]) -> list[dict[str, Any]]:
                 if not isinstance(function, dict):
                     continue
                 if function.get("name"):
-                    current["function"]["name"] = str(function["name"])
+                    # Streaming providers may send suffix fragments, cumulative
+                    # snapshots, or repeated copies of a function name.
+                    name = str(function["name"])
+                    previous = current["function"]["name"]
+                    if not previous:
+                        current["function"]["name"] = name
+                    elif name == previous:
+                        pass
+                    elif name.startswith(previous):
+                        current["function"]["name"] = name
+                    elif not previous.endswith(name):
+                        current["function"]["name"] += name
                 if "arguments" in function:
                     current["function"]["arguments"] += _tool_argument_text(
                         function.get("arguments")
