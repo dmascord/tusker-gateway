@@ -12,6 +12,7 @@ import threading
 import time
 from collections import OrderedDict
 from typing import Any
+from tusker_gateway import tool_feedback_store
 
 _LOCK = threading.Lock()
 _SECRET = os.urandom(32)
@@ -31,6 +32,7 @@ def _expire(now: float) -> None:
 
 def register_generated_calls(call_ids: list[str], *, request_id: str | None = None) -> int:
     """Register emitted IDs after normalization; never persist raw IDs."""
+    return tool_feedback_store.register(call_ids, request_id)
     now = time.monotonic()
     with _LOCK:
         _expire(now)
@@ -68,7 +70,7 @@ def correlate_chat_messages(messages: Any) -> dict[str, int]:
                 duplicate += 1
                 continue
             seen.add(digest)
-            if _PENDING.pop(digest, None) is not None:
+            if tool_feedback_store.consume(call_id):
                 matched += 1
             else:
                 untracked += 1
