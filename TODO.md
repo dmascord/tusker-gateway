@@ -1,6 +1,6 @@
 # Project TODOs
 
-## Rejected turns keep the provider's exact bytes (2026-10-15, pending deploy)
+## Rejected turns keep the provider's exact bytes (2026-10-15, deployed)
 
 A turn the gateway rejects before the client sees it is re-dispatched, so the
 rejected provider's own bytes are gone by the time anyone investigates. The
@@ -46,6 +46,20 @@ receives the recovered turn.
 
 To read a capture: `python -m json.tool <file>`; to clear, delete the
 `unusable-*.json` files in the capture directory.
+
+**Deployed 2026-10-15** as commit `c50c86f` / image `sha256:a52192b1…` (pin
+commit recorded in `k8s/deployment.yaml`): `k8s/verify-provenance.sh` reports
+full agreement (tracked manifest = live Deployment = both pod imageIDs = registry
+tag = `/health` = git HEAD), `TUSKER_STREAM_CAPTURE=1` is live in the pod env,
+`/health`+`/ready` are 200, the authenticated smoke returns `{"ok": true}` and
+the new pod reports 0 restarts. Verified inside the running pod: the store wrote
+a byte-exact `0600` record under the `0700` capture directory on the
+`tusker-home` PVC (then removed it). No live rejection occurred during the probe
+window — the incident route (`alibaba/deepseek-v4.1-flash`, twice) answered with
+a tool call, and an invalid model id surfaces as an upstream error — so nothing
+was written for those attempts, which is the correct no-false-positive
+behaviour. The rejection-to-capture wiring is covered by the integration test
+that drives the real client through the real endpoint.
 
 ## Unusable tool turns now fail over to another candidate (2026-10-15, deployed)
 
