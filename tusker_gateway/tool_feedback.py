@@ -34,35 +34,60 @@ def register_generated_calls(call_ids: list[str], *, request_id: str | None = No
     """Register emitted IDs after normalization; never persist raw IDs."""
     return tool_feedback_store.register(call_ids, request_id)
 
-def correlate_chat_messages(messages: Any) -> dict[str, int]:
-    """Observe standard role=tool feedback in an incoming chat request.
+def _feedback_kind(content: Any) -> str:
+    """Recognise explicit structured failures, never infer success from prose."""
+    if isinstance(content, dict):
+        if content.get("isError") is True or content.get("is_error") is True:
+            return "error"
+        if content.get("resultType") == "error" or content.get("result_type") == "error":
+            return "error"
+        if content.get("status") in ("error", "failed", "rejected", "timeout"):
+            return "error"
+    if isinstance(content, str) and content.strip() == "Tool result missing":
+        return "synthetic_missing"
+    return "unknown"
 
-    Repeated conversation history must not be interpreted as repeated
-    executions. A previously consumed ID is reported as untracked.
-    """
+
+def correlate_chat_messages(messages: Any) -> dict[str, int]:
+    """Correlate tool feedback, ignoring historical results in replayed context."""
+    counts = {
+        "result_messages": 0, "matched_results": 0, "untracked_results": 0,
+        "duplicate_results": 0, "historical_results": 0,
+        "explicit_errors": 0, "synthetic_missing": 0,
+    }
     if not isinstance(messages, list):
-        return {"result_messages": 0, "matched_results": 0, "untracked_results": 0,
-                "duplicate_results": 0}
-    ids = []
-    for message in messages[:512]:
-        if isinstance(message, dict) and message.get("role") == "tool":
-            call_id = message.get("tool_call_id")
-            if isinstance(call_id, str) and call_id:
-                ids.append(call_id)
-    matched = untracked = duplicate = 0
+        return counts
+    recent_assistant = max(
+        (i for i, msg in enumerate(messages[:512])
+         if isinstance(msg, dict) and msg.get("role") == "assistant"),
+        default=-1,
+    )
     seen: set[str] = set()
-    for call_id in ids:
+    for index, msg in enumerate(messages[:512]):
+        if not isinstance(msg, dict) or msg.get("role") != "tool":
+            continue
+        call_id = msg.get("tool_call_id")
+        if not isinstance(call_id, str) or not call_id:
+            continue
+        if index < recent_assistant:
+            counts["historical_results"] += 1
+            continue
+        counts["result_messages"] += 1
         digest = _digest(call_id)
         if digest in seen:
-            duplicate += 1
+            counts["duplicate_results"] += 1
             continue
         seen.add(digest)
-        if tool_feedback_store.consume(call_id):
-            matched += 1
-        else:
-            untracked += 1
-    return {"result_messages": len(ids), "matched_results": matched,
-            "untracked_results": untracked, "duplicate_results": duplicate}
+        if not tool_feedback_store.consume(call_id):
+            counts["untracked_results"] += 1
+            continue
+        counts["matched_results"] += 1
+        kind = _feedback_kind(msg.get("content"))
+        if kind == "error":
+            counts["explicit_errors"] += 1
+        elif kind == "synthetic_missing":
+            counts["synthetic_missing"] += 1
+    return counts
 
 
 def chat_result_call_ids(result: dict[str, Any]) -> list[str]:
