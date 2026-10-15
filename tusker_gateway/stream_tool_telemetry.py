@@ -93,6 +93,10 @@ class StreamToolTelemetry:
                                 else:
                                     self._oversize += 1
 
+    def emitted_call_ids(self) -> list[str]:
+        """Return transient call IDs for correlation; never log them."""
+        return [item["id"] for item in self._calls.values() if item["id"]]
+
     def summary(self) -> dict[str, Any]:
         calls = [
             {"id": item["id"], "function": {"arguments": item["arguments"]}}
