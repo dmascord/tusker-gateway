@@ -1,6 +1,38 @@
 # Project TODOs
 
 
+## Unusable tool turns now fail over to another candidate (2026-10-15, deployed)
+
+A provider that returns a complete but empty tool turn (`role` +
+`finish_reason=stop`, no content, no tool call) was rejected as
+`reasoning_only_or_empty` *after* the 200 was committed, so the client received
+the gateway's error message even though another candidate could answer.
+Incident: `req_639b33b3904d2d0c` (2026-10-15) on `alibaba/deepseek-v4.1-flash`;
+the same route served six 190k-215k-token prompt estimates minutes later, which
+rules out prompt length and context window as causes.
+`UnusableToolResponseError` is now failover-eligible in the pre-visible recovery
+gate (`tusker_gateway/endpoints.py`), which still refuses to re-route once
+visible output has reached the client. The route is still quarantined for
+`TUSKER_TOOL_RESPONSE_COOLDOWN_SECS` (default 300s), and
+`output_budget_exhausted` stays request-dependent and is never quarantined.
+
+Evidence: failing-before/passing-after regression
+(`tests/test_chat.py::test_chat_stream_empty_tool_response_falls_back_before_client_response`)
+plus the full offline suite at 1610 passed / 8 skipped. Deployed as `759f13a` /
+`sha256:56c5f4f5…` (pin commit `565acd0`): `verify-provenance.sh` reports full
+agreement, the gate is present in the running artifact (`endpoints.py:4165`),
+and the 15-minute window after rollout shows 0 ERROR, 0 traceback, 59x 200 and
+15 tool-stream preflights.
+
+Follow-ups resolved in the same pass: Alertmanager was already converged (helm
+revision 19, live config carries the wildduck email route), so no further action
+was needed; the stale visor build directories were pruned (7 dirs, 33 MB);
+`k8s/kilo-worker.yaml`'s `:latest` placeholder is now documented as
+deploy-time-only (the tag does not exist in the registry, so a direct apply
+fails loudly instead of drifting); and the `opencode-cli` catalog logs one
+`CatalogError` at cold start and then `status=ok entries=9`, so that warning is
+a startup glitch rather than a routing gap.
+
 ## Gateway OOM crash-loop + CLI source-tree leak fixed (2026-10-15, deployed)
 
 The gateway pod OOM-killed 16 times in its first ~5 hours (2026-10-14 04:27Z→09:35Z,

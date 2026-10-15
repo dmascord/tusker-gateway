@@ -26,6 +26,8 @@ spec:
           type: RuntimeDefault
       containers:
       - name: kilo-worker
+        # deploy.sh replaces this non-existent placeholder with the immutable build digest.
+        # Do not apply this tracked manifest directly; use k8s/deploy.sh.
         image: registry.tusker.net.au:5000/tusker-gateway:latest
         imagePullPolicy: Always
         command: ["python", "-m", "tusker_gateway.kilo_worker"]
