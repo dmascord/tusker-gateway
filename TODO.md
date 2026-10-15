@@ -31,11 +31,19 @@ Fixes (all in-tree, `pytest tests/ -p no:cacheprovider --ignore=tests/test_passt
 - **Gateway alert rules** (`k8s/prometheus-rules.yaml`): a `tusker-gateway`
   PrometheusRule (scrape-down, restart-storm, fresh-OOM, memory-near-limit) and a
   `tusker-kilo-worker` group, applied to the `monitoring` namespace and verified
-  live/healthy in Prometheus. **Caveat: Alertmanager is not deployed** (no
-  `alertmanager` pod/svc in `monitoring`), so these — like the pre-existing
-  `cluster-health`/`wildduck-backup` rules — are visible in Prometheus/Grafana but
-  page nobody until Alertmanager + a receiver are enabled (kube-prometheus-stack
-  values, a cluster-infra decision outside this repo).
+  live/healthy in Prometheus. **Alertmanager is now deployed** (helm revision 19,
+  2026-10-15): `k8s/prometheus-values.yaml` enables it with a **global** email
+  route to the operator mailbox over `wildduck.tusker.net.au:587` (STARTTLS,
+  `send_resolved`), suppressing `Watchdog`/`InfoInhibitor`. Routing is defined in
+  the chart base `alertmanager.config`, **not** an `AlertmanagerConfig` CR — the
+  operator injects a `namespace="<cr-ns>"` matcher into every CR route, so a
+  monitoring-scoped CR silently drops the gateway alerts (`namespace=hermes`) and
+  node/cluster alerts (no namespace label). The SMTP password is the
+  `monitoring/alertmanager-smtp` secret, mounted via `alertmanagerSpec.secrets`.
+  Verified end-to-end: alerts shaped like `TuskerGatewayOOMKilled` (hermes) and
+  `KubernetesNodeNotReady` (no namespace) each increment
+  `alertmanager_notifications_total{integration="email"}` with zero failures;
+  `Watchdog` stays suppressed.
 
 **Deployed 2026-10-15** as commit `7bca178` / image `sha256:2fc5a520…` (pin
 commit `a8b2ac5`). `k8s/verify-provenance.sh` reports full agreement (tracked
@@ -43,8 +51,8 @@ manifest = live Deployment = both pod imageIDs = registry tag = `/health`);
 `/health`+`/ready` 200, chat SSE smoke `{"ok": true}`, new pod `restarts=0`,
 `TUSKER_CLI_MAX_CONCURRENT=3` live in the pod env, gateway 27% / kilo-worker
 29% of their 3 GiB limits. The rolling-update + AVX2 nodeSelector moved the
-gateway from `warden` to `wraith` with zero downtime. (Commit `7bca178` is the
-deployed revision; the two commits remain **local — not yet pushed** to origin.)
+gateway from `warden` to `wraith` with zero downtime. All deploy/pin commits are
+pushed to `origin/main`.
 
 ## Deploy provenance: digest pinning and drift check (2026-09-29)
 

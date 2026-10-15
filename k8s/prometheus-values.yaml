@@ -2,8 +2,55 @@
 # Minimal install: Prometheus + Grafana only.
 # Storage: Longhorn (default SC).
 
+# Alertmanager delivers every PrometheusRule alert (k8s/prometheus-rules.yaml)
+# to the operator mailbox over wildduck SMTP. Routing lives in the GLOBAL base
+# config below, NOT in an AlertmanagerConfig CR: the operator injects a
+# namespace="<cr-ns>" matcher into every AlertmanagerConfig route, so a single
+# monitoring-scoped CR silently drops every alert whose series does not carry
+# namespace="monitoring" -- including all tusker-gateway alerts (namespace=hermes)
+# and all node/cluster alerts (no namespace label). The base route is not
+# namespaced, so "receiver: email" catches everything.
+#
+# The SMTP password is mounted from the monitoring/alertmanager-smtp secret via
+# alertmanagerSpec.secrets and referenced as a file; it is NEVER stored here.
+# Recreate the secret out-of-band:
+#   kubectl -n monitoring create secret generic alertmanager-smtp \
+#     --from-literal=username=remediation --from-literal=password='<smtp password>'
 alertmanager:
-  enabled: false
+  enabled: true
+  config:
+    global:
+      resolve_timeout: 5m
+    route:
+      receiver: email
+      group_by: ["alertname", "namespace", "instance"]
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 12h
+      routes:
+        # Suppress the always-on heartbeat and the info-only inhibitor probe.
+        - matchers: ['alertname=~"Watchdog|InfoInhibitor"']
+          receiver: "null"
+    receivers:
+      - name: "null"
+      - name: email
+        email_configs:
+          - to: "-tusker@tusker.org"
+            from: "-remediation@tusker.net.au"
+            smarthost: "wildduck.tusker.net.au:587"
+            auth_username: "remediation"
+            auth_password_file: /etc/alertmanager/secrets/alertmanager-smtp/password
+            require_tls: true
+            send_resolved: true
+    inhibit_rules:
+      - source_matchers: ['severity="critical"']
+        target_matchers: ['severity=~"warning|info"']
+        equal: ["alertname", "instance"]
+      - source_matchers: ['alertname="InfoInhibitor"']
+        target_matchers: ['severity="info"']
+  alertmanagerSpec:
+    secrets:
+      - alertmanager-smtp
 
 # The control-plane and kube-proxy metrics endpoints are not bound in this
 # cluster. Keep their ServiceMonitors disabled so Prometheus does not report

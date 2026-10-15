@@ -150,6 +150,46 @@ kubectl apply -f k8s/prometheus-rules.yaml
 `KubeJobFailedRecent` is intentionally limited to `disk-health-check-*` jobs;
 unrelated CrashLoop or batch failures must not make the storage monitor alert.
 
+### Alert delivery
+
+The same values file enables **Alertmanager**, which emails every
+`prometheus-rules.yaml` alert to the operator mailbox over
+`wildduck.tusker.net.au:587` (STARTTLS, `send_resolved`), suppressing
+`Watchdog`/`InfoInhibitor`. Routing lives in the chart's **global base config**
+(`alertmanager.config`), deliberately **not** an `AlertmanagerConfig` CR: the
+operator injects a `namespace="<cr-ns>"` matcher into every AlertmanagerConfig
+route, so a single `monitoring`-scoped CR silently drops every alert whose series
+lacks `namespace="monitoring"` — all `tusker-gateway` alerts (`namespace=hermes`)
+and all node/cluster alerts (no namespace label). The global route has no such
+matcher and catches everything.
+
+The SMTP password is never stored in values. `alertmanager.alertmanagerSpec.secrets`
+mounts the `monitoring/alertmanager-smtp` secret into the Alertmanager pods, and
+the config references it as `auth_password_file:
+/etc/alertmanager/secrets/alertmanager-smtp/password`. Recreate the secret
+out-of-band (never commit it):
+
+```bash
+kubectl -n monitoring create secret generic alertmanager-smtp \
+  --from-literal=username=remediation --from-literal=password='<smtp password>'
+```
+
+Verify delivery without waiting for a real incident: post a shaped alert and
+confirm the counter increments with no failures.
+
+```bash
+kubectl -n monitoring port-forward \
+  alertmanager-prometheus-kube-prometheus-alertmanager-0 9093
+curl -s -XPOST http://127.0.0.1:9093/api/v2/alerts \
+  -H 'Content-Type: application/json' \
+  -d '[{"labels":{"alertname":"TuskerGatewayOOMKilled","severity":"critical","namespace":"hermes"},"startsAt":"2026-10-15T00:00:00Z","endsAt":"2026-10-15T00:02:00Z"}]'
+curl -s http://127.0.0.1:9093/metrics | grep '^alertmanager_notifications_total{integration="email"}'
+```
+
+`alertmanager_notifications_total{integration="email"}` must rise by one per
+distinct alert group after the 30 s group wait, and
+`alertmanager_notifications_failed_total{integration="email"}` must stay 0.
+
 ## 4. DNS
 
 `ai.tusker.net.au` already points at the cluster LB. The gateway shares the
