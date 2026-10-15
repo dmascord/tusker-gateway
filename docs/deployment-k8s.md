@@ -252,17 +252,17 @@ The gateway reads provider keys for every provider named in those pools:
 - `NVIDIA_API_KEY` (retained in the isolated secret, but direct NVIDIA
   catalog discovery is disabled while its upstream capacity is saturated)
 - `SYNTHETIC_API_KEY`
-Rejected-turn stream captures - the evidence for a provider turn the gateway
-rejects before the client sees it - are written under
-`TUSKER_STREAM_DIAGNOSTICS_DIR`, default
-`/home/tusker/.hermes/stream-diagnostics` on the `tusker-home` PVC, mode 0700
-with mode-0600 files. `k8s/deployment.yaml` enables them with
-`TUSKER_STREAM_CAPTURE=1`; the directory stays at its default unless captures
-need to move. `unusable-*.json` records share the directory budget with
-`cycle-*.jsonl`: at most 200 files and 2 MiB total, with no age-based expiry;
-when full, capture stops until an operator clears the directory. The in-memory
-request-body attribution window is separate (900 seconds, capped at 64 pending
-requests). Nothing is written for a turn that is served.
+Rejected-turn captures are stored in the shared state database (`turn_captures`)
+with a seven-day TTL, not in the `tusker-home` capture directory. The
+deployment enables them with `TUSKER_STREAM_CAPTURE=1`; production uses the
+database configured by `TUSKER_STATE_DATABASE_URL`, while local SQLite uses
+`TUSKER_TURN_CAPTURE_PATH`. The privacy pool and unknown pools retain verdict
+metadata but no prompt/response bytes. Operators can query the admin capture
+endpoints or use `python3 -m tusker_gateway.tools.replay_capture`; see
+`docs/turn-capture-replay.md` for the environment knobs and refusal rules.
+Reasoning-cycle captures still use `TUSKER_STREAM_DIAGNOSTICS_DIR` with the
+existing mode-0700/mode-0600 bounded directory store. Nothing is written for a
+turn that is served.
 
 
 Kilo Code CLI runs in a dedicated worker deployment scheduled on nodes labeled

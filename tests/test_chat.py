@@ -2761,7 +2761,13 @@ async def test_chat_stream_rejected_turn_capture_records_provider_bytes(
     was right.
     """
     monkeypatch.setenv("TUSKER_STREAM_CAPTURE", "1")
-    monkeypatch.setenv("TUSKER_STREAM_DIAGNOSTICS_DIR", str(tmp_path / "captures"))
+    monkeypatch.setenv("TUSKER_TURN_CAPTURE_PATH", str(tmp_path / "turn-captures.db"))
+    # Keep a shared-state DSN out of the way so the throwaway sqlite file is used.
+    monkeypatch.setenv("TUSKER_STATE_DATABASE_URL", "")
+    import tusker_gateway.turn_capture as turn_capture
+
+    monkeypatch.setattr(turn_capture, "_STORE", None)
+    monkeypatch.setattr(turn_capture, "_STORE_CONFIG", None)
     pool_manager = MagicMock()
     pool_manager.select.side_effect = [
         ("alibaba", "deepseek-v4.1-flash"),
@@ -2822,20 +2828,22 @@ async def test_chat_stream_rejected_turn_capture_records_provider_bytes(
     assert b"call-capture-fallback" in body
     assert pool_manager.select.call_count == 2
 
-    captures = list((tmp_path / "captures").glob("unusable-*.json"))
-    assert len(captures) == 1
-    record = json.loads(captures[0].read_text())
+    records = turn_capture.list_turn_captures(limit=10)
+    assert len(records) == 1
+    record = turn_capture.fetch_turn_capture(records[0]["capture_id"])
     assert record["provider"] == "alibaba"
     assert record["model"] == "deepseek-v4.1-flash"
     assert record["pool"] == "code"
     assert record["request_source"] == "chat_completions"
     assert record["reason"] == "reasoning_only_or_empty"
     # The exact provider bytes, including the frame that caused the verdict.
-    expected_response = b"".join(unusable_frames).decode()
-    assert record["upstream_response"]["text"] == expected_response
-    assert record["upstream_response"]["bytes"] == len(expected_response)
-    assert record["upstream_response"]["truncated_bytes"] == 0
-    assert record["upstream_request"]["text"] == json.dumps(request_body)
+    expected_response = b"".join(unusable_frames)
+    assert record["response_body"] == expected_response
+    assert record["response_bytes"] == len(expected_response)
+    assert record["response_truncated_bytes"] == 0
+    assert record["request_body"] == json.dumps(request_body).encode()
+    # A byte-complete request is what makes a capture replayable.
+    assert record["replayable"] is True
     verdict = record["verdict"]
     assert verdict["content_chars"] == 0
     assert verdict["reasoning_chars"] == 0

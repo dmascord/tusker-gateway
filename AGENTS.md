@@ -34,6 +34,7 @@ Topic-specific:
 | `IMAGE_GENERATION_IMPLEMENTATION_PLAN.md` | Phased plan for image/video wiring. |
 | `IMPLEMENTATION_SUMMARY.md` / `IMPLEMENTATION_COMPLETE.md` | Milestones + acceptance evidence. |
 | `docs/qwen3.8-27b-perf-2026-09-23.md` | Qwen3.8-27B local and gateway benchmark, including vision verification. |
+| `docs/turn-capture-replay.md` | DB-backed rejected-turn capture: retention, privacy policy, admin/replay ops. |
 
 Source of truth for runtime config: `tusker_gateway/config.py`
 (`DEFAULT_PROVIDER_REGISTRY`, `PoolConfig`). Manifest source: `k8s/`.

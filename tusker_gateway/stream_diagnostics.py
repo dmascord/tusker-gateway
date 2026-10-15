@@ -1,15 +1,17 @@
-"""Private, bounded captures for diagnosing provider stream anomalies.
+"""Captures for diagnosing provider stream anomalies.
 
-Two kinds of capture live here: repeated-reasoning cycles, and provider turns
-that the gateway rejected as unusable. Captured text can contain
-prompt-derived or otherwise sensitive material. It is therefore kept out of
-ordinary logs and written only to a mode-0700 directory with mode-0600 files.
-Captures are bounded by count and total bytes; clear the directory to resume
-capture once that budget is exhausted.
+Two kinds of capture live here. Rejected provider turns are stored as rows in
+the shared state database (``tusker_gateway.turn_capture``) so they outlive log
+rotation and can be replayed. Repeated-reasoning cycles still go to a mode-0700
+directory with mode-0600 files, bounded by count and total bytes; clear that
+directory to resume cycle captures once its budget is exhausted.
+
+Both carry prompt-derived material, so neither is written to ordinary logs. The
+in-memory copy of a provider-bound request is dropped as soon as its turn
+resolves, so a successful turn never pins prompt bytes.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
@@ -20,6 +22,11 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
+from tusker_gateway.turn_capture import (
+    load_turn_capture_config_from_env,
+    store_turn_capture,
+)
+
 logger = logging.getLogger(__name__)
 
 _LOCK = threading.Lock()
@@ -29,15 +36,13 @@ _MAX_TEXT_CHARS = 4096
 
 
 def _capture_files(root: Path) -> list[Path]:
-    """Return the capture files sharing one count/byte budget.
+    """Return the reasoning-cycle capture files sharing one budget.
 
     Only files this module writes are counted: an unrelated ``.json`` in the
-    capture directory must not consume the budget for real captures.
+    capture directory must not consume the budget for real captures. Rejected
+    turns no longer land here, so legacy ``unusable-*.json`` files are ignored.
     """
-    return [
-        *root.glob("cycle-*.jsonl"),
-        *root.glob("unusable-*.json"),
-    ]
+    return list(root.glob("cycle-*.jsonl"))
 
 
 def store_reasoning_cycle(
@@ -99,10 +104,11 @@ def extract_cycle_text(text: str, cycle_chars: int, repeats: int) -> str:
 # A rejected tool turn is usually hidden from the client by an immediate
 # failover, so the only durable evidence of whether the verdict was correct is
 # what the provider actually sent and what the gateway actually asked for.
-# Both are captured here, bounded, together with the verdict counters, as one
-# private JSON record. Enable with TUSKER_STREAM_CAPTURE.
+# The bytes go to the capture database together with the verdict counters, so
+# the record outlives container log rotation. Enable with TUSKER_STREAM_CAPTURE.
 
-_REQUEST_CAPTURE_MAX_BYTES = 16 * 1024
+# The response buffer is held in memory for the life of one stream, so it keeps
+# its own small bound. The request hold is bounded by the capture policy.
 _RESPONSE_CAPTURE_MAX_BYTES = 64 * 1024
 _MAX_PENDING_REQUESTS = 64
 _PENDING_TTL_SECS = 900.0
@@ -119,26 +125,16 @@ def stream_capture_enabled() -> bool:
     }
 
 
-def _bounded_capture(payload: bytes, limit: int) -> dict[str, Any]:
-    """Describe a payload as byte count, digest, and a head+tail excerpt."""
-    if len(payload) <= limit:
-        text = payload.decode("utf-8", errors="replace")
-        elided = 0
-    else:
-        head = limit // 2
-        tail = limit - head
-        elided = len(payload) - limit
-        text = (
-            payload[:head].decode("utf-8", errors="replace")
-            + f"\n<<TUSKER-CAPTURE-TRUNCATED: {elided} bytes elided>>\n"
-            + payload[-tail:].decode("utf-8", errors="replace")
-        )
-    return {
-        "bytes": len(payload),
-        "sha256": hashlib.sha256(payload).hexdigest(),
-        "truncated_bytes": elided,
-        "text": text,
-    }
+def _held_bytes() -> int:
+    """Return the byte count currently pinned by pending request holds.
+
+    Called with ``_LOCK`` held.
+    """
+    return sum(
+        len(value["payload"])
+        for value in _PENDING.values()
+        if value.get("payload") is not None
+    )
 
 
 def remember_upstream_request(
@@ -151,16 +147,19 @@ def remember_upstream_request(
     source: str,
     payload: bytes,
 ) -> None:
-    """Hold a bounded copy of the provider-bound request until the turn ends.
+    """Hold the provider-bound request until the turn ends.
 
     Only streaming turns are held: those are the ones the gateway can reject
-    after the response is committed. An entry is dropped when the rejection
-    reads it, and otherwise expires, so a successful turn cannot pin prompt
-    bytes in memory.
+    after the response is committed. The payload is kept whole so a rejected
+    turn can be replayed, bounded by the capture policy; a request larger than
+    that bound is held without bytes, so its rejection still records the size
+    and verdict. An entry is dropped when the rejection reads it, and otherwise
+    expires, so a successful turn cannot pin prompt bytes in memory.
     """
     if not stream or not request_id or not stream_capture_enabled():
         return
-    capture = _bounded_capture(payload, _REQUEST_CAPTURE_MAX_BYTES)
+    config = load_turn_capture_config_from_env()
+    held = payload if len(payload) <= config.max_request_bytes else None
     with _LOCK:
         now = time.time()
         for key, value in list(_PENDING.items()):
@@ -172,9 +171,12 @@ def remember_upstream_request(
             "model": model,
             "pool": pool,
             "source": source,
-            "request": capture,
+            "payload": held,
+            "payload_bytes": len(payload),
         }
         while len(_PENDING) > _MAX_PENDING_REQUESTS:
+            _PENDING.popitem(last=False)
+        while _held_bytes() > config.pending_bytes and len(_PENDING) > 1:
             _PENDING.popitem(last=False)
 
 
@@ -204,58 +206,35 @@ def store_unusable_stream_capture(
     response: bytes,
     verdict: dict[str, Any],
 ) -> str | None:
-    """Persist one rejected provider turn; return a safe basename or None."""
+    """Persist one rejected provider turn; return its capture id or ``None``.
+
+    The row outlives the container log, so the rejection stays auditable and
+    replayable. Prompt and response bytes are withheld when the pool is
+    excluded (the ZDR boundary) or cannot be established at all; the verdict
+    counters are kept in every case. See ``tusker_gateway.turn_capture``.
+    """
     if not stream_capture_enabled():
         return None
-    record: dict[str, Any] = {
-        "timestamp": time.time(),
-        "request_id": request_id,
-        "provider": provider,
-        "model": model,
-        "reason": reason,
-        "verdict": verdict,
-        "upstream_response": _bounded_capture(response, _RESPONSE_CAPTURE_MAX_BYTES),
-    }
     pending = take_upstream_request(request_id)
     if pending is None:
         # Process-backed adapters and the Anthropic entry point assemble their
-        # own provider payload, so only the response side is available there.
-        record["pool"] = None
-        record["request_source"] = "unavailable"
-        record["upstream_request"] = None
+        # own provider payload, and an expired or evicted hold leaves nothing
+        # behind, so the pool that served this turn is not known here.
+        pool = None
+        request_source = "unavailable"
+        request_payload = None
     else:
-        record["pool"] = pending["pool"]
-        record["request_source"] = pending["source"]
-        record["upstream_request"] = pending["request"]
-    payload = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
-    root = Path(os.environ.get(
-        "TUSKER_STREAM_DIAGNOSTICS_DIR",
-        "/home/tusker/.hermes/stream-diagnostics",
-    ))
-    name = f"unusable-{int(time.time())}-{uuid.uuid4().hex}.json"
-    try:
-        with _LOCK:
-            root.mkdir(mode=0o700, parents=True, exist_ok=True)
-            os.chmod(root, 0o700)
-            files = _capture_files(root)
-            total = sum(path.stat().st_size for path in files if path.is_file())
-            if len(files) >= _MAX_RECORDS or total + len(payload) > _MAX_TOTAL_BYTES:
-                # The store is shared with the reasoning-cycle captures; the
-                # operator has to clear it before capture resumes.
-                logger.warning(
-                    "stream capture store full; dropped request_id=%s files=%d bytes=%d",
-                    request_id or "unknown",
-                    len(files),
-                    total,
-                )
-                return None
-            path = root / name
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, "wb") as stream:
-                stream.write(payload)
-                stream.flush()
-                os.fsync(stream.fileno())
-        return name
-    except OSError:
-        # Diagnostics must never turn an upstream issue into a gateway outage.
-        return None
+        pool = pending["pool"]
+        request_source = pending["source"]
+        request_payload = pending["payload"]
+    return store_turn_capture(
+        request_id=request_id,
+        provider=provider,
+        model=model,
+        pool=pool,
+        request_source=request_source,
+        reason=reason,
+        verdict=verdict,
+        request_payload=request_payload,
+        response_payload=response,
+    )

@@ -61,6 +61,11 @@ from tusker_gateway.config_store import ConfigConflictError, ConfigUnavailableEr
 from tusker_gateway.errors import AuthorizationError, BadRequestError, GatewayError, NotFoundError
 from tusker_gateway.identity import CallerIdentity, fingerprint_api_key
 from tusker_gateway.storage import storage_status
+from tusker_gateway.turn_capture import (
+    fetch_turn_capture,
+    json_safe_capture,
+    list_turn_captures,
+)
 
 
 # ─── Security helpers ────────────────────────────────────────────────────────
@@ -1568,6 +1573,74 @@ async def admin_audit_execution(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "subject": subject, "execution_result": result})
 
 
+# ─── Turn capture inspection ──────────────────────────────────────────
+#
+# Captures are retained only while the capture policy stays enabled and within
+# the configured TTL, so the list is a live view rather than an archive.  Body
+# bytes may also be absent by policy — ``body_policy`` reports which case
+# applied (excluded pool, unknown pool, or unavailable request) and replayable
+# payload text is only ever returned by the single-capture endpoint.
+
+_CAPTURE_LIST_LIMIT_DEFAULT = 50
+_CAPTURE_LIST_LIMIT_MAX = 500
+
+
+def _capture_limit(request: web.Request) -> int:
+    """Parse the list ``limit`` query param, defaulting and clamping it."""
+    raw = request.query.get("limit")
+    if raw is None or raw == "":
+        return _CAPTURE_LIST_LIMIT_DEFAULT
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise BadRequestError("limit must be an integer", code="invalid_limit") from exc
+    return max(1, min(value, _CAPTURE_LIST_LIMIT_MAX))
+
+
+def _capture_since(request: web.Request) -> float | None:
+    """Parse the optional ``since`` query param as epoch seconds."""
+    raw = request.query.get("since")
+    if raw is None or raw == "":
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError) as exc:
+        raise BadRequestError("since must be epoch seconds", code="invalid_since") from exc
+
+
+def _capture_metadata(record: dict[str, Any]) -> dict[str, Any]:
+    """Drop raw body bytes so the list surface stays metadata-only."""
+    return {key: value for key, value in record.items() if not key.endswith("_body")}
+
+
+@_admin_error_guard
+async def admin_captures(request: web.Request) -> web.Response:
+    """GET /admin/captures — recent rejected-turn captures, newest first."""
+    captures = list_turn_captures(
+        provider=request.query.get("provider") or None,
+        model=request.query.get("model") or None,
+        pool=request.query.get("pool") or None,
+        reason=request.query.get("reason") or None,
+        request_id=request.query.get("request_id") or None,
+        since=_capture_since(request),
+        limit=_capture_limit(request),
+    )
+    return web.json_response({
+        "captures": [_capture_metadata(record) for record in captures],
+        "count": len(captures),
+    })
+
+
+@_admin_error_guard
+async def admin_capture_detail(request: web.Request) -> web.Response:
+    """GET /admin/captures/{capture_id} — one capture with bodies rendered for JSON."""
+    capture_id = request.match_info["capture_id"]
+    record = fetch_turn_capture(capture_id)
+    if record is None:
+        raise NotFoundError(f"capture {capture_id} not found", code="capture_not_found")
+    return web.json_response(json_safe_capture(record))
+
+
 def register_admin_config_routes(app: web.Application) -> None:
     """Register the read/write admin config endpoints on ``app``.
 
@@ -1578,6 +1651,8 @@ def register_admin_config_routes(app: web.Application) -> None:
     app.router.add_post("/admin/audit/review", admin_audit_review)
     app.router.add_post("/admin/audit/execution", admin_audit_execution)
     app.router.add_get("/admin/config", admin_config)
+    app.router.add_get("/admin/captures", admin_captures)
+    app.router.add_get("/admin/captures/{capture_id}", admin_capture_detail)
     app.router.add_post("/admin/keys", admin_keys_create)
     app.router.add_put("/admin/keys/{fingerprint}", admin_keys_update)
     app.router.add_delete("/admin/keys/{fingerprint}", admin_keys_delete)

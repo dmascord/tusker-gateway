@@ -1,5 +1,15 @@
 # Project TODOs
 
+## Rejected-turn capture moved to the state database (2026-10-15)
+
+The rejected-turn capture store writes rows to the shared state database
+(table `turn_captures`, `tusker_gateway/turn_capture.py`) with a seven-day TTL
+instead of `unusable-*.json` files on the `tusker-home` PVC. The capture
+directory now holds only reasoning-cycle captures (`cycle-*.jsonl`). See
+`docs/turn-capture-replay.md` for the replay CLI, retention, privacy policy,
+and environment knobs. Deployment remains a separate operational step because
+applying the gateway manifest requires explicit approval.
+
 ## Rejected turns keep the provider's exact bytes (2026-10-15, deployed)
 
 A turn the gateway rejects before the client sees it is re-dispatched, so the
