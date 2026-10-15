@@ -6856,6 +6856,9 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                 stream_frame_count = 1
                 stream_bytes = len(role_frame)
                 stream_visible_output = False
+                from tusker_gateway.stream_tool_telemetry import StreamToolTelemetry
+
+                tool_stream_health = StreamToolTelemetry(requested=bool(tools))
                 try:
                     cycle_fallbacks = 0
                     while True:
@@ -6867,6 +6870,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                                     if chunk == sse_done():
                                         continue
                                     await resp.write(chunk)
+                                    tool_stream_health.feed(chunk)
                                     stream_frame_count += 1
                                     stream_bytes += len(chunk)
                                     stream_visible_output |= _stream_chunk_has_visible_output(chunk)
@@ -6901,6 +6905,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                                     )
                                 async for chunk in stream_result:
                                     await resp.write(chunk)
+                                    tool_stream_health.feed(chunk)
                                     stream_frame_count += 1
                                     stream_bytes += len(chunk)
                                     stream_visible_output |= _stream_chunk_has_visible_output(chunk)
@@ -6933,6 +6938,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                             ):
                                 raise
                             cycle_fallbacks += 1
+                            tool_stream_health.reset_for_fallback()
                             failed_provider, failed_model = provider, target_model
                             if isinstance(
                                 stream_recovery_exc,
@@ -7170,6 +7176,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                     # raise — swallow so we still record metrics.
                     try:
                         await resp.write(sse_done())
+                        tool_stream_health.feed(sse_done())
                     except (ConnectionResetError, ConnectionError, BrokenPipeError):
                         stream_ok = False
                 finally:
@@ -7187,6 +7194,10 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                     stream_resp = None
                     stream_stop = None
                     stream_hb_task = None
+                set_access_log_context(
+                    request,
+                    tool_telemetry=tool_stream_health.summary(),
+                )
                 status = "ok" if stream_ok else status
                 _emit(status)
                 return resp
