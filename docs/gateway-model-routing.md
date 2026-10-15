@@ -504,15 +504,16 @@ hammering it.
 `opencode-cli`, `claude-code-cli`, and `kilo-cli` (only when it is *not*
 proxied to the dedicated worker) each run a CLI child process inside the
 gateway container for the whole request, so they share one `cli` capacity
-group at `TUSKER_CLI_MAX_CONCURRENT=3`. An uncapped burst of concurrent
-clients exhausts the 3 GiB pod limit and the kernel OOM-kills the gateway,
-taking every other pool down with it — this is what happened 16 times on
-2026-10-14. The in-flight slot is held across the entire streamed response
+group at `TUSKER_CLI_MAX_CONCURRENT=1`. An uncapped burst of concurrent
+clients exhausted the 3 GiB pod limit and the kernel OOM-killed the gateway,
+taking every other pool down with it — this happened 16 times on 2026-10-14.
+The in-flight slot is held across the entire streamed response
 (`_lease_released_stream`) and released on completion, failure, or consumer
 close; when the group is saturated the gateway fails fast to another
 candidate (or `503` for an explicit route) and quarantines the `cli` group
 for `TUSKER_PROVIDER_CAPACITY_BUSY_COOLDOWN_SECS` (default 2s) instead of
-spawning another child.
+spawning another child. One slot is intentional: an individual CLI child can
+approach a GiB alongside the gateway process and its warm service.
 
 Because these CLIs treat their working directory as the project and load its
 file tree and instructions into the model context, every child process runs

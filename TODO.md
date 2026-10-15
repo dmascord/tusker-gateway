@@ -225,56 +225,29 @@ a reason to bump; the weekly CronJob is an expected review signal, not an outage
 
 ## Gateway OOM crash-loop + CLI source-tree leak fixed (2026-10-15, deployed)
 
-The gateway pod OOM-killed 16 times in its first ~5 hours (2026-10-14 04:27Z→09:35Z,
-exit 137 against the 3 GiB limit) and then stayed up; the kilo worker sits at
-~2 GiB / 3 GiB. Root cause: `opencode-cli` / `claude-code-cli` / in-process
-`kilo-cli` each spawn a CLI child process inside the gateway container for the
-whole request, with **no concurrency cap** — an uncapped burst exhausts the pod
-limit and the kernel OOM-kills the gateway, taking every other pool down.
+The gateway pod OOM-killed 16 times in its first ~5 hours (2026-10-14
+04:27Z→09:35Z, exit 137 against the 3 GiB limit). The first mitigation
+bounded process-backed CLI requests, but the live pod still OOM-killed once
+under a burst with three admitted children (2026-10-15 11:12:22Z). The
+gateway process and warm CLI service share the same 3 GiB cgroup, so three
+children are not a safe memory budget.
 
-Fixes (all in-tree, `pytest tests/ -p no:cacheprovider --ignore=tests/test_passthrough_providers.py`
-→ 1609 passed, 8 skipped):
+The safe limit is now one in-process CLI child (`TUSKER_CLI_MAX_CONCURRENT=1`);
+proxied Kilo requests remain bounded independently by the dedicated worker.
+Saturated CLI routes fail fast to another candidate or return 503 for an
+explicit route. Source-tree isolation remains enabled for every CLI child and
+warm server.
 
-- **CLI capacity gate** (`provider_usage.py`, `passthrough.py`, `k8s/deployment.yaml`):
-  the three process-backed providers share a `cli` capacity group at
-  `TUSKER_CLI_MAX_CONCURRENT=3` (env-driven, *not* shadowed by the DB config
-  store). The lease is held across the entire streamed response
-  (`_lease_released_stream`) and released on completion/failure/close; when
-  saturated the gateway fails fast to another candidate (or 503 for an explicit
-  route) and quarantines the group for `TUSKER_PROVIDER_CAPACITY_BUSY_COOLDOWN_SECS`
-  (default 2s) instead of spawning another child.
-- **Source-tree isolation** (`cli_streaming.py`, `opencode_cli.py`, `kilo_cli.py`,
-  `claude_code.py`, `kilo_worker.py`): every CLI child now runs from a
-  request-scoped empty directory (`KILO_DISABLE_PROJECT_CONFIG=true`), and the
-  long-lived warm servers are started from the broker dir. These CLIs index their
-  working directory as the project, so inheriting the gateway source tree leaked
-  it into third-party prompts and made file tools target gateway code (auto-reject
-  → failed request).
-- **Gateway alert rules** (`k8s/prometheus-rules.yaml`): a `tusker-gateway`
-  PrometheusRule (scrape-down, restart-storm, fresh-OOM, memory-near-limit) and a
-  `tusker-kilo-worker` group, applied to the `monitoring` namespace and verified
-  live/healthy in Prometheus. **Alertmanager is now deployed** (helm revision 19,
-  2026-10-15): `k8s/prometheus-values.yaml` enables it with a **global** email
-  route to the operator mailbox over `wildduck.tusker.net.au:587` (STARTTLS,
-  `send_resolved`), suppressing `Watchdog`/`InfoInhibitor`. Routing is defined in
-  the chart base `alertmanager.config`, **not** an `AlertmanagerConfig` CR — the
-  operator injects a `namespace="<cr-ns>"` matcher into every CR route, so a
-  monitoring-scoped CR silently drops the gateway alerts (`namespace=hermes`) and
-  node/cluster alerts (no namespace label). The SMTP password is the
-  `monitoring/alertmanager-smtp` secret, mounted via `alertmanagerSpec.secrets`.
-  Verified end-to-end: alerts shaped like `TuskerGatewayOOMKilled` (hermes) and
-  `KubernetesNodeNotReady` (no namespace) each increment
-  `alertmanager_notifications_total{integration="email"}` with zero failures;
-  `Watchdog` stays suppressed.
+The previous fix also added gateway alert rules for scrape-down, restart storm,
+fresh OOM, and memory-near-limit, plus a `tusker-kilo-worker` group. Alertmanager
+routes these alerts through the chart's global email route; the monitoring
+namespace `AlertmanagerConfig` route was not used because the operator adds a
+namespace matcher that would exclude gateway and cluster alerts.
 
-**Deployed 2026-10-15** as commit `7bca178` / image `sha256:2fc5a520…` (pin
-commit `a8b2ac5`). `k8s/verify-provenance.sh` reports full agreement (tracked
-manifest = live Deployment = both pod imageIDs = registry tag = `/health`);
-`/health`+`/ready` 200, chat SSE smoke `{"ok": true}`, new pod `restarts=0`,
-`TUSKER_CLI_MAX_CONCURRENT=3` live in the pod env, gateway 27% / kilo-worker
-29% of their 3 GiB limits. The rolling-update + AVX2 nodeSelector moved the
-gateway from `warden` to `wraith` with zero downtime. All deploy/pin commits are
-pushed to `origin/main`.
+Verification before this follow-up: the offline suite passed 1609 tests with
+8 skips; the live pod with the three-slot setting OOM-killed once, then
+recovered and served `/health` and `/ready` with restart count 1. Re-deploy
+the one-slot setting and verify that no further OOM occurs under normal traffic.
 
 ## Deploy provenance: digest pinning and drift check (2026-09-29)
 

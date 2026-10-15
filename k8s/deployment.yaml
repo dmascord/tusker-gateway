@@ -578,9 +578,10 @@ spec:
         # process inside this container for the whole request. A burst of
         # concurrent clients exhausted the 3Gi limit on 2026-10-14 and the
         # kernel OOM-killed the gateway 16 times; the shared capacity
-        # controller now fails fast to another candidate instead.
+        # controller now fails fast to another candidate. Keep this at one:
+        # each CLI child can approach a GiB alongside the gateway process.
         - name: TUSKER_CLI_MAX_CONCURRENT
-          value: '3'
+          value: '1'
         - name: TUSKER_BUDGETS_ENABLED
           value: 'false'
         # Rejected turns are re-dispatched before the client sees them, so the

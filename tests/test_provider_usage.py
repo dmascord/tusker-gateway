@@ -180,7 +180,7 @@ def test_process_backed_providers_share_cli_capacity_group(monkeypatch):
     assert capacity_group_for_route("kilo-cli", "kilo/kilo-auto/free") is None
     # Streaming HTTP transports stay uncapped by the CLI budget.
     assert capacity_group_for_route("groq", "qwen/qwen3.8-27b") is None
-    assert capacity_limit(CLI_CAPACITY_GROUP) == 3
+    assert capacity_limit(CLI_CAPACITY_GROUP) == 1
 
 
 def test_process_backed_capacity_gate_rejects_fourth_concurrent_request(monkeypatch, tmp_path):
