@@ -7,8 +7,12 @@ The rejected-turn capture store writes rows to the shared state database
 instead of `unusable-*.json` files on the `tusker-home` PVC. The capture
 directory now holds only reasoning-cycle captures (`cycle-*.jsonl`). See
 `docs/turn-capture-replay.md` for the replay CLI, retention, privacy policy,
-and environment knobs. Deployment remains a separate operational step because
-applying the gateway manifest requires explicit approval.
+and environment knobs.
+
+Deployment completed 2026-10-15 as source commit `9e45dd9`, image
+`sha256:3434d7cd…`, with provenance fully verified. The live Postgres probe
+confirmed byte-exact write/read, metadata-only listing, read-time expiry, and
+prune cleanup with no leftover row. Remaining work: none for this feature.
 
 ## Rejected turns keep the provider's exact bytes (2026-10-15, deployed)
 
