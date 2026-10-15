@@ -93,6 +93,23 @@ fails loudly instead of drifting); and the `opencode-cli` catalog logs one
 `CatalogError` at cold start and then `status=ok entries=9`, so that warning is
 a startup glitch rather than a routing gap.
 
+## CLI pins have drifted on npm, but the free-model catalog is unchanged (2026-10-15, no action)
+
+`k8s/check_cli_version_drift.py` flags all three pins (claude-code 2.1.281→2.1.300,
+`@opencode/cli` 2.0.15→2.0.29, kilo 7.7.9→7.8.8) — the first drift since the
+2026-09-24 pins. The flag is freshness, not correctness, and this time the
+freshness is empty: `opencode models` on 2.0.15 and on 2.0.29 return identical
+lists (26 models, the same 10 `opencode/*` free entries), so a bump would adopt
+no new free capacity into the code pool. Production agrees — 0 retired-model /
+invalid-model-reference rejections in 24h and `catalog refresh
+provider=opencode-cli status=ok entries=10`. A bump is still a deliberate,
+provenance-tracked deploy that must re-verify the CLI adapters
+(`tests/test_opencode_cli_adapter.py` plus a live tool-qualification probe),
+because those adapters parse CLI stdout for rejections and a previous bump
+required matching-code fixes. Re-check when the free set actually changes; the
+weekly CronJob (Mondays 06:17 UTC) is the alert path and had not run yet
+(created 2026-10-13).
+
 ## Gateway OOM crash-loop + CLI source-tree leak fixed (2026-10-15, deployed)
 
 The gateway pod OOM-killed 16 times in its first ~5 hours (2026-10-14 04:27Z→09:35Z,
