@@ -3792,6 +3792,24 @@ def _max_pool_provider_attempts() -> int:
         return 6
 
 
+def _max_previsible_failovers() -> int:
+    """Bound re-dispatches that happen after the 200 but before visible output.
+
+    The SSE headers and the assistant role frame are already committed, yet no
+    assistant output has reached the client, so the candidate can still be
+    swapped. Pools full of cheap routes hand back several candidates in a row
+    whose tool turn is unusable (e.g. a DeepSeek DSML opener leaked as content
+    with no structured call). A single retry is not enough there: the client
+    then reads "the route was temporarily quarantined" although nothing was
+    ever streamed. Each retry re-sends the whole prompt, so the count stays
+    small and env-tunable.
+    """
+    try:
+        return max(1, int(os.environ.get("TUSKER_MAX_PREVISIBLE_FAILOVERS", "3")))
+    except ValueError:
+        return 3
+
+
 def _candidate_extra_body(
     extra_body: dict[str, Any],
     provider: str,
@@ -6899,7 +6917,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                             # only for failures that carry no usable content
                             # (transport aborts and CLI adapter exits).
                             if (
-                                cycle_fallbacks >= 1
+                                cycle_fallbacks >= _max_previsible_failovers()
                                 or stream_visible_output
                                 or pool_name is None
                                 or not _stream_failure_can_fail_over(stream_recovery_exc)
@@ -6939,12 +6957,16 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                                 b": gateway: upstream output was unusable; trying another model\n\n"
                             )
                             logger.warning(
-                                "stream pre-visible fallback rid=%s from=%s/%s reason=%s visible_frames=%d attempt=1",
+                                (
+                                    "stream pre-visible fallback rid=%s from=%s/%s "
+                                    "reason=%s visible_frames=%d attempt=%d"
+                                ),
                                 request_id,
                                 failed_provider,
                                 failed_model,
                                 getattr(stream_recovery_exc, "code", type(stream_recovery_exc).__name__),
                                 stream_frame_count - 1,
+                                cycle_fallbacks,
                             )
                             try:
                                 provider, target_model, result = await _call_with_pool_fallback(
@@ -6958,7 +6980,10 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                                     request_id=request_id,
                                     conversation_id=conversation_id,
                                     excluded_candidates={(failed_provider, failed_model)},
-                                    attempt_offset=1,
+                                    attempt_offset=min(
+                                        cycle_fallbacks + 1,
+                                        max(0, _max_pool_provider_attempts() - 1),
+                                    ),
                                 )
                             except Exception as retry_exc:
                                 raise stream_recovery_exc from retry_exc
@@ -6969,7 +6994,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                                 provider=provider,
                                 model=target_model,
                                 pool=pool_name,
-                                candidate_attempts=2,
+                                candidate_attempts=cycle_fallbacks + 1,
                             )
                 except (ConnectionResetError, ConnectionError, BrokenPipeError) as exc:
                     stream_ok = False
