@@ -7203,6 +7203,10 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                     stream_resp = None
                     stream_stop = None
                     stream_hb_task = None
+                if stream_ok and not request.get("_stream_error"):
+                    register_generated_calls(
+                        tool_stream_health.emitted_call_ids(), request_id=request_id,
+                    )
                 set_access_log_context(
                     request,
                     tool_telemetry=tool_stream_health.summary(),
