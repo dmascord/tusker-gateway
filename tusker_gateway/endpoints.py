@@ -7413,6 +7413,8 @@ async def _responses_handler_impl(request: web.Request) -> web.Response | web.St
         )
         if not isinstance(body, dict):
             raise BadRequestError("Request body must be a JSON object", code="invalid_request")
+        from tusker_gateway.tool_feedback import correlate_responses_input, register_generated_calls, chat_result_call_ids
+        set_access_log_context(request, tool_feedback=correlate_responses_input(body.get("input")))
         messages = _responses_input_to_messages(body.get("input"))
         if body.get("instructions") is not None:
             messages.insert(
@@ -7727,6 +7729,7 @@ async def _responses_handler_impl(request: web.Request) -> web.Response | web.St
                     scope=store_scope,
                     embedding=semantic_embedding,
                 )
+            register_generated_calls(chat_result_call_ids(result), request_id=request.get("_request_id"))
             return web.json_response(
                 _chat_result_to_responses(
                     result,
