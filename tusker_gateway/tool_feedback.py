@@ -12,7 +12,7 @@ from typing import Any
 from tusker_gateway import tool_feedback_store
 
 def _digest(call_id: str) -> str:
-    return hmac.new(_SECRET, call_id.encode(), hashlib.sha256).hexdigest()
+    return hashlib.sha256(call_id.encode("utf-8")).hexdigest()
 
 
 def register_generated_calls(call_ids: list[str], *, request_id: str | None = None) -> int:
