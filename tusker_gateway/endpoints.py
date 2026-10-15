@@ -6760,6 +6760,16 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                     source=f"{provider}/{target_model}",
                 )
 
+            if isinstance(result, dict):
+                from tusker_gateway.tool_telemetry import summarize_chat_tool_result
+
+                set_access_log_context(
+                    request,
+                    tool_telemetry=summarize_chat_tool_result(
+                        result, requested=bool(tools),
+                    ),
+                )
+
             # Gateway-routed responses echo the alias; passthrough keeps upstream id.
             if response_alias is not None and isinstance(result, dict):
                 result["model"] = response_alias
