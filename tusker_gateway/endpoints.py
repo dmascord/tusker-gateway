@@ -7673,9 +7673,33 @@ async def _responses_handler_impl(request: web.Request) -> web.Response | web.St
                     emit_created=False,
                 )
 
+            responses_call_ids: set[str] = set()
+            responses_stream_completed = False
             try:
                 async for chunk in response_stream:
                     await stream_resp.write(chunk)
+                    # Responses SSE events are complete frames from our adapter.
+                    for line in chunk.splitlines():
+                        if not line.startswith(b"data:"):
+                            continue
+                        try:
+                            event = json.loads(line[5:].strip())
+                        except (ValueError, UnicodeDecodeError):
+                            continue
+                        if not isinstance(event, dict):
+                            continue
+                        if event.get("type") == "response.output_item.added":
+                            item = event.get("item")
+                            if isinstance(item, dict) and item.get("type") == "function_call":
+                                call_id = item.get("call_id")
+                                if isinstance(call_id, str) and call_id:
+                                    responses_call_ids.add(call_id)
+                        elif event.get("type") == "response.completed":
+                            responses_stream_completed = True
+                if responses_stream_completed:
+                    register_generated_calls(
+                        list(responses_call_ids), request_id=request.get("_request_id"),
+                    )
             except (ConnectionResetError, ConnectionError, BrokenPipeError):
                 logger.info("responses stream client disconnected")
                 request["_stream_error"] = "client_disconnected"
