@@ -244,7 +244,8 @@ class AccessLog:
 
         if isinstance(tool_feedback, dict):
             allowed = {"result_messages", "matched_results", "untracked_results",
-                       "duplicate_results"}
+                       "duplicate_results", "historical_results",
+                       "explicit_errors", "synthetic_missing"}
             record["tool_feedback"] = {
                 key: min(value, 100000) for key, value in tool_feedback.items()
                 if key in allowed and isinstance(value, int) and not isinstance(value, bool)
