@@ -1,6 +1,19 @@
 # Project TODOs
 
 
+## Dependency update review (2026-10-16)
+
+- Accepted the narrow changes from Dependabot PRs #2, #3, and #5 directly on
+  current `main`: `actions/checkout` v4 → v7, `actions/setup-python` v5 → v7
+  in both CI jobs, and `sentence-transformers` 6.0.0 → 6.1.0 in the optional
+  semantic-cache extra. The PR branches were stale and carried unrelated
+  deletions, so they were not merged verbatim.
+- Rejected PR #7. Its streamed DeepSeek change removes the existing contract
+  that promotes reasoning-only chunks into visible `content`; the full suite
+  caught this with `tests/test_tool_call_stripper.py::test_stream_normalizer_promotes_reasoning_content`.
+  The merge was reverted as `d002c0d`.
+
+
 ## Unusable tool turns recover across several candidates (2026-10-15, deployed)
 
 The pre-visible recovery gate originally allowed a single alternate candidate
