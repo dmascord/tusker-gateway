@@ -231,7 +231,9 @@ class AccessLog:
         if isinstance(tool_telemetry, dict):
             # Only bounded, non-content metadata is allowed in access logs.
             allowed = {"requested", "returned", "invalid_arguments", "missing_ids",
-                       "duplicate_ids", "reasoning_present", "protocol", "finish_reason"}
+                       "duplicate_ids", "reasoning_present", "protocol", "finish_reason",
+                       "conflicting_ids", "invalid_frames", "oversize_frames",
+                       "incomplete_stream", "finish_mismatch"}
             record["tool_telemetry"] = {
                 key: value for key, value in tool_telemetry.items()
                 if key in allowed and (isinstance(value, (bool, int)) or
