@@ -51,6 +51,19 @@ def _oauth_config() -> dict[str, Any]:
     )
 
 
+def _codex_config_without_credentials() -> dict[str, Any]:
+    """A config whose Codex pool is empty and cannot hydrate from disk.
+
+    ``PassthroughClient`` falls back to the shared ``~/.hermes/auth.json`` when
+    ``codex_credentials`` is empty, so an explicitly missing path is what keeps
+    the pool deterministically empty.
+    """
+    return _base_config(
+        codex_credentials=[],
+        auth_file="/nonexistent/tusker-gateway-test-auth.json",
+    )
+
+
 @pytest.fixture
 def mock_http():
     """A minimal mock aiohttp.ClientSession."""
@@ -693,6 +706,128 @@ async def test_codex_rotator_empty():
     from tusker_gateway.passthrough import CodexTokenRotator
     rotator = CodexTokenRotator([])
     assert await rotator.get_token() is None
+
+
+
+@pytest.mark.asyncio
+async def test_codex_has_available_credential_tracks_get_token():
+    """The availability predicate must agree with a tokenless ``get_token()``.
+
+    Callers use it to skip a request that could only be answered with 401, so
+    it has to mirror every skip ``get_token()`` performs.
+    """
+    from tusker_gateway.passthrough import CodexTokenRotator
+
+    assert CodexTokenRotator([]).has_available_credential("gpt-5.6-luna") is False
+
+    pooled = CodexTokenRotator([{"token": "tok-a"}])
+    assert pooled.has_available_credential("gpt-5.6-luna") is True
+
+    # A refresh token with no access token cannot authenticate anything.
+    assert CodexTokenRotator([{"refresh_token": "rt-1"}]).has_available_credential() is False
+
+    # A credential cooling down after a quota 429 is skipped by both paths.
+    pooled.cooldown_credential(pooled.fingerprint("tok-a"), 60.0)
+    assert pooled.has_available_credential("gpt-5.6-luna") is False
+    assert await pooled.get_token(model="gpt-5.6-luna") is None
+
+
+@pytest.mark.asyncio
+async def test_codex_without_credential_fails_before_sending_request(
+    mock_http, quality_db, caplog,
+):
+    """An empty credential pool must not spend a request that can only 401.
+
+    A tokenless call comes back 401, which the request path logs as an upstream
+    auth failure - it reads as a broken credential while the pool is simply
+    empty, e.g. while it reloads after a restart.
+    """
+    from tusker_gateway import passthrough as passthrough_module
+
+    passthrough_module._OAUTH_NO_CREDENTIAL_LOGGED_AT.clear()
+    client = PassthroughClient(_codex_config_without_credentials(), quality_db, mock_http)
+    mock_http.request = AsyncMock()
+
+    with caplog.at_level("WARNING", logger="tusker_gateway.passthrough"):
+        with pytest.raises(ProviderError) as excinfo:
+            await client._chat_codex(
+                provider="openai-codex",
+                model="gpt-5.6-luna",
+                messages=[{"role": "user", "content": "hello"}],
+                stream=False,
+                api_key=None,
+            )
+
+    assert excinfo.value.code == "oauth_credential_unavailable"
+    assert excinfo.value.upstream_status == 503
+    assert mock_http.request.await_count == 0
+    assert [r.levelname for r in caplog.records if r.levelno >= 40] == []
+    warnings = [r for r in caplog.records if "oauth credential unavailable" in r.getMessage()]
+    assert len(warnings) == 1
+
+
+@pytest.mark.asyncio
+async def test_codex_unavailable_warning_is_rate_limited(mock_http, quality_db, caplog):
+    """A restart burst must not emit one warning per failed request."""
+    from tusker_gateway import passthrough as passthrough_module
+
+    passthrough_module._OAUTH_NO_CREDENTIAL_LOGGED_AT.clear()
+    client = PassthroughClient(_codex_config_without_credentials(), quality_db, mock_http)
+    mock_http.request = AsyncMock()
+
+    with caplog.at_level("WARNING", logger="tusker_gateway.passthrough"):
+        for _ in range(5):
+            with pytest.raises(ProviderError):
+                await client._chat_codex(
+                    provider="openai-codex",
+                    model="gpt-5.6-luna",
+                    messages=[{"role": "user", "content": "hello"}],
+                    stream=False,
+                    api_key=None,
+                )
+
+    warnings = [r for r in caplog.records if "oauth credential unavailable" in r.getMessage()]
+    assert len(warnings) == 1
+
+
+@pytest.mark.asyncio
+async def test_codex_static_provider_key_used_when_credential_pool_empty(
+    mock_http, quality_db,
+):
+    """A static provider key is the credential source when the pool is empty.
+
+    ``CodexAuthenticator`` prefers ``provider_api_keys[provider]`` over the
+    rotator, so the empty-pool guard must not fire when one is configured:
+    blocking there would break a route that can still authenticate.
+    """
+    config = _codex_config_without_credentials()
+    config["provider_api_keys"] = {"openai-codex": "static-codex-key"}
+    client = PassthroughClient(config, quality_db, mock_http)
+    response = MagicMock()
+    response.status = 400
+    response.headers = {}
+    response.text = AsyncMock(return_value='{"error":{"message":"bad request"}}')
+    response.release = MagicMock()
+    mock_http.request = AsyncMock(return_value=response)
+
+    with pytest.raises(ProviderError) as excinfo:
+        await client._chat_codex(
+            provider="openai-codex",
+            model="gpt-5.6-luna",
+            messages=[{"role": "user", "content": "hello"}],
+            stream=False,
+            api_key=None,
+            endpoint={
+                "base_url": "http://127.0.0.1:9",
+                "chat_path": "/responses",
+                "auth_type": "codex",
+            },
+        )
+
+    assert excinfo.value.code != "oauth_credential_unavailable"
+    assert mock_http.request.await_count == 1
+    headers = mock_http.request.await_args.kwargs["headers"]
+    assert headers["Authorization"] == "Bearer static-codex-key"
 
 
 @pytest.mark.asyncio

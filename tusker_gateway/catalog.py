@@ -367,9 +367,10 @@ class CatalogClient:
         Used by Codex/Copilot catalogs whose endpoints require a
         short-lived OAuth bearer that the static ``set_api_key`` model
         can't represent. The callable is invoked from
-        :meth:`_resolve_token`; a falsy return is treated as
-        unauthenticated (the request will fail upstream as 401/400,
-        and the cached catalog state is retained). Pass None to clear.
+        :meth:`_resolve_token`; a falsy return means the fetch has no
+        bearer to send, which the subclass reports as a refresh failure
+        instead of spending a request that can only be rejected. The
+        cached catalog state is retained either way. Pass None to clear.
         """
         self._token_source = source
 
@@ -519,14 +520,14 @@ class CodexCatalog(CatalogClient):
         # header set is identical so the two paths can't drift.
         from tusker_gateway.auth_strategies import codex_auth_headers
         token = await self._resolve_token()
-        if token:
-            headers = codex_auth_headers(token)
-            headers["accept"] = "application/json"
-        else:
-            headers = {
-                "User-Agent": "tusker-gateway/1.0 (catalog-refresh)",
-                "accept": "application/json",
-            }
+        if not token:
+            # A tokenless request can only come back 401, which the refresh
+            # path records as an upstream auth failure; the actual condition
+            # is an empty or still-loading credential pool. Cached entries
+            # are retained, as with any other catalog error.
+            raise CatalogError("codex credential unavailable")
+        headers = codex_auth_headers(token)
+        headers["accept"] = "application/json"
         async with session.get(self.ENDPOINT, headers=headers) as resp:
             if resp.status != 200:
                 raise CatalogError(f"codex models HTTP {resp.status}")

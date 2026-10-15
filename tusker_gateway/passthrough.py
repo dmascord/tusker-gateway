@@ -801,6 +801,47 @@ def _creds_expires_at(cred: dict[str, Any]) -> float:
         return 0.0
 
 
+# An OAuth-backed route with no usable credential must fail before the request
+# is sent: a credential-less call can only come back 401, which the request path
+# records and logs as an upstream auth failure - it reads as a broken credential
+# even when the real cause is an empty or fully cooled-down pool, typically
+# right after a restart before the credential pool has loaded. One line per
+# window keeps a restart from producing a burst of identical warnings.
+_OAUTH_NO_CREDENTIAL_LOG_WINDOW_SECS = 60.0
+_OAUTH_NO_CREDENTIAL_LOG_MAX_KEYS = 256
+_OAUTH_NO_CREDENTIAL_LOGGED_AT: dict[tuple[str, str], float] = {}
+
+
+def _oauth_credentials_unavailable(provider: str, model: str) -> ProviderError:
+    """Return the error for an OAuth route whose credential pool is unusable.
+
+    ``upstream_status`` is 503 (not the 401 the upstream would have returned):
+    the gateway never reached upstream, and a 5xx stays a transient failure for
+    cooldown purposes instead of cooling the model down for the long
+    credential/permanent window.
+    """
+    key = (provider, model)
+    now = time.time()
+    last = _OAUTH_NO_CREDENTIAL_LOGGED_AT.get(key, 0.0)
+    if now - last >= _OAUTH_NO_CREDENTIAL_LOG_WINDOW_SECS:
+        if len(_OAUTH_NO_CREDENTIAL_LOGGED_AT) >= _OAUTH_NO_CREDENTIAL_LOG_MAX_KEYS:
+            _OAUTH_NO_CREDENTIAL_LOGGED_AT.clear()
+        _OAUTH_NO_CREDENTIAL_LOGGED_AT[key] = now
+        logger.warning(
+            "oauth credential unavailable provider=%s model=%s "
+            "reason=pool_empty_or_all_cooling",
+            provider,
+            model,
+        )
+    exc = ProviderError(
+        f"no usable OAuth credential for {provider}/{model}",
+        code="oauth_credential_unavailable",
+    )
+    exc.upstream_status = 503
+    exc.upstream_body = "no usable OAuth credential"
+    return exc
+
+
 class CodexTokenRotator:
     """Rotate OAuth tokens across one provider-specific credential pool.
 
@@ -1068,6 +1109,45 @@ class CodexTokenRotator:
         if expiry <= time.time():
             # Expired; drop it so the dict does not grow forever.
             self._credential_cooldowns.pop(fingerprint, None)
+            return True
+        return False
+
+    def has_available_credential(self, model: str | None = None) -> bool:
+        """Return whether some credential could serve ``model`` right now.
+
+        Mirrors the skips ``get_token`` performs - empty pool, per-credential
+        cooldown, model exclusion, and a dead access token that this process
+        cannot refresh - without refreshing, mutating state, or advancing the
+        round-robin cursor. Callers use it to fail fast instead of sending an
+        unauthenticated request that can only come back 401.
+
+        Synchronous by design: it never awaits, so under asyncio no other
+        coroutine can interleave with the scan.
+        """
+        creds = self._creds
+        if not creds:
+            return False
+        now = time.time()
+        for idx, cred in enumerate(creds):
+            token = _creds_access_token(cred)
+            if not token:
+                continue
+            if model:
+                identity = self._credential_identity(cred, token)
+                if (identity, str(model).casefold()) in self._unsupported_models:
+                    continue
+            cooldown_until = self._credential_cooldowns.get(self.fingerprint(token))
+            if cooldown_until is not None and cooldown_until > now:
+                continue
+            if self._is_expired(cred):
+                # A dead access token is usable only while this process can
+                # still refresh it; otherwise ``get_token`` skips it too.
+                if self._canary_skip_rotation(cred):
+                    continue
+                if not self._refresh_enabled:
+                    continue
+                if self._refresh_failed_until.get(idx, 0.0) > now:
+                    continue
             return True
         return False
 
@@ -2596,7 +2676,11 @@ class PassthroughClient:
         request_id: str | None = None,
         pool: str | None = None,
     ) -> dict[str, Any] | AsyncIterator[bytes]:
-        from tusker_gateway.auth_strategies import get_auth_strategy
+        from tusker_gateway.auth_strategies import (
+            CodexAuthenticator,
+            OAuthAuthenticator,
+            get_auth_strategy,
+        )
         from tusker_gateway.models import ProviderConfig
         from tusker_gateway.tool_formats import normalize_tools
         from tusker_gateway.stream_diagnostics import remember_upstream_request
@@ -2615,6 +2699,14 @@ class PassthroughClient:
             strategy = get_auth_strategy("api_key", getattr(self, "_codex_rotator", None))
         else:
             strategy = get_auth_strategy("bearer", getattr(self, "_codex_rotator", None))
+        # CodexAuthenticator and OAuthAuthenticator prefer a static provider key
+        # over the rotator, and the bearer/api_key strategies never consult it:
+        # an empty pool is only fatal when the rotator is the credential source.
+        rotator_is_credential_source = (
+            rotator is not None
+            and isinstance(strategy, (CodexAuthenticator, OAuthAuthenticator))
+            and not self._config.get("provider_api_keys", {}).get(provider.lower())
+        )
         # headers are built inside the retry loop below so each attempt can
         # pick a fresh credential from the rotator when the previous one
         # gets quarantined by a per-user quota 429.
@@ -2748,6 +2840,17 @@ class PassthroughClient:
         max_attempts = max(rotator.size, 1) if rotator else 1
         last_exc: RateLimitError | None = None
         for attempt in range(max_attempts):
+            # A pool with no usable credential can only answer 401 upstream, so
+            # fail before sending: the request path would otherwise log an
+            # upstream auth failure for what is really an empty or cooling-down
+            # pool. The all-models-excluded case is left to the check below,
+            # which reports it with the more specific error.
+            if (
+                rotator_is_credential_source
+                and not rotator.model_excluded_for_all_credentials(model)
+                and not rotator.has_available_credential(model)
+            ):
+                raise _oauth_credentials_unavailable(provider, model)
             # Rebuild headers so the strategy picks the next credential
             # from the rotator (the previous attempt's credential may be
             # quarantined by the time we get here).

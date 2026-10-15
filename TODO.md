@@ -1,5 +1,41 @@
 # Project TODOs
 
+
+## Codex OAuth burst of 401s with an empty credential pool (2026-10-15)
+
+During a restart the codex credential pool is empty for a few seconds before
+the config-store snapshot loads. Every codex request in that window was sent
+upstream without a bearer, which can only answer 401; each one logged an
+ERROR-level `codex auth error model=... stream=... status=401`, one
+`codex auth credential missing ... source=none` warning, and for the catalog
+path a tokenless refresh. The 2026-10-15 restart produced 57 such ERRORs in
+9 seconds plus 8 catalog 401s, each of which also consumed the provider's
+quota and looked like a broken credential in the alert stream.
+
+Fixed in the working tree (not yet deployed):
+
+- `CodexTokenRotator.has_available_credential(model)` mirrors every skip
+  `get_token()` performs (empty pool, per-credential cooldown, model
+  exclusion, dead token the process cannot refresh) without refreshing,
+  mutating state, or advancing the cursor.
+- `_chat_codex` fails before sending when the rotator is the credential
+  source and cannot serve the model, raising `ProviderError` with code
+  `oauth_credential_unavailable` and `upstream_status=503` (transient for
+  cooldown purposes; the previous 401 fed the permanent-error window). The
+  guard does not fire when a static `provider_api_keys` entry or a bearer /
+  api_key strategy is the credential source, so those routes keep working.
+- `CodexCatalog.fetch` raises `CatalogError("codex credential unavailable")`
+  instead of spending a tokenless request that only 401s.
+- The warning is rate-limited to one per (provider, model) per 60s.
+
+Client-visible behavior is unchanged: a pool route still returns 502 with the
+generic provider message; the access log carries
+`failure_class=oauth_credential_unavailable`.
+
+Remaining: deploy via the visor flow and verify the new pod's first ten
+minutes log zero `codex auth error` lines (the burst only appears in the
+post-restart window).
+
 ## Rejected-turn capture moved to the state database (2026-10-15)
 
 The rejected-turn capture store writes rows to the shared state database

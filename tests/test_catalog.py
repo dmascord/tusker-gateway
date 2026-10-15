@@ -117,6 +117,18 @@ class FakeSession:
         return self._responses.get(url) or self._responses["default"]
 
 
+def _codex_catalog_with_token() -> CodexCatalog:
+    """A CodexCatalog with a bearer, as production always wires one.
+
+    ``app.py`` injects a token source for the Codex catalog unconditionally,
+    and the endpoint rejects tokenless requests with 401, so the parsing and
+    caching tests must supply a token to reach the request path at all.
+    """
+    cat = CodexCatalog()
+    cat.set_token_source(lambda: _coro("test-codex-token"))
+    return cat
+
+
 @pytest.mark.asyncio
 async def test_codex_catalog_parses_models():
     body = {
@@ -128,7 +140,7 @@ async def test_codex_catalog_parses_models():
         ]
     }
     session = FakeSession({"default": FakeResponse(200, body)})
-    cat = CodexCatalog()
+    cat = _codex_catalog_with_token()
     entries = await cat.fetch(session)
     slugs = {e.model for e in entries}
     assert "gpt-5.6-sol" in slugs
@@ -140,7 +152,7 @@ async def test_codex_catalog_parses_models():
 @pytest.mark.asyncio
 async def test_codex_catalog_handles_non_200():
     session = FakeSession({"default": FakeResponse(503, {"error": "down"})})
-    cat = CodexCatalog()
+    cat = _codex_catalog_with_token()
     with pytest.raises(CatalogError, match="HTTP 503"):
         await cat.fetch(session)
 
@@ -157,7 +169,7 @@ async def test_codex_catalog_skips_invalid_entries():
         ]
     }
     session = FakeSession({"default": FakeResponse(200, body)})
-    cat = CodexCatalog()
+    cat = _codex_catalog_with_token()
     entries = await cat.fetch(session)
     assert len(entries) == 1
     assert entries[0].model == "valid-model"
@@ -457,18 +469,18 @@ async def test_codex_catalog_uses_token_source_auth_headers():
 
 
 @pytest.mark.asyncio
-async def test_codex_catalog_without_token_omits_authorization():
-    """Without a token_source or static key, the request must not
-    include an Authorization header (so callers see the upstream 401
-    rather than a malformed request).
+async def test_codex_catalog_without_token_fails_without_sending_request():
+    """A tokenless CodexCatalog.fetch is a refresh failure, not a request.
+
+    The endpoint requires the ChatGPT OAuth bearer, so a tokenless call can
+    only come back 401 - which the refresh path would record as an upstream
+    auth failure even when the real cause is an empty credential pool.
     """
     session = _CapturingSession(FakeResponse(401, {"error": "unauth"}))
     cat = CodexCatalog()
-    with pytest.raises(CatalogError):
+    with pytest.raises(CatalogError, match="credential unavailable"):
         await cat.fetch(session)
-    headers = session.captured["headers"]
-    assert "Authorization" not in headers
-    assert headers["accept"] == "application/json"
+    assert session.captured == {}
 
 
 @pytest.mark.asyncio
@@ -968,7 +980,7 @@ async def test_refresh_replaces_entries_on_success():
     body2 = {"models": [{"slug": "model-b"}]}
     session = FakeSession({"default": FakeResponse(200, body1)})
 
-    cat = CodexCatalog()
+    cat = _codex_catalog_with_token()
     await cat.refresh(session)
     assert len(cat._entries) == 1
     assert cat._entries[0].model == "model-a"
@@ -983,7 +995,7 @@ async def test_refresh_replaces_entries_on_success():
 async def test_refresh_keeps_last_good_state_on_failure():
     """A failed refresh doesn't blow away the cached entries."""
     body_ok = {"models": [{"slug": "model-a"}]}
-    cat = CodexCatalog()
+    cat = _codex_catalog_with_token()
     session_ok = FakeSession({"default": FakeResponse(200, body_ok)})
     await cat.refresh(session_ok)
     assert cat._last_error is None
