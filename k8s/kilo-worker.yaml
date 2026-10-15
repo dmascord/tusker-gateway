@@ -17,7 +17,7 @@ spec:
     spec:
       automountServiceAccountToken: false
       nodeSelector:
-        kubernetes.io/hostname: visor
+        feature.node.kubernetes.io/cpu-cpuid.AVX2: "true"
       securityContext:
         runAsNonRoot: true
         runAsUser: 65534
