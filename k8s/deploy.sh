@@ -80,6 +80,25 @@ fi
 IMAGE_REF="${REGISTRY}/tusker-gateway@${IMAGE_DIGEST}"
 echo "Image pushed: ${IMAGE} -> ${IMAGE_REF}"
 
+# The registry is the durable image store. Keep only this build's local tag so
+# successive releases do not accumulate old gateway layers under the builder's
+# home directory. Scope cleanup to this app's versioned tags; leave other images
+# and the just-pushed image untouched.
+IMAGE_PREFIX="${REGISTRY}/${DEPLOY}:swarm-alpine-"
+mapfile -t OLD_IMAGES < <(
+    buildah images --format '{{.Name}}:{{.Tag}}' \
+        | awk -v prefix="${IMAGE_PREFIX}" -v current="${IMAGE}" \
+            'index($0, prefix) == 1 && $0 != current { print }'
+)
+for old_image in "${OLD_IMAGES[@]}"; do
+    [[ -n "${old_image}" ]] || continue
+    if buildah rmi "${old_image}"; then
+        echo "Removed old local image: ${old_image}"
+    else
+        echo "WARNING: could not remove old local image: ${old_image}" >&2
+    fi
+done
+
 # Render the manifest locally without connecting to the cluster (--local).
 # The spec is pinned to the immutable digest, so a re-push of a tag can never
 # change what a restarted pod runs. Local rendering never mutates the tracked
