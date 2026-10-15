@@ -12,7 +12,12 @@ and environment knobs.
 Deployment completed 2026-10-15 as source commit `9e45dd9`, image
 `sha256:3434d7cd…`, with provenance fully verified. The live Postgres probe
 confirmed byte-exact write/read, metadata-only listing, read-time expiry, and
-prune cleanup with no leftover row. Remaining work: none for this feature.
+prune cleanup with no leftover row.
+
+Remaining: clear the legacy captures. The `tusker-home` capture directory still
+holds 1 `unusable-*.json` file (plus 1 reasoning-cycle `cycle-*.jsonl`). It is
+never written, counted, or read any more, so deleting it is housekeeping only;
+the database store and the cycle captures are unaffected.
 
 ## Rejected turns keep the provider's exact bytes (2026-10-15, deployed)
 
