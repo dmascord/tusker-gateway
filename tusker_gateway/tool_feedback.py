@@ -8,26 +8,11 @@ from __future__ import annotations
 import hashlib
 import hmac
 import os
-import threading
-import time
-from collections import OrderedDict
 from typing import Any
 from tusker_gateway import tool_feedback_store
 
-_LOCK = threading.Lock()
-_SECRET = os.urandom(32)
-_PENDING: "OrderedDict[str, tuple[float, str]]" = OrderedDict()
-_TTL = 3600.0
-_MAX_PENDING = 8192
-
-
 def _digest(call_id: str) -> str:
     return hmac.new(_SECRET, call_id.encode(), hashlib.sha256).hexdigest()
-
-
-def _expire(now: float) -> None:
-    while _PENDING and (len(_PENDING) > _MAX_PENDING or next(iter(_PENDING.values()))[0] < now - _TTL):
-        _PENDING.popitem(last=False)
 
 
 def register_generated_calls(call_ids: list[str], *, request_id: str | None = None) -> int:
