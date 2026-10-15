@@ -6327,6 +6327,12 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                 credential_rotators=request.app.get("credential_rotators"),
             )
             tools = body.get("tools") if isinstance(body.get("tools"), list) else None
+            from tusker_gateway.tool_feedback import (
+                correlate_chat_messages, chat_result_call_ids, register_generated_calls,
+            )
+            set_access_log_context(
+                request, tool_feedback=correlate_chat_messages(body.get("messages")),
+            )
             if os.environ.get("TUSKER_TOOL_DIAGNOSTICS", "0").strip().lower() in {
                 "1",
                 "true",
@@ -6769,6 +6775,9 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                         result, requested=bool(tools),
                     ),
                 )
+
+            if isinstance(result, dict):
+                register_generated_calls(chat_result_call_ids(result), request_id=request_id)
 
             # Gateway-routed responses echo the alias; passthrough keeps upstream id.
             if response_alias is not None and isinstance(result, dict):
