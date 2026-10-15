@@ -60,6 +60,22 @@ always fine.
 `tests/test_passthrough_providers.py` for offline runs (hits live upstreams).
 ~1397 passed + 8 skipped (offline, 2026-09-25; use `--ignore=tests/test_passthrough_providers.py`).
 
+## Secure production smoke testing
+
+Run an authenticated production smoke without storing or printing a gateway
+credential:
+
+```bash
+k8s/smoke_production.sh
+```
+
+The wrapper connects to `tusker@tusker.duckdns.org` on SSH port `8022`, reads
+the first key from `hermes/tusker-env-vault`'s `API_KEYS` field on `visor`, and
+passes it only to the existing smoke helper in the remote shell. The key is
+never written to `.env`, emitted in output, or placed on the command line.
+The default request uses `hermes-privacy`; use `--model hermes-code` for the
+general pool or `--with-media` to include embedding/rerank checks.
+
 ## visor USB-flap monitor — DEPLOYMENT STATUS UNCLEAR (2026-09-14 audit)
 
 `tusker_gateway/tools/usb-flap-monitor.{sh,service,timer}` exists in the
