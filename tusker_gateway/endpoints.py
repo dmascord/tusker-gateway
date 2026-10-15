@@ -790,18 +790,10 @@ async def _normalize_stream_legacy(raw_stream: AsyncIterator[bytes]) -> AsyncIte
                 saw_finish_reason = True
             raw_content = delta.get("content")
             reasoning_content = delta.get("reasoning_content")
-            # Some reasoning models (qwen, etc.) emit reasoning/thinking in
-            # `reasoning_content` while leaving `content` null or empty.
-            # OMP treats content=null as "no text" and ends the turn early.
-            # Promote reasoning_content to content when content is absent so
-            # clients see real text and keep the conversation alive.
-            if raw_content is None and reasoning_content is not None:
-                raw_content = reasoning_content
-                delta["content"] = reasoning_content
-                # OMP client compatibility: sometimes reasoning models omit "content"
-                # when "reasoning_content" is present.
-                if "reasoning_content" in delta:
-                    del delta["reasoning_content"]
+            # Reasoning is not assistant-visible content. In particular, DeepSeek
+            # may emit reasoning-only chunks before structured tool calls.
+            # Preserve reasoning_content as its own field for downstream clients
+            # and conversation replay; never promote it into content.
             has_content = isinstance(raw_content, str) and bool(raw_content)
             tc = delta.get("tool_calls")
             if not tc:
@@ -1391,13 +1383,8 @@ async def _normalize_stream(
             # `reasoning_content` field. OMP renders that field as a thinking
             # block, so tool markup there bypassed the content-only stripper
             # and arrived as visible, unstructured text.
-            if (raw_content is None or raw_content == "") and isinstance(reasoning_content, str):
-                raw_content = reasoning_content
-                promoted_reasoning_chars += len(reasoning_content)
-                stream_diag["content_chars"] += len(reasoning_content)
-                delta["content"] = reasoning_content
-                delta.pop("reasoning_content", None)
-                reasoning_content = None
+            # Do not reinterpret reasoning as assistant content. Auxiliary
+            # reasoning sources are inspected separately below for tool markup.
 
             auxiliary_sources: list[tuple[str, str]] = []
             if isinstance(reasoning_content, str) and reasoning_content:
