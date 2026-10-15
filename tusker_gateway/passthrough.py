@@ -2644,19 +2644,16 @@ class PassthroughClient:
                 body["tool_choice"] = tool_choice
         if extra_body:
             body.update(extra_body)
-        from tusker_gateway.model_capabilities import resolve_tool_capabilities
+        from tusker_gateway.model_capabilities import (
+            prepare_native_deepseek_chat,
+            resolve_tool_capabilities,
+        )
 
         capabilities = resolve_tool_capabilities(provider, model)
-        if not capabilities.supports_explicit_tool_choice_in_thinking:
-            # DeepSeek's native thinking endpoint does not accept tool_choice.
-            # Do not silently relax a caller's required/named tool request:
-            # that would change the requested execution contract.
-            choice = body.get("tool_choice")
-            if choice not in (None, "auto"):
-                raise ProviderError(
-                    "DeepSeek thinking mode does not support explicit tool_choice"
-                )
-            body.pop("tool_choice", None)
+        try:
+            prepare_native_deepseek_chat(body, capabilities)
+        except ValueError as exc:
+            raise ProviderError(str(exc)) from exc
         if provider.lower() == "google":
             # Gemini's OpenAI compatibility endpoint rejects the `store` field
             # even when explicitly disabled; drop it so valid requests succeed.
