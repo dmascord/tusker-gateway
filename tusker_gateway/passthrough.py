@@ -2644,16 +2644,6 @@ class PassthroughClient:
                 body["tool_choice"] = tool_choice
         if extra_body:
             body.update(extra_body)
-        from tusker_gateway.model_capabilities import (
-            prepare_native_deepseek_chat,
-            resolve_tool_capabilities,
-        )
-
-        capabilities = resolve_tool_capabilities(provider, model)
-        try:
-            prepare_native_deepseek_chat(body, capabilities)
-        except ValueError as exc:
-            raise ProviderError(str(exc)) from exc
         if provider.lower() == "google":
             # Gemini's OpenAI compatibility endpoint rejects the `store` field
             # even when explicitly disabled; drop it so valid requests succeed.
