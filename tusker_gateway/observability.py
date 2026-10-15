@@ -77,6 +77,7 @@ _ACCESS_LOG_FIELDS = frozenset({
     "failure_class",
     "cache_status",
     "tool_telemetry",
+    "tool_feedback",
         "tokens_in",
         "tokens_out",
         "error_detail",
@@ -156,6 +157,7 @@ class AccessLog:
         error_detail: str | None = None,
         failure_class: str | None = None,
         tool_telemetry: dict[str, Any] | None = None,
+        tool_feedback: dict[str, int] | None = None,
     ) -> None:
         """Log a structured access record for one request.
 
@@ -240,6 +242,14 @@ class AccessLog:
                                        (isinstance(value, str) and len(value) <= 48))
             }
 
+        if isinstance(tool_feedback, dict):
+            allowed = {"result_messages", "matched_results", "untracked_results",
+                       "duplicate_results"}
+            record["tool_feedback"] = {
+                key: min(value, 100000) for key, value in tool_feedback.items()
+                if key in allowed and isinstance(value, int) and not isinstance(value, bool)
+                and value >= 0
+            }
         self.logger.info(json.dumps(record))
 
 
