@@ -90,6 +90,14 @@ digest, a `tusker.net.au/commit` annotation that disagrees with `/health` or git
 HEAD, or a recorded tag whose registry digest has moved. Run it after each deploy
 and whenever a pod is restarted out of band; `--allow-unresolved` downgrades
 unverifiable links (registry or `/health` unreachable) to warnings.
+As of 2026-10-15, production was observed at commit `c50c86f` - image
+`registry.tusker.net.au:5000/tusker-gateway@sha256:a52192b15ae8936b261d23321e1b1eaac4a94a14a72be4472eab3fdc75b9025a`,
+the digest the tracked manifest pins; the Kilo worker ran the same digest.
+At that verification point, `k8s/verify-provenance.sh` reported all links
+(tracked manifest pin, live Deployment, pod imageIDs, registry tag, `/health`,
+git HEAD) in agreement.
+
+
 
 ### Provider CLI pins and the weekly drift check
 
@@ -109,6 +117,24 @@ and exits 1 on drift. `k8s/cli-drift-cronjob.yaml` runs it weekly in the
 repo checkout, so it mounts the checker from a ConfigMap and duplicates
 the pins in env - `tests/test_cli_drift_wiring.py` fails if either copy
 diverges from the `Dockerfile`/script.
+Dated assessment (2026-10-15): all three pins have drifted -
+`@anthropic-ai/claude-code` 2.1.281 to 2.1.300, `@opencode/cli` 2.0.15 to
+2.0.29, `@kilocode/cli` 7.7.9 to 7.8.8 (the first drift since the 2026-09-24
+pins). `opencode models` on the pinned 2.0.15 and on 2.0.29 returns the same
+26 models and the same ten `opencode/*` free entries, so there is no measured
+catalog-name delta for that comparison. The available post-deploy logs show 0
+retired-model / invalid-model-reference rejections, and include
+`catalog refresh provider=opencode-cli status=ok entries=10`; this is not a
+24-hour request count. The observed catalog refresh evidence covers
+`opencode-cli`; it does not establish that the other adapters cannot
+auto-catalog. No release-note, security, or broader bug-fix review was
+performed, so the model-list comparison alone is not a reason to treat an
+upgrade as having no benefit. Re-check the decision if the free set changes, a
+model is refused on the routing path, an upstream CLI bug is reported, or a
+release/security review identifies a reason to bump. The weekly
+`tusker-cli-drift-check` reporting drift remains an expected signal to review,
+not by itself an outage.
+
 
 Upgrades stay deliberate: bump the `Dockerfile` ARG (and the CronJob env
 mirror), rebuild through `k8s/deploy.sh`, and re-verify the CLI adapters
@@ -226,6 +252,18 @@ The gateway reads provider keys for every provider named in those pools:
 - `NVIDIA_API_KEY` (retained in the isolated secret, but direct NVIDIA
   catalog discovery is disabled while its upstream capacity is saturated)
 - `SYNTHETIC_API_KEY`
+Rejected-turn stream captures - the evidence for a provider turn the gateway
+rejects before the client sees it - are written under
+`TUSKER_STREAM_DIAGNOSTICS_DIR`, default
+`/home/tusker/.hermes/stream-diagnostics` on the `tusker-home` PVC, mode 0700
+with mode-0600 files. `k8s/deployment.yaml` enables them with
+`TUSKER_STREAM_CAPTURE=1`; the directory stays at its default unless captures
+need to move. `unusable-*.json` records share the directory budget with
+`cycle-*.jsonl`: at most 200 files and 2 MiB total, with no age-based expiry;
+when full, capture stops until an operator clears the directory. The in-memory
+request-body attribution window is separate (900 seconds, capped at 64 pending
+requests). Nothing is written for a turn that is served.
+
 
 Kilo Code CLI runs in a dedicated worker deployment scheduled on nodes labeled
 with AVX2 support, not inside the gateway pod. `k8s/kilo-worker.yaml` gives it

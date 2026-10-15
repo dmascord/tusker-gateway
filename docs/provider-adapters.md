@@ -8,6 +8,17 @@ same tool-contract, high-impact audit, and stream validation path as HTTP
 providers. Adapters are code-registered; request data and provider config
 cannot choose an executable or import arbitrary code.
 
+### CLI version coupling and model catalog
+
+The CLI adapters classify some provider rejections from the executable's
+stdout, so their parsing contract is coupled to the installed CLI version.
+After any CLI bump, re-verify the adapters with
+`tests/test_opencode_cli_adapter.py` and a live tool-qualification probe;
+the adapter's rejection parsing must still match the CLI's output. Only
+`opencode-cli` feeds the automatic model catalog: its pinned `opencode
+models` output supplies the `opencode/` entries. The Claude Code and Kilo CLI
+adapters do not add models to that catalog.
+
 ## Claude Code CLI
 
 The built-in `claude-code-cli` adapter invokes the official `claude -p` CLI

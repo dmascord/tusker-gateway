@@ -58,7 +58,12 @@ always fine.
 
 `pytest tests/ -p no:cacheprovider` — skip
 `tests/test_passthrough_providers.py` for offline runs (hits live upstreams).
-~1397 passed + 8 skipped (offline, 2026-09-25; use `--ignore=tests/test_passthrough_providers.py`).
+~1617 passed + 8 skipped (offline, 2026-10-15; use `--ignore=tests/test_passthrough_providers.py`).
+
+## Rejected-turn capture
+
+With `TUSKER_STREAM_CAPTURE=1`, rejected provider turns are stored under `/home/tusker/.hermes/stream-diagnostics` on the `tusker-home` PVC. Each JSON record contains the request when available, raw response bytes, and gateway verdict; it only records turns the client never saw, making it the evidence source for judging a re-dispatched turn.
+On-disk `unusable-*.json` records have no age TTL and share a bounded store with cycle captures: at most 200 files / 2 MiB total; when full, capture resumes only after an operator clears the directory.
 
 ## Secure production smoke testing
 

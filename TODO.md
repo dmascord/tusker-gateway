@@ -73,7 +73,7 @@ rules out prompt length and context window as causes.
 `UnusableToolResponseError` is now failover-eligible in the pre-visible recovery
 gate (`tusker_gateway/endpoints.py`), which still refuses to re-route once
 visible output has reached the client. The route is still quarantined for
-`TUSKER_TOOL_RESPONSE_COOLDOWN_SECS` (default 300s), and
+`TUSKER_TOOL_FAILURE_COOLDOWN_SECS` (default 300s), and
 `output_budget_exhausted` stays request-dependent and is never quarantined.
 
 Evidence: failing-before/passing-after regression
@@ -93,22 +93,23 @@ fails loudly instead of drifting); and the `opencode-cli` catalog logs one
 `CatalogError` at cold start and then `status=ok entries=9`, so that warning is
 a startup glitch rather than a routing gap.
 
-## CLI pins have drifted on npm, but the free-model catalog is unchanged (2026-10-15, no action)
+## CLI pins drifted; OpenCode catalog names unchanged (2026-10-15 assessment)
 
 `k8s/check_cli_version_drift.py` flags all three pins (claude-code 2.1.281→2.1.300,
 `@opencode/cli` 2.0.15→2.0.29, kilo 7.7.9→7.8.8) — the first drift since the
-2026-09-24 pins. The flag is freshness, not correctness, and this time the
-freshness is empty: `opencode models` on 2.0.15 and on 2.0.29 return identical
-lists (26 models, the same 10 `opencode/*` free entries), so a bump would adopt
-no new free capacity into the code pool. Production agrees — 0 retired-model /
-invalid-model-reference rejections in 24h and `catalog refresh
-provider=opencode-cli status=ok entries=10`. A bump is still a deliberate,
+2026-09-24 pins. The measured OpenCode effect is limited: `opencode models` on
+2.0.15 and on 2.0.29 return identical lists (26 models, the same 10
+`opencode/*` free entries), so there is no catalog-name delta in that comparison.
+Available post-deploy logs showed no retired-model / invalid-model-reference
+rejections and included `catalog refresh provider=opencode-cli status=ok
+entries=10`; this was not a 24-hour request count. No release-note, security, or
+broader bug-fix review was performed. A bump remains a deliberate,
 provenance-tracked deploy that must re-verify the CLI adapters
 (`tests/test_opencode_cli_adapter.py` plus a live tool-qualification probe),
 because those adapters parse CLI stdout for rejections and a previous bump
-required matching-code fixes. Re-check when the free set actually changes; the
-weekly CronJob (Mondays 06:17 UTC) is the alert path and had not run yet
-(created 2026-10-13).
+required matching-code fixes. Re-check when the free set changes, a model is
+refused, an upstream CLI bug is reported, or a release/security review identifies
+a reason to bump; the weekly CronJob is an expected review signal, not an outage.
 
 ## Gateway OOM crash-loop + CLI source-tree leak fixed (2026-10-15, deployed)
 

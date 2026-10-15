@@ -559,27 +559,32 @@ the Qwen tokenizer: code ~3.3, schema JSON ~3.4, prose ~5.1), plus
 `context budget rid=... window=... prompt_estimate=... requested_max_tokens=...
 effective_max_tokens=... clamped=...`.
 
+
+A tool turn whose provider output is unusable is rejected by stream validation. This
+includes a complete turn with no answer and no tool call
+(`reasoning_only_or_empty`), as well as other unusable tool responses. Such a
+turn is eligible for failover in the pre-visible recovery gate: the gateway may
+re-dispatch it to one alternative candidate while only role/SSE metadata has
+reached the client. The gate refuses to re-route once visible assistant output
+has reached the client. The failed route is quarantined for
+`TUSKER_TOOL_FAILURE_COOLDOWN_SECS` (default 300s).
+
+Only if the alternative also fails does the client receive the gateway error
+message. Incident: `req_639b33b3904d2d0c` (2026-10-15) on
+`alibaba/deepseek-v4.1-flash`; the same route served six requests with
+190k-215k-token prompt estimates in the following five minutes, so the empty
+turn was not a window or length effect. The rejection-to-failover regression is
+covered by `tests/test_chat.py::test_chat_stream_empty_tool_response_falls_back_before_client_response`.
+
 A tool turn that ends `finish_reason=length` with no answer or tool call is
-rejected as `output_budget_exhausted`. That depends on the request, not the
-model, so the route is not quarantined, and the client is told the prompt
-nearly filled the window. Incident: `req_7b0d460047e30296` (2026-09-23)
-sent a 32,669-token prompt to ornith's 32,768-token slot.
+classified as `output_budget_exhausted`. That depends on the request, not the
+model, so the route is never quarantined for this verdict. The client is told
+the prompt nearly filled the window. Incident: `req_7b0d460047e30296`
+(2026-09-23) sent a 32,669-token prompt to ornith's 32,768-token slot.
 
-A tool turn that ends with no answer and no tool call at all is rejected as
-`reasoning_only_or_empty`, and that verdict is transient rather than a property
-of the request: some upstreams intermittently return a complete, well-formed
-turn carrying only `role` and `finish_reason=stop`. The route is quarantined
-for `TUSKER_TOOL_RESPONSE_COOLDOWN_SECS` (default 300s) and, when no assistant
-output has reached the client yet, the stream is re-dispatched to one
-alternative candidate so the client sees an answer rather than an error. Only
-if that also fails does the client receive the gateway error message. Incident:
-`req_639b33b3904d2d0c` (2026-10-15) on `alibaba/deepseek-v4.1-flash`; the same
-route served six requests with 190k-215k-token prompt estimates in the
-following five minutes, so the empty turn was not a window or length effect.
-
-Because the output budget is the only other cause of an empty tool turn, and
-that depends on the request rather than the model, the two verdicts differ
-deliberately: `output_budget_exhausted` leaves the route alone.
+Because the output budget is the only request-dependent cause of an empty tool
+turn, `output_budget_exhausted` leaves the route alone; other unusable tool
+turns are treated as route failures and quarantined.
 
 Operators should expect:
 

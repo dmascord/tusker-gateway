@@ -26,6 +26,13 @@ app.py         — aiohttp application factory + entry point
 __main__.py    — python -m tusker_gateway
 ```
 
+### Stream diagnostics and recovery
+
+Rejected-turn capture is enabled with `TUSKER_STREAM_CAPTURE=1`. Rejected provider turns are written as private JSON files under `TUSKER_STREAM_DIAGNOSTICS_DIR` (default `/home/tusker/.hermes/stream-diagnostics`), with mode `0700` for the directory and `0600` for files. Each `unusable-*.json` record contains the request ID, provider, model, rejection reason, verdict counters, and bounded raw upstream response bytes (byte count, SHA-256, and a head/tail text excerpt); when the adapter provides it, it also contains the bounded upstream request body, pool, and request source. Request and response excerpts are capped at 16 KiB and 64 KiB respectively. The store is shared with reasoning-cycle captures, capped at 200 files and 2 MiB total, and has no age-based expiry; when full, capture stops until an operator clears it. Pending in-memory request copies are capped at 64 and expire after 15 minutes. Read captures with a JSON viewer such as `jq . /home/tusker/.hermes/stream-diagnostics/unusable-*.json`; clear the store with `find /home/tusker/.hermes/stream-diagnostics -type f -delete`. Served turns are never written: only a turn rejected before client-visible output is captured.
+
+When an unusable tool turn is detected before any visible assistant output reaches the client, the gateway may fail over once to another pool candidate. The rejected route is quarantined for `TUSKER_TOOL_FAILURE_COOLDOWN_SECS` seconds (default 300); request-specific `output_budget_exhausted` failures are not quarantined. Once visible output has reached the client, the gateway does not splice in another provider.
+
+
 ## Media endpoints
 
 | Surface | Route | Providers |
