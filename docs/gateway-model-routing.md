@@ -564,17 +564,32 @@ A tool turn whose provider output is unusable is rejected by stream validation. 
 includes a complete turn with no answer and no tool call
 (`reasoning_only_or_empty`), as well as other unusable tool responses. Such a
 turn is eligible for failover in the pre-visible recovery gate: the gateway may
-re-dispatch it to one alternative candidate while only role/SSE metadata has
-reached the client. The gate refuses to re-route once visible assistant output
-has reached the client. The failed route is quarantined for
+re-dispatch it to alternative candidates while only role/SSE metadata has
+reached the client, bounded by `TUSKER_MAX_PREVISIBLE_FAILOVERS` (default 3).
+Each retry also spends the shared per-request candidate budget
+(`TUSKER_MAX_PROVIDER_ATTEMPTS`), so a pool full of unusable routes cannot
+multiply its own retries. The gate refuses to re-route once visible assistant
+output has reached the client. Each failed route is quarantined for
 `TUSKER_TOOL_FAILURE_COOLDOWN_SECS` (default 300s).
 
-Only if the alternative also fails does the client receive the gateway error
+Only if every alternative also fails does the client receive the gateway error
 message. Incident: `req_639b33b3904d2d0c` (2026-10-15) on
 `alibaba/deepseek-v4.1-flash`; the same route served six requests with
 190k-215k-token prompt estimates in the following five minutes, so the empty
 turn was not a window or length effect. The rejection-to-failover regression is
 covered by `tests/test_chat.py::test_chat_stream_empty_tool_response_falls_back_before_client_response`.
+
+The single alternate this gate originally allowed was still too tight for a
+pool served mostly by cheap routes. Incident: `req_15253924bceb5747`
+(2026-10-15) on the same route, which streamed a truncated DSML opener
+(`<tool`, `_c`, `alls`) as content and stopped with no structured call; the
+stripper swallowed the markup, so the turn carried no client-visible bytes and
+was rejected as `reasoning_only_or_empty`. Two such turns in a row exhausted the
+budget and the client read "the route was temporarily quarantined" although
+nothing had been streamed. Multi-candidate recovery is covered by
+`tests/test_tool_stream_integrity.py::test_unusable_tool_turns_fail_over_before_client_output`,
+which replays the captured upstream bytes for two unusable candidates before a
+usable one.
 
 A tool turn that ends `finish_reason=length` with no answer or tool call is
 classified as `output_budget_exhausted`. That depends on the request, not the

@@ -1,6 +1,44 @@
 # Project TODOs
 
 
+## Unusable tool turns recover across several candidates (2026-10-15, deployed)
+
+The pre-visible recovery gate originally allowed a single alternate candidate
+(`cycle_fallbacks >= 1`). A `code` pool served mostly by cheap routes can hand
+back two unusable turns in a row, and then the client — which had seen nothing —
+still received "The gateway could not use the provider's tool response. The
+route was temporarily quarantined." Incident: `req_15253924bceb5747`
+(2026-10-15T08:16:17Z) on `alibaba/deepseek-v4.1-flash`, which streamed a
+truncated DSML opener (`<tool`, `_c`, `alls`) as content and stopped with no
+structured call; the stripper swallowed the markup, so the turn was rejected as
+`reasoning_only_or_empty` with zero client-visible bytes.
+
+`TUSKER_MAX_PREVISIBLE_FAILOVERS` (default 3, `endpoints._max_previsible_failovers`)
+now bounds how many alternates the gate may try before the failure becomes the
+client's problem. Each retry spends the shared per-request candidate budget
+(`attempt_offset=min(cycle_fallbacks + 1, _max_pool_provider_attempts() - 1)`),
+so a pool of unusable routes cannot multiply its own retries, and the access
+log's `candidate_attempts` now reports the real count instead of a hard-coded 2.
+Quarantine (`TUSKER_TOOL_FAILURE_COOLDOWN_SECS`, default 300s) and the refusal
+to splice after client-visible output are unchanged.
+
+Evidence: failing-before/passing-after regression
+`tests/test_tool_stream_integrity.py::test_unusable_tool_turns_fail_over_before_client_output`
+replays the captured upstream bytes for two unusable candidates before a usable
+one (with `TUSKER_MAX_PREVISIBLE_FAILOVERS=1` the third candidate is never
+reached and the test fails), plus the full offline suite at 1650 passed / 8
+skipped. Deployed as `24d6c52` / `sha256:739c3f6f…` (pin commit `ab55924`):
+`verify-provenance.sh` reports full agreement, the gate is present in the
+running artifact (`endpoints.py`, default 3), a live streamed `bash` tool call
+on the `code` pool returns `finish_reason=tool_calls`, and the capture store
+(Postgres `turn_captures`) holds zero rejected turns since it went live.
+
+Residual: the leak is upstream model behavior, so three consecutive unusable
+routes still surface the message; each failover re-sends the full prompt, so the
+worst case is one initial dispatch plus three retries. The `code` pool does not
+set `require_tool_qualification` (default `False`), so unqualified catalog
+routes remain eligible for tool traffic — that stays an operator decision.
+
 ## Codex OAuth burst of 401s with an empty credential pool (2026-10-15)
 
 During a restart the codex credential pool is empty for a few seconds before
@@ -12,7 +50,7 @@ path a tokenless refresh. The 2026-10-15 restart produced 57 such ERRORs in
 9 seconds plus 8 catalog 401s, each of which also consumed the provider's
 quota and looked like a broken credential in the alert stream.
 
-Fixed in the working tree (not yet deployed):
+Fixed in `24d6c52` and deployed 2026-10-15:
 
 - `CodexTokenRotator.has_available_credential(model)` mirrors every skip
   `get_token()` performs (empty pool, per-credential cooldown, model
@@ -32,9 +70,15 @@ Client-visible behavior is unchanged: a pool route still returns 502 with the
 generic provider message; the access log carries
 `failure_class=oauth_credential_unavailable`.
 
-Remaining: deploy via the visor flow and verify the new pod's first ten
-minutes log zero `codex auth error` lines (the burst only appears in the
-post-restart window).
+Verified live in the pod that rolled out at 10:38Z (revision 568, image
+`sha256:739c3f6f…`, `/health` commit `24d6c52`): zero `codex auth error`, zero
+`status=401` and zero ERROR-level lines across its first window, against the two
+`oauth credential unavailable provider=openai-codex … reason=pool_empty_or_all_cooling`
+warnings the guard now emits in their place - and one `status=503 body=no usable
+OAuth credential` candidate failure that the pool route failed over
+(`attempt=2/6`). The running `passthrough.py`, `endpoints.py` and `catalog.py`
+hash identically to `HEAD`, and `k8s/verify-provenance.sh` reports agreement
+across the tracked manifest, the live Deployment, both pods and `/health`.
 
 ## Rejected-turn capture moved to the state database (2026-10-15)
 

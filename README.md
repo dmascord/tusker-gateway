@@ -30,7 +30,7 @@ __main__.py    — python -m tusker_gateway
 
 Rejected provider turns are captured when `TUSKER_STREAM_CAPTURE=1`. They are stored as rows in the shared state database (`turn_captures`) with a seven-day TTL, using `TUSKER_TURN_CAPTURE_PATH` for local SQLite when `TUSKER_STATE_DATABASE_URL` is empty. Prompt/response bodies are withheld for the privacy pool and unknown pools; byte-complete captures can be inspected through the admin API or replayed with `python3 -m tusker_gateway.tools.replay_capture`. Reasoning-cycle diagnostics remain in the bounded private directory controlled by `TUSKER_STREAM_DIAGNOSTICS_DIR`. See `docs/turn-capture-replay.md` for retention, privacy, filters, and exit codes.
 
-When an unusable tool turn is detected before any visible assistant output reaches the client, the gateway may fail over once to another pool candidate. The rejected route is quarantined for `TUSKER_TOOL_FAILURE_COOLDOWN_SECS` seconds (default 300); request-specific `output_budget_exhausted` failures are not quarantined. Once visible output has reached the client, the gateway does not splice in another provider.
+When an unusable tool turn is detected before any visible assistant output reaches the client, the gateway may re-dispatch to another pool candidate, up to `TUSKER_MAX_PREVISIBLE_FAILOVERS` (default 3) alternates before the failure reaches the client. Each rejected route is quarantined for `TUSKER_TOOL_FAILURE_COOLDOWN_SECS` seconds (default 300); request-specific `output_budget_exhausted` failures are not quarantined. Once visible output has reached the client, the gateway does not splice in another provider.
 
 
 ## Media endpoints
