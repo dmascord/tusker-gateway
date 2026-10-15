@@ -76,6 +76,7 @@ _ACCESS_LOG_FIELDS = frozenset({
     "candidate_attempts",
     "failure_class",
     "cache_status",
+    "tool_telemetry",
         "tokens_in",
         "tokens_out",
         "error_detail",
@@ -154,6 +155,7 @@ class AccessLog:
         error: str | None = None,
         error_detail: str | None = None,
         failure_class: str | None = None,
+        tool_telemetry: dict[str, Any] | None = None,
     ) -> None:
         """Log a structured access record for one request.
 
@@ -226,6 +228,15 @@ class AccessLog:
             record["error_detail"] = str(error_detail)[:512]
         if failure_class:
             record["failure_class"] = failure_class
+        if isinstance(tool_telemetry, dict):
+            # Only bounded, non-content metadata is allowed in access logs.
+            allowed = {"requested", "returned", "invalid_arguments", "missing_ids",
+                       "duplicate_ids", "reasoning_present", "protocol", "finish_reason"}
+            record["tool_telemetry"] = {
+                key: value for key, value in tool_telemetry.items()
+                if key in allowed and (isinstance(value, (bool, int)) or
+                                       (isinstance(value, str) and len(value) <= 48))
+            }
 
         self.logger.info(json.dumps(record))
 
