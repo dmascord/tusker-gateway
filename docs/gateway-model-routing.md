@@ -499,6 +499,28 @@ route is in capacity cooldown (`TUSKER_PROVIDER_CAPACITY_COOLDOWN_SECS=300`)
 so a hot backend can finish its current request and the gateway stops
 hammering it.
 
+#### Process-backed CLI capacity gate
+
+`opencode-cli`, `claude-code-cli`, and `kilo-cli` (only when it is *not*
+proxied to the dedicated worker) each run a CLI child process inside the
+gateway container for the whole request, so they share one `cli` capacity
+group at `TUSKER_CLI_MAX_CONCURRENT=3`. An uncapped burst of concurrent
+clients exhausts the 3 GiB pod limit and the kernel OOM-kills the gateway,
+taking every other pool down with it — this is what happened 16 times on
+2026-10-14. The in-flight slot is held across the entire streamed response
+(`_lease_released_stream`) and released on completion, failure, or consumer
+close; when the group is saturated the gateway fails fast to another
+candidate (or `503` for an explicit route) and quarantines the `cli` group
+for `TUSKER_PROVIDER_CAPACITY_BUSY_COOLDOWN_SECS` (default 2s) instead of
+spawning another child.
+
+Because these CLIs treat their working directory as the project and load its
+file tree and instructions into the model context, every child process runs
+in a request-scoped empty directory with `KILO_DISABLE_PROJECT_CONFIG=true`.
+Inheriting the gateway's own source tree would leak it into third-party
+prompts and make the model's file tools (edit/find) target gateway code,
+auto-reject, and fail the request.
+
 #### Declared context windows and max_tokens fitting
 
 Ollama sizes `num_ctx` from host memory unless `OLLAMA_CONTEXT_LENGTH` or a

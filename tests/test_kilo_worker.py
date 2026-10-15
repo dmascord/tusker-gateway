@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
@@ -278,3 +279,33 @@ async def test_gateway_kilo_adapter_defaults_non_string_worker_error_fields(monk
         await worker.close()
     assert exc.value.code == "kilo_worker_failed"
     assert exc.value.message == "Kilo worker request failed"
+
+
+@pytest.mark.asyncio
+async def test_warm_text_server_runs_in_isolated_workspace(monkeypatch, tmp_path):
+    # The warm text server has no MCP bridge, but it still indexes its working
+    # directory as the model's project. It must start in a request-scoped,
+    # empty workspace with project config disabled, exactly like the tool
+    # server — otherwise free models enumerate the worker's source tree and
+    # their edit/find attempts auto-reject and fail the request.
+    captured: dict = {}
+
+    async def fake_exec(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        proc = AsyncMock()
+        proc.pid = 4242
+        proc.returncode = None
+        return proc
+
+    monkeypatch.setattr(kilo_worker.asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(kilo_worker, "_BROKER_DIR", str(tmp_path / "broker"))
+    monkeypatch.setattr(kilo_worker, "_WARM_SERVER", None)
+
+    url = await kilo_worker._ensure_warm_server()
+
+    assert url == kilo_worker._WARM_SERVER_URL
+    kwargs = captured["kwargs"]
+    assert kwargs["env"]["KILO_DISABLE_PROJECT_CONFIG"] == "true"
+    assert str(kwargs["cwd"]) == str(tmp_path / "broker" / "text-work")
+    assert Path(kwargs["cwd"]).is_dir()

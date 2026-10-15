@@ -295,6 +295,7 @@ class KiloCLIAdapter:
             return stream_cli_jsonl(
                 command, env=env, prompt=prompt.encode(), model=model, timeout=timeout,
                 text_extractor=text_from_event, call_file=call_file, cleanup_dir=temp_dir,
+                cwd=temp_dir,
                 error_code="kilo_cli_failed", timeout_message="Kilo CLI request timed out",
             )
 
@@ -332,6 +333,7 @@ class KiloCLIAdapter:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     env=env,
+                    cwd=temp_dir,
                     start_new_session=True,
                 )
                 communicate_task = asyncio.create_task(proc.communicate(prompt.encode()))
@@ -432,19 +434,27 @@ class KiloCLIAdapter:
         command = [resolved, "run", "--pure", "--format", "json", "--attach", server_url, "--model", cli_model]
         timeout = max(10.0, float(os.environ.get("TUSKER_KILO_CLI_TIMEOUT_SECS", "600")))
         started = asyncio.get_running_loop().time()
-        proc = await asyncio.create_subprocess_exec(
-            *command,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=os.environ.copy(),
-            start_new_session=True,
-        )
-        try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(prompt.encode()), timeout)
-        except asyncio.TimeoutError as exc:
-            await _stop_process(proc)
-            raise ProviderError("Kilo warm request timed out", code="upstream_timeout") from exc
+        # The attach client opens its session in the working directory, so an
+        # inherited source tree is indexed as the model's project: file-tool
+        # attempts (edit, find) then target gateway code, auto-reject, and fail
+        # the request. Keep the session workspace request-scoped and empty.
+        env = os.environ.copy()
+        env["KILO_DISABLE_PROJECT_CONFIG"] = "true"
+        with tempfile.TemporaryDirectory(prefix="tusker-kilo-warm-text-") as temp_name:
+            proc = await asyncio.create_subprocess_exec(
+                *command,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+                cwd=temp_name,
+                start_new_session=True,
+            )
+            try:
+                stdout, stderr = await asyncio.wait_for(proc.communicate(prompt.encode()), timeout)
+            except asyncio.TimeoutError as exc:
+                await _stop_process(proc)
+                raise ProviderError("Kilo warm request timed out", code="upstream_timeout") from exc
         logger.info("kilo warm request model=%s elapsed_s=%.3f rc=%s", cli_model, asyncio.get_running_loop().time() - started, proc.returncode)
         if proc.returncode != 0:
             logger.warning("kilo warm client failed rc=%s stderr=%r", proc.returncode, stderr.decode(errors="replace")[:512])

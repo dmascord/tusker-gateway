@@ -1762,6 +1762,26 @@ async def _stream_with_model_alias(
         await wrapped.aclose()
 
 
+async def _lease_released_stream(
+    wrapped: AsyncIterator[bytes],
+    lease: "CapacityLease | None",
+) -> AsyncIterator[bytes]:
+    """Yield a provider stream and release its capacity lease when it ends.
+
+    Process-backed providers hold a CLI child process for the whole stream, so
+    the in-flight slot must survive until the last frame is delivered or the
+    consumer closes the stream - releasing it when the generator is merely
+    created would leave the memory bound unenforced.
+    """
+    try:
+        async for chunk in wrapped:
+            yield chunk
+    finally:
+        if lease is not None:
+            lease.release()
+        await wrapped.aclose()
+
+
 class PassthroughClient:
     """HTTP client for provider passthrough requests."""
 
@@ -2059,18 +2079,31 @@ class PassthroughClient:
         # Process-backed providers use the same OpenAI response contract as
         # HTTP transports. Keeping this dispatch at the client boundary means
         # every result still passes through endpoint-level validation/audit.
+        # Each request runs a CLI child process inside this container, so it is
+        # admitted through the shared capacity controller: an uncapped burst of
+        # concurrent clients exhausts the pod memory limit and the kernel
+        # OOM-kills the gateway, taking every other pool down with it.
         from tusker_gateway.provider_adapters import provider_adapters
 
         adapter = provider_adapters.get(provider)
         if adapter is not None:
-            return await adapter.chat(
-                provider=provider,
-                model=model,
-                messages=messages,
-                stream=stream,
-                tools=tools,
-                tool_choice=tool_choice,
-            )
+            _, capacity_lease = self._reserve_capacity(provider, model)
+            try:
+                result = await adapter.chat(
+                    provider=provider,
+                    model=model,
+                    messages=messages,
+                    stream=stream,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                )
+            except BaseException:
+                self._release_capacity(capacity_lease)
+                raise
+            if hasattr(result, "__aiter__"):
+                return _lease_released_stream(result, capacity_lease)
+            self._release_capacity(capacity_lease)
+            return result
 
         # Resolve the endpoint up front so the dispatch can decide between
         # the standard chat-completions passthrough and the openai-codex

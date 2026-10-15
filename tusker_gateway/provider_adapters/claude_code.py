@@ -584,7 +584,7 @@ class ClaudeCodeCLIAdapter:
                     prompt=_stream_json_input(prompt, images) if images else prompt.encode(),
                     model=model, timeout=timeout,
                     text_extractor=claude_text_from_event, event_error_extractor=stream_error,
-                    call_file=call_file,
+                    call_file=call_file, cwd=temp_dir,
                     cleanup_dir=temp_dir, error_code="claude_code_cli_failed",
                     timeout_message="Claude Code CLI request timed out",
                 ),
@@ -634,6 +634,7 @@ class ClaudeCodeCLIAdapter:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     env=env,
+                    cwd=temp_dir,
                     start_new_session=True,
                 )
                 stdin_payload = _stream_json_input(prompt, images) if images else prompt.encode()

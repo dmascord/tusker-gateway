@@ -165,6 +165,14 @@ The server is a child of the gateway and shares its cgroup: expect roughly
 160 MiB resident while warm, so the container memory limit must leave room for
 it plus one transient `opencode run` client.
 
+The long-lived `opencode serve` is started by a control command whose working
+directory it inherits, so `service start` runs from the broker directory — not
+the gateway's source tree. OpenCode indexes its working directory as the
+project, so an inherited source tree would leak gateway code into every warm
+prompt. The same isolation applies to the Kilo warm text/tool servers and the
+Kilo worker's text server (`KILO_DISABLE_PROJECT_CONFIG=true`, empty request
+workspace).
+
 If the server cannot start, or a non-streaming request fails inside it, the
 adapter logs a warning and falls back to the isolated `--standalone` path. A
 streaming failure after the first frame propagates, because the client already

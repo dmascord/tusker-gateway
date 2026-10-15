@@ -573,6 +573,14 @@ spec:
         # conservative default to avoid hammering the upstream.
         - name: TUSKER_SYNTHETIC_MAX_CONCURRENT
           value: '4'
+        # Process-backed providers (opencode-cli, claude-code-cli, and kilo-cli
+        # when it is not proxied to the dedicated worker) run a CLI child
+        # process inside this container for the whole request. A burst of
+        # concurrent clients exhausted the 3Gi limit on 2026-10-14 and the
+        # kernel OOM-killed the gateway 16 times; the shared capacity
+        # controller now fails fast to another candidate instead.
+        - name: TUSKER_CLI_MAX_CONCURRENT
+          value: '3'
         - name: TUSKER_BUDGETS_ENABLED
           value: 'false'
         ports:

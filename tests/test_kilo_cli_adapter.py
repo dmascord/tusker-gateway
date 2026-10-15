@@ -121,6 +121,32 @@ async def test_kilo_stream_uses_incremental_json_event_reader(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_kilo_warm_text_client_runs_in_isolated_workspace(monkeypatch):
+    # The warm text attach client opens its session in its working directory.
+    # Inheriting the source tree made free models index gateway code and fail
+    # on auto-rejected edit/find; it must run in a request-scoped empty dir.
+    monkeypatch.setenv("TUSKER_KILO_CLI_ENABLED", "true")
+    monkeypatch.setenv("TUSKER_KILO_WARM_SERVER_URL", "http://127.0.0.1:4096")
+    monkeypatch.delenv("TUSKER_KILO_WORKER_URL", raising=False)
+    stdout = b"\n".join([
+        json.dumps({"type": "step_start", "part": {}}).encode(),
+        json.dumps({"type": "text", "part": {"text": "warm"}}).encode(),
+    ])
+    with patch("tusker_gateway.provider_adapters.kilo_cli.shutil.which", return_value="/opt/kilo"), \
+         patch("tusker_gateway.provider_adapters.kilo_cli.asyncio.create_subprocess_exec",
+               new=AsyncMock(return_value=_FakeProcess(stdout))) as spawn:
+        result = await KiloCLIAdapter().chat(
+            provider="kilo-cli", model="kilo/kilo-auto/free",
+            messages=[{"role": "user", "content": "hi"}],
+        )
+    assert result["choices"][0]["message"]["content"] == "warm"
+    kwargs = spawn.await_args.kwargs
+    assert kwargs["env"]["KILO_DISABLE_PROJECT_CONFIG"] == "true"
+    assert "--attach" in spawn.await_args.args
+    assert Path(kwargs["cwd"]) != Path.cwd()
+    assert Path(kwargs["cwd"]).name.startswith("tusker-kilo-warm-text-")
+
+@pytest.mark.asyncio
 async def test_kilo_client_tools_are_only_exposed_as_request_scoped_mcp(monkeypatch):
     monkeypatch.setenv("TUSKER_KILO_CLI_ENABLED", "1")
 

@@ -44,6 +44,7 @@ def stream_cli_jsonl(
     timeout: float, text_extractor: Callable[[dict[str, Any]], str | None],
     event_error_extractor: Callable[[dict[str, Any]], Exception | None] | None = None,
     call_file: Path | None = None, cleanup_dir: Path | None = None,
+    cwd: Path | None = None,
     error_code: str = "cli_failed", timeout_message: str = "CLI request timed out",
 ):
     """Return an async iterator that emits text as JSON-lines arrive.
@@ -51,6 +52,11 @@ def stream_cli_jsonl(
     Process output is never treated as model text unless the adapter-specific
     extractor recognizes a text delta. Request-scoped tool calls are still
     surfaced as OpenAI tool-call chunks and are never executed here.
+
+    ``cwd`` is the CLI's working directory. It must be a request-scoped empty
+    directory: these CLIs treat their working directory as the project and
+    load its instructions and file tree into the model context, so inheriting
+    the gateway's own source tree would leak it into third-party prompts.
     """
 
     async def events():
@@ -63,7 +69,7 @@ def stream_cli_jsonl(
             proc = await asyncio.create_subprocess_exec(
                 *command, stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                env=env, start_new_session=True,
+                env=env, cwd=cwd, start_new_session=True,
             )
             assert proc.stdin and proc.stdout and proc.stderr
             proc.stdin.write(prompt)

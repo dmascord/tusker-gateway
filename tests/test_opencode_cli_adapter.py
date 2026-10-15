@@ -340,7 +340,7 @@ def _warm_control_recorder(url: str = "http://127.0.0.1:4096"):
     """Fake `_run_cli_tool`: records (args, env) and reports the warm service."""
     calls: list[tuple[list[str], dict[str, str]]] = []
 
-    async def run(binary: str, args: list[str], env: dict[str, str], *, timeout: float = 30.0):
+    async def run(binary: str, args: list[str], env: dict[str, str], *, timeout: float = 30.0, cwd=None):
         calls.append((list(args), dict(env)))
         if args[:2] in (["service", "status"], ["service", "start"]):
             return 0, f"opencode server listening on {url}\n".encode(), b""

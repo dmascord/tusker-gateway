@@ -21,11 +21,13 @@ LOCAL_LLM_CAPACITY_GROUP = "local-llm"
 MLX_MAC_CAPACITY_GROUP = "mlx-mac"
 OLLAMA_CLOUD_CAPACITY_GROUP = "ollama-cloud"
 SYNTHETIC_CAPACITY_GROUP = "synthetic"
+CLI_CAPACITY_GROUP = "cli"
 DEFAULT_NVIDIA_MAX_CONCURRENT = 8
 DEFAULT_LOCAL_LLM_MAX_CONCURRENT = 1
 DEFAULT_MLX_MAC_MAX_CONCURRENT = 1
 DEFAULT_OLLAMA_CLOUD_MAX_CONCURRENT = 3
 DEFAULT_SYNTHETIC_MAX_CONCURRENT = 4
+DEFAULT_CLI_MAX_CONCURRENT = 3
 DEFAULT_CAPACITY_COOLDOWN_SECS = 300.0
 DEFAULT_CAPACITY_BUSY_COOLDOWN_SECS = 2.0
 _CAPACITY_HINTS = (
@@ -57,6 +59,12 @@ def capacity_group_for_route(
     OpenRouter exposes Nvidia models under ``nvidia/<model>`` while direct
     Nvidia requests use the ``nvidia`` provider. Local providers are isolated
     separately because each backend has its own single-request worker budget.
+
+    Process-backed providers (``opencode-cli``, ``claude-code-cli``) share one
+    budget because each in-flight request runs a CLI child process inside the
+    gateway container: an uncapped burst exhausts the pod memory limit and the
+    kernel OOM-kills the gateway. ``kilo-cli`` only counts when it is not
+    proxied to the dedicated worker, which bounds its own subprocesses.
     """
     provider_name = str(provider or "").strip().lower()
     model_name = str(model or "").strip().lower()
@@ -69,6 +77,13 @@ def capacity_group_for_route(
         return OLLAMA_CLOUD_CAPACITY_GROUP
     if provider_name == SYNTHETIC_CAPACITY_GROUP:
         return SYNTHETIC_CAPACITY_GROUP
+    if provider_name in ("opencode-cli", "claude-code-cli"):
+        return CLI_CAPACITY_GROUP
+    if (
+        provider_name == "kilo-cli"
+        and not os.environ.get("TUSKER_KILO_WORKER_URL", "").strip()
+    ):
+        return CLI_CAPACITY_GROUP
     if (
         provider_name == NVIDIA_CAPACITY_GROUP
         or model_name.startswith("nvidia/")
@@ -119,6 +134,9 @@ def capacity_limit(group: str) -> int:
         ),
         SYNTHETIC_CAPACITY_GROUP: (
             "TUSKER_SYNTHETIC_MAX_CONCURRENT", DEFAULT_SYNTHETIC_MAX_CONCURRENT
+        ),
+        CLI_CAPACITY_GROUP: (
+            "TUSKER_CLI_MAX_CONCURRENT", DEFAULT_CLI_MAX_CONCURRENT
         ),
     }
     setting = settings.get(group)
@@ -343,7 +361,9 @@ class ProviderUsageDB:
 __all__ = [
     "CapacityController",
     "CapacityLease",
+    "CLI_CAPACITY_GROUP",
     "DEFAULT_CAPACITY_COOLDOWN_SECS",
+    "DEFAULT_CLI_MAX_CONCURRENT",
     "DEFAULT_LOCAL_LLM_MAX_CONCURRENT",
     "DEFAULT_MLX_MAC_MAX_CONCURRENT",
     "DEFAULT_NVIDIA_MAX_CONCURRENT",

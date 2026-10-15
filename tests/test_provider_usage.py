@@ -163,3 +163,145 @@ def test_local_backend_capacity_controller_rejects_second_request(monkeypatch):
     mlx_first.release()
     assert controller.acquire("local-llm") is not None
     controller.reset()
+
+
+def test_process_backed_providers_share_cli_capacity_group(monkeypatch):
+    from tusker_gateway.provider_usage import CLI_CAPACITY_GROUP, capacity_limit
+
+    monkeypatch.delenv("TUSKER_CLI_MAX_CONCURRENT", raising=False)
+    monkeypatch.delenv("TUSKER_KILO_WORKER_URL", raising=False)
+    assert capacity_group_for_route("opencode-cli", "openai/gpt-5") == CLI_CAPACITY_GROUP
+    assert capacity_group_for_route("claude-code-cli", "sonnet") == CLI_CAPACITY_GROUP
+    # Without the dedicated worker, kilo-cli runs its subprocess in-process.
+    assert capacity_group_for_route("kilo-cli", "kilo/kilo-auto/free") == CLI_CAPACITY_GROUP
+    # The worker pod bounds its own subprocesses, so proxied kilo requests
+    # must not consume a gateway-side CLI slot.
+    monkeypatch.setenv("TUSKER_KILO_WORKER_URL", "http://tusker-kilo-worker:8643")
+    assert capacity_group_for_route("kilo-cli", "kilo/kilo-auto/free") is None
+    # Streaming HTTP transports stay uncapped by the CLI budget.
+    assert capacity_group_for_route("groq", "qwen/qwen3.8-27b") is None
+    assert capacity_limit(CLI_CAPACITY_GROUP) == 3
+
+
+def test_process_backed_capacity_gate_rejects_fourth_concurrent_request(monkeypatch, tmp_path):
+    from unittest.mock import MagicMock
+
+    from tusker_gateway.passthrough import PassthroughClient
+    from tusker_gateway.quality import QualityDB
+    from tusker_gateway.provider_usage import CLI_CAPACITY_GROUP
+
+    monkeypatch.setenv("TUSKER_CLI_MAX_CONCURRENT", "3")
+    monkeypatch.delenv("TUSKER_KILO_WORKER_URL", raising=False)
+    controller = capacity_controller()
+    controller.reset()
+    config = {
+        "api_keys": ["gateway-test"],
+        "provider_api_keys": {"opencode-cli": ""},
+        "codex_credentials": [],
+        "quality_db_path": str(tmp_path / "quality.db"),
+    }
+    client = PassthroughClient(
+        config,
+        QualityDB(config["quality_db_path"]),
+        MagicMock(),
+    )
+    leases = [controller.acquire(CLI_CAPACITY_GROUP) for _ in range(3)]
+    assert all(lease is not None for lease in leases)
+    try:
+        with pytest.raises(ProviderCapacityError) as caught:
+            client._reserve_capacity("opencode-cli", "openai/gpt-5")
+    finally:
+        for lease in leases:
+            lease.release()
+
+    assert caught.value.capacity_rejected is True
+    assert controller.snapshot()[CLI_CAPACITY_GROUP]["active"] == 0
+    controller.reset()
+
+
+@pytest.mark.asyncio
+async def test_process_backed_dispatch_holds_lease_until_stream_ends(monkeypatch, tmp_path):
+    from unittest.mock import MagicMock
+
+    from tusker_gateway import passthrough as passthrough_module
+    from tusker_gateway.passthrough import PassthroughClient
+    from tusker_gateway.provider_usage import CLI_CAPACITY_GROUP
+    from tusker_gateway.quality import QualityDB
+
+    monkeypatch.setenv("TUSKER_CLI_MAX_CONCURRENT", "3")
+    controller = capacity_controller()
+    controller.reset()
+    config = {
+        "api_keys": ["gateway-test"],
+        "provider_api_keys": {},
+        "codex_credentials": [],
+        "quality_db_path": str(tmp_path / "quality.db"),
+    }
+
+    class _FakeAdapter:
+        def __init__(self) -> None:
+            self.active_during_stream = None
+
+        async def chat(self, **_kwargs):
+            async def stream():
+                self.active_during_stream = controller.snapshot().get(
+                    CLI_CAPACITY_GROUP, {}
+                ).get("active", 0)
+                yield b"data: partial\n\n"
+                yield b"data: [DONE]\n\n"
+            return stream()
+
+    adapter = _FakeAdapter()
+    monkeypatch.setattr(
+        "tusker_gateway.provider_adapters.provider_adapters", {"opencode-cli": adapter},
+    )
+    client = PassthroughClient(config, QualityDB(config["quality_db_path"]), MagicMock())
+
+    result = await client.chat(
+        provider="opencode-cli", model="openai/gpt-5",
+        messages=[{"role": "user", "content": "hi"}], stream=True,
+    )
+    frames = [frame async for frame in result]
+
+    assert len(frames) == 2
+    assert adapter.active_during_stream == 1
+    assert controller.snapshot().get(CLI_CAPACITY_GROUP, {}).get("active", 0) == 0
+    controller.reset()
+
+
+@pytest.mark.asyncio
+async def test_process_backed_dispatch_releases_lease_on_failure(monkeypatch, tmp_path):
+    from unittest.mock import MagicMock
+
+    from tusker_gateway.errors import ProviderError
+    from tusker_gateway.passthrough import PassthroughClient
+    from tusker_gateway.provider_usage import CLI_CAPACITY_GROUP
+    from tusker_gateway.quality import QualityDB
+
+    monkeypatch.setenv("TUSKER_CLI_MAX_CONCURRENT", "3")
+    controller = capacity_controller()
+    controller.reset()
+    config = {
+        "api_keys": ["gateway-test"],
+        "provider_api_keys": {},
+        "codex_credentials": [],
+        "quality_db_path": str(tmp_path / "quality.db"),
+    }
+
+    class _FailingAdapter:
+        async def chat(self, **_kwargs):
+            raise ProviderError("CLI exploded", code="opencode_cli_failed")
+
+    monkeypatch.setattr(
+        "tusker_gateway.provider_adapters.provider_adapters", {"opencode-cli": _FailingAdapter()},
+    )
+    client = PassthroughClient(config, QualityDB(config["quality_db_path"]), MagicMock())
+
+    with pytest.raises(ProviderError):
+        await client.chat(
+            provider="opencode-cli", model="openai/gpt-5",
+            messages=[{"role": "user", "content": "hi"}], stream=False,
+        )
+
+    assert controller.snapshot().get(CLI_CAPACITY_GROUP, {}).get("active", 0) == 0
+    controller.reset()

@@ -113,14 +113,21 @@ def _warm_bridge_config(broker_dir: Path) -> dict[str, Any]:
 
 async def _run_cli_tool(
     binary: str, args: list[str], env: dict[str, str], *, timeout: float = 30.0,
+    cwd: Path | None = None,
 ) -> tuple[int, bytes, bytes]:
-    """Run a short-lived control command (service lifecycle, session control)."""
+    """Run a short-lived control command (service lifecycle, session control).
+
+    ``cwd`` is inherited by any daemon the command starts: ``service start``
+    launches the shared warm server, so it must run from the broker directory
+    rather than the gateway's source tree.
+    """
     proc = await asyncio.create_subprocess_exec(
         binary, *args,
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         env=env,
+        cwd=cwd,
         start_new_session=True,
     )
     try:
@@ -183,7 +190,7 @@ async def _ensure_warm_service(binary: str, env: dict[str, str]) -> str | None:
         )
         await _run_cli_tool(binary, ["service", "stop"], env, timeout=60)
         code, stdout, stderr = await _run_cli_tool(
-            binary, ["service", "start"], service_env, timeout=180,
+            binary, ["service", "start"], service_env, timeout=180, cwd=broker_dir,
         )
         url = _service_url(stdout) if code == 0 else None
         if not url:
@@ -493,6 +500,7 @@ class OpenCodeCLIAdapter:
             return stream_cli_jsonl(
                 command, env=env, prompt=prompt.encode(), model=model, timeout=timeout,
                 text_extractor=text_from_event, call_file=call_file, cleanup_dir=temp_dir,
+                cwd=temp_dir,
                 error_code="opencode_cli_failed", timeout_message="OpenCode CLI request timed out",
             )
 

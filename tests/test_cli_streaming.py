@@ -140,3 +140,21 @@ async def test_nonzero_cli_exit_logs_bounded_stderr_preview():
     assert (rc, size) == (1, len(stderr))
     assert preview == stderr.decode("utf-8")[:512]
     assert len(preview) == 512
+
+
+@pytest.mark.asyncio
+async def test_stream_cli_jsonl_spawns_in_the_given_working_directory():
+    # The model must never inherit the gateway's source tree as its project:
+    # the streaming helper has to forward the adapter's request-scoped cwd to
+    # the child process.
+    process = _Process([json.dumps({"type": "text", "part": {"text": "x"}}).encode() + b"\n"])
+    stream = stream_cli_jsonl(
+        ["fake-cli"], env={}, prompt=b"prompt", model="kilo-cli/kilo/kilo-auto/free",
+        timeout=1, text_extractor=text_from_event, cwd="/tmp/isolated-workspace",
+    )
+    with patch(
+        "tusker_gateway.provider_adapters.cli_streaming.asyncio.create_subprocess_exec",
+        new=AsyncMock(return_value=process),
+    ) as spawn:
+        [item async for item in stream]
+    assert spawn.await_args.kwargs["cwd"] == "/tmp/isolated-workspace"

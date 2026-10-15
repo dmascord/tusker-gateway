@@ -61,12 +61,22 @@ async def _ensure_warm_server() -> str:
     async with _WARM_SERVER_LOCK:
         if _WARM_SERVER is not None and _WARM_SERVER.returncode is None:
             return _WARM_SERVER_URL
+        # The model must not inherit the worker's source tree as its project:
+        # a text server with no MCP bridge still indexes its working directory,
+        # so give it a request-scoped, empty workspace and disable project
+        # config exactly like the tool server below.
+        work_dir = Path(_BROKER_DIR) / "text-work"
+        work_dir.mkdir(parents=True, exist_ok=True)
+        env = dict(os.environ)
+        env["KILO_DISABLE_PROJECT_CONFIG"] = "true"
         started = asyncio.get_running_loop().time()
         _WARM_SERVER = await asyncio.create_subprocess_exec(
             "kilo", "serve", "--pure", "--hostname", "127.0.0.1",
             "--port", _WARM_SERVER_URL.rsplit(":", 1)[1],
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
+            env=env,
+            cwd=str(work_dir),
             start_new_session=True,
         )
         await asyncio.sleep(0.2)

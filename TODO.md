@@ -1,5 +1,46 @@
 # Project TODOs
 
+
+## Gateway OOM crash-loop + CLI source-tree leak fixed (2026-10-15, deploy pending)
+
+The gateway pod OOM-killed 16 times in its first ~5 hours (2026-10-14 04:27Z→09:35Z,
+exit 137 against the 3 GiB limit) and then stayed up; the kilo worker sits at
+~2 GiB / 3 GiB. Root cause: `opencode-cli` / `claude-code-cli` / in-process
+`kilo-cli` each spawn a CLI child process inside the gateway container for the
+whole request, with **no concurrency cap** — an uncapped burst exhausts the pod
+limit and the kernel OOM-kills the gateway, taking every other pool down.
+
+Fixes (all in-tree, `pytest tests/ -p no:cacheprovider --ignore=tests/test_passthrough_providers.py`
+→ 1609 passed, 8 skipped):
+
+- **CLI capacity gate** (`provider_usage.py`, `passthrough.py`, `k8s/deployment.yaml`):
+  the three process-backed providers share a `cli` capacity group at
+  `TUSKER_CLI_MAX_CONCURRENT=3` (env-driven, *not* shadowed by the DB config
+  store). The lease is held across the entire streamed response
+  (`_lease_released_stream`) and released on completion/failure/close; when
+  saturated the gateway fails fast to another candidate (or 503 for an explicit
+  route) and quarantines the group for `TUSKER_PROVIDER_CAPACITY_BUSY_COOLDOWN_SECS`
+  (default 2s) instead of spawning another child.
+- **Source-tree isolation** (`cli_streaming.py`, `opencode_cli.py`, `kilo_cli.py`,
+  `claude_code.py`, `kilo_worker.py`): every CLI child now runs from a
+  request-scoped empty directory (`KILO_DISABLE_PROJECT_CONFIG=true`), and the
+  long-lived warm servers are started from the broker dir. These CLIs index their
+  working directory as the project, so inheriting the gateway source tree leaked
+  it into third-party prompts and made file tools target gateway code (auto-reject
+  → failed request).
+- **Gateway alert rules** (`k8s/prometheus-rules.yaml`): a `tusker-gateway`
+  PrometheusRule (scrape-down, restart-storm, fresh-OOM, memory-near-limit) and a
+  `tusker-kilo-worker` group, applied to the `monitoring` namespace and verified
+  live/healthy in Prometheus. **Caveat: Alertmanager is not deployed** (no
+  `alertmanager` pod/svc in `monitoring`), so these — like the pre-existing
+  `cluster-health`/`wildduck-backup` rules — are visible in Prometheus/Grafana but
+  page nobody until Alertmanager + a receiver are enabled (kube-prometheus-stack
+  values, a cluster-infra decision outside this repo).
+
+**Pending:** deploy the code fixes (rsync + `k8s/deploy.sh`, gated by the
+AGENTS.md destructive-action policy — needs operator go-ahead). Until then the
+live pod runs the uncapped build and can OOM-loop again under a CLI burst.
+
 ## Deploy provenance: digest pinning and drift check (2026-09-29)
 
 `k8s/deploy.sh` pins the image by digest instead of the mutable tag, annotates
