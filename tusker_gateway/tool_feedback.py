@@ -88,3 +88,23 @@ def chat_result_call_ids(result: dict[str, Any]) -> list[str]:
             if isinstance(call, dict) and isinstance(call.get("id"), str):
                 ids.append(call["id"])
     return ids
+
+
+def response_result_call_ids(items: Any) -> list[str]:
+    """Return generated Responses function call IDs."""
+    if not isinstance(items, list):
+        return []
+    return [item["call_id"] for item in items[:128]
+            if isinstance(item, dict) and item.get("type") == "function_call"
+            and isinstance(item.get("call_id"), str) and item["call_id"]]
+
+
+def correlate_responses_input(items: Any) -> dict[str, int]:
+    """Reuse Chat Completions correlation for standard Responses tool feedback."""
+    if not isinstance(items, list):
+        return correlate_chat_messages(None)
+    messages = [{"role": "tool", "tool_call_id": item.get("call_id"),
+                 "content": item.get("output")}
+                for item in items[:512] if isinstance(item, dict)
+                and item.get("type") == "function_call_output"]
+    return correlate_chat_messages(messages)
