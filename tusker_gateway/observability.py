@@ -76,6 +76,8 @@ _ACCESS_LOG_FIELDS = frozenset({
     "candidate_attempts",
     "failure_class",
     "cache_status",
+    "tool_telemetry",
+    "tool_feedback",
         "tokens_in",
         "tokens_out",
         "error_detail",
@@ -154,6 +156,8 @@ class AccessLog:
         error: str | None = None,
         error_detail: str | None = None,
         failure_class: str | None = None,
+        tool_telemetry: dict[str, Any] | None = None,
+        tool_feedback: dict[str, int] | None = None,
     ) -> None:
         """Log a structured access record for one request.
 
@@ -226,7 +230,27 @@ class AccessLog:
             record["error_detail"] = str(error_detail)[:512]
         if failure_class:
             record["failure_class"] = failure_class
+        if isinstance(tool_telemetry, dict):
+            # Only bounded, non-content metadata is allowed in access logs.
+            allowed = {"requested", "returned", "invalid_arguments", "missing_ids",
+                       "duplicate_ids", "reasoning_present", "protocol", "finish_reason",
+                       "conflicting_ids", "invalid_frames", "oversize_frames",
+                       "incomplete_stream", "finish_mismatch"}
+            record["tool_telemetry"] = {
+                key: value for key, value in tool_telemetry.items()
+                if key in allowed and (isinstance(value, (bool, int)) or
+                                       (isinstance(value, str) and len(value) <= 48))
+            }
 
+        if isinstance(tool_feedback, dict):
+            allowed = {"result_messages", "matched_results", "untracked_results",
+                       "duplicate_results", "historical_results",
+                       "explicit_errors", "synthetic_missing"}
+            record["tool_feedback"] = {
+                key: min(value, 100000) for key, value in tool_feedback.items()
+                if key in allowed and isinstance(value, int) and not isinstance(value, bool)
+                and value >= 0
+            }
         self.logger.info(json.dumps(record))
 
 

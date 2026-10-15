@@ -790,18 +790,10 @@ async def _normalize_stream_legacy(raw_stream: AsyncIterator[bytes]) -> AsyncIte
                 saw_finish_reason = True
             raw_content = delta.get("content")
             reasoning_content = delta.get("reasoning_content")
-            # Some reasoning models (qwen, etc.) emit reasoning/thinking in
-            # `reasoning_content` while leaving `content` null or empty.
-            # OMP treats content=null as "no text" and ends the turn early.
-            # Promote reasoning_content to content when content is absent so
-            # clients see real text and keep the conversation alive.
-            if raw_content is None and reasoning_content is not None:
-                raw_content = reasoning_content
-                delta["content"] = reasoning_content
-                # OMP client compatibility: sometimes reasoning models omit "content"
-                # when "reasoning_content" is present.
-                if "reasoning_content" in delta:
-                    del delta["reasoning_content"]
+            # Reasoning is not assistant-visible content. In particular, DeepSeek
+            # may emit reasoning-only chunks before structured tool calls.
+            # Preserve reasoning_content as its own field for downstream clients
+            # and conversation replay; never promote it into content.
             has_content = isinstance(raw_content, str) and bool(raw_content)
             tc = delta.get("tool_calls")
             if not tc:
@@ -1391,13 +1383,8 @@ async def _normalize_stream(
             # `reasoning_content` field. OMP renders that field as a thinking
             # block, so tool markup there bypassed the content-only stripper
             # and arrived as visible, unstructured text.
-            if (raw_content is None or raw_content == "") and isinstance(reasoning_content, str):
-                raw_content = reasoning_content
-                promoted_reasoning_chars += len(reasoning_content)
-                stream_diag["content_chars"] += len(reasoning_content)
-                delta["content"] = reasoning_content
-                delta.pop("reasoning_content", None)
-                reasoning_content = None
+            # Do not reinterpret reasoning as assistant content. Auxiliary
+            # reasoning sources are inspected separately below for tool markup.
 
             auxiliary_sources: list[tuple[str, str]] = []
             if isinstance(reasoning_content, str) and reasoning_content:
@@ -2968,7 +2955,19 @@ def _assemble_stream_tool_calls(frames: list[bytes]) -> list[dict[str, Any]]:
                 if not isinstance(function, dict):
                     continue
                 if function.get("name"):
-                    current["function"]["name"] = str(function["name"])
+                    # Streaming providers may fragment function names. Accept
+                    # cumulative snapshots as well as incremental suffixes,
+                    # without duplicating a repeated name on later frames.
+                    name = str(function["name"])
+                    previous = current["function"]["name"]
+                    if not previous:
+                        current["function"]["name"] = name
+                    elif name == previous:
+                        pass
+                    elif name.startswith(previous):
+                        current["function"]["name"] = name
+                    elif not previous.endswith(name):
+                        current["function"]["name"] += name
                 if "arguments" in function:
                     current["function"]["arguments"] += _tool_argument_text(
                         function.get("arguments")
@@ -6328,6 +6327,12 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                 credential_rotators=request.app.get("credential_rotators"),
             )
             tools = body.get("tools") if isinstance(body.get("tools"), list) else None
+            from tusker_gateway.tool_feedback import (
+                correlate_chat_messages, chat_result_call_ids, register_generated_calls,
+            )
+            set_access_log_context(
+                request, tool_feedback=correlate_chat_messages(body.get("messages")),
+            )
             if os.environ.get("TUSKER_TOOL_DIAGNOSTICS", "0").strip().lower() in {
                 "1",
                 "true",
@@ -6761,6 +6766,19 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                     source=f"{provider}/{target_model}",
                 )
 
+            if isinstance(result, dict):
+                from tusker_gateway.tool_telemetry import summarize_chat_tool_result
+
+                set_access_log_context(
+                    request,
+                    tool_telemetry=summarize_chat_tool_result(
+                        result, requested=bool(tools),
+                    ),
+                )
+
+            if isinstance(result, dict):
+                register_generated_calls(chat_result_call_ids(result), request_id=request_id)
+
             # Gateway-routed responses echo the alias; passthrough keeps upstream id.
             if response_alias is not None and isinstance(result, dict):
                 result["model"] = response_alias
@@ -6847,6 +6865,9 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                 stream_frame_count = 1
                 stream_bytes = len(role_frame)
                 stream_visible_output = False
+                from tusker_gateway.stream_tool_telemetry import StreamToolTelemetry
+
+                tool_stream_health = StreamToolTelemetry(requested=bool(tools))
                 try:
                     cycle_fallbacks = 0
                     while True:
@@ -6858,6 +6879,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                                     if chunk == sse_done():
                                         continue
                                     await resp.write(chunk)
+                                    tool_stream_health.feed(chunk)
                                     stream_frame_count += 1
                                     stream_bytes += len(chunk)
                                     stream_visible_output |= _stream_chunk_has_visible_output(chunk)
@@ -6892,6 +6914,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                                     )
                                 async for chunk in stream_result:
                                     await resp.write(chunk)
+                                    tool_stream_health.feed(chunk)
                                     stream_frame_count += 1
                                     stream_bytes += len(chunk)
                                     stream_visible_output |= _stream_chunk_has_visible_output(chunk)
@@ -6924,6 +6947,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                             ):
                                 raise
                             cycle_fallbacks += 1
+                            tool_stream_health.reset_for_fallback()
                             failed_provider, failed_model = provider, target_model
                             if isinstance(
                                 stream_recovery_exc,
@@ -7161,6 +7185,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                     # raise — swallow so we still record metrics.
                     try:
                         await resp.write(sse_done())
+                        tool_stream_health.feed(sse_done())
                     except (ConnectionResetError, ConnectionError, BrokenPipeError):
                         stream_ok = False
                 finally:
@@ -7178,6 +7203,14 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                     stream_resp = None
                     stream_stop = None
                     stream_hb_task = None
+                if stream_ok and not request.get("_stream_error"):
+                    register_generated_calls(
+                        tool_stream_health.emitted_call_ids(), request_id=request_id,
+                    )
+                set_access_log_context(
+                    request,
+                    tool_telemetry=tool_stream_health.summary(),
+                )
                 status = "ok" if stream_ok else status
                 _emit(status)
                 return resp
@@ -7380,6 +7413,8 @@ async def _responses_handler_impl(request: web.Request) -> web.Response | web.St
         )
         if not isinstance(body, dict):
             raise BadRequestError("Request body must be a JSON object", code="invalid_request")
+        from tusker_gateway.tool_feedback import correlate_responses_input, register_generated_calls, chat_result_call_ids
+        set_access_log_context(request, tool_feedback=correlate_responses_input(body.get("input")))
         messages = _responses_input_to_messages(body.get("input"))
         if body.get("instructions") is not None:
             messages.insert(
@@ -7638,9 +7673,33 @@ async def _responses_handler_impl(request: web.Request) -> web.Response | web.St
                     emit_created=False,
                 )
 
+            responses_call_ids: set[str] = set()
+            responses_stream_completed = False
             try:
                 async for chunk in response_stream:
                     await stream_resp.write(chunk)
+                    # Responses SSE events are complete frames from our adapter.
+                    for line in chunk.splitlines():
+                        if not line.startswith(b"data:"):
+                            continue
+                        try:
+                            event = json.loads(line[5:].strip())
+                        except (ValueError, UnicodeDecodeError):
+                            continue
+                        if not isinstance(event, dict):
+                            continue
+                        if event.get("type") == "response.output_item.added":
+                            item = event.get("item")
+                            if isinstance(item, dict) and item.get("type") == "function_call":
+                                call_id = item.get("call_id")
+                                if isinstance(call_id, str) and call_id:
+                                    responses_call_ids.add(call_id)
+                        elif event.get("type") == "response.completed":
+                            responses_stream_completed = True
+                if responses_stream_completed:
+                    register_generated_calls(
+                        list(responses_call_ids), request_id=request.get("_request_id"),
+                    )
             except (ConnectionResetError, ConnectionError, BrokenPipeError):
                 logger.info("responses stream client disconnected")
                 request["_stream_error"] = "client_disconnected"
@@ -7694,6 +7753,7 @@ async def _responses_handler_impl(request: web.Request) -> web.Response | web.St
                     scope=store_scope,
                     embedding=semantic_embedding,
                 )
+            register_generated_calls(chat_result_call_ids(result), request_id=request.get("_request_id"))
             return web.json_response(
                 _chat_result_to_responses(
                     result,
