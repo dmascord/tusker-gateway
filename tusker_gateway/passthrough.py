@@ -2063,6 +2063,8 @@ class PassthroughClient:
         upstream_gateway: str | None = None,
         rtk_compress: bool = True,
         metrics_registry: Any | None = None,
+        request_id: str | None = None,
+        pool: str | None = None,
     ) -> dict[str, Any] | AsyncIterator[bytes]:
         """Make a passthrough chat completions call to the provider."""
         logger.info("passthrough %s/%s stream=%s", provider, model, stream)
@@ -2084,9 +2086,30 @@ class PassthroughClient:
         # concurrent clients exhausts the pod memory limit and the kernel
         # OOM-kills the gateway, taking every other pool down with it.
         from tusker_gateway.provider_adapters import provider_adapters
+        from tusker_gateway.stream_diagnostics import remember_upstream_request
 
         adapter = provider_adapters.get(provider)
         if adapter is not None:
+            # Process adapters build their own provider prompt, so record the
+            # logical request the gateway was asked to serve.
+            remember_upstream_request(
+                request_id=request_id,
+                provider=provider,
+                model=model,
+                pool=pool,
+                stream=stream,
+                source="process_adapter_reconstructed",
+                payload=json.dumps(
+                    {
+                        "provider": provider,
+                        "model": model,
+                        "stream": stream,
+                        "tools": tools,
+                        "messages": messages,
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+            )
             _, capacity_lease = self._reserve_capacity(provider, model)
             try:
                 result = await adapter.chat(
@@ -2167,6 +2190,8 @@ class PassthroughClient:
                 extra_headers=extra_headers,
                 extra_body=extra_body,
                 endpoint=endpoint,
+                request_id=request_id,
+                pool=pool,
             )
 
         base_url = endpoint["base_url"]
@@ -2191,6 +2216,18 @@ class PassthroughClient:
             extra_body=extra_body,
             conversation_id=conversation_id,
             endpoint=endpoint,
+        )
+
+        # Exactly what aiohttp serializes for ``json=body``; held only until the
+        # turn resolves so a rejected turn can be audited byte-for-byte.
+        remember_upstream_request(
+            request_id=request_id,
+            provider=provider,
+            model=model,
+            pool=pool,
+            stream=stream,
+            source="chat_completions",
+            payload=json.dumps(body).encode("utf-8"),
         )
 
         capacity_group, capacity_lease = self._reserve_capacity(provider, model)
@@ -2556,10 +2593,13 @@ class PassthroughClient:
         extra_headers: dict[str, str] | None = None,
         extra_body: dict[str, Any] | None = None,
         endpoint: dict[str, Any] | None = None,
+        request_id: str | None = None,
+        pool: str | None = None,
     ) -> dict[str, Any] | AsyncIterator[bytes]:
         from tusker_gateway.auth_strategies import get_auth_strategy
         from tusker_gateway.models import ProviderConfig
         from tusker_gateway.tool_formats import normalize_tools
+        from tusker_gateway.stream_diagnostics import remember_upstream_request
 
         endpoint_raw = endpoint or PROVIDER_ENDPOINTS["openai-codex"]
         endpoint_model = ProviderConfig.from_raw(endpoint_raw)
@@ -2689,6 +2729,18 @@ class PassthroughClient:
                 if "effort" in reasoning:
                     reasoning["effort"] = _normalize_reasoning_effort(reasoning["effort"])
         url = f"{endpoint_raw['base_url']}{endpoint_raw['chat_path']}"
+        # Exactly what aiohttp serializes for ``json=body``; held only until the
+        # turn resolves so a rejected turn can be audited byte-for-byte. The
+        # Responses adapter builds its own body, so it must be recorded here.
+        remember_upstream_request(
+            request_id=request_id,
+            provider=provider,
+            model=model,
+            pool=pool,
+            stream=stream,
+            source="responses_api",
+            payload=json.dumps(body).encode("utf-8"),
+        )
         # Retry loop: per-credential quota exhaustion and account-specific
         # model entitlement errors quarantine only that credential, then try
         # the next account. Generic throttling and unrelated errors re-raise.

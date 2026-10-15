@@ -583,6 +583,12 @@ spec:
           value: '3'
         - name: TUSKER_BUDGETS_ENABLED
           value: 'false'
+        # Rejected turns are re-dispatched before the client sees them, so the
+        # provider's own bytes are the only evidence of whether the verdict was
+        # right. Bounded (200 records / 2MiB) and private (0700/0600) under the
+        # mounted tusker-home PVC; nothing is written for a turn that is served.
+        - name: TUSKER_STREAM_CAPTURE
+          value: '1'
         ports:
         - containerPort: 8642
           name: http

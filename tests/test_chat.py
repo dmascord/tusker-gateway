@@ -33,6 +33,7 @@ from tusker_gateway.endpoints import (
     _validate_complete_tool_response,
     _validate_tool_call_contract,
 )
+from tusker_gateway.quality import QualityDB
 from .conftest import HEADERS_AUTH, HEADERS_NO_AUTH
 
 
@@ -2702,3 +2703,150 @@ async def test_provider_attempt_timeout_helper_ignores_invalid_override_json():
     finally:
         os.environ.pop("TUSKER_PROVIDER_ATTEMPT_TIMEOUT_SECS", None)
         os.environ.pop("TUSKER_PROVIDER_ATTEMPT_TIMEOUT_OVERRIDES_JSON", None)
+
+
+class _FakeUpstreamContent:
+    """Minimal async byte source matching aiohttp's ``content.iter_any()``."""
+
+    def __init__(self, chunks):
+        self._chunks = list(chunks)
+
+    def iter_any(self):
+        return self
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self._chunks:
+            raise StopAsyncIteration
+        return self._chunks.pop(0)
+
+
+class _FakeUpstreamResponse:
+    def __init__(self, chunks):
+        self.status = 200
+        self.headers = {"Content-Type": "text/event-stream"}
+        self.url = "https://upstream.test/v1/chat/completions"
+        self.content = _FakeUpstreamContent(chunks)
+        self.released = False
+
+    async def text(self):
+        return ""
+
+    def release(self):
+        self.released = True
+
+
+class _FakeUpstreamHttp:
+    """Hands out pre-built upstream responses and records what was sent."""
+
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.calls = []
+
+    async def request(self, method, url, **kwargs):
+        self.calls.append({"method": method, "url": url, **kwargs})
+        return self._responses.pop(0)
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_rejected_turn_capture_records_provider_bytes(
+    app, client, tmp_path, monkeypatch,
+):
+    """A turn the gateway throws away keeps both sides for later triage.
+
+    The client only sees the recovery, so the provider's own bytes and the
+    request that produced them are the sole evidence of whether the verdict
+    was right.
+    """
+    monkeypatch.setenv("TUSKER_STREAM_CAPTURE", "1")
+    monkeypatch.setenv("TUSKER_STREAM_DIAGNOSTICS_DIR", str(tmp_path / "captures"))
+    pool_manager = MagicMock()
+    pool_manager.select.side_effect = [
+        ("alibaba", "deepseek-v4.1-flash"),
+        ("openai", "tool-capable-fallback"),
+    ]
+    app["pool_manager"] = pool_manager
+    app["quality_db"] = QualityDB(":memory:")
+
+    unusable_frames = [
+        b'data: {"choices":[{"index":0,"delta":{"role":"assistant"},'
+        b'"finish_reason":null}]}\n\n',
+        b'data: {"choices":[],"finish_reason":"stop"}\n\n',
+        b"data: [DONE]\n\n",
+    ]
+    healthy_payload = {
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "tool_calls": [{
+                    "id": "call-capture-fallback",
+                    "type": "function",
+                    "function": {"name": "read", "arguments": '{"path":"/tmp"}'},
+                }],
+            },
+            "finish_reason": "tool_calls",
+        }],
+    }
+    healthy_frames = [f"data: {json.dumps(healthy_payload)}\n\n".encode()]
+    app["http_session"] = _FakeUpstreamHttp([
+        _FakeUpstreamResponse(unusable_frames),
+        _FakeUpstreamResponse(healthy_frames),
+    ])
+
+    request_body = {
+        "model": "deepseek-v4.1-flash",
+        "messages": [{"role": "user", "content": "read the file"}],
+        "stream": True,
+    }
+    with patch(
+        "tusker_gateway.endpoints.PassthroughClient._build_request",
+        new_callable=AsyncMock,
+        return_value=({"Content-Type": "application/json"}, request_body),
+    ):
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-code",
+                "messages": [{"role": "user", "content": "read the file"}],
+                "tools": [{"type": "function", "function": {"name": "read"}}],
+                "stream": True,
+            },
+            headers=HEADERS_AUTH,
+        )
+        body = await resp.read()
+
+    # The client still gets the recovered turn, unchanged.
+    assert resp.status == 200
+    assert b"call-capture-fallback" in body
+    assert pool_manager.select.call_count == 2
+
+    captures = list((tmp_path / "captures").glob("unusable-*.json"))
+    assert len(captures) == 1
+    record = json.loads(captures[0].read_text())
+    assert record["provider"] == "alibaba"
+    assert record["model"] == "deepseek-v4.1-flash"
+    assert record["pool"] == "code"
+    assert record["request_source"] == "chat_completions"
+    assert record["reason"] == "reasoning_only_or_empty"
+    # The exact provider bytes, including the frame that caused the verdict.
+    expected_response = b"".join(unusable_frames).decode()
+    assert record["upstream_response"]["text"] == expected_response
+    assert record["upstream_response"]["bytes"] == len(expected_response)
+    assert record["upstream_response"]["truncated_bytes"] == 0
+    assert record["upstream_request"]["text"] == json.dumps(request_body)
+    verdict = record["verdict"]
+    assert verdict["content_chars"] == 0
+    assert verdict["reasoning_chars"] == 0
+    assert verdict["tool_call_deltas"] == 0
+    assert verdict["empty_choice_events"] == 1
+    # Only the role frame carried a delta; the provider then stopped without
+    # ever attaching a finish reason to a choice, and the rejection fired
+    # before the trailing [DONE] frame was consumed.
+    assert verdict["delta_fields"] == ["role"]
+    assert verdict["upstream_bytes"] == len(expected_response)
+    assert verdict["saw_finish"] is False
+    assert verdict["saw_done"] is False
+    assert verdict["finish_reason"] is None
+    assert verdict["tools_requested"] is True

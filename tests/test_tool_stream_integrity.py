@@ -63,7 +63,7 @@ async def test_large_bash_tool_turn_is_preserved_end_to_end(
 
     async def fake_chat(
         _client, provider, model, messages, *, stream, tools, tool_choice, extra_body,
-        conversation_id, metrics_registry,
+        conversation_id, metrics_registry, request_id, pool,
     ):
         forwarded.update(
             provider=provider,

@@ -387,7 +387,13 @@ async def _call_with_pool_fallback_anthropic(
                                           stream=bool(body.get("stream")), tools=tools,
                                           tool_choice=body.get("tool_choice"),
                                           extra_body=_build_extra_body(body) or None,
-                                          conversation_id=conversation_id)
+                                          conversation_id=conversation_id,
+                                          request_id=(
+                                              request.get("_request_id")
+                                              if request is not None
+                                              else None
+                                          ),
+                                          pool=pool_name)
                 if isinstance(result, dict):
                     result = normalize_response_tool_calls(
                         result,

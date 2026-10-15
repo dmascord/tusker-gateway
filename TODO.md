@@ -1,5 +1,51 @@
 # Project TODOs
 
+## Rejected turns keep the provider's exact bytes (2026-10-15, pending deploy)
+
+A turn the gateway rejects before the client sees it is re-dispatched, so the
+rejected provider's own bytes are gone by the time anyone investigates. The
+2026-10-15 incident (`req_639b33b3904d2d0c`, `alibaba/deepseek-v4.1-flash`) was
+diagnosed from counters alone: the log line carries `empty_choice_events=1`,
+`delta_fields=role`, `finish_reason=stop`, `content_chars=0`, but not the frames
+that produced them. A wrong verdict would therefore be indistinguishable from a
+correct one, which is the failure mode that costs most.
+
+`TUSKER_STREAM_CAPTURE=1` (set in `k8s/deployment.yaml`) makes
+`tusker_gateway/stream_diagnostics.py` hold a bounded copy of the provider-bound
+request while a streaming turn is in flight, and `endpoints.py` appends every
+upstream chunk as it arrives. When the turn is rejected
+(`reasoning_only_or_empty` / `empty_stream`), both sides plus the verdict
+counters are written as one private `unusable-*.json` under
+`TUSKER_STREAM_DIAGNOSTICS_DIR` (default
+`/home/tusker/.hermes/stream-diagnostics`, on the `tusker-home` PVC):
+
+- the request body exactly as `aiohttp` serializes it for `json=body` (16 KiB
+  bound, head+tail with an elision marker, plus byte count and sha256), for the
+  chat-completions branch, the Codex/Responses branch (which builds its own
+  body), the process adapters (the logical request the gateway was asked to
+  serve, `source=process_adapter_reconstructed`) and `/v1/messages` (which now
+  forwards `request_id`/`pool` so the two halves join);
+- the upstream response bytes verbatim (64 KiB bound), including frames the
+  gateway rejected mid-stream;
+- the verdict, so the record is self-contained.
+
+Prompt-bearing text is deliberately *not* logged: log lines keep only the
+counters and the capture file name, and the store is capped at 200 records /
+2 MiB with `0700`/`0600` modes, so it cannot fill the PVC or leak into
+aggregated logs. Nothing is written for a turn that is served: the pending
+in-memory request is consumed by the rejection itself, and the streaming handler
+drops any entry still pending once the turn is done, so a served turn cannot pin
+prompt bytes until the TTL.
+
+Evidence: `tests/test_stream_diagnostics.py` (store bounds, opt-in gating,
+truncation, unrelated files not consuming the budget) and
+`tests/test_chat.py::test_chat_stream_rejected_turn_capture_records_provider_bytes`,
+which runs the real client against a fake upstream and asserts the recorded
+request body, the exact provider frames and the verdict while the client still
+receives the recovered turn.
+
+To read a capture: `python -m json.tool <file>`; to clear, delete the
+`unusable-*.json` files in the capture directory.
 
 ## Unusable tool turns now fail over to another candidate (2026-10-15, deployed)
 

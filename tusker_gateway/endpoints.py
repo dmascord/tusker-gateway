@@ -1050,6 +1050,17 @@ async def _normalize_stream(
         tool_markup_kinds,
     )
 
+    from tusker_gateway.stream_diagnostics import (
+        append_response_capture,
+        store_unusable_stream_capture,
+        stream_capture_enabled,
+    )
+
+    # Bounded copy of the raw upstream bytes. Retained only so a rejected turn
+    # stays auditable: the client never sees the failure once the stream is
+    # re-dispatched, so the provider's actual bytes are the only evidence left.
+    raw_capture: bytearray | None = bytearray() if stream_capture_enabled() else None
+
     buffer = b""
     stream_diag: dict[str, Any] = {
         "chunks": 0,
@@ -1083,6 +1094,52 @@ async def _normalize_stream(
     native_next_indices: dict[int, int] = {}
     synthetic_tool_call_sequence = 0
     last_tool_diagnostics_signature: tuple[Any, ...] | None = None
+
+
+    def capture_rejection(reason: str) -> None:
+        """Persist the exact bytes behind a rejected turn.
+
+        The text can carry prompt-derived material, so it goes to the private
+        capture directory instead of the log line, together with the verdict
+        counters that justified the rejection.
+        """
+        if raw_capture is None:
+            return
+        name = store_unusable_stream_capture(
+            request_id=request_id,
+            provider=provider or "unknown",
+            model=model or "unknown",
+            reason=reason,
+            response=bytes(raw_capture),
+            verdict={
+                "reasoning_chars": reasoning_chars,
+                "content_chars": stream_diag["content_chars"],
+                "chunks": stream_diag["chunks"],
+                "upstream_bytes": stream_diag["upstream_bytes"],
+                "frames": stream_diag["frames"],
+                "data_events": stream_diag["data_events"],
+                "non_data_frames": stream_diag["non_data_frames"],
+                "invalid_json_events": stream_diag["invalid_json_events"],
+                "empty_choice_events": stream_diag["empty_choice_events"],
+                "delta_fields": sorted(stream_diag["delta_fields"]),
+                "tool_call_deltas": stream_diag["tool_call_deltas"],
+                "finish_reason": emitted_finish_reason,
+                "saw_finish": saw_finish_reason,
+                "saw_done": saw_done,
+                "buffer_bytes": len(buffer),
+                "tools_requested": tools_requested,
+            },
+        )
+        if name:
+            logger.warning(
+                "unusable stream capture request_id=%s provider=%s model=%s "
+                "reason=%s capture=%s",
+                request_id or "unknown",
+                provider or "unknown",
+                model or "unknown",
+                reason,
+                name,
+            )
 
     def malformed_tool_error() -> MalformedToolCallError:
         marker_types = tuple(sorted(tool_markup_seen)) or ("unknown",)
@@ -1136,6 +1193,7 @@ async def _normalize_stream(
             saw_done,
             len(buffer),
         )
+        capture_rejection(reason)
         return UnusableToolResponseError(
             reason=reason,
             reasoning_chars=reasoning_chars,
@@ -1155,6 +1213,7 @@ async def _normalize_stream(
             saw_finish_reason,
             saw_done,
         )
+        capture_rejection("empty_stream")
         return ProviderEmptyStreamError(
             provider=provider or "unknown",
             model=model or "unknown",
@@ -1215,6 +1274,7 @@ async def _normalize_stream(
             async for upstream_chunk in raw_stream:
                 stream_diag["chunks"] += 1
                 stream_diag["upstream_bytes"] += len(upstream_chunk)
+                append_response_capture(raw_capture, upstream_chunk)
                 yield upstream_chunk
         except Exception as exc:
             logger.warning(
@@ -4437,6 +4497,8 @@ async def _call_with_pool_fallback(
                     ),
                     conversation_id=conversation_id,
                     metrics_registry=metrics_registry,
+                    request_id=request_id,
+                    pool=pool_name,
                 )
                 if hasattr(result, "__aiter__"):
                     result = _attempt_touch_iterator(result, activity)
@@ -4770,6 +4832,8 @@ async def _call_with_pool_fallback(
                     ),
                     conversation_id=conversation_id,
                     metrics_registry=metrics_registry,
+                    request_id=request_id,
+                    pool=pool_name,
                 )
                 if hasattr(result, "__aiter__"):
                     result = _attempt_touch_iterator(result, activity)
@@ -6742,6 +6806,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                 )
 
             if body.get("stream", False):
+                from tusker_gateway.stream_diagnostics import take_upstream_request
                 if budget is not None and api_key and not budget_recorded:
                     await asyncio.to_thread(
                         budget.record,
@@ -7074,6 +7139,10 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                     except (ConnectionResetError, ConnectionError, BrokenPipeError):
                         stream_ok = False
                 finally:
+                    # A rejection consumes the pending capture itself; anything
+                    # still pending belongs to a turn that was served, so drop
+                    # it instead of pinning prompt bytes until the TTL.
+                    take_upstream_request(request_id)
                     if "stream_result" in locals():
                         await _close_async_iterator(stream_result)
                     stop.set()
