@@ -3117,9 +3117,10 @@ async def _prepare_stream_result(
     are yielded as they arrive so the client sees content within the upstream TTFB
     rather than after full consumption.  When a terminal frame or EOF is reached,
     tool-call contract and argument validation run on the buffered frames.  If
-    validation fails the iterator raises and the caller aborts the stream — the
-    client can recover via its own retry (pool-level fallback is no longer
-    possible once a 200 response has been sent).
+    validation fails the iterator raises.  When no assistant output has reached
+    the client yet, the stream loop recovers by re-dispatching to one
+    alternative candidate; once visible output has been sent, only the client's
+    own retry can recover.
     """
     if isinstance(result, dict) and (tools is not None or tool_choice is not None):
         from tusker_gateway.tool_formats import normalize_response_tool_calls
@@ -4155,8 +4156,13 @@ _STREAM_RECOVERY_CODES = frozenset({
 
 
 def _stream_failure_can_fail_over(exc: BaseException) -> bool:
-    """Whether a committed-stream failure is retryable before visible output."""
-    if isinstance(exc, (ProviderStreamLoopError, MalformedToolCallError)):
+    """Whether a committed-stream failure is retryable before visible output.
+
+    These failures carry no usable assistant output, so one alternative
+    candidate can still be tried while only role/SSE metadata has reached the
+    client.
+    """
+    if isinstance(exc, (ProviderStreamLoopError, MalformedToolCallError, UnusableToolResponseError)):
         return True
     if str(getattr(exc, "code", "") or "") in _STREAM_RECOVERY_CODES:
         return True
@@ -6836,7 +6842,10 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                                 raise
                             cycle_fallbacks += 1
                             failed_provider, failed_model = provider, target_model
-                            if isinstance(stream_recovery_exc, MalformedToolCallError):
+                            if isinstance(
+                                stream_recovery_exc,
+                                (MalformedToolCallError, UnusableToolResponseError),
+                            ):
                                 _quarantine_tool_response_failure(
                                     config, failed_provider, failed_model, stream_recovery_exc
                                 )

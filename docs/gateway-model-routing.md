@@ -565,6 +565,22 @@ model, so the route is not quarantined, and the client is told the prompt
 nearly filled the window. Incident: `req_7b0d460047e30296` (2026-09-23)
 sent a 32,669-token prompt to ornith's 32,768-token slot.
 
+A tool turn that ends with no answer and no tool call at all is rejected as
+`reasoning_only_or_empty`, and that verdict is transient rather than a property
+of the request: some upstreams intermittently return a complete, well-formed
+turn carrying only `role` and `finish_reason=stop`. The route is quarantined
+for `TUSKER_TOOL_RESPONSE_COOLDOWN_SECS` (default 300s) and, when no assistant
+output has reached the client yet, the stream is re-dispatched to one
+alternative candidate so the client sees an answer rather than an error. Only
+if that also fails does the client receive the gateway error message. Incident:
+`req_639b33b3904d2d0c` (2026-10-15) on `alibaba/deepseek-v4.1-flash`; the same
+route served six requests with 190k-215k-token prompt estimates in the
+following five minutes, so the empty turn was not a window or length effect.
+
+Because the output budget is the only other cause of an empty tool turn, and
+that depends on the request rather than the model, the two verdicts differ
+deliberately: `output_budget_exhausted` leaves the route alone.
+
 Operators should expect:
 
 - First request after a cold start of a large model may take ~25s on

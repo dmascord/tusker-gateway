@@ -1373,6 +1373,74 @@ async def test_chat_stream_malformed_tool_markup_after_terminal_falls_back_befor
     assert pool_manager.select.call_count == 1
 
 
+
+@pytest.mark.asyncio
+async def test_chat_stream_empty_tool_response_falls_back_before_client_response(app, client):
+    """An empty pre-visible tool stream must use the next pool candidate."""
+    pool_manager = MagicMock()
+    pool_manager.select.side_effect = [
+        ("alibaba", "deepseek-v4.1-flash"),
+        ("openai", "tool-capable-fallback"),
+    ]
+    app["pool_manager"] = pool_manager
+
+    async def empty_stream(*args, **kwargs):
+        yield (
+            b'data: {"choices":[{"index":0,"delta":{"role":"assistant"},'
+            b'"finish_reason":null}]}\n\n'
+        )
+        yield b'data: {"choices":[],"finish_reason":"stop"}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    async def valid_stream(*args, **kwargs):
+        payload = {
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "id": "call-empty-fallback-1",
+                        "type": "function",
+                        "function": {
+                            "name": "read",
+                            "arguments": '{"path":"/tmp/does-not-exist"}',
+                        },
+                    }],
+                },
+                "finish_reason": "tool_calls",
+            }],
+        }
+        yield f"data: {json.dumps(payload)}\n\n".encode()
+
+    with patch("tusker_gateway.endpoints.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
+        mock_chat.side_effect = [empty_stream(), valid_stream()]
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-code",
+                "messages": [{"role": "user", "content": "read the file"}],
+                "tools": [{"type": "function", "function": {"name": "read"}}],
+                "stream": True,
+            },
+            headers=HEADERS_AUTH,
+        )
+        body = await resp.read()
+
+    assert resp.status == 200
+    assert b"call-empty-fallback-1" in body
+    assert b"gateway: upstream output was unusable" in body
+    assert pool_manager.select.call_count == 2
+    assert pool_manager.select.call_args_list[1].kwargs["excluded"] == {
+        ("alibaba", "deepseek-v4.1-flash")
+    }
+    assert mock_chat.call_count == 2
+    # The unusable route is quarantined even though the request recovered, so
+    # the next request in the same session does not select it again.
+    from tusker_gateway.cooldown import global_tracker
+
+    assert global_tracker().is_cooldown("alibaba", "deepseek-v4.1-flash")
+    assert not global_tracker().is_cooldown("openai", "tool-capable-fallback")
+
+
 @pytest.mark.asyncio
 async def test_chat_stream_required_tool_call_falls_back_on_clean_stop(app, client):
     """A strict tool request must not accept a text-only provider stop."""
