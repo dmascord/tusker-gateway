@@ -412,13 +412,26 @@ encryption is deterministic — the same value always maps to the same token.
 - Request sealing covers `messages[*].content` (string or array text blocks,
   including `tool_result`), `tools[*]` JSON-schema strings, **and replayed
   tool invocations**: `tool_calls[*].function.arguments` and the legacy
-  `function_call.arguments`. This matters for the read-then-use flow — turn 1
+  `function_call.arguments`.
+  - `/v1/messages` (Anthropic) runs the guard on the converted OpenAI-shaped
+    body; its SSE adapter restores each chunk before translating to
+    Anthropic events.
+  - `/v1/images/*`, `/v1/videos`, `/v1/embeddings`, `/v1/rerank` seal every
+    string leaf of the payload (prompt/input/documents/query) via
+    `redact_body_strings` and restore the response.
+  - `TUSKER_REDACTION_ENTROPY_FALLBACK` (default `false`): an opt-in rule
+    that also seals a 32+ char unprefixed run within 80 chars after a
+    credential context word (`key`, `token`, `secret`, `password`, `bearer`,
+    …). Off by default: it can false-positive on long identifiers in code. This matters for the read-then-use flow — turn 1
   reads `.env`, turn 1 emits a bash call whose arguments hold the credential,
   turn 2 replays the transcript. Without this the replayed arguments reach the
   upstream model in plaintext (fixed 2026-10-16).
 - Response restore walks every string in chat-completions and responses-API
   payloads, including tool-call arguments and reasoning text. Streaming is
-  restored with a carry buffer so tokens split across SSE chunks reassemble.
+  restored with a carry buffer so tokens split across SSE chunks reassemble:
+  each streamed `arguments` fragment is replaced with restored text, and an
+  unterminated `[TUSKER:` prefix is held back and released as a final
+  fragment before `finish_reason` (clients concatenate fragments).
   Cache hits restore too: the exact and semantic caches store the *tokenized*
   form, so both hit paths run `restore_response` before replying.
 - Cache writes (response and semantic) intentionally store the tokenized
