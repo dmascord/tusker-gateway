@@ -416,4 +416,20 @@ def status_handler(request: web.Request) -> web.Response:
         "idempotency_enabled": bool(getattr(idempotency_config, "enabled", False)),
         "idempotency_ttl_secs": getattr(idempotency_config, "ttl_secs", 0),
     }
+    # Phase 0: shadow-mode client-profile resolution. Always zero in Phase 0
+    # (record_resolved increments the request counter, not the mismatch one);
+    # Phase 1 dispatcher will populate shadow_shape_mismatch_total.
+    from tusker_gateway.normalization import (
+        profile_counts_snapshot,
+        shadow_mismatch_snapshot,
+    )
+    counts = profile_counts_snapshot()
+    mismatches = shadow_mismatch_snapshot()
+    status["client_profiles"] = {
+        "shadow_mode": True,
+        "counts": {p.value if hasattr(p, "value") else p: int(c) for p, c in counts.items()},
+        "shadow_mismatch_total": {
+            f"{p}|{s}": int(c) for (p, s), c in mismatches.items()
+        },
+    }
     return web.json_response(status)

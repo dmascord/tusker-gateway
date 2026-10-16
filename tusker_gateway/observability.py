@@ -191,6 +191,17 @@ class AccessLog:
                 identity, "key_fingerprint", "unknown"
             )
 
+        # Client profile (Phase 0: header-only resolution at auth time, may be
+        # upgraded by handlers once the body is read). Surface is left null in
+        # the access log; per-surface counters live on /metrics.
+        profile = request.get("client_profile")
+        if profile is not None:
+            record["client_profile"] = getattr(profile, "profile", "unknown").value \
+                if hasattr(getattr(profile, "profile", None), "value") else str(getattr(profile, "profile", "unknown"))
+            record["client_profile_source"] = getattr(profile, "detection_source", "unknown")
+            record["key_fingerprint_64"] = getattr(profile, "key_fingerprint_64", "unknown")
+            record["key_fingerprint_short"] = getattr(profile, "key_fingerprint_short", "unknown")
+
         # Upstream details
         if provider:
             record["provider"] = provider

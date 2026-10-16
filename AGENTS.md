@@ -148,3 +148,17 @@ To change runtime configuration:
 the DB retains its previous definition and shadows the env vars. Use the
 migration tool (or the admin API `PUT /admin/pools/{pool}` / `PUT
 /admin/providers/{provider}`) to propagate changes.
+
+## Client-profile normalization (Phase 0 shadow release)
+
+`tusker_gateway/normalization.py` resolves a `ClientProfile` per request
+(see `docs/investigation-2026-10-16-ua-normalization.md` for the locked
+precedence rules and profile set). Phase 0 is **log + span only** — no
+client-visible bytes change. The resolver runs in shadow mode by
+default, gated on `TUSKER_NORMALIZATION_SHADOW` (per-request env
+read, no startup caching; default `1` so the very first deploy of Phase
+0 ships in shadow mode without operator action). Set to `0` to disable
+the resolver and stop emitting `tusker.client_profile` access-log and
+span attributes. Phase 1 (the error-envelope dispatcher) is the only
+consumer of `tusker_shadow_shape_mismatch_total{profile, surface}`;
+that counter stays at `0` until Phase 1 ships.

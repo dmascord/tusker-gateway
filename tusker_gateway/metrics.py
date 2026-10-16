@@ -27,9 +27,8 @@ Metric catalogue:
     tusker_budget_records_total                                counter
     tusker_budget_refunds_total                                counter
     tusker_guardrail_blocks_total{kind}                        counter
+    tusker_shadow_shape_mismatch_total{profile,surface}        counter
     tusker_pool_candidates{pool,state}                         gauge
-    tusker_cooldowns_active{provider,model}                    gauge
-    tusker_rtk_blocks_total{filter,outcome}                   counter
     tusker_rtk_bytes_saved_total                               counter
     tusker_rtk_calls_total{outcome}                           counter
 
@@ -286,6 +285,17 @@ class MetricsRegistry:
             "Requests blocked by guardrail checks",
             ("kind",),
         )
+        # Shadow-shape mismatches. Phase 0 keeps this at zero; Phase 1 will
+        # increment from the error-envelope dispatcher when the shadow shape
+        # would have differed from the emitted shape. Bounded cardinality:
+        # 6 profiles × 3 surfaces (chat_request, anthropic_request, error_envelope)
+        # = 18 series.
+        self.shadow_shape_mismatch_total = Counter(
+            "tusker_shadow_shape_mismatch_total",
+            "Per-(profile, surface) requests where the shadow shape would "
+            "have differed from the emitted shape (Phase 1 dispatcher).",
+            ("profile", "surface"),
+        )
         # RTK (token-saver) observability.
         #
         # tusker_rtk_blocks_total{filter,outcome}
@@ -361,6 +371,7 @@ class MetricsRegistry:
             self.semantic_cache_writes, self.semantic_cache_evictions,
             self.semantic_cache_errors, self.semantic_cache_skips,
             self.budget_blocks, self.budget_records, self.budget_refunds, self.guardrail_blocks,
+            self.shadow_shape_mismatch_total,
             self.pool_candidates, self.cooldowns_active,
             self.rtk_blocks, self.rtk_bytes_saved, self.rtk_calls,
         ):

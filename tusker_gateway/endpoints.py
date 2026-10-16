@@ -6260,6 +6260,16 @@ async def metrics_handler(request: web.Request) -> web.Response:
             (metrics.semantic_cache_skips, "skips"),
         ):
             metric._values[()] = float(s.get(key, 0))  # noqa: SLF001
+    # Client-profile + shadow-mismatch counters (Phase 0, always 0 in Phase 0;
+    # Phase 1 dispatcher will populate shadow_shape_mismatch_total).
+    from tusker_gateway.normalization import (
+        profile_counts_snapshot,
+        shadow_mismatch_snapshot,
+    )
+    for profile, count in profile_counts_snapshot().items():
+        metrics.shadow_shape_mismatch_total._values[(profile, "chat_request")] = 0.0  # noqa: SLF001
+    for (profile, surface), count in shadow_mismatch_snapshot().items():
+        metrics.shadow_shape_mismatch_total._values[(profile, surface)] = float(count)  # noqa: SLF001
     body = metrics.render()
     return web.Response(
         status=200,
@@ -6356,6 +6366,25 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
             body = _validate_chat_body(await _json_request_body(request))
             if tracer is not None and tracer.enabled and root_span is not None:
                 root_span.attributes["tusker.model"] = str(body.get("model") or "")
+            # Re-resolve with body available so the first-message tie-breaker and
+            # body.harness / metadata.harness rules can fire. The latest write to
+            # request["client_profile"] wins for the access log.
+            from tusker_gateway.normalization import (
+                record_resolved,
+                resolve_profile,
+                set_current as set_client_profile,
+            )
+            headers = dict(request.headers) if request.headers else None
+            token = request.get("_api_key_fingerprint") or request.headers.get("Authorization", "").removeprefix("Bearer ").strip() or None
+            chat_resolved = resolve_profile(headers=headers, body=body, api_key=token)
+            request["client_profile"] = chat_resolved
+            set_client_profile(chat_resolved)
+            if not request.get("_client_profile_recorded"):
+                record_resolved(chat_resolved)
+                request["_client_profile_recorded"] = True
+            if tracer is not None and tracer.enabled and root_span is not None:
+                root_span.attributes["tusker.client_profile"] = chat_resolved.profile.value
+                root_span.attributes["tusker.client_profile_source"] = chat_resolved.detection_source
             config = request.app["config"]
             client = PassthroughClient(
                 config,

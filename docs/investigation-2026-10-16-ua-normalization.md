@@ -20,9 +20,11 @@ fingerprint, session headers, IP/XFF/Cloudflare).
 | **Fingerprint surface** | UA is consumed in exactly **one** place today (`question_adapters.detect_adapter`, `question_adapters.py:69-95`) and only for the approval-question envelope. The auth-key fingerprint (`identity.fingerprint_api_key`, 64-hex SHA-256) is the de-facto client_id and already reaches logs, audit, traces, caches, quotas, idempotency, and approvals — but not `/status`, not `/metrics` labels, not upstream headers. |
 | **Existing per-client branching** | Three header-driven branches exist today: `X-Tusker-Harness`/`X-Client-Harness`/body `harness` (the explicit trust-hierarchy header) drives the question envelope; `X-Tusker-Tool-Qualification` adds `x_tusker_stream_error` to chat error chunks; `X-Tusker-Cache: bypass` skips caching. None of these today govern response body shape end-to-end. |
 | **TODO pressure** | 25 actionable items in `TODO.md`; 6 of them sit on the critical path or adjacent path for normalization (extracting chat-SSE assembly out of `endpoints.py`, standardizing one fingerprint width, fixing test flakes, and proving no provider splice after client-visible output). The rest are independent and can run in parallel. |
-| **Recommendation** | Defer the feature 1–2 weeks. First: extract chat-SSE assembly (item 10/11 from TODO) so a normalizer can be applied at one place. Second: standardize the four inconsistent fingerprint widths (item 5 ⚠) and pick one canonical `client_id` for the new layer. Third: implement Phase 0 (read-only `ClientProfile` resolver) and Phase 1 (error-envelope dispatcher) with no shape change. Phases 2-5 (chat SSE, Responses, Anthropic, cache, ops) follow with per-pool canary. |
+| **Recommendation** | Defer the feature 1–2 weeks. First: extract chat-SSE assembly (item 10/11 from TODO) so a normalizer can be applied at one place. Second: standardize the four inconsistent fingerprint widths (item 5 ⚠) and pick one canonical `client_id` for the new layer. Third: implement Phase 0 (read-only `ClientProfile` resolver) and Phase 1 (error-envelope dispatcher) with no shape change. Phases 2-5 (chat SSE, Responses, Anthropic, cache, ops) follow with per-pool canary, starting from a log-only shadow release. |
 
 **The single highest-leverage prerequisite is the chat-SSE extraction in `endpoints.py`.** Without it, the normalizer has to either live in five places or get bolted onto each of the inline `json.dumps` emission sites, which is harder to test and easier to leak through.
+
+**Decisions locked in (this turn):** canonical fingerprint width 64-hex (with 32-hex and 16-hex derived short forms); precedence `X-Tusker-Harness` > body `harness` > UA + key fingerprint; profile set `omp`, `opencode`, `claude-code`, `kilo`, `codex_cli`, `default-openai`, `default` (explicit catch-all); Phase 5 deployment posture is log-only shadow mode for one release, then per-pool canary. See §6.
 
 ---
 
@@ -386,18 +388,77 @@ The plan assumes the feature is approved after this survey. Each phase is shippa
 
 ### Phase 5 — Ops rollout
 
-- Per-pool canary. Start with pools that have no streaming tool traffic. Enable the `ClientProfile` resolver and the error dispatcher in shadow mode first (log the would-have-been shape but emit the current shape), then flip one pool at a time.
+- **Log-only shadow mode for one release.** `ClientProfile` is computed for every request and logged (access log + chat/anthropic span attribute), and the error dispatcher is wired in shadow mode: it computes the would-have-been shape and logs it as `tusker.shadow_shape=<...>` but emits the current shape. No client sees different bytes during the shadow release.
+- The shadow release surfaces drift (e.g., a new UA string landing in `default` when a real client profile was intended) via the access log and a new `tusker.shadow_shape_mismatch_total{profile, surface}` counter.
+- **Per-pool canary** after the shadow release. Start with pools that have no streaming tool traffic. Flip one pool at a time, with the same shadow counter for the per-pool population. Phase 5 lifts the shadow flag for a pool only after the shadow counter has shown zero unexpected mismatches for that pool over 24 hours.
 - `/metrics` gains a per-`client_profile` series for error and shape-mismatch counts.
 - Doc updates: `docs/feature-matrix-and-plan.md` (roadmap), `AGENTS.md` (runtime notes), `docs/enterprise-controls.md` if the new behavior is part of the enterprise contract.
 
-### What I recommend the user decide before approving Phase 0
+### Decisions locked in for Phase 0
 
-1. **Pick the canonical fingerprint width.** 64-hex, or stick with the existing 16-hex span attribute and use a longer one only in the access log?
-2. **Pick the precedence rule for `client_profile`.** Recommended: `X-Tusker-Harness` > body `harness` > UA + key fingerprint. Same as `question_adapters.py:69-95`. Confirm.
-3. **Pick the set of profiles.** `omp`, `opencode`, `claude-code`, `kilo`, `codex_cli`, and an explicit `default` for everything else. Anything else?
-4. **Pick the deployment posture.** Shadow mode (log-only) for one release, then per-pool canary, or straight to per-pool canary?
+1. **Canonical fingerprint width: 64-hex full SHA-256.** Existing 16-hex trace attribute (`endpoints.py:6345-6348` / `anthropic_adapter.py:578-582`) and 12-hex log principal (`identity.py:140`) are **derived** from the full 64-hex, not the other way around. 32-hex `rate_limit.py:93` is also derived. No DB migration: budget, rate-limit, idempotency, and cache tables keep their existing column widths (they don't need a wider key; the wider value is propagated only via the access log and span attribute).
+2. **Precedence: `X-Tusker-Harness` > `X-Client-Harness` > body `harness` > `metadata.harness` > `User-Agent` substring > `Authorization` key fingerprint.** Same hierarchy as `question_adapters.py:69-95`; explicit header beats body beats UA beats raw key. UA alone never downgrades any safety posture.
+3. **Profile set (closed list, no fallback aliasing):**
 
----
+   | Profile | Detection |
+   |---|---|
+   | `omp` | `User-Agent` substring `omp` (default for the OMP harness) |
+   | `opencode` | `User-Agent` substring `opencode` or `open-code` |
+   | `claude-code` | `User-Agent` substring `claude-code` or `claude_code` |
+   | `kilo` | `User-Agent` substring `kilo` |
+   | `codex_cli` | `User-Agent` substring `codex` (matches Codex CLI; not the same as ChatGPT Codex) |
+   | `default-openai` | `User-Agent` matches `OpenAI/Python`, `openai-`, `python-requests`, `httpx`, `curl/`, `Postman`, or any client that presents a standard OpenAI-style `Authorization: Bearer sk-...` header **and** no other marker. The first request fingerprint is consulted only when the UA is ambiguous between `default-openai` and `default` (see below). |
+   | `default` | None of the above. Explicit catch-all so every request has a profile. |
+
+   First-message fingerprint: only used as a tie-breaker between `default-openai` and `default` for clients whose UA is empty or generic (e.g., `curl/8.0`, `python-requests/2.31`). Tie-breaker rule: if the first user message is a chat-style question (length 4–4000 chars, ends in `?` or has sentence punctuation, no embedded JSON Schema), classify as `default-openai`; otherwise `default`. **This is the only place the first-message fingerprint is consulted.** All other decisions are made at request entry, before any upstream call.
+4. **Deployment posture:** Phase 0 ships behind `TUSKER_NORMALIZATION_SHADOW=1` (default `1` for the first release). The resolver and error dispatcher are wired but always emit the current shape; the shadow counter is the only client-visible output of the feature during the shadow release. Phase 5 lifts the flag for one pool at a time, gated on the shadow counter showing zero unexpected mismatches for that pool over 24 hours.
+
+### 6.1 Phase 0 ship note (2026-10-16)
+
+Phase 0 of the plan above has landed on `main` (commit `acdb876` lineage;
+see `git log -- tusker_gateway/normalization.py tusker_gateway/auth.py
+tusker_gateway/endpoints.py tusker_gateway/anthropic_adapter.py
+tusker_gateway/observability.py tusker_gateway/health.py
+tusker_gateway/metrics.py tests/test_normalization.py .env.sample`).
+
+What shipped (no behavior change; log + span only):
+
+- `tusker_gateway/normalization.py` — `ClientProfile` enum, fingerprint
+  helpers (64/32/16/12-hex derivation), the resolver with the locked 8-rule
+  precedence and the ambiguous-UA skip (curl/python-requests/httpx fall
+  through to the first-message tie-breaker), a `ContextVar` mirroring
+  `set_current` / `current`, and idempotent `record_resolved` /
+  `record_shadow_mismatch` counters.
+- `tusker_gateway/auth.py` — `AuthMiddleware.verify` populates
+  `request["client_profile"]` and the `ContextVar` before returning, so
+  every authenticated request has a profile at handler entry.
+- `tusker_gateway/endpoints.py` and `tusker_gateway/anthropic_adapter.py`
+  — handlers re-resolve once the body is in scope (so the first-message
+  tie-breaker and body/metadata harness rules can fire) and stamp
+  `tusker.client_profile` + `tusker.client_profile_source` on the root
+  span.
+- `tusker_gateway/observability.py` — access log gains `client_profile`,
+  `client_profile_source`, `key_fingerprint_64`, `key_fingerprint_short`.
+- `tusker_gateway/metrics.py` + `tusker_gateway/endpoints.py` —
+  `tusker_shadow_shape_mismatch_total{profile, surface}` counter is
+  registered and rendered by `/metrics`. Always `0` in Phase 0; Phase 1
+  dispatcher will populate it.
+- `tusker_gateway/health.py` — `/status` gains a `client_profiles` block
+  with per-profile request counts and the shadow-mismatch surface map.
+- `.env.sample` — `TUSKER_NORMALIZATION_SHADOW=1` documented; default is
+  `1` so the very first deploy of Phase 0 ships in shadow mode without
+  operator action.
+- `tests/test_normalization.py` — 45 tests covering precedence, UA
+  substring detection, first-message tie-breaker, fingerprint-width
+  derivation, propagation through `auth.py`, the shadow-mode env-var
+  contract, and the counter emission contract. Full offline suite
+  green at this commit.
+
+**Operational posture:** Phase 0 does not change any client-visible
+bytes. The shadow counter is the only observability signal. If
+`tusker_shadow_shape_mismatch_total` shows non-zero values in
+production before Phase 1 ships, treat it as a design drift signal,
+not a client-facing regression.
 
 ## 7. Evidence trail (this investigation)
 
@@ -407,4 +468,5 @@ The plan assumes the feature is approved after this survey. Each phase is shippa
 | Methods | `read_file`, `grep_files`, `find_files` against `/Volumes/dev/dev/tusker-ai-gateway/`. Read selectively, not whole files. Three parallel research agents. |
 | Read-only | No source modified. Only `docs/investigation-2026-10-16-ua-normalization.md` created. |
 | Not deployed | Per delivery-mode `plan-and-commit-no-deploy`. Report will be committed locally and not pushed. |
-| Next action (only if user approves) | Phase 0 implementation. Until then, no work. |
+| Next action (only if user approves) | Phase 0 implementation. The four decisions in §6 are now locked; no more user input needed before Phase 0 lands. Until then, no work. |
+| Phase 0 ship (2026-10-16, this session) | Per §6.1, Phase 0 has landed on `main` with all 10 implementation items closed, 45 normalization tests added, full offline suite green. No deploy — per AGENTS.md policy, this is a commit-only change. |

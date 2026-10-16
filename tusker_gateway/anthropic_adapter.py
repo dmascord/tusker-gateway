@@ -579,6 +579,16 @@ async def anthropic_messages_handler(request: web.Request) -> web.Response | web
             "http.method": request.method,
             "http.path": "/v1/messages",
             "tusker.api_key_fingerprint": api_key[:16],
+            **{
+                k: v for k, v in {
+                    "tusker.client_profile": getattr(
+                        request.get("client_profile"), "profile", None
+                    ) and request["client_profile"].profile.value,
+                    "tusker.client_profile_source": getattr(
+                        request.get("client_profile"), "detection_source", None
+                    ) or "",
+                }.items() if v
+            },
         })
         if tracer is not None and tracer.enabled
         else _noop_cm()
@@ -589,7 +599,21 @@ async def anthropic_messages_handler(request: web.Request) -> web.Response | web
             body = _validate_anthropic_body(await _json_request_body(request))
             original_model = body.get("model", "")
             logger.info("anthropic request model=%s stream=%s", original_model, body.get("stream"))
-
+            # Re-resolve with body available so the first-message tie-breaker and
+            # body.harness rules can fire; mirrors endpoints.py chat handler.
+            from tusker_gateway.normalization import (
+                record_resolved,
+                resolve_profile,
+                set_current as set_client_profile,
+            )
+            headers = dict(request.headers) if request.headers else None
+            api_key_token = (request.headers.get("Authorization", "").removeprefix("Bearer ").strip() or None)
+            anthropic_resolved = resolve_profile(headers=headers, body=body, api_key=api_key_token)
+            request["client_profile"] = anthropic_resolved
+            set_client_profile(anthropic_resolved)
+            if not request.get("_client_profile_recorded"):
+                record_resolved(anthropic_resolved)
+                request["_client_profile_recorded"] = True
             # Convert to OpenAI format.
             openai_body = _anthropic_to_openai(body)
             _validate_tool_choice_request(

@@ -84,10 +84,25 @@ class AuthMiddleware:
                 self._attach_identity(request, token)
                 from tusker_gateway.identity import fingerprint_api_key
                 from tusker_gateway.native_question import set_caller_context
+                from tusker_gateway.normalization import (
+                    record_resolved,
+                    resolve_profile,
+                    set_current as set_client_profile,
+                )
 
                 set_caller_context(
                     request.get("_api_key_fingerprint") or fingerprint_api_key(token)
                 )
+                # Header-only resolution at verify time. Handlers may re-resolve
+                # after reading the body to pick up body.harness / metadata.harness
+                # / first-message fingerprint; the access log reads the value of
+                # request["client_profile"] at completion, so the latest write wins.
+                resolved = resolve_profile(headers=request.headers, api_key=token)
+                request["client_profile"] = resolved
+                set_client_profile(resolved)
+                if not request.get("_client_profile_recorded"):
+                    record_resolved(resolved)
+                    request["_client_profile_recorded"] = True
                 return
         from tusker_gateway.observability import client_ip
 
