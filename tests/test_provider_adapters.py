@@ -4,8 +4,10 @@ import asyncio
 import contextlib
 import io
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -17,7 +19,10 @@ from tusker_gateway.errors import (
     ProviderRouteDisabledError,
 )
 from tusker_gateway.provider_adapters import ProviderAdapterRegistry, provider_adapters
-from tusker_gateway.provider_adapters.claude_code import ClaudeCodeCLIAdapter
+from tusker_gateway.provider_adapters.claude_code import (
+    ClaudeCodeCLIAdapter,
+    _seconds_until_reset,
+)
 from tusker_gateway.provider_adapters.kilo_cli import KiloCLIAdapter
 from tusker_gateway.provider_adapters.opencode_cli import OpenCodeCLIAdapter
 from tusker_gateway.passthrough import _configured_endpoint
@@ -962,6 +967,72 @@ async def test_claude_nonzero_exit_logs_bounded_stderr_preview(monkeypatch, capl
     assert "login error:" in caplog.text
     # Preview is bounded so a runaway stack trace can't blow up the log.
     assert caplog.text.count("x") <= 513
+
+
+_RESET_NOW = datetime(2026, 10, 16, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def _zone_available(name: str) -> bool:
+    try:
+        ZoneInfo(name)
+    except Exception:
+        return False
+    return True
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # Claude names the runtime's local zone in the parenthesized token.
+        ("You've hit your session limit · resets 4am (UTC)", 16 * 3600),
+        ("resets 4am UTC", 16 * 3600),
+        # A numeric offset is applied to the stated wall-clock time.
+        ("resets at 4:00 PM +10:00", 18 * 3600),
+        # A bare time carries no zone; the cooldown convention treats it as UTC.
+        ("resets 23:15", 11 * 3600 + 15 * 60),
+    ],
+)
+def test_seconds_until_reset_resolves_zone_tokens(text, expected):
+    assert _seconds_until_reset(text, now=_RESET_NOW) == expected
+
+
+@pytest.mark.skipif(
+    not _zone_available("Australia/Sydney"),
+    reason="tz database unavailable; named-zone resets fall back to None",
+)
+def test_seconds_until_reset_applies_named_iana_zone():
+    """A non-UTC parenthesized zone must resolve, not be silently dropped.
+
+    The runtime reports its reset in its own local zone, so a host set to
+    Australia/Sydney yields "resets 7:30pm (Australia/Sydney)". Treating that
+    as UTC would place the instant 11 hours early and make the breaker re-probe
+    into an exhausted quota window.
+    """
+    sydney = ZoneInfo("Australia/Sydney")
+    # now is 2026-10-16 23:00 Sydney; 19:30 local has passed, so the reset is
+    # the following day. Compare instants rather than asserting a fixed offset
+    # so the test stays correct across tz-database DST revisions.
+    expected = (
+        datetime(2026, 10, 17, 19, 30, tzinfo=sydney) - _RESET_NOW
+    ).total_seconds()
+    assert _seconds_until_reset("resets 7:30pm (Australia/Sydney)", now=_RESET_NOW) == expected
+    # ...and it must differ from the naive reading of the same wall clock as UTC.
+    assert _seconds_until_reset(
+        "resets 7:30pm (Australia/Sydney)", now=_RESET_NOW
+    ) != (datetime(2026, 10, 16, 19, 30, tzinfo=timezone.utc) - _RESET_NOW).total_seconds()
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "connection was reset 2 times",  # no time shape: not a clock time
+        "resets 2 times",
+        "no reset wording here",
+        "resets 4am (Not/AZone)",  # unresolvable zone keeps the default window
+    ],
+)
+def test_seconds_until_reset_ignores_non_clock_or_unknown_zone(text):
+    assert _seconds_until_reset(text, now=_RESET_NOW) is None
 
 
 @pytest.mark.asyncio

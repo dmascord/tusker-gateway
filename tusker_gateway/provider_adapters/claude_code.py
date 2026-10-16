@@ -24,9 +24,10 @@ import shutil
 import signal
 import sys
 import tempfile
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from tusker_gateway.errors import (
     BadRequestError,
@@ -123,32 +124,81 @@ def _quota_error_indicated(*parts: bytes | str) -> bool:
 
 
 _RESET_AT_RE = re.compile(
-    r"reset(?:s|ting)?(?:\s+at)?\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*"
-    r"(?:\(utc\)|utc)",
+    r"\breset(?:s|ting)?(?:\s+at)?\s+"
+    r"(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?(?:\s*(?P<meridiem>am|pm))?"
+    r"\s*(?:\((?P<paren_zone>[^)]+)\)|(?P<bare_zone>UTC|GMT|Z|[+-]\d{2}:?\d{2}))?",
     re.IGNORECASE,
 )
 
+# Tokens that name UTC itself (case-insensitive).
+_UTC_ZONE_TOKENS = frozenset({"", "utc", "gmt", "z"})
+_OFFSET_RE = re.compile(r"(?P<sign>[+-])(?P<hours>\d{2}):?(?P<minutes>\d{2})")
+
+
+def _reset_zone(token: str | None) -> tzinfo | None:
+    """Resolve the timezone token on a reset time, or ``None`` if unresolvable.
+
+    Claude reports its reset in the runtime's local timezone, e.g.
+    ``resets 4am (UTC)`` on a UTC host but ``resets 7:30pm (Australia/Sydney)``
+    on a host in that zone. A bare time (``resets 23:15``) is treated as UTC,
+    matching the convention in :mod:`tusker_gateway.cooldown`. A named zone is
+    resolved through ``zoneinfo``; when no tz database is available the token is
+    reported unresolvable so the caller keeps its conservative default window
+    rather than guessing an offset.
+    """
+    text = (token or "").strip()
+    if text.lower() in _UTC_ZONE_TOKENS:
+        return timezone.utc
+    offset = _OFFSET_RE.fullmatch(text)
+    if offset is not None:
+        hours = int(offset.group("hours"))
+        minutes = int(offset.group("minutes"))
+        if hours <= 23 and minutes <= 59:
+            delta = timedelta(hours=hours, minutes=minutes)
+            return timezone(-delta if offset.group("sign") == "-" else delta)
+    try:
+        return ZoneInfo(text)
+    except (ZoneInfoNotFoundError, ValueError, KeyError, OSError):
+        return None
+
 
 def _seconds_until_reset(text: str, *, now: datetime | None = None) -> float | None:
-    """Seconds until the UTC reset time named in a quota message, if parseable.
+    """Seconds until the reset time named in a quota message, if parseable.
 
-    Claude reports e.g. ``You've hit your session limit · resets 4am (UTC)``.
+    Claude reports e.g. ``You've hit your session limit · resets 4am (UTC)``,
+    but the parenthesized token is the runtime's local zone, so it may be an
+    IANA name. Returns ``None`` when the message names no reset, gives no time
+    shape (so prose like "resets 2 times" is not mistaken for a clock time), or
+    names a zone that cannot be resolved.
     """
     match = _RESET_AT_RE.search(text or "")
     if match is None:
         return None
-    hour = int(match.group(1))
-    minute = int(match.group(2) or 0)
-    meridiem = (match.group(3) or "").lower()
+    zone_token = match.group("paren_zone") or match.group("bare_zone")
+    # Require a time shape: a minute, a meridiem, or an explicit zone. This
+    # rejects a bare "resets 2" that is not a clock time.
+    if not (match.group("minute") or match.group("meridiem") or zone_token):
+        return None
+    hour = int(match.group("hour"))
+    minute = int(match.group("minute") or 0)
+    meridiem = (match.group("meridiem") or "").lower()
     if meridiem == "pm" and hour < 12:
         hour += 12
     elif meridiem == "am" and hour == 12:
         hour = 0
     if not 0 <= hour <= 23 or not 0 <= minute <= 59:
         return None
+    zone = _reset_zone(zone_token)
+    if zone is None:
+        return None
     current = now or datetime.now(timezone.utc)
-    target = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    if target <= current:
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    # Place the stated wall-clock time in its own zone, then compare instants.
+    target = current.astimezone(zone).replace(
+        hour=hour, minute=minute, second=0, microsecond=0
+    )
+    if target <= current.astimezone(zone):
         target += timedelta(days=1)
     return max(1.0, (target - current).total_seconds())
 
