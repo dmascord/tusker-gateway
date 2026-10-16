@@ -1,0 +1,237 @@
+{
+  "model": "hermes-code",
+  "stream": true,
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a coding assistant. Use the provided tools to inspect, edit, and run code."
+    },
+    {
+      "role": "user",
+      "content": "please do an audit of the gateway, to see what additional changes are needed to make it a solid offering"
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "ask",
+        "description": "OMP ask tool",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "input": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "input"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "bash",
+        "description": "OMP bash tool",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "input": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "input"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "edit",
+        "description": "OMP edit tool",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "input": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "input"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "find",
+        "description": "OMP find tool",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "input": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "input"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "glob",
+        "description": "OMP glob tool",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "input": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "input"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "grep",
+        "description": "OMP grep tool",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "input": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "input"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "read",
+        "description": "OMP read tool",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "input": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "input"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "task",
+        "description": "OMP task tool",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "input": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "input"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "todo",
+        "description": "OMP todo tool",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "input": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "input"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "wait",
+        "description": "OMP wait tool",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "input": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "input"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "web_search",
+        "description": "OMP web_search tool",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "input": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "input"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "write",
+        "description": "OMP write tool",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "input": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "input"
+          ]
+        }
+      }
+    }
+  ],
+  "tool_choice": "auto",
+  "metadata": {
+    "source": "regression-fixture",
+    "captured_from": "omp-session-2026-09-25T06-46-56Z"
+  }
+}

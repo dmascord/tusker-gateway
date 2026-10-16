@@ -44,6 +44,7 @@ from tusker_gateway.errors import (
     ProviderEmptyStreamError,
     ProviderError,
     ProviderRouteDisabledError,
+    ProviderStreamClosedError,
     ProviderStreamLoopError,
     RateLimitError,
     RequiredToolCallError,
@@ -1298,6 +1299,31 @@ async def _normalize_stream(
                 saw_done,
                 len(buffer),
             )
+            # Re-raise transport-level failures (peer reset, broken pipe,
+            # incomplete read) as ProviderStreamClosedError so the outer
+            # stream-loop catch distinguishes "upstream closed" (vLLM /
+            # OpenRouter-style error frame + [DONE]) from "client
+            # disconnected" (silent teardown + budget refund). Domain
+            # exceptions like ProviderError / ProviderCapacityError must
+            # pass through unchanged so the existing sanitized-error
+            # classification still surfaces the right code.
+            # Only wrap the *transport-level* "peer closed" exceptions.
+            # asyncio.TimeoutError / asyncio.IncompleteReadError have other
+            # call sites in the stream loop (per-attempt idle budget, pool
+            # fallback) and must pass through so pre-visible failover and
+            # 504 status mapping keep working.
+            # asyncio.TimeoutError is an OSError subclass in Python 3.11+
+            # but it has its own call site in the per-attempt idle budget,
+            # so it must not be wrapped here. OSError is also intentionally
+            # excluded: aiohttp's ClientPayloadError is what we really want,
+            # but a bare OSError from a downstream adapter carries a
+            # different meaning and should pass through to its handler.
+            if isinstance(exc, (ConnectionResetError, ConnectionError, BrokenPipeError)):
+                raise ProviderStreamClosedError(
+                    provider=provider or "unknown",
+                    model=model or "unknown",
+                    detail=f"{type(exc).__name__}: {exc}"[:300],
+                ) from exc
             raise
 
     async for chunk in diagnostic_raw_stream():
@@ -7152,6 +7178,20 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                             error_chunk["x_tusker_stream_error"] = (
                                 stream_error_code or "stream_error"
                             )
+                        # vLLM/OpenRouter shape: top-level `error` object so the
+                        # OpenAI SDK raises APIError instead of absorbing the
+                        # failure into a successful assistant turn. Only
+                        # ProviderStreamClosedError gets this shape; the other
+                        # branches (approval, tool contract, generic
+                        # provider_error) are already classified by their
+                        # x_tusker_stream_error field or surface via the
+                        # post-final-error frame.
+                        if isinstance(exc, ProviderStreamClosedError):
+                            error_chunk["error"] = {
+                                "message": client_message,
+                                "type": "upstream_stream_error",
+                                "code": stream_error_code or "stream_closed_prematurely",
+                            }
                         await resp.write(sse_frame(error_chunk))
                         await resp.write(
                             sse_frame(

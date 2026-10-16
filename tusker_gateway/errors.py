@@ -196,6 +196,26 @@ class ProviderStreamLoopError(ProviderError):
         )
 
 
+class ProviderStreamClosedError(ProviderError):
+    """The upstream stream closed before producing a complete assistant turn.
+
+    Distinct from a client disconnect: the bytes stop arriving from the
+    provider, not from the OMP reader. Once the HTTP 200 has been
+    committed the gateway cannot fall over, so it surfaces a vLLM/OpenRouter
+    shape ``data: {"error": {...}}`` event so the client sees a verdict
+    before its own read timeout.
+    """
+
+    def __init__(self, *, provider: str, model: str, detail: str) -> None:
+        self.provider = provider
+        self.model = model
+        self.upstream_status = 499
+        self.upstream_body = detail
+        super().__init__(
+            "upstream stream closed before finish; partial content emitted",
+            code="stream_closed_prematurely",
+        )
+
 class ProviderEmptyStreamError(ProviderError):
     """An upstream completed without content, a tool call, or useful output."""
 

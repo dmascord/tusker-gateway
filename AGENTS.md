@@ -59,12 +59,32 @@ always fine.
 
 `pytest tests/ -p no:cacheprovider` — skip
 `tests/test_passthrough_providers.py` for offline runs (hits live upstreams).
-~1617 passed + 8 skipped (offline, 2026-10-15; use `--ignore=tests/test_passthrough_providers.py`).
+~1656 passed + 8 skipped (offline, 2026-10-16; use `--ignore=tests/test_passthrough_providers.py`).
 
-## Rejected-turn capture
+`tests/test_fault_scenarios.py` exercises historical stream/provider fault
+classes with mock upstream injection: mid-stream close, transient 502,
+request-level 413, repeated-reasoning cycles, and a real OMP-shaped
+`hermes-code` turn from `tests/fixtures/hermes_code_turn.json`. These run
+in the offline suite and protect against regression in the recovery
+semantics (failover bounds, cooldown classification, cycle capture
+write) that production traffic depended on through 2026-10.
 
-With `TUSKER_STREAM_CAPTURE=1`, rejected provider turns are stored under `/home/tusker/.hermes/stream-diagnostics` on the `tusker-home` PVC. Each JSON record contains the request when available, raw response bytes, and gateway verdict; it only records turns the client never saw, making it the evidence source for judging a re-dispatched turn.
-On-disk `unusable-*.json` records have no age TTL and share a bounded store with cycle captures: at most 200 files / 2 MiB total; when full, capture resumes only after an operator clears the directory.
+### Mid-stream upstream close: vLLM/OpenRouter-shape error frame
+
+When an upstream SSE stream closes mid-flight (peer reset, no
+`[DONE]`, no `finish_reason`) the gateway cannot fall over after the
+HTTP 200 has been committed. `diagnostic_raw_stream` re-raises the
+failure as `ProviderStreamClosedError`, which reaches the same
+post-commit error path as `ProviderStreamLoopError` /
+`ProviderEmptyStreamError` and emits a vLLM/OpenRouter-shape
+`data: {"error": {...}}` frame followed by `data: [DONE]`. The OpenAI
+SDK raises `APIError` on receiving the top-level `error` object
+instead of absorbing the failure into a successful assistant turn;
+the OMP path no longer waits on its 300s read timeout to verdict
+(2026-10-14 00:17Z case). A bare `ConnectionResetError` from the
+*client* write side still hits the silent
+`stream client disconnected mid-flight` teardown — the two are
+distinguished by exception type, not by request flag.
 
 ## Secure production smoke testing
 
