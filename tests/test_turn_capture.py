@@ -322,3 +322,49 @@ def test_capture_store_is_off_unless_enabled(tmp_path, monkeypatch):
     # Turning the switch off again must not hand out the stale handle.
     monkeypatch.delenv("TUSKER_STREAM_CAPTURE")
     assert capture_store() is None
+
+
+def test_delete_by_source_removes_only_that_source(tmp_path, monkeypatch):
+    """Prune is scoped to one source: organic captures must survive."""
+    monkeypatch.setenv("TUSKER_STATE_DATABASE_URL", "")
+    store = TurnCaptureStore(
+        TurnCaptureConfig(enabled=True, path=str(tmp_path / "captures.db"))
+    )
+
+    def add(source: str) -> str:
+        capture_id = store.record(
+            request_id=f"req-{source}",
+            provider="alibaba",
+            model="m",
+            pool="code",
+            request_source=source,
+            reason="reasoning_only_or_empty",
+            verdict={},
+            request_payload=b'{"model":"m","stream":true,"tools":[{"x":1}]}',
+            response_payload=b"data: [DONE]\n\n",
+        )
+        assert capture_id is not None
+        return capture_id
+
+    seeded_a = add("seed_captures")
+    seeded_b = add("seed_captures")
+    organic = add("chat_completions")
+
+    assert store.delete_by_source("seed_captures") == 2
+    assert store.fetch(seeded_a) is None
+    assert store.fetch(seeded_b) is None
+    # The organic row is untouched: pruning a synthetic source must never
+    # remove real traffic.
+    assert store.fetch(organic) is not None
+
+    # Idempotent: nothing left to remove.
+    assert store.delete_by_source("seed_captures") == 0
+
+
+def test_delete_by_source_is_a_noop_when_disabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("TUSKER_STATE_DATABASE_URL", "")
+    store = TurnCaptureStore(
+        TurnCaptureConfig(enabled=False, path=str(tmp_path / "captures.db"))
+    )
+
+    assert store.delete_by_source("seed_captures") == 0

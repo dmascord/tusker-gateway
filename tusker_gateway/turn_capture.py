@@ -290,6 +290,27 @@ class TurnCaptureStore:
                     return 0
                 return int(getattr(cursor, "rowcount", 0) or 0)
 
+    def delete_by_source(self, request_source: str) -> int:
+        """Delete every row whose ``request_source`` matches; returns the count.
+
+        Intended for operator-driven cleanup of synthetic captures (the
+        ``seed_captures`` request_source produced by ``tools/seed_captures.py``)
+        and other known-internal sources. Real-traffic rows are never named
+        by an internal source string, so this cannot remove organic captures
+        by accident.
+        """
+        if self._db is None or not request_source:
+            return 0
+        with self._lock:
+            with self._db.connection() as conn:
+                cursor = conn.execute(
+                    f"DELETE FROM {_TABLE} WHERE request_source = ?",
+                    (request_source,),
+                )
+                if conn.degraded:
+                    return 0
+                return int(getattr(cursor, "rowcount", 0) or 0)
+
     def record(
         self,
         *,
