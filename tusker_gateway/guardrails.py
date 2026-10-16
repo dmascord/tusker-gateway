@@ -203,6 +203,99 @@ class PIIRedactionGuard:
         return GuardResult(allowed=True)
 
 
+
+@dataclass
+class SecretRedactionGuard:
+    """Hide secrets from upstream by sealing them into reversible tokens.
+
+    Uses tusker_gateway.redaction (AES-SIV self-contained tokens) plus a
+    per-request vault of what was tokenized at other locations. The response
+    pass restores tokens before client delivery, so this is transparent to
+    the caller. Disabled when ``tokenizer`` is None (key absent):
+    fail-open, because tokenizing without the ability to restore loses data.
+
+    Also rewrites JSON-string leaves inside ``tools[*].parameters`` and
+    tool-result content so provider-visible arguments are redacted too.
+    """
+
+    tokenizer: Any  # redaction.Tokenizer | None
+
+    def __post_init__(self) -> None:
+        # json-string leaf walker for nested dicts/lists
+        pass
+
+    def _walk_strings(self, node: Any) -> Any:
+        if isinstance(node, dict):
+            return {k: self._walk_strings(v) for k, v in node.items()}
+        if isinstance(node, list):
+            return [self._walk_strings(v) for v in node]
+        if isinstance(node, str):
+            return self.tokenizer.tokenize_text(node)
+        return node
+
+    async def check(self, body: dict[str, Any]) -> GuardResult:
+        if self.tokenizer is None:
+            return GuardResult(allowed=True)
+        messages = body.get("messages")
+        if not isinstance(messages, list):
+            return GuardResult(allowed=True)
+        new_messages: list[dict[str, Any]] = []
+        mutated = False
+        for msg in messages:
+            content = msg.get("content")
+            # String content: tokenize. Array content: tokenize text blocks
+            # only (image parts carry no text).
+            if isinstance(content, str):
+                new_content = self.tokenizer.tokenize_text(content)
+                if new_content != content:
+                    mutated = True
+                    new_messages.append({**msg, "content": new_content})
+                    continue
+                new_messages.append(msg)
+                continue
+            if isinstance(content, list):
+                new_blocks: list[Any] = []
+                block_mutated = False
+                for block in content:
+                    if (
+                        isinstance(block, dict)
+                        and isinstance(block.get("text"), str)
+                        and block.get("type") in {"text", "input_text", "output_text"}
+                    ):
+                        new_text = self.tokenizer.tokenize_text(block["text"])
+                        if new_text != block["text"]:
+                            block_mutated = True
+                            new_blocks.append({**block, "text": new_text})
+                            continue
+                    new_blocks.append(block)
+                if block_mutated:
+                    mutated = True
+                    new_messages.append({**msg, "content": new_blocks})
+                    continue
+                new_messages.append(msg)
+                continue
+            new_messages.append(msg)
+        # Tool definitions: JSON-schema 'default'/'examples' strings.
+        tools = body.get("tools")
+        if isinstance(tools, list):
+            new_tools = []
+            tools_mutated = False
+            for tool in tools:
+                if isinstance(tool, dict):
+                    new_tool = self._walk_strings(tool)
+                    if new_tool != tool:
+                        tools_mutated = True
+                        new_tools.append(new_tool)
+                        continue
+                new_tools.append(tool)
+            if tools_mutated:
+                mutated = True
+                modified = {**body, "messages": new_messages, "tools": new_tools}
+                return GuardResult(allowed=True, modified_body=modified)
+        if mutated:
+            return GuardResult(allowed=True, modified_body={**body, "messages": new_messages})
+        return GuardResult(allowed=True)
+
 _DEFAULT_INJECTION_PATTERNS: list[str] = [
     r"^(?:please\s+|kindly\s+)?ignore\s+(?:previous|all)\s+instructions",
     r"^you\s+are\s+(?:now\s+)?(?:a|an)\s+\w+",
@@ -388,6 +481,11 @@ def load_guardrails_config_from_env(env: dict[str, str] | None = None) -> dict[s
         "pii_email_redaction": _flag("TUSKER_GUARDRAILS_PII_EMAIL", False),
         "pii_credit_card_redaction": _flag("TUSKER_GUARDRAILS_PII_CREDIT_CARD", True),
         "injection_guard": _flag("TUSKER_GUARDRAILS_INJECTION", True),
+        "redaction_enabled": _flag("TUSKER_REDACTION_ENABLED", True),
+        "redaction_email": _flag("TUSKER_REDACTION_EMAIL", True),
+        "redaction_credit_card": _flag("TUSKER_REDACTION_CREDIT_CARD", True),
+        "redact_api_keys": _flag("TUSKER_REDACTION_API_KEYS", True),
+        "_env": e,
     }
 
 
@@ -398,6 +496,28 @@ def init_guard_pipeline(config: dict[str, Any]) -> GuardPipeline:
     guards: list[Guard] = [
         OutputLengthGuard(max_tokens=config.get("max_output_tokens", 4096)),
     ]
+    if config.get("redaction_enabled", True):
+        from tusker_gateway.redaction import (
+            RedactionRuleSet,
+            Tokenizer,
+            load_redaction_key,
+        )
+        key = load_redaction_key(config.get("_env"))
+        if key is not None:
+            rules = RedactionRuleSet(
+                redact_emails=config.get("redaction_email", True),
+                redact_credit_cards=config.get("redaction_credit_card", True),
+                redact_api_keys=config.get("redact_api_keys", True),
+            )
+            guards.append(SecretRedactionGuard(
+                tokenizer=Tokenizer(key=key, rules=rules),
+            ))
+        else:
+            import logging
+            logging.getLogger("tusker_gateway.guardrails").warning(
+                "redaction enabled but TUSKER_REDACTION_KEY missing/invalid; "
+                "secret redaction disabled (fail-open)"
+            )
     pii_email = config.get("pii_email_redaction", False)
     pii_cc = config.get("pii_credit_card_redaction", True)
     if pii_email or pii_cc:
@@ -460,6 +580,7 @@ __all__ = [
     "Guard",
     "OutputLengthGuard",
     "PIIRedactionGuard",
+    "SecretRedactionGuard",
     "PromptInjectionGuard",
     "GuardPipeline",
     "load_guardrails_config_from_env",

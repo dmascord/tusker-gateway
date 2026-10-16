@@ -391,6 +391,29 @@ provider dispatch:
   `TUSKER_GUARDRAILS_PII_CREDIT_CARD` (default `true`),
   `TUSKER_GUARDRAILS_INJECTION` (default `true`) controls the guard
   below.
+
+### Reversible secret redaction
+
+`TUSKER_REDACTION_ENABLED=true` (default) seals detected secrets into
+self-contained AES-SIV tokens before the request reaches upstream providers
+and decrypts them back before the client receives the response. Upstream
+models never see the plaintext; multi-turn consistency is preserved because
+encryption is deterministic — the same value always maps to the same token.
+
+- `TUSKER_REDACTION_EMAIL`, `TUSKER_REDACTION_CREDIT_CARD`,
+  `TUSKER_REDACTION_API_KEYS` (all default `true`) select rules: emails,
+  Luhn-valid card numbers, and provider API key shapes (`sk-…`, `ghp_…`,
+  `AIza…`, `xox…`, `npm_…`, `github_pat_…`).
+- `TUSKER_REDACTION_KEY` (32-byte hex or raw) is the AES-SIV key. **A missing
+  or invalid key disables redaction entirely (fail-open)** — the gateway never
+  tokenizes data it cannot restore. Store it in `tusker-env-vault`; rotate by
+  changing the secret and restarting (tokens in flight from the old key stop
+  restoring, they pass through verbatim).
+- Response restore walks every string in chat-completions and responses-API
+  payloads, including tool-call arguments and reasoning text. Streaming is
+  restored with a carry buffer so tokens split across SSE chunks reassemble.
+- Cache writes (response and semantic) intentionally store the tokenized
+  form: cached entries never carry plaintext secrets.
 - `PromptInjectionGuard` blocks suspicious directives that appear at the
   start of a user message (`^ignore previous instructions`, `^you are now`,
   etc., with an optional `please`/`kindly` politeness prefix). Operator-

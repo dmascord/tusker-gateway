@@ -15,6 +15,7 @@ from typing import Any, AsyncIterator
 
 from aiohttp import ClientError, web
 from aiohttp.http_exceptions import TransferEncodingError
+from tusker_gateway.redaction import _BufferedRestorer
 
 from tusker_gateway.cache import ResponseCache, make_cache_key, make_caller_scope
 from tusker_gateway.budget import BudgetTracker
@@ -671,7 +672,11 @@ def _strip_xml_tool_calls(content: str) -> str:
     return strip_tool_text(content)
 
 
-async def _normalize_stream_legacy(raw_stream: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
+async def _normalize_stream_legacy(
+    raw_stream: AsyncIterator[bytes],
+    *,
+    restorer: Any | None = None,
+) -> AsyncIterator[bytes]:
     """Normalize upstream SSE chunks for OMP/client compatibility.
 
     Some upstream providers bundle `delta.content` and `finish_reason` in the
@@ -702,6 +707,7 @@ async def _normalize_stream_legacy(raw_stream: AsyncIterator[bytes]) -> AsyncIte
 
     buffer = b""
     tool_stripper = _ToolCallStripper()
+    _rest = _BufferedRestorer(tokenizer=restorer) if restorer is not None else None
     saw_finish_reason = False
     saw_done = False
 
@@ -768,6 +774,8 @@ async def _normalize_stream_legacy(raw_stream: AsyncIterator[bytes]) -> AsyncIte
             # Pass through [DONE] sentinel as-is
             if stripped == b"data: [DONE]":
                 tool_stripper.flush()
+                if _rest is not None:
+                    _rest.flush()
                 saw_done = True
                 # Emit any pending blocks the upstream never got to close
                 # before [DONE]. If we accumulated an unclosed block, drop
@@ -820,6 +828,8 @@ async def _normalize_stream_legacy(raw_stream: AsyncIterator[bytes]) -> AsyncIte
             # gets reassembled with this chunk's content.
             if has_content:
                 cleaned = tool_stripper.feed(raw_content)
+                if _rest is not None:
+                    cleaned = _rest.feed(cleaned)
                 if not cleaned and has_tools:
                     delta = {k: v for k, v in delta.items() if k != "content"}
                 else:
@@ -1032,6 +1042,7 @@ async def _normalize_stream(
     tools_requested: bool = False,
     require_tool_call: bool = False,
     detect_repeated_reasoning: bool = False,
+    restorer: Any | None = None,
 ) -> AsyncIterator[bytes]:
     """Sanitize and normalize a provider's OpenAI-compatible SSE stream.
 
@@ -1076,6 +1087,7 @@ async def _normalize_stream(
         "tool_call_deltas": 0,
     }
     tool_stripper = _ToolCallStripper()
+    _rest = _BufferedRestorer(tokenizer=restorer) if restorer is not None else None
     saw_finish_reason = False
     saw_done = False
     saw_tool_call = False
@@ -1345,6 +1357,8 @@ async def _normalize_stream(
             stream_diag["data_events"] += 1
             if stripped == b"data: [DONE]":
                 tool_stripper.flush()
+                if _rest is not None:
+                    _rest.flush()
                 if require_tool_call and not saw_tool_call:
                     raise required_tool_error()
                 if tools_requested and saw_tool_markup_opening and not saw_tool_call:
@@ -1496,6 +1510,8 @@ async def _normalize_stream(
                 # preserves token-boundary spaces in ordinary reasoning.
                 if _TOOL_MARKUP_HINT_RE.search(cleaned):
                     cleaned = strip_tool_text(cleaned)
+                if _rest is not None:
+                    cleaned = _rest.feed(cleaned)
                 return cleaned
 
             has_content = isinstance(raw_content, str) and bool(raw_content)
@@ -3204,6 +3220,7 @@ async def _prepare_stream_result(
     content_regex: re.Pattern[str] | None = None,
     messages: Any = None,
     force_deny: bool = False,
+    redaction_tokenizer: Any = None,
     audit: Any = None,
 ) -> Any:
     """Validate a tool-bearing stream and return a stream ready for client consumption.
@@ -3256,6 +3273,7 @@ async def _prepare_stream_result(
         tools_requested=tools_requested,
         require_tool_call=require_tool_call,
         detect_repeated_reasoning=True,
+        restorer=redaction_tokenizer,
     )
 
     async def _first_frame(
@@ -4573,6 +4591,7 @@ async def _call_with_pool_fallback(
                     greylisted=model_is_greylisted(config, provider, model),
                     argument_regex=_compiled_argument_regex(config),
                     content_regex=_compiled_content_regex(config),
+                    redaction_tokenizer=request.app.get("redaction_tokenizer"),
                     messages=body.get("messages"),
                     force_deny=high_impact_greylist_force_deny(config),
                     audit=(request.app.get("audit") if request is not None else None),
@@ -4908,6 +4927,7 @@ async def _call_with_pool_fallback(
                     greylisted=model_is_greylisted(config, provider, model),
                     argument_regex=_compiled_argument_regex(config),
                     content_regex=_compiled_content_regex(config),
+                    redaction_tokenizer=request.app.get("redaction_tokenizer"),
                     messages=body.get("messages"),
                     force_deny=high_impact_greylist_force_deny(config),
                     audit=(request.app.get("audit") if request is not None else None),
@@ -6889,6 +6909,14 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                     target_model,
                 )
 
+            # Restore tokenized secrets for the client. Cache/semantic-store
+            # writes above intentionally keep the tokenized form: cached
+            # entries must never carry plaintext secrets.
+            _tokenizer = request.app.get("redaction_tokenizer")
+            if _tokenizer is not None and isinstance(result, dict):
+                from tusker_gateway.redaction import restore_response
+                result = restore_response(result, _tokenizer)
+
             if body.get("stream", False):
                 from tusker_gateway.stream_diagnostics import take_upstream_request
                 if budget is not None and api_key and not budget_recorded:
@@ -6947,6 +6975,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                                         require_tool_call=_tool_choice_requires_call(
                                             body.get("tool_choice")
                                         ),
+                                        restorer=request.app.get("redaction_tokenizer"),
                                     )
                                 )
                                 if response_alias is not None and response_alias != target_model:
@@ -7774,6 +7803,11 @@ async def _responses_handler_impl(request: web.Request) -> web.Response | web.St
                     scope=store_scope,
                     embedding=semantic_embedding,
                 )
+            # Restore tokenized secrets for the client (caches kept tokenized form).
+            _tokenizer = request.app.get("redaction_tokenizer")
+            if _tokenizer is not None:
+                from tusker_gateway.redaction import restore_response
+                result = restore_response(result, _tokenizer)
             return web.json_response(
                 _chat_result_to_responses(
                     result,

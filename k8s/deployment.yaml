@@ -249,6 +249,25 @@ spec:
           value: 'true'
         - name: TUSKER_GUARDRAILS_INJECTION
           value: 'true'
+        # Reversible secret redaction (tusker_gateway/redaction.py): values
+        # matching enabled rules are sealed into AES-SIV tokens for upstream
+        # and restored for the client. TUSKER_REDACTION_KEY comes from the
+        # vault; a missing/invalid key disables the guard (fail-open), so
+        # redaction never destroys data it cannot restore.
+        - name: TUSKER_REDACTION_ENABLED
+          value: 'true'
+        - name: TUSKER_REDACTION_EMAIL
+          value: 'true'
+        - name: TUSKER_REDACTION_CREDIT_CARD
+          value: 'true'
+        - name: TUSKER_REDACTION_API_KEYS
+          value: 'true'
+        - name: TUSKER_REDACTION_KEY
+          valueFrom:
+            secretKeyRef:
+              name: tusker-env-vault
+              key: TUSKER_REDACTION_KEY
+              optional: true
         # outage blocks the request rather than silently dropping the event.
         # The log path is on the writable tusker-home RWX PVC.
         - name: TUSKER_AUDIT_LOG_PATH

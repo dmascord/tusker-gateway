@@ -205,6 +205,12 @@ def create_app() -> web.Application:
     else:
         log.info("guardrails disabled")
 
+    # Response-side redaction restore: the tokenizer used by the
+    # SecretRedactionGuard; None when redaction is off or key is absent.
+    app["redaction_tokenizer"] = _extract_redaction_tokenizer(app["guard_pipeline"])
+
+
+
     # Shared PoolManager so catalog refresh + session stickiness +
     # cooldown state are consistent across all request handlers.
     from tusker_gateway.pools import PoolManager
@@ -685,6 +691,18 @@ def create_app() -> web.Application:
 
     app.on_startup.append(on_startup)
     return app
+
+
+def _extract_redaction_tokenizer(pipeline: Any) -> Any:
+    """Pull the redaction Tokenizer out of the guard pipeline, or None."""
+    if pipeline is None:
+        return None
+    for guard in getattr(pipeline, "guards", []) or []:
+        sentinel = object()
+        tok = getattr(guard, "tokenizer", sentinel)
+        if tok is not sentinel and tok is not None and hasattr(tok, "restore_text"):
+            return tok
+    return None
 
 
 

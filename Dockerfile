@@ -49,6 +49,7 @@ RUN pip install --no-cache-dir --upgrade pip \
  && pip install --no-cache-dir \
       "aiohttp>=3.9,<4" \
       "psycopg[binary,pool]>=3.2,<4" \
+      "cryptography>=43,<51" \
       chromadb==1.5.9 \
       sentence-transformers==6.0.0
 
