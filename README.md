@@ -2,6 +2,9 @@
 
 Lightweight OpenAI-compatible API gateway. Focused exclusively on the API server — no desktop, no CLI.
 
+See [Architecture remediation roadmap](docs/architecture-remediation-roadmap.md) for the staged target boundaries and refactoring constraints.
+
+
 ## Architecture
 
 ```

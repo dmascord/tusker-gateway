@@ -724,7 +724,7 @@ async def qualification_maintenance_loop(
         # Check whether the tool cycle is due (first cycle uses initial_delay;
         # subsequent cycles use interval_secs).
         tool_due = (
-            first_cycle is False  # noqa: already cleared above
+            first_cycle is False  # already cleared above
             and now_mono - (now_mono - tool_delay) >= 0  # always
         )
         # Simpler: schedule the tool cycle independently. We track when the

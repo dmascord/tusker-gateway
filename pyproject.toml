@@ -25,7 +25,7 @@ tusker-gateway-auth = "tusker_gateway.cli:main"
 tusker-gateway-score-omp = "tusker_gateway.omp_scoring:main"
 tusker-gateway-qualify-tools = "tusker_gateway.tool_qualification:main"
 tusker-gateway-qualify-image-tools = "tusker_gateway.tool_qualification:composite_main"
-    tusker-gateway-verify-audit = "tusker_gateway.tools.verify_audit:main"
+tusker-gateway-verify-audit = "tusker_gateway.tools.verify_audit:main"
 tusker-gateway-qualify-structured = "tusker_gateway.structured_qualification:main"
 
 [tool.setuptools.packages.find]

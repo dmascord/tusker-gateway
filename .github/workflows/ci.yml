@@ -33,8 +33,10 @@ jobs:
         run: python -m compileall -q tusker_gateway tests
       - name: Static defect checks
         run: ruff check tusker_gateway tests
+      - name: Architecture hotspot growth check
+        run: python tools/check_module_size.py
       - name: Deterministic test suite
-        run: pytest tests/ -p no:cacheprovider --ignore=tests/test_passthrough_providers.py
+        run: pytest tests/ -p no:cacheprovider --durations=50 --ignore=tests/test_passthrough_providers.py
 
   dependency-audit:
     name: Dependency audit

@@ -1,5 +1,42 @@
 # Project TODOs
 
+## Engineering review remediation (2026-10-16)
+
+### Priority 0: restore a clean deterministic suite
+
+- [ ] Resolve `TestIdempotency.test_deadline_cancellation_releases_processing_claim`. The cancellation can occur while a non-cancellable worker-thread database operation is in flight. The fix must cover claim acquisition, lease renewal and abandonment for SQLite and PostgreSQL without delaying an unrelated 504 indefinitely.
+- [ ] Run the complete deterministic suite on Python 3.11 and 3.12 and retain the 50 slowest-test report added to CI.
+- [ ] Investigate `test_sync_zero_seed_ttl_disables_retention`, which was active when the review run exceeded its execution window. Confirm whether it is slow, blocked or merely the interruption point.
+- [ ] Make required CI checks and branch protection explicit for `main`.
+- [ ] Make OpenCode CLI adapter tests hermetic. Seven warm-service tests currently fail when the `opencode` executable is absent, despite using mocked warm-service behaviour; either mock executable discovery consistently or mark true runtime integration tests explicitly.
+
+### Priority 1: protocol and streaming correctness
+
+- [ ] Add state-machine coverage for fragmented tool names/arguments, mixed reasoning and tool content, failover before first byte, failure after first byte, incomplete streams, duplicate tool results and provider finish-reason disagreements.
+- [ ] Define one shared timeout budget across qualification, candidate selection, provider attempts, fallback and persistence cleanup.
+- [ ] Document which failures permit fallback and prove that no provider splice occurs after client-visible output.
+
+### Priority 2: architecture hotspots
+
+- [ ] Follow `docs/architecture-remediation-roadmap.md`; do not rewrite the gateway wholesale.
+- [ ] Reduce `endpoints.py` by extracting stream assembly, feedback correlation, completion classification and provider-independent orchestration.
+- [ ] Split `passthrough.py` into transport, timeout, cancellation, stream-reading and credential components.
+- [ ] Lower the baselines in `tools/check_module_size.py` after every extraction. Raising a baseline requires an explicit architecture rationale.
+
+### Priority 3: warnings and engineering gates
+
+- [ ] Migrate string application/request keys to typed `aiohttp` keys through a compatibility layer supporting the declared dependency range.
+- [ ] Reduce the warning baseline to zero, then run tests with unexpected warnings treated as errors.
+- [ ] Expand Ruff rules progressively (`F`, `B`, `ASYNC`, selected `S` and `RUF`) using a baseline so existing debt does not block unrelated delivery.
+- [ ] Add coverage and branch-coverage thresholds for routing, streaming, idempotency and persistence state machines.
+- [ ] Add container vulnerability, Kubernetes manifest and secret scanning.
+
+### Priority 4: distributed-state contract
+
+- [ ] Inventory every state store and label it request-local, process-local, pod-local or cluster-shared.
+- [ ] Define behaviour when PostgreSQL is unavailable, including which features fail closed, degrade or use SQLite.
+- [ ] Add multi-replica PostgreSQL integration tests for correlation, idempotency, cooldown and ranking state.
+
 
 ## Dependency update review (2026-10-16)
 
@@ -8,10 +45,13 @@
   in both CI jobs, and `sentence-transformers` 6.0.0 → 6.1.0 in the optional
   semantic-cache extra. The PR branches were stale and carried unrelated
   deletions, so they were not merged verbatim.
-- Rejected PR #7. Its streamed DeepSeek change removes the existing contract
-  that promotes reasoning-only chunks into visible `content`; the full suite
-  caught this with `tests/test_tool_call_stripper.py::test_stream_normalizer_promotes_reasoning_content`.
-  The merge was reverted as `d002c0d`.
+- Rejected PR #7 as a full merge. Its streamed DeepSeek change removes the
+  existing contract that promotes reasoning-only chunks into visible `content`;
+  the full suite caught this with
+  `tests/test_tool_call_stripper.py::test_stream_normalizer_promotes_reasoning_content`.
+  The merge was reverted as `d002c0d`. The independent streamed function-name
+  assembly fix from `a84021e` was later integrated safely as `3aa7949`, with
+  coverage for suffix fragments, cumulative snapshots, and repeated names.
 
 
 ## Unusable tool turns recover across several candidates (2026-10-15, deployed)
