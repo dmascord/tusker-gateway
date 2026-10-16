@@ -409,9 +409,18 @@ encryption is deterministic — the same value always maps to the same token.
   tokenizes data it cannot restore. Store it in `tusker-env-vault`; rotate by
   changing the secret and restarting (tokens in flight from the old key stop
   restoring, they pass through verbatim).
+- Request sealing covers `messages[*].content` (string or array text blocks,
+  including `tool_result`), `tools[*]` JSON-schema strings, **and replayed
+  tool invocations**: `tool_calls[*].function.arguments` and the legacy
+  `function_call.arguments`. This matters for the read-then-use flow — turn 1
+  reads `.env`, turn 1 emits a bash call whose arguments hold the credential,
+  turn 2 replays the transcript. Without this the replayed arguments reach the
+  upstream model in plaintext (fixed 2026-10-16).
 - Response restore walks every string in chat-completions and responses-API
   payloads, including tool-call arguments and reasoning text. Streaming is
   restored with a carry buffer so tokens split across SSE chunks reassemble.
+  Cache hits restore too: the exact and semantic caches store the *tokenized*
+  form, so both hit paths run `restore_response` before replying.
 - Cache writes (response and semantic) intentionally store the tokenized
   form: cached entries never carry plaintext secrets.
 - `PromptInjectionGuard` blocks suspicious directives that appear at the
