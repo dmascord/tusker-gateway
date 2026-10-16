@@ -41,6 +41,7 @@ class OutputLengthGuard:
         return GuardResult()
 
 
+# Email matcher — only used when TUSKER_GUARDRAILS_PII_EMAIL=true.
 _EMAIL_RE = re.compile(
     r"(?<![a-zA-Z0-9._%+-])"
     r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}"
@@ -161,9 +162,20 @@ def _latest_user_text(messages: Any) -> str:
 
 @dataclass
 class PIIRedactionGuard:
-    """Scan user messages for PII and replace with redaction tokens."""
+    """Scan messages for PII and replace with redaction tokens.
+
+    ``redact_emails`` restores the historical ``[REDACTED-EMAIL]``
+    behaviour (disabled by default: email redaction broke coding
+    workflows that legitimately reference addresses). Credit-card
+    redaction is Luhn-gated and on by default.
+    """
+
+    redact_emails: bool = False
+    redact_credit_cards: bool = True
 
     async def check(self, body: dict[str, Any]) -> GuardResult:
+        if not (self.redact_emails or self.redact_credit_cards):
+            return GuardResult(allowed=True)
         messages = body.get("messages")
         if not isinstance(messages, list):
             return GuardResult(allowed=True)
@@ -175,8 +187,11 @@ class PIIRedactionGuard:
             if not isinstance(content, str):
                 new_messages.append(msg)
                 continue
-            new_content = _EMAIL_RE.sub("[REDACTED-EMAIL]", content)
-            new_content = _CC_RE.sub(_redact_cc, new_content)
+            new_content = content
+            if self.redact_emails:
+                new_content = _EMAIL_RE.sub("[REDACTED-EMAIL]", new_content)
+            if self.redact_credit_cards:
+                new_content = _CC_RE.sub(_redact_cc, new_content)
             if new_content != content:
                 mutated = True
                 new_messages.append({**msg, "content": new_content})
@@ -355,6 +370,8 @@ class HarnessSystemPromptGuard:
 def load_guardrails_config_from_env(env: dict[str, str] | None = None) -> dict[str, Any]:
     """Load guardrails configuration from environment variables."""
     e = os.environ if env is None else env
+    def _flag(name: str, default: bool) -> bool:
+        return e.get(name, "true" if default else "false").strip().lower() in ("true", "1", "yes")
     enabled = e.get("TUSKER_GUARDRAILS_ENABLED", "false").strip().lower() in ("true", "1", "yes")
     max_output = int(e.get("TUSKER_MAX_OUTPUT_TOKENS", "4096"))
     injection_raw = e.get("TUSKER_GUARDRAILS_INJECTION_PATTERNS", "")
@@ -368,6 +385,9 @@ def load_guardrails_config_from_env(env: dict[str, str] | None = None) -> dict[s
         "max_output_tokens": max_output,
         "injection_patterns": extra_patterns,
         "harness_principals": harness_principals,
+        "pii_email_redaction": _flag("TUSKER_GUARDRAILS_PII_EMAIL", False),
+        "pii_credit_card_redaction": _flag("TUSKER_GUARDRAILS_PII_CREDIT_CARD", True),
+        "injection_guard": _flag("TUSKER_GUARDRAILS_INJECTION", True),
     }
 
 
@@ -377,9 +397,13 @@ def init_guard_pipeline(config: dict[str, Any]) -> GuardPipeline:
         return GuardPipeline()
     guards: list[Guard] = [
         OutputLengthGuard(max_tokens=config.get("max_output_tokens", 4096)),
-        PIIRedactionGuard(),
-        PromptInjectionGuard(extra_patterns=config.get("injection_patterns", [])),
     ]
+    pii_email = config.get("pii_email_redaction", False)
+    pii_cc = config.get("pii_credit_card_redaction", True)
+    if pii_email or pii_cc:
+        guards.append(PIIRedactionGuard(redact_emails=pii_email, redact_credit_cards=pii_cc))
+    if config.get("injection_guard", True):
+        guards.append(PromptInjectionGuard(extra_patterns=config.get("injection_patterns", [])))
     principals = config.get("harness_principals") or ()
     if principals:
         guards.append(HarnessSystemPromptGuard(target_principals=tuple(principals)))

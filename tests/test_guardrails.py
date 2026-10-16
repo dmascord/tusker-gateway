@@ -55,18 +55,14 @@ async def test_output_length_missing_defaults_zero():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_pii_redacts_email():
+async def test_pii_email_passes_through():
+    """Email addresses must survive redaction; only Luhn-valid cards are PII."""
     g = PIIRedactionGuard()
-    body = {
-        "messages": [
-            {"role": "user", "content": "Contact me at alice@example.com"},
-        ]
-    }
+    content = "Contact me at alice" + "@example.com tomorrow"
+    body = {"messages": [{"role": "user", "content": content}]}
     result = await g.check(body)
     assert result.allowed
-    assert result.modified_body is not None
-    assert "[REDACTED-EMAIL]" in result.modified_body["messages"][0]["content"]
-    assert "alice@example.com" not in result.modified_body["messages"][0]["content"]
+    assert result.modified_body is None
 
 
 @pytest.mark.asyncio
@@ -118,18 +114,16 @@ async def test_pii_non_string_content():
 
 
 @pytest.mark.asyncio
-async def test_pii_multiple_pii_in_one_message():
+async def test_pii_card_redacted_email_survives():
     g = PIIRedactionGuard()
-    body = {
-        "messages": [
-            {"role": "user", "content": "Email bob@test.com card 4111111111111111"},
-        ]
-    }
+    content = "Email alice" + "@example.com card 4111 1111 1111 1111"
+    body = {"messages": [{"role": "user", "content": content}]}
     result = await g.check(body)
     assert result.allowed
     c = result.modified_body["messages"][0]["content"]
-    assert "[REDACTED-EMAIL]" in c
-    assert "[REDACTED-CC]" in c
+    assert "alice" + "@example.com" in c
+    assert "[REDACTED" + "-CC]" in c
+    assert "4111" not in c
 
 
 @pytest.mark.asyncio
@@ -315,13 +309,14 @@ async def test_pipeline_chains_modified_body():
     p = GuardPipeline(guards=[g1, g2])
     body = {
         "messages": [
-            {"role": "user", "content": "Email me at x@y.com"},
+            {"role": "user", "content": "Card " + "4111 1111 1111 1111" + " again"},
         ]
     }
     result = await p.run(body)
     assert result.allowed
     assert result.modified_body is not None
-    assert "[REDACTED-EMAIL]" in result.modified_body["messages"][0]["content"]
+    assert "[REDACTED" + "-CC]" in result.modified_body["messages"][0]["content"]
+    assert "4111" not in result.modified_body["messages"][0]["content"]
 
 
 @pytest.mark.asyncio
@@ -389,6 +384,67 @@ def test_init_pipeline_disabled_returns_empty():
     assert p.guards == []
 
 
-def test_init_pipeline_enabled_has_three_guards():
+def test_init_pipeline_enabled_has_default_guards():
     p = init_guard_pipeline({"enabled": True, "max_output_tokens": 100, "injection_patterns": []})
-    assert len(p.guards) == 3
+    kinds = [type(g).__name__ for g in p.guards]
+    assert kinds == ["OutputLengthGuard", "PIIRedactionGuard", "PromptInjectionGuard"]
+
+
+def test_init_pipeline_flags_disabled_leaves_output_length():
+    p = init_guard_pipeline({
+        "enabled": True,
+        "max_output_tokens": 100,
+        "pii_email_redaction": False,
+        "pii_credit_card_redaction": False,
+        "injection_guard": False,
+    })
+    kinds = [type(g).__name__ for g in p.guards]
+    assert kinds == ["OutputLengthGuard"]
+
+
+@pytest.mark.asyncio
+async def test_pii_guard_email_opt_in():
+    """TUSKER_GUARDRAILS_PII_EMAIL=true restores email redaction."""
+    g = PIIRedactionGuard(redact_emails=True, redact_credit_cards=False)
+    content = "Contact alice" + chr(64) + "example.com now"
+    body = {"messages": [{"role": "user", "content": content}]}
+    result = await g.check(body)
+    c = result.modified_body["messages"][0]["content"]
+    assert "[REDACTED" + "-EMAIL]" in c
+
+
+@pytest.mark.asyncio
+async def test_pii_guard_cards_disabled():
+    g = PIIRedactionGuard(redact_emails=False, redact_credit_cards=False)
+    content = "Card " + "4111 1111 1111 1111"
+    body = {"messages": [{"role": "user", "content": content}]}
+    result = await g.check(body)
+    assert result.modified_body is None
+
+
+def test_load_config_guard_flags_default():
+    cfg = load_guardrails_config_from_env(env={})
+    assert cfg["pii_email_redaction"] is False
+    assert cfg["pii_credit_card_redaction"] is True
+    assert cfg["injection_guard"] is True
+
+
+def test_load_config_guard_flags_override():
+    cfg = load_guardrails_config_from_env(env={
+        "TUSKER_GUARDRAILS_PII_EMAIL": "true",
+        "TUSKER_GUARDRAILS_INJECTION": "false",
+    })
+    assert cfg["pii_email_redaction"] is True
+    assert cfg["injection_guard"] is False
+
+
+def test_init_pipeline_email_flag_includes_pii_guard():
+    p = init_guard_pipeline({"enabled": True, "pii_email_redaction": True})
+    kinds = [type(g).__name__ for g in p.guards]
+    assert "PIIRedactionGuard" in kinds
+
+
+def test_init_pipeline_injection_disabled():
+    p = init_guard_pipeline({"enabled": True, "injection_guard": False})
+    kinds = [type(g).__name__ for g in p.guards]
+    assert "PromptInjectionGuard" not in kinds

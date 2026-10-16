@@ -240,6 +240,15 @@ spec:
           value: '16384'
         - name: TUSKER_GUARDRAILS_HARNESS_PRINCIPALS
           value: omp-harness
+        # Per-guard toggles: email redaction is OFF (addresses must stay
+        # visible for coding workflows), credit-card redaction and the
+        # prompt-injection guard stay ON.
+        - name: TUSKER_GUARDRAILS_PII_EMAIL
+          value: 'false'
+        - name: TUSKER_GUARDRAILS_PII_CREDIT_CARD
+          value: 'true'
+        - name: TUSKER_GUARDRAILS_INJECTION
+          value: 'true'
         # outage blocks the request rather than silently dropping the event.
         # The log path is on the writable tusker-home RWX PVC.
         - name: TUSKER_AUDIT_LOG_PATH

@@ -382,10 +382,15 @@ provider dispatch:
 
 - `OutputLengthGuard` clamps `max_tokens` to `TUSKER_MAX_OUTPUT_TOKENS`
   (default 4096) so a request cannot exceed the configured output ceiling.
-- `PIIRedactionGuard` replaces emails with `[REDACTED-EMAIL]` and
-  Luhn-valid card numbers with `[REDACTED-CC]` in user messages only.
-  Long digit runs that do not pass the Luhn checksum (e.g. order IDs) are
-  passed through unchanged.
+- `PIIRedactionGuard` replaces Luhn-valid card numbers with
+  `[REDACTED-CC]` (long digit runs that fail the Luhn checksum, e.g.
+  order IDs, pass through). Email addresses pass through by default;
+  set `TUSKER_GUARDRAILS_PII_EMAIL=true` to restore the historical
+  `[REDACTED-EMAIL]` behaviour. Toggles:
+  `TUSKER_GUARDRAILS_PII_EMAIL` (default `false`),
+  `TUSKER_GUARDRAILS_PII_CREDIT_CARD` (default `true`),
+  `TUSKER_GUARDRAILS_INJECTION` (default `true`) controls the guard
+  below.
 - `PromptInjectionGuard` blocks suspicious directives that appear at the
   start of a user message (`^ignore previous instructions`, `^you are now`,
   etc., with an optional `please`/`kindly` politeness prefix). Operator-

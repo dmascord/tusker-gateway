@@ -315,9 +315,6 @@ def _verify_one(
 
 # ---------------------------------------------------------------------------
 # CLI
-# ---------------------------------------------------------------------------
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=__doc__.splitlines()[0] if __doc__ else "seed captures"
@@ -349,6 +346,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="List the seeded captures already in the store and exit.",
     )
+    parser.add_argument(
+        "--prune",
+        action="store_true",
+        help="Delete every seed_captures row from the store and exit (irreversible).",
+    )
     return parser
 
 
@@ -376,6 +378,12 @@ def main(argv: list[str] | None = None) -> int:
                 f"replay_runs={len(r.get('replay_runs') or [])}"
             )
         return 0
+
+    if args.prune:
+        removed = store.delete_by_source("seed_captures")
+        print(f"pruned {removed} seed_captures row(s)")
+        return 0
+
 
     fixtures = _build_fixtures()
     if args.reason:

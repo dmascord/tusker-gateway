@@ -125,6 +125,7 @@ async def test_init_guard_pipeline_omits_harness_guard_when_no_principals(monkey
             "enabled": True,
             "max_output_tokens": 4096,
             "injection_patterns": [],
+            "pii_credit_card_redaction": True,
             "harness_principals": (),
         }
     )
@@ -139,6 +140,7 @@ async def test_init_guard_pipeline_adds_harness_guard_by_default(monkeypatch):
             "enabled": True,
             "max_output_tokens": 4096,
             "injection_patterns": [],
+            "pii_credit_card_redaction": True,
             "harness_principals": ("omp-harness", "hermes-bot"),
         }
     )
@@ -155,6 +157,7 @@ async def test_run_guard_pipeline_attaches_identity_marker(monkeypatch):
             "enabled": True,
             "max_output_tokens": 4096,
             "injection_patterns": [],
+            "pii_credit_card_redaction": True,
             "harness_principals": ("omp-harness",),
         }
     )
@@ -196,6 +199,7 @@ async def test_pii_redaction_still_runs_after_harness_rewrite(monkeypatch):
             "enabled": True,
             "max_output_tokens": 4096,
             "injection_patterns": [],
+            "pii_credit_card_redaction": True,
             "harness_principals": ("omp-harness",),
         }
     )
@@ -208,7 +212,7 @@ async def test_pii_redaction_still_runs_after_harness_rewrite(monkeypatch):
     )
     body = {
         "messages": [
-            {"role": "user", "content": "Email me at alice@example.com"},
+            {"role": "user", "content": "Card " + "4111 1111 1111 1111" + " again"},
         ]
     }
     result = await run_guard_pipeline(cfg, body, request=request)
@@ -216,4 +220,5 @@ async def test_pii_redaction_still_runs_after_harness_rewrite(monkeypatch):
     # System prompt from harness rewriter is at index 0; the redacted user
     # message is at index 1.
     assert msgs[0]["role"] == "system"
-    assert "[REDACTED-EMAIL]" in msgs[1]["content"]
+    assert "[REDACTED" + "-CC]" in msgs[1]["content"]
+    assert "4111" not in msgs[1]["content"]
