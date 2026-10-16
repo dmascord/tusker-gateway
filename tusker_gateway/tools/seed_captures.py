@@ -1,19 +1,27 @@
-"""Seed the live turn-capture store with one synthetic capture per reason category.
+"""Seed the live turn-capture store with synthetic captures for the *recorded* reasons.
 
-The harness can classify every reason the gateway produces, but the live store
-only carries captures from real traffic — which means most reason categories
-have no live evidence to replay against. This tool writes a *synthetic* capture
-for each category, using request/response bodies the gateway would have stored
-if the upstream had actually produced them. The replay tool then re-runs each
-capture through the harness and asserts the verdict matches the seeded reason.
+The gateway's capture store persists a narrow, fixed set of reason strings —
+every ``capture_rejection`` call site in ``endpoints.py`` is reached via one
+of two functions:
 
-Synthetic seeds are honest: every seeded capture represents a *plausible* bad
-response that the gateway would have rejected with that reason. They are not
-fabricated data; they are test fixtures stored in the live store so that
-``replay_capture --list --reason X`` returns real rows for every reason.
+* ``unusable_tool_error(reason)`` — called with ``reason="reasoning_only_or_empty"``,
+  downgraded to ``output_budget_exhausted`` when ``finish_reason == "length"``.
+* ``empty_stream_error()`` — called when a non-tools turn emits no visible
+  content.
+
+Everything else (``MalformedToolCallError``, ``RequiredToolCallError``,
+``InvalidToolCallArgumentsError``, ``ProviderStreamLoopError``,
+``ProviderCapacityError``, ``ProviderModelRetiredError``,
+``ClaudeAuthRequiredError``, ``ToolPolicyDeniedError``,
+``HighImpactApprovalRequiredError``, ``ToolCallContractError``) is **raised
+but never persisted** to the capture store. A replay tool cannot reproduce
+something the gateway never captured, so this tool seeds only the three
+real reasons — and one documentation-only fixture for the harness's
+``malformed_tool_response`` mirror (a reason the harness can return but the
+gateway never writes).
 
 Usage:
-    python -m tusker_gateway.tools.seed_captures              # seed all categories
+    python -m tusker_gateway.tools.seed_captures              # seed all
     python -m tusker_gateway.tools.seed_captures --verify    # re-run --repeat 5
     python -m tusker_gateway.tools.seed_captures --reason reasoning_only_or_empty
     python -m tusker_gateway.tools.seed_captures --provider synthetic
@@ -125,21 +133,6 @@ def _malformed_chunk() -> bytes:
     return _openai_chunk(content="<tool_call>truncated, never closed", finish_reason="stop")
 
 
-def _native_tool_call_chunk() -> bytes:
-    """A clean streamed tool call: should be classified usable on replay."""
-    return _openai_chunk(
-        tool_calls=[
-            {
-                "index": 0,
-                "id": "call_seed",
-                "type": "function",
-                "function": {"name": "noop", "arguments": "{}"},
-            }
-        ],
-        finish_reason="tool_calls",
-    )
-
-
 @dataclass
 class SeedSpec:
     """One fixture: a request, a response, the reason the gateway would record."""
@@ -157,10 +150,21 @@ class SeedSpec:
     extra_replay_runs: list[dict[str, Any]] = field(default_factory=list)
 
 
+# Reasons the harness can mirror but the gateway never persists. Kept as
+# documentation so a future operator sees the surface gap explicitly.
+HARNESS_ONLY_REASONS: frozenset[str] = frozenset({"malformed_tool_response"})
+
+# Reasons the gateway records. This is the *complete* set verified by AST
+# walk over tusker_gateway/endpoints.py.
+RECORDED_REASONS: frozenset[str] = frozenset(
+    {"reasoning_only_or_empty", "output_budget_exhausted", "empty_stream"}
+)
+
+
 # ---------------------------------------------------------------------------
-# Per-reason fixtures. Every fixture must produce a request that the harness
-# will issue (so replayable=True) and a response that the harness's
-# _unusable_reason (or its sibling rules) classifies with the labelled reason.
+# Per-reason fixtures. The harness mirror is the source of truth for what
+# these captures represent; the gateway records only the three reasons
+# listed in RECORDED_REASONS.
 # ---------------------------------------------------------------------------
 
 
@@ -168,8 +172,8 @@ def _build_fixtures() -> list[SeedSpec]:
     fixtures: list[SeedSpec] = []
 
     # 1. reasoning_only_or_empty (finish_reason=stop, no tool call, no content).
-    # The gateway records this when a tool turn ends with no tool call and no
-    # visible content. The harness reproduces via _unusable_reason.
+    # The gateway records this for a tools turn that ends with no tool call
+    # and no visible content. The harness mirrors it in _unusable_reason.
     fixtures.append(
         SeedSpec(
             reason="reasoning_only_or_empty",
@@ -183,7 +187,9 @@ def _build_fixtures() -> list[SeedSpec]:
     )
 
     # 2. output_budget_exhausted (finish_reason=length, reasoning-filled).
-    # The gateway downgrades reasoning_only_or_empty to this when finish_reason=length.
+    # The gateway downgrades reasoning_only_or_empty to this when
+    # finish_reason=length (endpoints.py:1166-1170). The harness applies the
+    # same downgrade.
     fixtures.append(
         SeedSpec(
             reason="output_budget_exhausted",
@@ -196,78 +202,14 @@ def _build_fixtures() -> list[SeedSpec]:
         )
     )
 
-    # 3. malformed_tool_response (opened but unclosed tool envelope).
-    # Reproduced by _unusable_reason when tool_markup_opening=True and no tool call.
-    fixtures.append(
-        SeedSpec(
-            reason="malformed_tool_response",
-            provider="zai",
-            model="glm-4.7",
-            pool="code",
-            description="Unclosed <tool_call> envelope.",
-            request_body=_request(tools=_TOOLS_PAYLOAD),
-            response_body=_malformed_chunk(),
-        )
-    )
-
-    # 4. required_tool_call_missing (tool_choice=required, no call).
-    # The gateway raises this only when tool_choice=required. The harness has
-    # no specific reason-name mapping for it; the replay will surface
-    # reasoning_only_or_empty since the response carries no tool call. We mark
-    # the seeded reason as the gateway-side classification, and the verifier
-    # records the harness-side reason separately. This is intentional: the
-    # harness mirrors only the unusable-tool rules; required-tool is a
-    # policy-layer check that happens before the response is parsed.
-    fixtures.append(
-        SeedSpec(
-            reason="required_tool_call_missing",
-            provider="github-copilot",
-            model="gpt-5.6-luna",
-            pool="premium",
-            description="tool_choice=required, response has no tool call.",
-            request_body=_request(
-                tools=_TOOLS_PAYLOAD,
-                tool_choice="required",
-            ),
-            response_body=_no_tool_call_chunk(),
-        )
-    )
-
-    # 5. invalid_tool_arguments (native call with malformed JSON arguments).
-    # The gateway raises InvalidToolCallArgumentsError when the JSON cannot be
-    # parsed or fails the tool schema. The harness's _unusable_reason does
-    # not have a specific branch for this; replay surfaces the response as
-    # usable=True (a native call was emitted). The seeded reason is the
-    # gateway-side classification; the verifier records this gap.
-    fixtures.append(
-        SeedSpec(
-            reason="invalid_tool_arguments",
-            provider="openai-codex",
-            model="gpt-5.6-luna",
-            pool="premium",
-            description="Native call with non-JSON arguments (gateway rejects; harness does not).",
-            request_body=_request(tools=_TOOLS_PAYLOAD),
-            response_body=_openai_chunk(
-                tool_calls=[
-                    {
-                        "index": 0,
-                        "id": "call_seed",
-                        "type": "function",
-                        "function": {
-                            "name": "noop",
-                            "arguments": "{not valid json",
-                        },
-                    }
-                ],
-                finish_reason="tool_calls",
-            ),
-        )
-    )
-
-    # 6. empty_stream (no-tools turn, no content, finish_reason=stop).
-    # The gateway raises ProviderEmptyStreamError. The harness classifies
-    # this as usable when no tools were requested. The seeded reason
-    # captures the gateway-side classification.
+    # 3. empty_stream (no-tools turn, no content, finish_reason=stop).
+    # The gateway records this for a non-tools turn that emits no visible
+    # content. The harness returns None for non-tools turns (it operates
+    # on the tools-turn axis), so the harness-side verdict for this reason
+    # is "usable=True" — the harness classifies a no-tools empty turn as
+    # a successful call, while the gateway calls it an empty stream. They
+    # classify on disjoint axes; a replay's --reason filter returning this
+    # row is correct.
     fixtures.append(
         SeedSpec(
             reason="empty_stream",
@@ -280,151 +222,23 @@ def _build_fixtures() -> list[SeedSpec]:
         )
     )
 
-    # 7. premature_upstream_close (the upstream sent a valid first frame then
-    # closed the socket). The gateway raises ProviderStreamClosedError. The
-    # harness sees a truncated SSE response; replay reports upstream_bytes < a
-    # normal chunk and finish_reason=null. The seeded reason is gateway-side.
+    # 4. malformed_tool_response (opened but unclosed tool envelope).
+    # The harness returns this from _unusable_reason when
+    # tool_markup_opening=True and no tool call. The gateway *raises*
+    # MalformedToolCallError at endpoints.py:1351/1578/1590/1736/1850 but
+    # never calls capture_rejection from that path — so this reason is
+    # **never persisted** to the live capture store. The fixture is kept
+    # so the harness's classification path is exercised and the operator
+    # can see the surface mismatch in the verifier output.
     fixtures.append(
         SeedSpec(
-            reason="premature_upstream_close",
-            provider="apim",
-            model="gpt-5.6-luna",
-            pool="privacy",
-            description="Upstream sends one frame then closes.",
-            request_body=_request(tools=_TOOLS_PAYLOAD),
-            # One valid data frame, no [DONE], no finish_reason.
-            response_body=_sse(
-                b'data: {"id":"seed","object":"chat.completion.chunk",'
-                b'"choices":[{"index":0,"delta":{"content":"partial"},'
-                b'"finish_reason":null}]}'
-            ),
-        )
-    )
-
-    # 8. stream_loop (the upstream repeats the same delta over and over).
-    # The gateway raises ProviderStreamLoopError after N repeats. The harness
-    # has no specific branch; replay reports the looped frame count. The
-    # seeded reason is gateway-side; the verifier records the surface mismatch.
-    fixtures.append(
-        SeedSpec(
-            reason="stream_loop",
-            provider="alibaba",
-            model="deepseek-v4-flash-0731",
+            reason="malformed_tool_response",
+            provider="zai",
+            model="glm-4.7",
             pool="code",
-            description="Same delta repeated; gateway kills the loop.",
+            description="Unclosed <tool_call> envelope (harness-only; gateway never persists).",
             request_body=_request(tools=_TOOLS_PAYLOAD),
-            response_body=_sse(
-                b'data: {"id":"seed","choices":[{"index":0,'
-                b'"delta":{"content":"repeat"},"finish_reason":null}]}',
-                b'data: {"id":"seed","choices":[{"index":0,'
-                b'"delta":{"content":"repeat"},"finish_reason":null}]}',
-                b'data: {"id":"seed","choices":[{"index":0,'
-                b'"delta":{"content":"repeat"},"finish_reason":null}]}',
-            ),
-        )
-    )
-
-    # 9. provider_capacity_unavailable (HTTP 429 from the upstream).
-    # The gateway raises ProviderCapacityError and falls over. The harness's
-    # _refusal_for_unreplayable does not cover HTTP-error cases; replay
-    # would raise ReplayError("upstream_http_error"). The seeded reason is
-    # the gateway-side classification; the verifier notes the gap.
-    fixtures.append(
-        SeedSpec(
-            reason="provider_capacity_unavailable",
-            provider="alibaba",
-            model="qwen3.8-max",
-            pool="premium",
-            description="Upstream 429; gateway triggers pool fallback.",
-            request_body=_request(tools=_TOOLS_PAYLOAD),
-            # The harness ignores response_body for HTTP errors; we record
-            # the gateway-side error here.
-            response_body=b'{"error":{"type":"rate_limit","message":"429"}}',
-            replay_response=b'{"error":{"type":"rate_limit","message":"429"}}',
-        )
-    )
-
-    # 10. model_retired_or_deprecated (HTTP 404 from the upstream).
-    # The gateway marks the model permanently failed. The harness surfaces
-    # this as ReplayError("upstream_http_error"). Seeded as gateway-side.
-    fixtures.append(
-        SeedSpec(
-            reason="model_retired_or_deprecated",
-            provider="google",
-            model="gemini-2.0-flash",
-            pool="code",
-            description="Upstream 404; gateway marks model retired.",
-            request_body=_request(tools=_TOOLS_PAYLOAD),
-            response_body=b'{"error":{"type":"not_found","message":"model retired"}}',
-        )
-    )
-
-    # 11. claude_auth_required (Claude Code CLI not authenticated).
-    # The gateway raises ClaudeAuthRequiredError before any upstream call.
-    # The harness has no surface for this — there is no request body to
-    # replay (the gateway never made an upstream call). The capture is
-    # record-only: replay will refuse with a non-replayable verdict.
-    fixtures.append(
-        SeedSpec(
-            reason="claude_auth_required",
-            provider="claude-code-cli",
-            model="sonnet",
-            pool="code",
-            description="Claude Code CLI missing credentials; gateway short-circuits.",
-            request_body=_request(tools=_TOOLS_PAYLOAD),
-            response_body=b"",  # No upstream response was ever produced.
-        )
-    )
-
-    # 12. tool_policy_denied (the gateway's high-impact guard rejected the
-    # model's proposed tool action). This is a post-tool-call rejection.
-    # The harness has no rule for it: replay reports usable=True (a clean
-    # tool call was emitted) but the original capture has the rejection.
-    # The verifier records the surface mismatch.
-    fixtures.append(
-        SeedSpec(
-            reason="tool_policy_denied",
-            provider="github-copilot-enterprise",
-            model="claude-opus-4.6",
-            pool="premium",
-            description="High-impact action denied by gateway policy.",
-            request_body=_request(tools=_TOOLS_PAYLOAD),
-            response_body=_native_tool_call_chunk(),
-        )
-    )
-
-    # 13. upstream_http_error (5xx from upstream). Same surface as
-    # provider_capacity_unavailable: the harness reports ReplayError; the
-    # gateway-side classification is distinct so we keep it as a separate
-    # seeded reason.
-    fixtures.append(
-        SeedSpec(
-            reason="upstream_http_error",
-            provider="mlx-mac",
-            model="qwen3.8-27b",
-            pool="privacy",
-            description="Upstream 503; gateway surfaces provider_error.",
-            request_body=_request(tools=_TOOLS_PAYLOAD),
-            response_body=b'{"error":{"type":"server_error","message":"503"}}',
-        )
-    )
-
-    # 14. flaky (replay-aggregated reason; not gateway-produced). Seeding
-    # this proves the new --repeat aggregation path can produce a non-empty
-    # "flaky" verdict when the harness is given a mixed sequence. The
-    # response is a clean tool call, but the verifier will assert the
-    # reason field is "flaky" after --repeat 5 against a transport that
-    # alternates usable and unusable. The seed itself is recorded with
-    # reason=flaky as a placeholder so --list --reason flaky returns a row.
-    fixtures.append(
-        SeedSpec(
-            reason="flaky",
-            provider="alibaba",
-            model="deepseek-v4-pro",
-            pool="premium",
-            description="Replay-aggregated; not a gateway reason.",
-            request_body=_request(tools=_TOOLS_PAYLOAD),
-            response_body=_native_tool_call_chunk(),
+            response_body=_malformed_chunk(),
         )
     )
 
@@ -436,23 +250,6 @@ def _build_fixtures() -> list[SeedSpec]:
 # ---------------------------------------------------------------------------
 
 
-def _seed_to_capture(
-    store: TurnCaptureStore, fixture: SeedSpec
-) -> str | None:
-    """Write one fixture into the live store. Returns the capture_id."""
-    return store.record(
-        request_id=f"seed-{fixture.reason}-{int(time.time() * 1000)}",
-        provider=fixture.provider,
-        model=fixture.model,
-        pool=fixture.pool,
-        request_source="seed_captures",
-        reason=fixture.reason,
-        verdict={"tools_requested": True, "seeded": True},
-        request_payload=fixture.request_body,
-        response_payload=fixture.response_body,
-    )
-
-
 def _verify_one(
     fixture: SeedSpec,
     capture_id: str,
@@ -461,11 +258,7 @@ def _verify_one(
 
     The replay-side transport is the captured ``response_body`` verbatim;
     here we are exercising the offline harness rather than a real upstream.
-    Empty bodies, HTTP-error bodies, and Claude-Code short-circuits are
-    caught and recorded as ``harness_reason="<replay_error>"`` so the sweep
-    survives — these are exactly the categories the offline harness does
-    not cover, and the gateway classifies them by HTTP path rather than
-    response bytes.
+    Empty bodies raise ReplayError and are caught so the sweep survives.
     """
     from tusker_gateway.tools.replay_capture import (
         ReplayError,
@@ -479,16 +272,13 @@ def _verify_one(
     try:
         summary = analyze_response(response)
     except ReplayError as exc:
-        # The replay tool refuses to analyse this body — record the refusal
-        # as the harness-side verdict so the operator can see which
-        # categories the offline harness cannot cover.
         return {
             "capture_id": capture_id,
             "reason": fixture.reason,
             "harness_reason": f"replay_error:{exc.reason}",
             "tools_requested": None,
             "summary": {"error": str(exc)},
-            "match": True,  # known gap; covered by harness_gap_reasons below
+            "match": False,
             "is_known_gap": True,
         }
 
@@ -496,23 +286,16 @@ def _verify_one(
         {"request_body": fixture.request_body}
     )
     harness_reason = _unusable_reason(summary, tools_requested)
-    # Surface mismatch is *expected* for reasons that live above the
-    # offline harness (rate-limits, auth gates, model retirement, etc.).
-    # The verifier reports the gap rather than failing the run.
-    harness_gap_reasons = {
-        "required_tool_call_missing",
-        "invalid_tool_arguments",
+    # Known surface gaps:
+    # - empty_stream: gateway records it for non-tools turns; harness
+    #   operates on the tools-turn axis and returns None, so a replay
+    #   of an empty_stream capture classifies as usable=True. Documented.
+    # - malformed_tool_response: gateway never persists; harness returns
+    #   it for an unclosed tool envelope. Documented.
+    is_known_gap = fixture.reason in {
         "empty_stream",
-        "premature_upstream_close",
-        "stream_loop",
-        "provider_capacity_unavailable",
-        "model_retired_or_deprecated",
-        "claude_auth_required",
-        "tool_policy_denied",
-        "upstream_http_error",
-        "flaky",
+        "malformed_tool_response",
     }
-    is_gap = fixture.reason in harness_gap_reasons
     return {
         "capture_id": capture_id,
         "reason": fixture.reason,
@@ -526,8 +309,9 @@ def _verify_one(
             "visible_content_chars": summary.get("visible_content_chars"),
         },
         "match": harness_reason == fixture.reason,
-        "is_known_gap": is_gap,
+        "is_known_gap": is_known_gap,
     }
+
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -634,6 +418,7 @@ def main(argv: list[str] | None = None) -> int:
                     "reason": fixture.reason,
                     "harness_reason": verdict["harness_reason"],
                     "match": verdict["match"],
+                    "is_known_gap": verdict["is_known_gap"],
                     "summary": verdict["summary"],
                 },
             )
@@ -644,8 +429,6 @@ def main(argv: list[str] | None = None) -> int:
             flag = "GAP"
             gaps += 1
         else:
-            # An unexplained mismatch is a harness regression, not a
-            # documented surface gap. Make it loud.
             flag = "!! "
             gaps += 1
         print(
@@ -660,10 +443,26 @@ def main(argv: list[str] | None = None) -> int:
     )
     print(
         f"Harness agreement: {matches}/{len(written)} classified identically; "
-        f"{gaps} documented surface gap(s) (gateway-side reasons that live "
-        f"above the offline response-bytes harness)."
+        f"{gaps} documented surface gap(s)."
     )
     return 0
+
+
+def _seed_to_capture(
+    store: TurnCaptureStore, fixture: SeedSpec
+) -> str | None:
+    """Write one fixture into the live store. Returns the capture_id."""
+    return store.record(
+        request_id=f"seed-{fixture.reason}-{int(time.time() * 1000)}",
+        provider=fixture.provider,
+        model=fixture.model,
+        pool=fixture.pool,
+        request_source="seed_captures",
+        reason=fixture.reason,
+        verdict={"tools_requested": True, "seeded": True},
+        request_payload=fixture.request_body,
+        response_payload=fixture.response_body,
+    )
 
 
 if __name__ == "__main__":
