@@ -131,6 +131,33 @@ def _excerpt(payload: bytes, limit: int) -> tuple[bytes, int]:
     return payload[:head] + marker + payload[-tail:], elided
 
 
+def _decode_replay_runs(raw: Any) -> list[dict[str, Any]]:
+    """Parse the ``replay_runs`` column. Returns ``[]`` on any failure."""
+    if not raw:
+        return []
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            raw = raw.decode("utf-8", errors="replace")
+        except Exception:
+            return []
+    if not isinstance(raw, str):
+        return []
+    try:
+        decoded = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    return decoded if isinstance(decoded, list) else []
+
+
+
+def _iso(epoch: float) -> str:
+    from datetime import datetime, timezone
+
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+
+
 class TurnCaptureStore:
     """Database-backed store for rejected provider turns."""
 
@@ -181,9 +208,15 @@ class TurnCaptureStore:
                     response_bytes INTEGER,
                     response_sha256 TEXT,
                     response_body {blob},
-                    response_truncated_bytes INTEGER NOT NULL DEFAULT 0
+                    response_truncated_bytes INTEGER NOT NULL DEFAULT 0,
+                    replay_runs TEXT NOT NULL DEFAULT '[]'
                 )
                 """
+            )
+            # Idempotent migration: ``replay_runs`` was added after initial
+            # deploy; older databases have the table without it.
+            self._add_column_if_missing(
+                conn, _TABLE, "replay_runs", "TEXT NOT NULL DEFAULT '[]'"
             )
             conn.execute(
                 f"CREATE INDEX IF NOT EXISTS idx_{_TABLE}_expires "
@@ -197,6 +230,44 @@ class TurnCaptureStore:
                 f"CREATE INDEX IF NOT EXISTS idx_{_TABLE}_request "
                 f"ON {_TABLE} (request_id)"
             )
+
+    @staticmethod
+    def _add_column_if_missing(
+        conn: Any, table: str, column: str, definition: str
+    ) -> None:
+        """Idempotent ``ALTER TABLE ADD COLUMN`` for sqlite + postgres.
+
+        sqlite stores schema in ``sqlite_master``; postgres exposes
+        ``information_schema.columns``. A failure here is logged and
+        swallowed: the column will simply be missing and reads will
+        fall back to a synthesized empty array.
+        """
+        try:
+            if conn.is_postgres:
+                cursor = conn.execute(
+                    "SELECT 1 FROM information_schema.columns "
+                    "WHERE table_name = ? AND column_name = ?",
+                    (table, column),
+                )
+                if cursor.fetchone() is None:
+                    conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
+                    )
+            else:
+                cursor = conn.execute(f"PRAGMA table_info({table})")
+                names = {row[1] for row in cursor.fetchall()}
+                if column not in names:
+                    conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
+                    )
+        except Exception as exc:  # pragma: no cover - best effort migration
+            logger.warning(
+                "turn capture column add failed table=%s column=%s: %s",
+                table,
+                column,
+                exc,
+            )
+
 
     def _body_policy(self, pool: str | None) -> str:
         if not pool:
@@ -330,6 +401,64 @@ class TurnCaptureStore:
                 return None
         return capture_id
 
+    def record_replay_run(
+        self,
+        capture_id: str,
+        run: Mapping[str, Any],
+    ) -> bool:
+        """Append one replay attempt's outcome to ``capture_id``'s replay log.
+
+        The store is append-only: each invocation reads the existing
+        ``replay_runs`` array, appends the new entry (stamped with the
+        current time and the attempt number from the caller), and writes
+        the result back. Concurrent appends on a single capture are
+        serialized through ``self._lock``; the worst case is one lost
+        update, which is acceptable for a diagnostic log.
+
+        Returns ``True`` when the row was updated, ``False`` when the
+        store is disabled, the capture is missing/expired, or the write
+        failed. The caller must never raise on a ``False`` return:
+        persistence is a best-effort observation, not a guarantee.
+        """
+        if self._db is None or not capture_id:
+            return False
+        run_dict = dict(run)
+        run_dict.setdefault("recorded_at", time.time())
+        run_dict["recorded_at_iso"] = _iso(run_dict["recorded_at"])
+        with self._lock:
+            try:
+                with self._db.connection() as conn:
+                    cursor = conn.execute(
+                        f"SELECT replay_runs FROM {_TABLE} "
+                        f"WHERE capture_id = ? AND expires_at > ?",
+                        (capture_id, time.time()),
+                    )
+                    row = cursor.fetchone()
+                    if row is None:
+                        return False
+                    existing = _decode_replay_runs(row[0])
+                    existing.append(run_dict)
+                    payload = json.dumps(
+                        existing, ensure_ascii=False, default=str
+                    )
+                    conn.execute(
+                        f"UPDATE {_TABLE} SET replay_runs = ? "
+                        f"WHERE capture_id = ? AND expires_at > ?",
+                        (payload, capture_id, time.time()),
+                    )
+                    if conn.degraded:
+                        return False
+            except Exception as exc:
+                logger.warning(
+                    "turn capture replay run append failed "
+                    "capture_id=%s: %s",
+                    capture_id,
+                    exc,
+                )
+                return False
+        return True
+
+
     def fetch(self, capture_id: str) -> dict[str, Any] | None:
         """Return one capture with raw payloads, or ``None``."""
         if self._db is None:
@@ -341,7 +470,7 @@ class TurnCaptureStore:
                        model, pool, request_source, reason, body_policy, replayable,
                        verdict, request_bytes, request_sha256, request_body,
                        request_truncated_bytes, response_bytes, response_sha256,
-                       response_body, response_truncated_bytes
+                       response_body, response_truncated_bytes, replay_runs
                 FROM {_TABLE} WHERE capture_id = ? AND expires_at > ?
                 """,
                 (capture_id, time.time()),
@@ -391,9 +520,10 @@ class TurnCaptureStore:
                        model, pool, request_source, reason, body_policy, replayable,
                        verdict, request_bytes, request_sha256, NULL,
                        request_truncated_bytes, response_bytes, response_sha256,
-                       NULL, response_truncated_bytes
+                       NULL, response_truncated_bytes, replay_runs
                 FROM {_TABLE}{where}
                 ORDER BY created_at DESC
+
                 LIMIT ?
                 """,
                 tuple(parameters),
@@ -433,6 +563,8 @@ class TurnCaptureStore:
             response_sha256,
             response_body,
             response_truncated,
+
+            replay_runs_raw,
         ) = row
         try:
             verdict = json.loads(verdict_raw) if verdict_raw else {}
@@ -459,6 +591,7 @@ class TurnCaptureStore:
             "response_sha256": response_sha256,
             "response_body": bytes(response_body) if response_body is not None else None,
             "response_truncated_bytes": int(response_truncated or 0),
+            "replay_runs": _decode_replay_runs(replay_runs_raw),
         }
 
 

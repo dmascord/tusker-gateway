@@ -202,6 +202,60 @@ def test_list_captures_filters_without_bodies(store):
     assert "request_body" not in rows[0]
     assert "response_body" not in rows[0]
     assert rows[0]["replayable"] is True
+    assert rows[0]["replay_runs"] == []
+
+
+def test_record_replay_run_appends_to_capture(store):
+    """A replay run is appended to the capture's replay_runs array, in order."""
+    capture_id = _record(store)
+    assert store.fetch(capture_id)["replay_runs"] == []
+
+    assert store.record_replay_run(
+        capture_id,
+        {"attempt": 1, "usable": True, "reason": None, "upstream_bytes": 1024},
+    ) is True
+    assert store.record_replay_run(
+        capture_id,
+        {"attempt": 2, "usable": False, "reason": "reasoning_only_or_empty", "upstream_bytes": 256},
+    ) is True
+
+    record = store.fetch(capture_id)
+    runs = record["replay_runs"]
+    assert len(runs) == 2
+    assert runs[0]["attempt"] == 1
+    assert runs[0]["usable"] is True
+    assert runs[1]["attempt"] == 2
+    assert runs[1]["reason"] == "reasoning_only_or_empty"
+    # Each entry is stamped with a recorded_at time.
+    assert all("recorded_at" in r and r["recorded_at"] > 0 for r in runs)
+    assert all("recorded_at_iso" in r for r in runs)
+
+
+def test_record_replay_run_returns_false_for_missing_capture(store):
+    """A no-op return on a missing or expired capture_id, never an exception."""
+    assert store.record_replay_run("not-a-real-id", {"attempt": 1}) is False
+
+
+def test_record_replay_run_no_op_on_disabled_store(tmp_path, monkeypatch):
+    monkeypatch.setenv("TUSKER_STATE_DATABASE_URL", "")
+    cfg = TurnCaptureConfig(enabled=False, path=str(tmp_path / "off.db"))
+    disabled = TurnCaptureStore(cfg)
+    assert disabled.enabled is False
+    assert disabled.record_replay_run("any", {"attempt": 1}) is False
+
+
+def test_list_captures_filters_without_bodies(store):
+    _record(store, provider="alibaba", reason="reasoning_only_or_empty")
+    _record(store, provider="zai", reason="empty_stream")
+
+    rows = store.list_captures(provider="zai")
+    assert len(rows) == 1
+    assert rows[0]["provider"] == "zai"
+    assert rows[0]["reason"] == "empty_stream"
+    # A listing carries metadata only: prompt bytes never travel in bulk.
+    assert "request_body" not in rows[0]
+    assert "response_body" not in rows[0]
+    assert rows[0]["replayable"] is True
 
 
 def test_list_captures_since_filters_older_rows(store):

@@ -47,7 +47,21 @@ class TestIsReasoningModel:
         assert is_reasoning_model("minimax-m3")
         assert is_reasoning_model("MiniMax.M3")
 
+
+    def test_glm_is_reasoning(self):
+        # Z.AI's glm-* family and the ollama-cloud mirror both emit inline
+        # <think> blocks; 2026-10-16 investigation confirmed glm-5.3-flash
+        # burned 63K chars of reasoning and finished with finish_reason=length,
+        # yielding an empty tool turn. See TODO.md and
+        # docs/investigation-2026-10-16-ollama-cloud-glm.md.
+        assert is_reasoning_model("glm-5.3-flash")
+        assert is_reasoning_model("glm-4.7")
+        assert is_reasoning_model("GLM-5.2")
+        assert is_reasoning_model("glm-air")
+
     def test_non_reasoning_models(self):
+
+
         assert not is_reasoning_model("gpt-4o")
         assert not is_reasoning_model("gpt-3.5-turbo")
         assert not is_reasoning_model("claude-sonnet-4")

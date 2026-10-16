@@ -326,6 +326,185 @@ def test_streaming_native_tool_call_is_usable(store, provider_config, capsys):
     assert result["replay"]["saw_tool_call"] is True
     assert result["replay"]["usable"] is True
     assert result["replay"]["reason"] is None
+    assert result["replay"]["repeat"] == 1
+    assert result["replay"]["usable_count"] == 1
+
+
+def test_repeat_aggregates_usable_count(store, provider_config, capsys):
+    """--repeat N re-issues the stored request N times and aggregates results."""
+    record = add_capture(store)
+    calls: list[int] = []
+
+    async def fake_transport(url, *, headers, body, timeout):
+        calls.append(1)
+        response = (
+            b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1",'
+            b'"type":"function","function":{"name":"my_tool","arguments":"{}"}}]},'
+            b'"finish_reason":"tool_calls"}]}\n\n'
+            b"data: [DONE]\n\n"
+        )
+        return 200, response
+
+    assert (
+        main(
+            [
+                "--capture-id",
+                record["capture_id"],
+                "--repeat",
+                "3",
+                "--json",
+            ],
+            store=store,
+            config=provider_config,
+            transport=fake_transport,
+        )
+        == 0
+    )
+    result = json.loads(capsys.readouterr().out)
+    assert len(calls) == 3
+    assert result["replay"]["repeat"] == 3
+    assert result["replay"]["usable_count"] == 3
+    assert result["replay"]["usable"] is True
+    assert result["replay"]["reason"] is None
+    assert len(result["replay"]["runs"]) == 3
+    for i, run in enumerate(result["replay"]["runs"], start=1):
+        assert run["attempt"] == i
+        assert run["usable"] is True
+
+
+def test_repeat_marks_flaky_when_some_attempts_fail(store, provider_config, capsys):
+    """Mixed outcomes yield usable_count < repeat and aggregate_reason='flaky'."""
+    record = add_capture(store)
+    attempt = {"n": 0}
+    good = (
+        b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1",'
+        b'"type":"function","function":{"name":"my_tool","arguments":"{}"}}]},'
+        b'"finish_reason":"tool_calls"}]}\n\n'
+        b"data: [DONE]\n\n"
+    )
+    bad = b'{"choices":[{"message":{"content":""}}]}'
+
+    async def fake_transport(url, *, headers, body, timeout):
+        attempt["n"] += 1
+        return 200, good if attempt["n"] % 2 == 1 else bad
+
+    assert (
+        main(
+            [
+                "--capture-id",
+                record["capture_id"],
+                "--repeat",
+                "4",
+                "--json",
+            ],
+            store=store,
+            config=provider_config,
+            transport=fake_transport,
+        )
+        == 3
+    )
+
+
+def test_repeat_zero_clamps_to_one(store, provider_config, capsys):
+    """--repeat 0 must still produce one attempt, not zero (and that attempt is evaluated)."""
+    record = add_capture(store)
+    calls: list[int] = []
+    response = (
+        b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1",'
+        b'"type":"function","function":{"name":"my_tool","arguments":"{}"}}]},'
+        b'"finish_reason":"tool_calls"}]}\n\n'
+        b"data: [DONE]\n\n"
+    )
+
+    async def fake_transport(url, *, headers, body, timeout):
+        calls.append(1)
+        return 200, response
+
+    assert (
+        main(
+            [
+                "--capture-id",
+                record["capture_id"],
+                "--repeat",
+                "0",
+                "--json",
+            ],
+            store=store,
+            config=provider_config,
+            transport=fake_transport,
+        )
+        == 0
+    )
+    assert len(calls) == 1
+    result = json.loads(capsys.readouterr().out)
+    assert result["replay"]["repeat"] == 1
+    assert result["replay"]["usable_count"] == 1
+
+
+def test_repeat_persists_replay_runs_to_capture(store, provider_config, capsys):
+    """--repeat N appends a single ``replay_runs`` entry to the capture record."""
+    record = add_capture(store)
+    assert store.fetch(record["capture_id"])["replay_runs"] == []
+
+    async def fake_transport(url, *, headers, body, timeout):
+        return 200, (
+            b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1",'
+            b'"type":"function","function":{"name":"my_tool","arguments":"{}"}}]},'
+            b'"finish_reason":"tool_calls"}]}\n\n'
+            b"data: [DONE]\n\n"
+        )
+
+    assert (
+        main(
+            [
+                "--capture-id",
+                record["capture_id"],
+                "--repeat",
+                "3",
+                "--json",
+            ],
+            store=store,
+            config=provider_config,
+            transport=fake_transport,
+        )
+        == 0
+    )
+    # One replay_runs entry per main() invocation, not per attempt.
+    updated = store.fetch(record["capture_id"])
+    assert len(updated["replay_runs"]) == 1
+    run = updated["replay_runs"][0]
+    assert run["repeat"] == 3
+    assert run["usable_count"] == 3
+    assert run["provider"] == "openai"
+    assert len(run["runs"]) == 3
+    assert [r["attempt"] for r in run["runs"]] == [1, 2, 3]
+
+
+def test_single_repeat_does_not_persist_replay_runs(store, provider_config, capsys):
+    """Without --repeat > 1, no replay_runs entry is written."""
+    record = add_capture(store)
+
+    async def fake_transport(url, *, headers, body, timeout):
+        return 200, (
+            b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1",'
+            b'"type":"function","function":{"name":"my_tool","arguments":"{}"}}]},'
+            b'"finish_reason":"tool_calls"}]}\n\n'
+            b"data: [DONE]\n\n"
+        )
+
+    assert (
+        main(
+            ["--capture-id", record["capture_id"], "--json"],
+            store=store,
+            config=provider_config,
+            transport=fake_transport,
+        )
+        == 0
+    )
+    assert store.fetch(record["capture_id"])["replay_runs"] == []
+
+
+
 
 def test_list_prints_capture_metadata_table(store, capsys):
     add_capture(store)
@@ -335,6 +514,7 @@ def test_list_prints_capture_metadata_table(store, capsys):
     assert "provider/model" in output
     assert "body_policy" in output
     assert "request_bytes" not in output
+
 
 
 class _StubProvider(BaseHTTPRequestHandler):

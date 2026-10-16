@@ -90,7 +90,6 @@ class ReplayError(Exception):
         self.reason = reason
         self.message = message
 
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     selection = parser.add_mutually_exclusive_group()
@@ -113,6 +112,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--limit", type=int, default=50, help="max rows for --list")
     parser.add_argument("--timeout", type=float, default=120.0, help="replay timeout seconds")
+    parser.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        help="re-issue the captured request N times and aggregate; for "
+             "disambiguating transient upstream incidents from flaky models.",
+    )
     parser.add_argument("--json", action="store_true", dest="as_json")
     parser.add_argument(
         "--show-body",
@@ -121,6 +127,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="print a bounded excerpt of the captured request/response text",
     )
     return parser
+
 
 
 def _parse_since(value: str | None) -> float | None:
@@ -588,37 +595,82 @@ async def _run(
     url = _request_url(endpoint)
     headers = _replay_headers(endpoint, token)
     body = bytes(record["request_body"])
-    status, response_body = await transport(
-        url, headers=headers, body=body, timeout=args.timeout
-    )
-    if status < 200 or status >= 300:
-        raise ReplayError(
-            "upstream_http_error",
-            f"provider returned HTTP {status}; replay could not be evaluated",
-        )
-
-    summary = analyze_response(response_body)
+    repeat_count = max(1, int(getattr(args, "repeat", 1) or 1))
     tools_requested = _tools_requested(record)
-    reason = _unusable_reason(summary, tools_requested)
-    usable = reason is None
+    runs: list[dict[str, Any]] = []
+    last_status: int | None = None
+    last_response_body: bytes = b""
+    for attempt in range(repeat_count):
+        status, response_body = await transport(
+            url, headers=headers, body=body, timeout=args.timeout
+        )
+        if status < 200 or status >= 300:
+            raise ReplayError(
+                "upstream_http_error",
+                f"provider returned HTTP {status} on attempt {attempt + 1}/{repeat_count}; "
+                "replay could not be evaluated",
+            )
+        last_status = status
+        last_response_body = response_body
+        summary = analyze_response(response_body)
+        reason = _unusable_reason(summary, tools_requested)
+        usable = reason is None
+        runs.append(
+            {
+                "attempt": attempt + 1,
+                "http_status": status,
+                "upstream_bytes": len(response_body),
+                "tools_requested": tools_requested,
+                "usable": usable,
+                "reason": reason,
+                **summary,
+            }
+        )
+    usable_count = sum(1 for r in runs if r["usable"])
+    if store is not None and repeat_count > 1 and runs:
+        record_replay = getattr(store, "record_replay_run", None)
+        if record_replay is not None:
+            try:
+                record_replay(
+                    str(record.get("capture_id") or ""),
+                    {
+                        "repeat": repeat_count,
+                        "usable_count": usable_count,
+                        "provider": provider,
+                        "url": url,
+                        "runs": runs,
+                    },
+                )
+            except Exception as exc:  # pragma: no cover - diagnostic best effort
+                # Persistence is best effort; never let it abort the replay.
+                pass
+    usable = usable_count == repeat_count
+
+    if not usable and usable_count > 0:
+        aggregate_reason = "flaky"
+    else:
+        aggregate_reason = runs[-1]["reason"] if runs else None
     result: dict[str, Any] = {
         "mode": "replay",
         "capture": meta,
         "replay": {
             "provider": provider,
             "url": url,
-            "http_status": status,
-            "upstream_bytes": len(response_body),
+            "http_status": last_status,
+            "upstream_bytes": len(last_response_body),
             "tools_requested": tools_requested,
             "usable": usable,
-            "reason": reason,
-            **summary,
+            "reason": aggregate_reason,
+            "repeat": repeat_count,
+            "usable_count": usable_count,
+            "runs": runs,
+            **(runs[-1] if runs else {}),
         },
     }
     if args.show_body:
         result["capture"]["request_excerpt"] = _body_excerpt(record, "request")
         result["capture"]["response_excerpt"] = _body_excerpt(record, "response")
-        result["replay"]["response_excerpt"] = bytes(response_body).decode(
+        result["replay"]["response_excerpt"] = bytes(last_response_body).decode(
             "utf-8", errors="replace"
         )[:_BODY_EXCERPT_CHARS]
     return (EXIT_OK if usable else EXIT_UNUSABLE), result
@@ -639,12 +691,23 @@ def _print_result(result: Mapping[str, Any], as_json: bool) -> None:
         "request_bytes={request_bytes} response_bytes={response_bytes}".format(**meta)
     )
     replay = result.get("replay") or {}
+
+    repeat = int(replay.get("repeat") or 1)
+    usable_count = int(replay.get("usable_count") or (1 if replay.get("usable") else 0))
     print(
         "replay provider={provider} url={url} http_status={http_status} "
         "upstream_bytes={upstream_bytes} frames={frames} data_events={data_events} "
         "content_chars={content_chars} tool_call_deltas={tool_call_deltas} "
         "finish_reason={finish_reason} tools_requested={tools_requested}".format(**replay)
     )
+    if repeat > 1:
+        print(
+            "repeat={repeat} usable_count={usable_count}/{repeat} aggregate_reason={aggregate_reason}".format(
+                repeat=repeat,
+                usable_count=usable_count,
+                aggregate_reason=replay.get("reason") or "none",
+            )
+        )
     print(
         "tool_markup_as_text={tool_markup_as_text} markup_kinds={markup} "
         "usable={usable} reason={reason}".format(
@@ -654,6 +717,7 @@ def _print_result(result: Mapping[str, Any], as_json: bool) -> None:
             reason=replay.get("reason") or "none",
         )
     )
+
     if "request_excerpt" in meta:
         print("--- captured request excerpt (prompt-derived) ---")
         print(meta["request_excerpt"])

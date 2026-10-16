@@ -43,6 +43,12 @@ _REASONING_SLUGS: tuple[str, ...] = (
     # the visible answer; without a floor the thinking budget eats the
     # response budget.
     "minimax",
+    # GLM family (Z.AI / zai provider and ollama-cloud mirror): every
+    # glm-* model currently shipped emits inline <think> blocks before the
+    # visible answer. Without a floor the thinking budget eats the
+    # response budget, which surfaced as silent empty turns on
+    # ollama-cloud/glm-5.3-flash in 2026-10-16 captures.
+    "glm",
 )
 
 _REASONING_RE = re.compile(
