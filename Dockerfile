@@ -3,9 +3,9 @@
 # Python-based gateway image.
 FROM node:22-bookworm-slim AS cli-tools
 
-ARG CLAUDE_CODE_CLI_VERSION=2.1.281
-ARG OPENCODE_CLI_VERSION=2.0.15
-ARG KILO_CLI_VERSION=7.7.9
+ARG CLAUDE_CODE_CLI_VERSION=2.1.301
+ARG OPENCODE_CLI_VERSION=2.0.30
+ARG KILO_CLI_VERSION=7.8.12
 
 RUN npm install --global --no-audit --no-fund \
       "@anthropic-ai/claude-code@${CLAUDE_CODE_CLI_VERSION}" \

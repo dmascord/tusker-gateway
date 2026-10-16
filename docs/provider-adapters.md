@@ -78,7 +78,7 @@ second time: the adapter re-runs the CLI without tools and answers in prose
 instead, and raises `tool_call_loop` when that produces no assistant text.
 
 The gateway image includes a pinned Claude Code CLI executable (currently
-2.1.281). The image does not include or provision credentials. In production,
+2.1.301). The image does not include or provision credentials. In production,
 the CLI reads its own runtime login from `CLAUDE_CONFIG_DIR` or
 `$HOME/.claude`; do not copy a developer's macOS Keychain into the image.
 Claude Code's self-updater is disabled in the image so the pinned version is
@@ -144,11 +144,14 @@ non-interactive permission handling remains in effect for other tools, so
 operators should also review any global CLI configuration used by the gateway.
 Follow-up tool calls and results are replayed as transcript history. The
 gateway image includes the pinned OpenCode v2 CLI executable (currently
-2.0.15). Production explicitly enables this adapter and includes
+2.0.30). Production explicitly enables this adapter and includes
 `opencode-cli/big-pickle` plus the free Zen models (`cat-jam-free`,
 `longcat-2.5-preview-free`, `mimo-v2.6-flash-free`,
 `muse-spark-1.3-contributor-free`, `nemotron-3.5-lightning-free`,
-`space-bunny-free`, `step-5-preview-free`) in the code pool. Zen's free tier
+`space-bunny-free`, `step-5-preview-free`) in the code pool. The listed Zen
+seed is a starting set, not a contract: the auto-catalog adopts whatever
+`opencode models` reports after a CLI bump, so the live free set is driven by
+the pinned binary (see `docs/deployment-k8s.md`). Zen's free tier
 rejects the gateway's direct HTTP provider path (`opencode-zen`) with
 `FreeTierError` regardless of client headers, so the free models are served
 exclusively through this CLI route; tool qualification for them runs through
@@ -310,7 +313,7 @@ the SSE error frame. Kilo has no catalog advertisement for image input, so
 re-probing it requires `python -m tusker_gateway.modality_qualification
 --include-unadvertised`. Other environments can run the adapter
 locally by leaving `TUSKER_KILO_WORKER_URL` unset. The gateway image includes
-the pinned Kilo CLI (currently 7.7.9); set `TUSKER_KILO_CLI_PATH` to use an
+the pinned Kilo CLI (currently 7.8.12); set `TUSKER_KILO_CLI_PATH` to use an
 operator-managed installation instead.
 
 Kilo Auto Free may route to providers that retain or use prompts for

@@ -263,6 +263,16 @@ required matching-code fixes. Re-check when the free set changes, a model is
 refused, an upstream CLI bug is reported, or a release/security review identifies
 a reason to bump; the weekly CronJob is an expected review signal, not an outage.
 
+**Acted on 2026-10-16.** Pins bumped to claude-code 2.1.301, `@opencode/cli`
+2.0.30, kilo 7.8.12 (`Dockerfile` ARGs plus the CronJob env mirror).
+Offline re-verification: 2.1.301 still carries every flag the isolation path
+uses; kilo 7.8.12 keeps `run --pure --format json --attach`; and
+`opencode models --standalone` lists ten `opencode/*` free entries on 2.0.30
+(the pinned 2.0.15 lists none in a clean environment), adding
+`deepseek-v4.1-flash-free`, `nemotron-3-ultra-free` and
+`nemotron-3.5-super-vl-free` while not listing `step-5-preview-free`. The live
+tool-qualification probe still gates trusting the new CLIs on the routing path.
+
 ## Gateway OOM crash-loop + CLI source-tree leak fixed (2026-10-15, deployed)
 
 The gateway pod OOM-killed 16 times in its first ~5 hours (2026-10-14

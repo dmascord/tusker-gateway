@@ -135,6 +135,25 @@ release/security review identifies a reason to bump. The weekly
 `tusker-cli-drift-check` reporting drift remains an expected signal to review,
 not by itself an outage.
 
+Dated assessment (2026-10-16 - drift acted on): the pins moved to
+`@anthropic-ai/claude-code` 2.1.301, `@opencode/cli` 2.0.30 and
+`@kilocode/cli` 7.8.12, in both the `Dockerfile` ARGs and the CronJob env
+mirror. Offline re-verification before deploy:
+
+- Claude Code 2.1.301 still carries every flag the isolation path depends on
+  (`--restricted`, `--mcp-config`, `--strict-mcp-config`, `--allowedTools`,
+  `--permission-mode`, `--tools`, `--no-session-persistence`,
+  `--include-partial-messages`).
+- Kilo 7.8.12 keeps `run --pure --format json --attach ...`, unchanged from
+  7.7.9.
+- `opencode models --standalone` on 2.0.30 lists ten `opencode/*` free entries;
+  the pinned 2.0.15 lists none in a clean environment (production reaches
+  `entries=10` only because the mounted state lets its background service
+  start). Relative to the `TUSKER_POOL_CODE` seed, 2.0.30 adds
+  `deepseek-v4.1-flash-free`, `nemotron-3-ultra-free` and
+  `nemotron-3.5-super-vl-free`, and does not list `step-5-preview-free`. The
+  seed is not a contract - the `opencode-cli` auto-catalog adopts whatever the
+  pinned binary reports, so the live free set follows the binary.
 
 Upgrades stay deliberate: bump the `Dockerfile` ARG (and the CronJob env
 mirror), rebuild through `k8s/deploy.sh`, and re-verify the CLI adapters

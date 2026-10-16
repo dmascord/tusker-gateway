@@ -70,7 +70,10 @@ feature.
 - ChatGPT pool credential cleanup (device-code enrollment flow) — blocked on a user-side browser authorization.
 - `openai-codex` credential 401s on every call (P1 from 09-26 audit) — re-enroll or delete; the rotator only covers 2 models via `credential_model_exclusions`.
 - `opencode-go` monthly quota exhausted (35 code + 12 premium + swarm `deepseek-v4-flash` degraded) — wait for reset or plan upgrade.
-- Deliberate bump decision for `claude-code 2.1.300` / `opencode 2.0.29` / `kilo 7.8.8` pins — needs CLI-adapter re-verify + live probe.
+- CLI pin bump — **decided and executed 2026-10-16** (`claude-code 2.1.301` /
+  `opencode 2.0.30` / `kilo 7.8.12`, in the `Dockerfile` ARGs and the CronJob
+  env mirror with offline re-verification). The live tool-qualification probe
+  on the deployed image is still outstanding.
 - Strength-probe follow-ups: re-run `syn:small:text` after synthetic-429 truncations.
 
 ### Net assessment for the normalization feature
