@@ -233,6 +233,45 @@ class SecretRedactionGuard:
             return self.tokenizer.tokenize_text(node)
         return node
 
+    def _seal_tool_calls(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Seal secrets inside replayed tool calls / function calls.
+
+        Replayed assistant turns carry prior invocations verbatim:
+        ``tool_calls[*].function.arguments`` (chat shape) and
+        ``function_call.arguments`` (responses shape). Those argument
+        strings frequently hold the credential a tool just used
+        (``curl -H "Authorization: Bearer ..."``), so they must be sealed
+        before the turn is replayed upstream.
+        """
+        changed = False
+        updates: dict[str, Any] = {}
+        calls = msg.get("tool_calls")
+        if isinstance(calls, list):
+            new_calls: list[Any] = []
+            for call in calls:
+                if isinstance(call, dict):
+                    fn = call.get("function")
+                    if isinstance(fn, dict) and isinstance(fn.get("arguments"), str):
+                        sealed = self.tokenizer.tokenize_text(fn["arguments"])
+                        if sealed != fn["arguments"]:
+                            changed = True
+                            new_calls.append({**call, "function": {**fn, "arguments": sealed}})
+                            continue
+                new_calls.append(call)
+            if changed:
+                updates["tool_calls"] = new_calls
+        fn = msg.get("function_call")
+        if isinstance(fn, dict) and isinstance(fn.get("arguments"), str):
+            sealed = self.tokenizer.tokenize_text(fn["arguments"])
+            if sealed != fn["arguments"]:
+                changed = True
+                fn = {**fn, "arguments": sealed}
+        if "function_call" in msg and changed and isinstance(fn, dict):
+            updates["function_call"] = fn
+        if not changed:
+            return msg
+        return {**msg, **updates}
+
     async def check(self, body: dict[str, Any]) -> GuardResult:
         if self.tokenizer is None:
             return GuardResult(allowed=True)
@@ -242,25 +281,25 @@ class SecretRedactionGuard:
         new_messages: list[dict[str, Any]] = []
         mutated = False
         for msg in messages:
+            if not isinstance(msg, dict):
+                new_messages.append(msg)
+                continue
+            out = msg
             content = msg.get("content")
             # String content: tokenize. Array content: tokenize text blocks
             # only (image parts carry no text).
             if isinstance(content, str):
                 new_content = self.tokenizer.tokenize_text(content)
                 if new_content != content:
-                    mutated = True
-                    new_messages.append({**msg, "content": new_content})
-                    continue
-                new_messages.append(msg)
-                continue
-            if isinstance(content, list):
+                    out = {**out, "content": new_content}
+            elif isinstance(content, list):
                 new_blocks: list[Any] = []
                 block_mutated = False
                 for block in content:
                     if (
                         isinstance(block, dict)
                         and isinstance(block.get("text"), str)
-                        and block.get("type") in {"text", "input_text", "output_text"}
+                        and block.get("type") in {"text", "input_text", "output_text", "tool_result"}
                     ):
                         new_text = self.tokenizer.tokenize_text(block["text"])
                         if new_text != block["text"]:
@@ -269,13 +308,12 @@ class SecretRedactionGuard:
                             continue
                     new_blocks.append(block)
                 if block_mutated:
-                    mutated = True
-                    new_messages.append({**msg, "content": new_blocks})
-                    continue
-                new_messages.append(msg)
-                continue
-            new_messages.append(msg)
-        # Tool definitions: JSON-schema 'default'/'examples' strings.
+                    out = {**out, "content": new_blocks}
+            # Replayed tool calls/function calls carry secrets in arguments.
+            out = self._seal_tool_calls(out)
+            if out is not msg:
+                mutated = True
+            new_messages.append(out)
         tools = body.get("tools")
         if isinstance(tools, list):
             new_tools = []

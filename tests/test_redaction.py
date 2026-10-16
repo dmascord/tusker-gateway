@@ -179,3 +179,93 @@ def test_restore_response_walks_nested_shapes():
 def test_restore_response_noop_without_tokenizer():
     resp = {"choices": [{"message": {"content": "[TUSKER:email:zzz]"}}]}
     assert restore_response(resp, None) is resp
+
+async def _guard_body(t, body):
+    from tusker_gateway.guardrails import SecretRedactionGuard
+    res = await SecretRedactionGuard(tokenizer=t).check(body)
+    return res.modified_body if res.modified_body is not None else body
+
+
+def test_guard_seals_replayed_tool_call_arguments():
+    """Turn-2 replay of an assistant tool call must not leak the secret.
+
+    Reading a .env in one turn then replaying the transcript on the next
+    sends ``tool_calls[*].function.arguments`` upstream verbatim unless the
+    guard seals it (the observed gap: content was sealed, arguments were not).
+    """
+    t = _tokenizer()
+    secret = "sk-" + "livekey0123456789ABCDEFGH"
+    body = {
+        "model": "m",
+        "messages": [
+            {"role": "user", "content": "read .env"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {
+                            "name": "bash",
+                            "arguments": json.dumps(
+                                {"command": "curl -H 'Authorization: Bearer " + secret + "' u"}
+                            ),
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "API_KEY=" + secret},
+        ],
+    }
+    out = asyncio.run(_guard_body(t, body))
+    assert secret not in json.dumps(out)
+    assert "[TUSKER:key:" in json.dumps(out)
+    # and the client-side round trip still yields plaintext
+    assert secret in json.dumps(restore_response(out, t))
+
+
+def test_guard_seals_legacy_function_call_arguments():
+    t = _tokenizer()
+    secret = "ghp_" + "abcdefghijklmnopqrstuvwxyz0123456789"
+    body = {
+        "model": "m",
+        "messages": [
+            {
+                "role": "assistant",
+                "function_call": {"name": "bash", "arguments": "run " + secret},
+            }
+        ],
+    }
+    out = asyncio.run(_guard_body(t, body))
+    assert secret not in json.dumps(out)
+
+
+def test_guard_seals_tool_result_blocks_in_array_content():
+    """Anthropic-shaped tool_result blocks inside array content."""
+    t = _tokenizer()
+    email = _make_email()
+    body = {
+        "model": "m",
+        "messages": [
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "text": "mail " + email}],
+            }
+        ],
+    }
+    out = asyncio.run(_guard_body(t, body))
+    assert email not in json.dumps(out)
+
+
+def test_guard_leaves_clean_body_identical():
+    t = _tokenizer()
+    body = {
+        "model": "m",
+        "messages": [
+            {"role": "user", "content": "no secrets here"},
+            {"role": "assistant", "tool_calls": [{"function": {"name": "f", "arguments": '{"a": 1}'}}]},
+        ],
+    }
+    out = asyncio.run(_guard_body(t, body))
+    assert out == body
