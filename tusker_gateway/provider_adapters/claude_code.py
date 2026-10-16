@@ -1,8 +1,13 @@
 """Adapter for Anthropic's official Claude Code CLI.
 
 The adapter uses the runtime's existing Claude Code login without reading,
-copying, refreshing, or persisting credentials. Built-in CLI tools are off;
-only request-scoped MCP proxies for the client's declared tools are exposed.
+copying, refreshing, or persisting credentials. Built-in CLI tools are off and
+every run is isolated from the runtime's own Claude configuration: a
+request-scoped config is always supplied with ``--strict-mcp-config`` and every
+run passes ``--restricted``, so the operator's claude.ai connectors, plugin MCP
+servers, plugin hooks, and plugin skills are never merged in or advertised to
+client prompts. Only request-scoped MCP proxies for the client's declared tools
+are exposed.
 Text and base64 image content are supported; images travel through Claude
 Code's ``stream-json`` input as base64 content blocks (remote image URLs are
 rejected because the CLI's fetcher honours robots.txt).
@@ -159,6 +164,57 @@ def _quota_limit_error(message: str) -> ProviderError:
     if reset_secs is not None:
         error.retry_after_secs = reset_secs
     return error
+
+
+def _isolation_args(temp_dir: Path, tool_manifest: list[dict[str, Any]]) -> tuple[list[str], Path | None]:
+    """Build the args that isolate a CLI run from the runtime's own Claude state.
+
+    Two independent leak paths exist, and both must be closed because a gateway
+    request must expose only what the client asked for:
+
+    ``--restricted``
+        Ignores user, project, and local settings files. Without it the CLI
+        loads the operator's own configuration: ``enabledPlugins`` (the swarm
+        plugin, whose ``SessionStart`` hook injects additionalContext into every
+        prompt and whose skills/agents appear in the session), custom commands,
+        and output styles. ``--setting-sources`` is equivalent, but a valueless
+        flag cannot be misparsed by a future CLI. ``--safe-mode`` is NOT
+        usable: it also drops the ``--mcp-config`` server below, which would
+        silently disable tool calling.
+
+    ``--strict-mcp-config`` with a request-scoped config
+        Without it the CLI merges the operator's claude.ai connectors
+        (Claude Docs, Drive, Gmail, Calendar), plugin-provided MCP servers, and
+        any ``~/.claude.json`` entries. Those servers are advertised to
+        third-party prompts and are visible to the model as its environment,
+        which both crosses the operator's consent boundary and makes the model
+        describe and act on an environment the gateway never intended to offer.
+
+    The config declares only this gateway's MCP proxy when the client declared
+    tools, and no servers at all when it did not, so the CLI can never inherit
+    ambient MCP state either way.
+    """
+    mcp_config = temp_dir / "mcp.json"
+    call_file: Path | None = None
+    servers: dict[str, Any] = {}
+    if tool_manifest:
+        manifest_file = temp_dir / "tools.json"
+        call_file = temp_dir / "tool-call.json"
+        manifest_file.write_text(json.dumps(tool_manifest), encoding="utf-8")
+        servers["gateway"] = {
+            "command": sys.executable,
+            "args": ["-m", "tusker_gateway.provider_adapters.mcp_stdio"],
+            "env": {
+                "TUSKER_MCP_MANIFEST": str(manifest_file),
+                "TUSKER_MCP_CALL_FILE": str(call_file),
+            },
+        }
+    mcp_config.write_text(json.dumps({"mcpServers": servers}), encoding="utf-8")
+    args = ["--restricted", "--mcp-config", str(mcp_config), "--strict-mcp-config"]
+    if tool_manifest:
+        args.extend(["--allowedTools", "mcp__gateway__*"])
+    return args, call_file
+
 
 def _cli_result_message(stdout: bytes) -> str | None:
     """Best-effort ``result`` text from CLI stdout, even on a failed exit."""
@@ -432,6 +488,18 @@ def _prompt(
                 + json.dumps(call, ensure_ascii=False, separators=(",", ":"))
                 + "\n</gateway_tool_call>"
             )
+    if has_tools:
+        transcript.append(
+            "<gateway_execution_context>The current process working directory is an "
+            "isolated, request-scoped scratch directory created by the gateway. It is "
+            "not the caller's project directory and does not describe the caller's "
+            "environment. Do not infer from this directory that the caller's files, "
+            "shell, or tools are unavailable. The only caller-side capabilities for "
+            "this request are the gateway tools supplied in the tool manifest; use "
+            "those tools to inspect or change caller-side state, and treat their "
+            "returned results as authoritative. Never claim a capability was used "
+            "unless a supplied tool result confirms it.</gateway_execution_context>"
+        )
     policy_appended = False
     if has_tools:
         if tool_choice == "required":
@@ -550,33 +618,11 @@ class ClaudeCodeCLIAdapter:
             command = [
                 resolved, "-p", "--output-format", "stream-json", "--verbose",
                 "--include-partial-messages", *input_format, "--model", cli_model,
-                "--tools", "", "--permission-mode",
-                "dontAsk" if tool_manifest else "plan",
+                "--tools", "", "--permission-mode", "dontAsk",
                 "--permission-prompts", "none", "--no-session-persistence",
             ]
-            call_file: Path | None = None
-            if tool_manifest:
-                manifest_file = temp_dir / "tools.json"
-                call_file = temp_dir / "tool-call.json"
-                mcp_config = temp_dir / "mcp.json"
-                manifest_file.write_text(json.dumps(tool_manifest), encoding="utf-8")
-                mcp_env = {
-                    "TUSKER_MCP_MANIFEST": str(manifest_file),
-                    "TUSKER_MCP_CALL_FILE": str(call_file),
-                }
-                mcp_config.write_text(json.dumps({
-                    "mcpServers": {
-                        "gateway": {
-                            "command": sys.executable,
-                            "args": ["-m", "tusker_gateway.provider_adapters.mcp_stdio"],
-                            "env": mcp_env,
-                        },
-                    },
-                }), encoding="utf-8")
-                command.extend([
-                    "--mcp-config", str(mcp_config), "--strict-mcp-config",
-                    "--allowedTools", "mcp__gateway__*",
-                ])
+            isolation_args, call_file = _isolation_args(temp_dir, tool_manifest)
+            command.extend(isolation_args)
             timeout = max(10.0, float(os.environ.get("TUSKER_CLAUDE_CODE_TIMEOUT_SECS", "600")))
             return self._guarded_stream(
                 stream_cli_jsonl(
@@ -599,34 +645,12 @@ class ClaudeCodeCLIAdapter:
             ]
             command = [
                 resolved, "-p", *input_format, *output_format, "--model", cli_model,
-                "--tools", "", "--permission-mode",
-                "dontAsk" if tool_manifest else "plan",
+                "--tools", "", "--permission-mode", "dontAsk",
                 "--permission-prompts", "none",
                 "--no-session-persistence",
             ]
-            call_file: Path | None = None
-            if tool_manifest:
-                manifest_file = temp_dir / "tools.json"
-                call_file = temp_dir / "tool-call.json"
-                mcp_config = temp_dir / "mcp.json"
-                manifest_file.write_text(json.dumps(tool_manifest), encoding="utf-8")
-                mcp_env = {
-                    "TUSKER_MCP_MANIFEST": str(manifest_file),
-                    "TUSKER_MCP_CALL_FILE": str(call_file),
-                }
-                mcp_config.write_text(json.dumps({
-                    "mcpServers": {
-                        "gateway": {
-                            "command": sys.executable,
-                            "args": ["-m", "tusker_gateway.provider_adapters.mcp_stdio"],
-                            "env": mcp_env,
-                        },
-                    },
-                }), encoding="utf-8")
-                command.extend([
-                    "--mcp-config", str(mcp_config), "--strict-mcp-config",
-                    "--allowedTools", "mcp__gateway__*",
-                ])
+            isolation_args, call_file = _isolation_args(temp_dir, tool_manifest)
+            command.extend(isolation_args)
             try:
                 proc = await asyncio.create_subprocess_exec(
                     *command,

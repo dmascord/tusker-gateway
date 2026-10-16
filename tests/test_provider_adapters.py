@@ -160,6 +160,100 @@ async def test_cli_returns_client_tool_call_without_executing_it(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_cli_text_only_runs_are_mcp_isolated(monkeypatch, stream):
+    """Text-only runs must never inherit the runtime's ambient Claude state.
+
+    Without ``--strict-mcp-config`` the CLI merges the operator's Claude Code
+    configuration: the claude.ai connectors (Claude Docs, Drive, Gmail,
+    Calendar) and plugin MCP servers. Those are then advertised to third-party
+    prompts, and the model describes that foreign environment -- it reported
+    itself blocked with only Claude Docs tools available. Without
+    ``--restricted`` the operator's plugin settings load too, so the swarm
+    plugin's SessionStart hook injects additionalContext and its skills/agents
+    are offered to the prompt. A text-only run must carry an explicit empty MCP
+    config, must not allow the gateway MCP server, must ignore ambient settings,
+    and must not sit in plan mode (which frames the model as awaiting a plan
+    approval the adapter never grants).
+    """
+    monkeypatch.setenv("TUSKER_CLAUDE_CODE_ENABLED", "true")
+    seen: dict = {}
+
+    async def start(*args, **_kwargs):
+        seen["args"] = args
+        seen["mcp_config"] = json.loads(
+            Path(args[args.index("--mcp-config") + 1]).read_text(encoding="utf-8")
+        )
+        if stream:
+            return _FakeStreamingProcess(
+                b'{"type":"stream_event","event":{"type":"content_block_delta",'
+                b'"delta":{"type":"text_delta","text":"ok"}}}\n'
+            )
+        return _FakeProcess(json.dumps({"result": "ok", "session_id": "s1"}).encode())
+
+    with patch("tusker_gateway.provider_adapters.claude_code.shutil.which", return_value="claude"), \
+         patch("tusker_gateway.provider_adapters.claude_code.asyncio.create_subprocess_exec",
+               new=AsyncMock(side_effect=start)):
+        result = await ClaudeCodeCLIAdapter().chat(
+            provider="claude-code-cli", model="sonnet",
+            messages=[{"role": "user", "content": "hi"}], stream=stream,
+        )
+        if stream:
+            _ = [frame async for frame in result]
+
+    args = seen["args"]
+    assert "--restricted" in args
+    assert "--strict-mcp-config" in args
+    assert seen["mcp_config"] == {"mcpServers": {}}
+    assert args[args.index("--tools") + 1] == ""
+    assert args[args.index("--permission-mode") + 1] == "dontAsk"
+    assert "plan" not in args
+    assert "--allowedTools" not in args
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_cli_tool_runs_declare_only_the_gateway_mcp_server(monkeypatch, stream):
+    """Tool-bearing runs stay isolated: the gateway proxy is the only MCP server.
+
+    ``--restricted`` must not remove the injected ``--mcp-config`` server, or
+    tool calling would break; ``--safe-mode`` does exactly that and is therefore
+    unusable here.
+    """
+    monkeypatch.setenv("TUSKER_CLAUDE_CODE_ENABLED", "true")
+    tool_call = {"id": "call_iso", "name": "ask", "arguments": {"q": "ok"}}
+    seen: dict = {}
+
+    async def start(*args, **_kwargs):
+        seen["args"] = args
+        config = json.loads(
+            Path(args[args.index("--mcp-config") + 1]).read_text(encoding="utf-8")
+        )
+        seen["mcp_config"] = config
+        Path(config["mcpServers"]["gateway"]["env"]["TUSKER_MCP_CALL_FILE"]).write_text(
+            json.dumps(tool_call)
+        )
+        return _FakeStreamingProcess(b"") if stream else _FakeProcess(b"")
+
+    with patch("tusker_gateway.provider_adapters.claude_code.shutil.which", return_value="claude"), \
+         patch("tusker_gateway.provider_adapters.claude_code.asyncio.create_subprocess_exec",
+               new=AsyncMock(side_effect=start)):
+        result = await ClaudeCodeCLIAdapter().chat(
+            provider="claude-code-cli", model="sonnet", messages=[], stream=stream,
+            tools=[{"type": "function", "function": {"name": "ask"}}],
+        )
+        if stream:
+            _ = [frame async for frame in result]
+
+    args = seen["args"]
+    assert "--restricted" in args
+    assert "--strict-mcp-config" in args
+    assert list(seen["mcp_config"]["mcpServers"]) == ["gateway"]
+    assert args[args.index("--allowedTools") + 1] == "mcp__gateway__*"
+    assert args[args.index("--permission-mode") + 1] == "dontAsk"
+
+
+@pytest.mark.asyncio
 async def test_cli_rejects_malformed_image_and_replays_tool_history(monkeypatch):
     monkeypatch.setenv("TUSKER_CLAUDE_CODE_ENABLED", "true")
     adapter = ClaudeCodeCLIAdapter()
@@ -697,8 +791,12 @@ async def test_cli_repeated_tool_call_becomes_prose_answer(monkeypatch):
     assert choice["message"]["content"] == "already ran"
     assert choice["message"].get("tool_calls") is None
     assert spawn.call_count == 2
-    # Second invocation is the prose fallback: no --mcp-config (tools dropped).
-    assert "--mcp-config" not in spawn.call_args_list[1].args
+    # Second invocation is the prose fallback: the gateway tool manifest is
+    # dropped (no --allowedTools), but strict MCP isolation still applies so the
+    # fallback cannot inherit the runtime's ambient MCP servers either.
+    fallback_args = spawn.call_args_list[1].args
+    assert "--strict-mcp-config" in fallback_args
+    assert "--allowedTools" not in fallback_args
 
 
 @pytest.mark.asyncio

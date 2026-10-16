@@ -40,8 +40,27 @@ Client-supplied OpenAI function tools are exposed through a request-scoped MCP
 proxy; when Claude invokes one, the adapter stops the CLI and returns an
 ordinary OpenAI `tool_calls` response for the connected harness to validate,
 approve, and execute. On the next turn, the assistant call and client tool
-result are replayed as history. Tool-bearing runs use `dontAsk` with a strict
-MCP config and allow only this gateway MCP server; text-only runs use plan
+result are replayed as history. Every run is isolated from the runtime's own
+Claude state on two independent axes, because a gateway request must expose only
+what the client asked for. `--restricted` ignores user, project and local
+settings files, so the operator's `enabledPlugins` (for example the swarm plugin,
+whose `SessionStart` hook injects additionalContext into every prompt and whose
+skills and agents would otherwise be offered to the prompt) never load.
+`--strict-mcp-config` with a request-scoped config stops the CLI merging the
+runtime's claude.ai connectors (Claude Docs, Drive, Gmail, Calendar),
+plugin-provided MCP servers, and any `~/.claude.json` entries. Tool-bearing runs
+declare only this gateway MCP server and allow only `mcp__gateway__*`; text-only
+runs declare no MCP servers at all.
+
+`--restricted` is used rather than `--setting-sources` (empirically equivalent,
+but a valueless flag cannot be misparsed by a future CLI). `--safe-mode` must not
+be used: it also drops the `--mcp-config` server, silently disabling tool
+calling.
+
+Both run types use `--permission-mode dontAsk`. Combined with `--tools ""` and
+strict MCP this leaves nothing executable, so plan mode adds no safety; it only
+frames the model as awaiting a plan approval the adapter never grants, which
+made tool-less turns describe themselves as blocked in a foreign environment.
 Text and image content are supported when the upstream provider accepts it
 (currently base64 image data URLs are forwarded to Claude Code's
 ``stream-json`` input; remote URL fetch is rejected because it depends on the
