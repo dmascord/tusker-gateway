@@ -296,6 +296,74 @@ def test_tool_markup_as_text_reproduces_unusable_turn(store, provider_config):
         == 3
     )
 
+def test_length_finish_downgrades_to_output_budget_exhausted(store, provider_config, capsys):
+    """finish_reason=length mirrors the gateway's output_budget_exhausted rule.
+
+    The gateway rewrites ``reasoning_only_or_empty`` to
+    ``output_budget_exhausted`` when the turn ran out of room (endpoints.py
+    ``unusable_tool_error``). The offline mirror must apply the same rule, or
+    a replayed capture of that shape classifies into the wrong bucket and the
+    ``--reason`` filter on the live store returns the wrong row category.
+    """
+    request_body = (
+        b'{"model":"gpt-4","messages":[],'
+        b'"tools":[{"function":{"name":"my_tool"}}]}'
+    )
+    record = add_capture(store, request_body=request_body)
+    response = (
+        b'data: {"choices":[{"delta":{"content":""},"finish_reason":"length"}]}'
+        b"\n\n"
+        b"data: [DONE]\n\n"
+    )
+
+    async def fake_transport(url, *, headers, body, timeout):
+        return 200, response
+
+    # Exit 3: the mirror still calls this an unusable tool turn, but the
+    # reason is the length-specific one rather than reasoning_only_or_empty.
+    assert (
+        main(
+            ["--capture-id", record["capture_id"], "--json"],
+            store=store,
+            config=provider_config,
+            transport=fake_transport,
+        )
+        == 3
+    )
+    result = json.loads(capsys.readouterr().out)
+    assert result["replay"]["usable"] is False
+    assert result["replay"]["reason"] == "output_budget_exhausted"
+
+
+def test_stop_finish_keeps_reasoning_only_or_empty(store, provider_config, capsys):
+    """The length downgrade must not swallow the ordinary empty-turn reason."""
+    request_body = (
+        b'{"model":"gpt-4","messages":[],'
+        b'"tools":[{"function":{"name":"my_tool"}}]}'
+    )
+    record = add_capture(store, request_body=request_body)
+    response = (
+        b'data: {"choices":[{"delta":{"content":""},"finish_reason":"stop"}]}'
+        b"\n\n"
+        b"data: [DONE]\n\n"
+    )
+
+    async def fake_transport(url, *, headers, body, timeout):
+        return 200, response
+
+    assert (
+        main(
+            ["--capture-id", record["capture_id"], "--json"],
+            store=store,
+            config=provider_config,
+            transport=fake_transport,
+        )
+        == 3
+    )
+    result = json.loads(capsys.readouterr().out)
+    assert result["replay"]["usable"] is False
+    assert result["replay"]["reason"] == "reasoning_only_or_empty"
+
 
 
 

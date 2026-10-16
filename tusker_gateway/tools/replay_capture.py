@@ -436,6 +436,11 @@ def _unusable_reason(summary: Mapping[str, Any], tools_requested: bool) -> str |
     not be turned into a tool call, or when the turn carried no answer at all.
     Reusing the same conditions means a non-zero result here corresponds to the
     same verdict the capture recorded.
+
+    The final downgrade mirrors ``endpoints.py:unusable_tool_error``: a turn
+    that ran out of room (``finish_reason == "length"``) is a property of the
+    request, not evidence the model broke the tool contract, and the gateway
+    records it as ``output_budget_exhausted`` instead.
     """
     if not tools_requested:
         return None
@@ -445,6 +450,8 @@ def _unusable_reason(summary: Mapping[str, Any], tools_requested: bool) -> str |
         # The gateway only calls this an unusable tool turn when there was no
         # executable envelope at all, or the envelope never closed.
         if not summary["tool_markup_kinds"] or summary["tool_markup_opening"]:
+            if summary.get("finish_reason") == "length":
+                return "output_budget_exhausted"
             return "reasoning_only_or_empty"
     return None
 

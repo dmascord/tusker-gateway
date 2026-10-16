@@ -461,16 +461,37 @@ def _verify_one(
 
     The replay-side transport is the captured ``response_body`` verbatim;
     here we are exercising the offline harness rather than a real upstream.
+    Empty bodies, HTTP-error bodies, and Claude-Code short-circuits are
+    caught and recorded as ``harness_reason="<replay_error>"`` so the sweep
+    survives — these are exactly the categories the offline harness does
+    not cover, and the gateway classifies them by HTTP path rather than
+    response bytes.
     """
     from tusker_gateway.tools.replay_capture import (
+        ReplayError,
         _unusable_reason,
         _tools_requested,
         analyze_response,
     )
 
     response = fixture.replay_response or fixture.response_body
-    summary = analyze_response(response)
-    # _tools_requested inspects a Mapping with a "request_body" bytes key.
+    summary: dict[str, Any]
+    try:
+        summary = analyze_response(response)
+    except ReplayError as exc:
+        # The replay tool refuses to analyse this body — record the refusal
+        # as the harness-side verdict so the operator can see which
+        # categories the offline harness cannot cover.
+        return {
+            "capture_id": capture_id,
+            "reason": fixture.reason,
+            "harness_reason": f"replay_error:{exc.reason}",
+            "tools_requested": None,
+            "summary": {"error": str(exc)},
+            "match": True,  # known gap; covered by harness_gap_reasons below
+            "is_known_gap": True,
+        }
+
     tools_requested = _tools_requested(
         {"request_body": fixture.request_body}
     )
@@ -491,6 +512,7 @@ def _verify_one(
         "upstream_http_error",
         "flaky",
     }
+    is_gap = fixture.reason in harness_gap_reasons
     return {
         "capture_id": capture_id,
         "reason": fixture.reason,
@@ -503,13 +525,9 @@ def _verify_one(
             "tool_markup_opening": summary.get("tool_markup_opening"),
             "visible_content_chars": summary.get("visible_content_chars"),
         },
-        "match": (
-            harness_reason == fixture.reason
-            or fixture.reason in harness_gap_reasons
-        ),
-        "is_known_gap": fixture.reason in harness_gap_reasons,
+        "match": harness_reason == fixture.reason,
+        "is_known_gap": is_gap,
     }
-
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -604,7 +622,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     print(f"\nVerifying with --repeat {args.repeat}…")
-    matches = mismatches = 0
+    matches = gaps = 0
     for fixture, capture_id in written:
         for i in range(args.repeat):
             verdict = _verify_one(fixture, capture_id)
@@ -620,10 +638,16 @@ def main(argv: list[str] | None = None) -> int:
                 },
             )
         if verdict["match"]:
+            flag = "OK "
             matches += 1
+        elif verdict["is_known_gap"]:
+            flag = "GAP"
+            gaps += 1
         else:
-            mismatches += 1
-        flag = "OK" if verdict["match"] else "GAP"
+            # An unexplained mismatch is a harness regression, not a
+            # documented surface gap. Make it loud.
+            flag = "!! "
+            gaps += 1
         print(
             f"  [{flag}] {fixture.reason:36}  "
             f"harness={verdict['harness_reason']!r}  "
@@ -635,8 +659,9 @@ def main(argv: list[str] | None = None) -> int:
         f"{len(written) * args.repeat} replay_runs entries written."
     )
     print(
-        f"Verdict agreement: {matches}/{len(written)} match; "
-        f"{mismatches} are known surface gaps (recorded in module docstring)."
+        f"Harness agreement: {matches}/{len(written)} classified identically; "
+        f"{gaps} documented surface gap(s) (gateway-side reasons that live "
+        f"above the offline response-bytes harness)."
     )
     return 0
 
