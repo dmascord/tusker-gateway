@@ -65,6 +65,26 @@ _KEY_RE = re.compile(
     r"|AIza[A-Za-z0-9_-]{30,})\b"
 )
 
+# Entropy-gated fallback: an unprefixed high-entropy run near a credential
+# context word. Conservative: 32+ chars of [A-Za-z0-9_-] (deliberately
+# excludes '=' and '.' to avoid colliding with base64/hex blob bodies inside
+# our own tokens and with file paths), within 80 chars after a context word
+# like "key", "token", "secret", "password", "bearer", "auth", "credential".
+# Disabled by default: this rule can false-positive on long identifiers in
+# code; operators opt in when they need the coverage.
+# The context word is matched with a lookbehind-style bounded scan so the
+# word itself is never consumed (and therefore never replaced). A plain
+# variable-width lookbehind is unavailable, so the word is captured in the
+# match and re-emitted verbatim by the substitution callback.
+_ENTROPY_CONTEXT_RE = re.compile(
+    r"((?:key|token|secret|password|passwd|pwd|api[-_]?key|access[-_]?token"
+    r"|auth(?:entication|orization)?|bearer|credential|private[-_]?key)"
+    r"[A-Za-z0-9_:,;.\s=\"'()]{0,80}?)"
+    r"([A-Za-z0-9_\-]{32,})"
+    r"(?![A-Za-z0-9_\-])",
+    re.IGNORECASE,
+)
+
 
 def _luhn(candidate: str) -> bool:
     digits = [int(c) for c in candidate if c.isdigit()]
@@ -104,6 +124,10 @@ class RedactionRuleSet:
     redact_emails: bool = True
     redact_credit_cards: bool = True
     redact_api_keys: bool = True
+    # Entropy-gated fallback: a context-word ("key", "token", "secret", ...)
+    # within 80 chars before a 32+ char unprefixed run. Disabled by default
+    # to avoid sealing ordinary identifiers in code.
+    redact_entropy_fallback: bool = False
     # Extra regexes from config: each is compiled once; matches are tokenized
     # as free text. Invalid patterns are skipped (logged by the caller).
     extra_patterns: list[re.Pattern[str]] = field(default_factory=list)
@@ -155,6 +179,10 @@ class Tokenizer:
             )
         if self.rules.redact_api_keys:
             out = _KEY_RE.sub(lambda m: self._seal(m.group(0), TOKEN_TYPE_KEY), out)
+        if self.rules.redact_entropy_fallback:
+            out = _ENTROPY_CONTEXT_RE.sub(
+                lambda m: m.group(1) + self._seal(m.group(2), TOKEN_TYPE_TEXT), out
+            )
         for pattern in self.rules.extra_patterns:
             out = pattern.sub(lambda m: self._seal(m.group(0), TOKEN_TYPE_TEXT), out)
         return out

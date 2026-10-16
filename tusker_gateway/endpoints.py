@@ -1033,6 +1033,47 @@ def _legacy_function_call_delta(
     ]
 
 
+def _emit_arg_tails(
+    restorers: dict[tuple[int, int], "_BufferedRestorer"],
+    *,
+    choice_index: int | None,
+    template: dict[str, Any] | None,
+    new_choice: dict[str, Any] | None,
+) -> Iterator[bytes]:
+    """Emit one final `arguments` fragment per held tool-call restorer.
+
+    Each per-index restorer is fed an empty probe. If the probe yields text,
+    that text is the held tail of a still-unterminated token; the client
+    receives it as the next arguments fragment (which OpenAI clients
+    concatenate with the prior fragments to form the complete arguments
+    string). If the restorer has nothing held, nothing is emitted for that
+    index.
+
+    When ``choice_index`` is given, only restorers for that choice are
+    considered (per-event emission). When ``choice_index`` is ``None``,
+    every still-held restorer is emitted grouped by its own choice index
+    (end-of-stream fallback).
+    """
+    if not restorers:
+        return
+    by_choice: dict[int, list[dict[str, Any]]] = {}
+    for (cidx, iidx), buf in restorers.items():
+        if choice_index is not None and cidx != choice_index:
+            continue
+        tail = buf.feed("")
+        if not tail:
+            continue
+        by_choice.setdefault(cidx, []).append({"index": iidx, "function": {"arguments": tail}})
+    for cidx, calls in by_choice.items():
+        if template is not None and new_choice is not None:
+            obj = template
+            choice = new_choice
+        else:
+            obj = {"id": f"chatcmpl-restore-{secrets.token_hex(8)}", "object": "chat.completion.chunk"}
+            choice = {"index": cidx, "delta": {}, "finish_reason": None}
+        yield f"data: {json.dumps({**obj, 'choices': [{**choice, 'delta': {'role': 'assistant', 'tool_calls': calls}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n".encode()
+
+
 async def _normalize_stream(
     raw_stream: AsyncIterator[bytes],
     *,
@@ -1088,6 +1129,13 @@ async def _normalize_stream(
     }
     tool_stripper = _ToolCallStripper()
     _rest = _BufferedRestorer(tokenizer=restorer) if restorer is not None else None
+    # Per-tool-call argument restorer: streamed arguments may be tokenized
+    # upstream and split across many deltas. OpenAI clients concatenate the
+    # `arguments` fragments they receive, so each fragment is replaced with
+    # the restored text that is safe to emit (an unterminated `[TUSKER:`
+    # prefix is held back), and the held tail is emitted as one more
+    # arguments fragment before the finish_reason chunk.
+    _arg_restorers: dict[tuple[int, int], _BufferedRestorer] = {}
     saw_finish_reason = False
     saw_done = False
     saw_tool_call = False
@@ -1487,6 +1535,24 @@ async def _normalize_stream(
             if isinstance(raw_tc, list):
                 delta["tool_calls"] = tc
             has_tools = isinstance(tc, list) and bool(tc)
+            if restorer is not None and isinstance(tc, list):
+                for call in tc:
+                    if not isinstance(call, dict):
+                        continue
+                    fn = call.get("function")
+                    if not isinstance(fn, dict):
+                        continue
+                    arg = fn.get("arguments")
+                    if not isinstance(arg, str) or not arg:
+                        continue
+                    key = (choice_index, int(call.get("index", -1)))
+                    buf = _arg_restorers.get(key)
+                    if buf is None:
+                        buf = _BufferedRestorer(tokenizer=restorer)
+                        _arg_restorers[key] = buf
+                    # Replace the fragment with restored text; an incomplete
+                    # token tail stays buffered and ships in the tail frame.
+                    fn["arguments"] = buf.feed(arg)
             raw_texts: list[tuple[str, str]] = []
             if isinstance(raw_content, str) and raw_content:
                 raw_texts.append(("content", raw_content))
@@ -1777,6 +1843,14 @@ async def _normalize_stream(
                 for tool_frame in pending_tool_frames:
                     yield tool_frame
                 reason = "tool_calls" if saw_tool_call else fr
+                # Release any argument text held back by the token restorer
+                # (an unterminated `[TUSKER:` prefix) as a final arguments
+                # fragment before the finish frame. Clients concatenate
+                # fragments, so restored text lines up with what they hold.
+                for tail_frame in _emit_arg_tails(
+                    _arg_restorers, choice_index=choice_index, template=new_obj, new_choice=new_choice
+                ):
+                    yield tail_frame
                 if emitted_finish_reason is None:
                     emitted_finish_reason = reason
                     yield f"data: {json.dumps({**new_obj, 'choices': [{**new_choice, 'delta': {}, 'finish_reason': reason}]}, ensure_ascii=False)}\n\n".encode()
@@ -1869,6 +1943,10 @@ async def _normalize_stream(
             raise unusable_tool_error("reasoning_only_or_empty")
     if not tools_requested and not saw_tool_call and not saw_visible_content:
         raise empty_stream_error()
+    for tail_frame in _emit_arg_tails(
+        _arg_restorers, choice_index=None, template=None, new_choice=None
+    ):
+        yield tail_frame
     if emitted_finish_reason is None:
         emitted_finish_reason = "tool_calls" if saw_tool_call else "stop"
         yield finish_frame(emitted_finish_reason)
@@ -7872,6 +7950,32 @@ def _noop_cm():
     return _NoOpCM()
 
 
+def _redact_media_body(request: web.Request, body: dict[str, Any]) -> dict[str, Any]:
+    """Seal every string in a media/embed/rerank body via the gateway tokenizer.
+
+    Image/video/embed/rerank requests do not run the chat-style guard
+    pipeline; instead we walk every string leaf and seal detected secrets.
+    The response path calls ``restore_response`` to decrypt tokens for the
+    client. Returns the original body when the tokenizer is None.
+    """
+    tok = request.app.get("redaction_tokenizer")
+    if tok is None:
+        return body
+    from tusker_gateway.guardrails import redact_body_strings
+    return redact_body_strings(body, tok)
+
+
+def _restore_media_response(request: web.Request, result: Any) -> Any:
+    """Restore sealed tokens in a media/embed/rerank response body."""
+    if result is None:
+        return result
+    tok = request.app.get("redaction_tokenizer")
+    if tok is None:
+        return result
+    from tusker_gateway.redaction import restore_response
+    return restore_response(result, tok)
+
+
 async def _media_preflight(
     request: web.Request,
     body: dict[str, Any],
@@ -8023,6 +8127,7 @@ async def images_handler(request: web.Request) -> web.Response:
         blocked = await _media_preflight(request, body, budget_units=budget_units)
         if blocked is not None:
             return blocked
+        body = _redact_media_body(request, body)
         model = body.get("model", "gpt-image-2")
 
         image_handler = request.app.get("image_handler")
@@ -8060,6 +8165,7 @@ async def images_handler(request: web.Request) -> web.Response:
             started=started,
         )
         await _record_media_budget(request, budget_units=budget_units)
+        result = _restore_media_response(request, result)
         return web.json_response(result)
 
     except GatewayError as exc:
@@ -8154,6 +8260,7 @@ async def video_handler(request: web.Request) -> web.Response:
         blocked = await _media_preflight(request, body, budget_units=budget_units)
         if blocked is not None:
             return blocked
+        body = _redact_media_body(request, body)
         model = body.get("model", "sora-2")
         wait = _truthy(request.query.get("wait", "true"))
         video = request.app.get("video_handler")
@@ -8183,6 +8290,7 @@ async def video_handler(request: web.Request) -> web.Response:
             started=started,
         )
         await _record_media_budget(request, budget_units=budget_units)
+        result = _restore_media_response(request, result)
         return web.json_response(result)
     except GatewayError as exc:
         logger.warning("Video request failed: %s", exc)
@@ -8253,6 +8361,8 @@ async def rerank_handler(request: web.Request) -> web.Response:
         if blocked is not None:
             _emit("blocked")
             return blocked
+        # Seal secrets in documents/query before the provider sees them.
+        body = _redact_media_body(request, body)
         # Guardrails may rewrite the body. Revalidate after that hook so the
         # provider never receives a shape the preflight did not inspect.
         parsed = RerankHandler.validate_request(body)
@@ -8274,6 +8384,7 @@ async def rerank_handler(request: web.Request) -> web.Response:
             budget_pool="rerank",
         )
         _emit("ok")
+        result = _restore_media_response(request, result)
         return web.json_response(result)
     except GatewayError as exc:
         _emit(exc.code or "error")
@@ -8352,6 +8463,8 @@ async def embeddings_handler(request: web.Request) -> web.Response:
         if blocked is not None:
             _emit("blocked")
             return blocked
+        # Seal secrets in input strings before the provider sees them.
+        body = _redact_media_body(request, body)
         parsed = EmbedHandler.validate_request(body)
 
         provider, model, result = await embedder.embed(
@@ -8371,6 +8484,7 @@ async def embeddings_handler(request: web.Request) -> web.Response:
             budget_pool="embed",
         )
         _emit("ok")
+        result = _restore_media_response(request, result)
         return web.json_response(result)
     except GatewayError as exc:
         _emit(exc.code or "error")

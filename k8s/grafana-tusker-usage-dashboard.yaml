@@ -1,0 +1,35 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tusker-gateway-usage-dashboard
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+data:
+  tusker-gateway-usage.json: |
+    {
+      "annotations": {"list": []},
+      "editable": true,
+      "graphTooltip": 1,
+      "panels": [
+        {"title":"Requests / second by provider","type":"timeseries","gridPos":{"h":8,"w":12,"x":0,"y":0},"targets":[{"expr":"sum by (provider) (rate(tusker_requests_total{provider=~\"$provider\",model=~\"$model\",status=~\"$status\"}[5m]))","legendFormat":"{{provider}}","refId":"A"}],"fieldConfig":{"defaults":{"unit":"reqps","custom":{"fillOpacity":15,"lineWidth":2}}}},
+        {"title":"Requests / second by model","type":"timeseries","gridPos":{"h":8,"w":12,"x":12,"y":0},"targets":[{"expr":"sum by (provider,model) (rate(tusker_requests_total{provider=~\"$provider\",model=~\"$model\",status=~\"$status\"}[5m]))","legendFormat":"{{provider}} / {{model}}","refId":"A"}],"fieldConfig":{"defaults":{"unit":"reqps","custom":{"fillOpacity":15,"lineWidth":2}}}},
+        {"title":"Token throughput","type":"timeseries","gridPos":{"h":8,"w":12,"x":0,"y":8},"targets":[{"expr":"sum by (direction) (rate(tusker_tokens_total{provider=~\"$provider\",model=~\"$model\",direction=~\"$direction\"}[5m]))","legendFormat":"{{direction}}","refId":"A"}],"fieldConfig":{"defaults":{"unit":"short","custom":{"fillOpacity":15,"lineWidth":2}}}},
+        {"title":"Daily requests by provider","type":"timeseries","gridPos":{"h":8,"w":12,"x":12,"y":8},"targets":[{"expr":"sum by (provider) (increase(tusker_requests_total{provider=~\"$provider\",model=~\"$model\",status=~\"$status\"}[24h]))","legendFormat":"{{provider}}","refId":"A"}],"fieldConfig":{"defaults":{"unit":"short","custom":{"fillOpacity":15,"lineWidth":2}}}},
+        {"title":"Success rate by provider","type":"timeseries","gridPos":{"h":8,"w":12,"x":0,"y":16},"targets":[{"expr":"100 * sum by (provider) (rate(tusker_requests_total{provider=~\"$provider\",model=~\"$model\",status=\"ok\"}[15m])) / clamp_min(sum by (provider) (rate(tusker_requests_total{provider=~\"$provider\",model=~\"$model\",status=~\"$status\"}[15m])), 0.000001)","legendFormat":"{{provider}}","refId":"A"}],"fieldConfig":{"defaults":{"unit":"percent","min":0,"max":100,"custom":{"fillOpacity":15,"lineWidth":2}}}},
+        {"title":"p95 latency by provider/model","type":"timeseries","gridPos":{"h":8,"w":12,"x":12,"y":16},"targets":[{"expr":"histogram_quantile(0.95, sum by (provider,model,le) (rate(tusker_request_duration_seconds_bucket{provider=~\"$provider\",model=~\"$model\"}[5m])))","legendFormat":"{{provider}} / {{model}}","refId":"A"}],"fieldConfig":{"defaults":{"unit":"s","custom":{"fillOpacity":15,"lineWidth":2}}}},
+        {"title":"Requests by model/provider (table)","type":"table","gridPos":{"h":8,"w":24,"x":0,"y":24},"targets":[{"expr":"sum by (provider,model,status) (increase(tusker_requests_total{provider=~\"$provider\",model=~\"$model\",status=~\"$status\"}[$__range]))","format":"table","instant":true,"refId":"A"}],"fieldConfig":{"defaults":{"unit":"short"}}}
+      ],
+      "schemaVersion": 39,
+      "tags":["tusker","gateway","usage"],
+      "templating":{"list":[
+        {"name":"provider","label":"Provider","type":"query","datasource":{"type":"prometheus","uid":"prometheus"},"query":"label_values(tusker_requests_total, provider)","includeAll":true,"multi":true,"allValue":".*","refresh":1},
+        {"name":"model","label":"Model","type":"query","datasource":{"type":"prometheus","uid":"prometheus"},"query":"label_values(tusker_requests_total{provider=~\"$provider\"}, model)","includeAll":true,"multi":true,"allValue":".*","refresh":1},
+        {"name":"status","label":"Status","type":"query","datasource":{"type":"prometheus","uid":"prometheus"},"query":"label_values(tusker_requests_total, status)","includeAll":true,"multi":true,"allValue":".*","refresh":1},
+        {"name":"direction","label":"Token direction","type":"custom","query":"prompt,completion","includeAll":true,"multi":true,"allValue":".*"}
+      ]},
+      "time":{"from":"now-24h","to":"now"},
+      "title":"Tusker Gateway — Usage",
+      "uid":"tusker-gateway-usage",
+      "version":1
+    }

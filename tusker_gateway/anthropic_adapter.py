@@ -150,9 +150,14 @@ class _AnthropicSSEStreamAdapter:
         openai_stream: AsyncIterator[bytes],
         model: str,
         input_tokens: int = 0,
+        tokenizer: Any = None,
     ):
         self._stream = openai_stream.__aiter__()
         self._state = init_anthropic_stream_state()
+        # Reversible redaction: the upstream OpenAI-shaped chunks may carry
+        # sealed tokens; restore them before translation so Anthropic
+        # clients receive the plaintext they originally sent.
+        self._tokenizer = tokenizer
         update_stream_state(
             self._state, model=model, input_tokens=input_tokens,
         )
@@ -191,6 +196,9 @@ class _AnthropicSSEStreamAdapter:
                 # not imply that the upstream stream has ended.
                 continue
 
+            if self._tokenizer is not None:
+                from tusker_gateway.redaction import restore_response
+                parsed = restore_response(parsed, self._tokenizer)
             frames = translators.stream_chunk(ANTHROPIC, parsed, self._state)
             if frames:
                 return b"".join(frames)
@@ -440,6 +448,10 @@ async def _call_with_pool_fallback_anthropic(
                         openai_stream,
                         model=model,
                         input_tokens=_estimated_tokens(body.get("messages", [])),
+                        tokenizer=(
+                            request.app.get("redaction_tokenizer")
+                            if request is not None else None
+                        ),
                     )
                 return prov, mdl, result
             except Exception as exc:
@@ -510,6 +522,10 @@ async def _call_with_pool_fallback_anthropic(
                     openai_stream,
                     model=model,
                     input_tokens=_estimated_tokens(body.get("messages", [])),
+                    tokenizer=(
+                        request.app.get("redaction_tokenizer")
+                        if request is not None else None
+                    ),
                 )
             return route.provider, route.model, result
         except Exception as exc:
@@ -616,6 +632,26 @@ async def anthropic_messages_handler(request: web.Request) -> web.Response | web
                 request["_client_profile_recorded"] = True
             # Convert to OpenAI format.
             openai_body = _anthropic_to_openai(body)
+            # Reversible secret redaction: seal secrets in the converted
+            # body before dispatch so Anthropic-native clients get the same
+            # protection as OpenAI-route clients. The response side restores
+            # them (non-streaming here, streaming in the SSE adapter).
+            from tusker_gateway.guardrails import run_guard_pipeline
+            _guard_pipeline = request.app.get("guard_pipeline")
+            if _guard_pipeline is not None:
+                _guard_result = await run_guard_pipeline(
+                    _guard_pipeline, openai_body, request=request
+                )
+                if not _guard_result.allowed:
+                    return web.json_response(
+                        _anthropic_error(
+                            _guard_result.message or "request blocked by guardrail",
+                            type="invalid_request_error",
+                        ),
+                        status=400,
+                    )
+                if _guard_result.modified_body is not None:
+                    openai_body = _guard_result.modified_body
             _validate_tool_choice_request(
                 openai_body.get("tool_choice"),
                 openai_body.get("tools"),
@@ -799,7 +835,12 @@ async def anthropic_messages_handler(request: web.Request) -> web.Response | web
                 status = "ok" if stream_ok else status
                 return stream_resp
 
-            # Non-streaming: convert OpenAI → Anthropic format.
+            # Non-streaming: restore sealed tokens, then convert to the
+            # Anthropic shape so the client receives plaintext.
+            _tok = request.app.get("redaction_tokenizer")
+            if _tok is not None and isinstance(result, dict):
+                from tusker_gateway.redaction import restore_response
+                result = restore_response(result, _tok)
             anthropic_resp = _openai_to_anthropic(result, original_model)
             _emit(status)
             if metrics is not None:

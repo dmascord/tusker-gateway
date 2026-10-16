@@ -269,3 +269,139 @@ def test_guard_leaves_clean_body_identical():
     }
     out = asyncio.run(_guard_body(t, body))
     assert out == body
+
+
+def _reassemble_tool_arguments(sse_text: str) -> str:
+    """Concatenate tool-call arguments the way an OpenAI client does."""
+    buf = ""
+    for line in sse_text.splitlines():
+        if not line.startswith("data: "):
+            continue
+        payload = line[6:].strip()
+        if payload == "[DONE]":
+            continue
+        try:
+            obj = json.loads(payload)
+        except ValueError:
+            continue
+        for choice in obj.get("choices", []):
+            for call in (choice.get("delta") or {}).get("tool_calls") or []:
+                args = (call.get("function") or {}).get("arguments")
+                if isinstance(args, str):
+                    buf += args
+    return buf
+
+
+def _stream_tool_args(parts: list[str], t):
+    """Run the SSE normalizer over `arguments` fragments; return client text."""
+    from tusker_gateway.endpoints import _normalize_stream
+
+    frames = []
+    for i, part in enumerate(parts):
+        delta: dict = {"role": "assistant"} if i == 0 else {}
+        delta["tool_calls"] = [
+            {
+                "index": 0,
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "bash", "arguments": part},
+            }
+        ]
+        frames.append(
+            {
+                "id": "c1",
+                "object": "chat.completion.chunk",
+                "model": "m",
+                "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+            }
+        )
+    frames.append(
+        {
+            "id": "c1",
+            "object": "chat.completion.chunk",
+            "model": "m",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+        }
+    )
+    raw = "".join("data: " + json.dumps(f) + "\n\n" for f in frames).encode()
+
+    async def _gen():
+        yield raw
+
+    async def _go() -> str:
+        acc = b""
+        async for chunk in _normalize_stream(
+            _gen(), provider="p", model="m", request_id="r",
+            tools_requested=True, restorer=t,
+        ):
+            acc += chunk
+        return acc.decode()
+
+    return asyncio.run(_go())
+
+
+@pytest.mark.parametrize("chunking", ["whole", "halves", "charwise"])
+def test_streaming_tool_call_arguments_restore(chunking):
+    """Streamed tool-call arguments must reach the client as plaintext.
+
+    OpenAI clients concatenate `arguments` fragments across deltas, so the
+    gateway replaces each fragment with restored text and releases any held
+    tail before finish_reason. A token split across deltas must still
+    reassemble (charwise is the worst case: every character its own frame).
+    """
+    t = _tokenizer()
+    secret = "sk-" + "livekey0123456789ABCDEFGH"
+    token = t.tokenize_text(secret)
+    whole = '{"command":"' + token + '"}'
+    if chunking == "whole":
+        parts = [whole]
+    elif chunking == "halves":
+        mid = len(token) // 2
+        parts = ['{"command":"' + token[:mid], token[mid:] + '"}']
+    else:
+        parts = list(whole)
+
+    text = _stream_tool_args(parts, t)
+    args = _reassemble_tool_arguments(text)
+    assert args == '{"command":"' + secret + '"}'
+    assert "[TUSKER:" not in args
+
+
+def test_streaming_tool_call_arguments_untouched_without_tokenizer():
+    t = _tokenizer()
+    token = t.tokenize_text("plain" + chr(64) + "example.test")
+    text = _stream_tool_args(['{"q":"' + token + '"}'], None)
+    assert token in _reassemble_tool_arguments(text)
+
+
+# --- entropy fallback rule -------------------------------------------------
+
+def test_entropy_fallback_seals_unprefixed_secret_by_context():
+    """An unprefixed 32+ char run near a credential word is sealed.
+
+    Off by default; the opt-in flag exists because the rule trades precision
+    for coverage of secrets with no recognizable provider prefix.
+    """
+    t = _tokenizer(redact_entropy_fallback=True)
+    bare = "9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c"
+    for context in ("api key: ", "Authorization: Bearer ", "PASSWORD=", "secret="):
+        text = context + bare
+        sealed = t.tokenize_text(text)
+        assert "[TUSKER:text:" in sealed, context
+        assert bare not in sealed
+        assert t.restore_text(sealed) == text
+
+
+def test_entropy_fallback_is_opt_in_and_conservative():
+    t_off = _tokenizer()  # default: rule disabled
+    bare = "9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c"
+    assert bare in t_off.tokenize_text("api key: " + bare)
+
+    t_on = _tokenizer(redact_entropy_fallback=True)
+    # no context word -> untouched
+    assert bare in t_on.tokenize_text("the value is " + bare)
+    # too short -> untouched
+    assert "abc123" in t_on.tokenize_text("api key: abc123")
+    # ordinary identifiers are not sealed
+    ident = "def some_function_name_that_is_quite_long_and_snake_case():"
+    assert t_on.tokenize_text(ident) == ident

@@ -1,0 +1,17 @@
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: grafana
+  namespace: monitoring
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - match: Host(`ai.tusker.net.au`) && PathPrefix(`/grafana`)
+      priority: 100
+      kind: Rule
+      services:
+        - name: prometheus-grafana
+          port: 80
+  tls:
+    secretName: tusker-gateway-tls

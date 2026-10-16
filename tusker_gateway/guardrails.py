@@ -334,6 +334,34 @@ class SecretRedactionGuard:
             return GuardResult(allowed=True, modified_body={**body, "messages": new_messages})
         return GuardResult(allowed=True)
 
+
+def redact_body_strings(body: Any, tokenizer: Any) -> Any:
+    """Seal detected secrets in every string of a request body.
+
+    For routes whose payload shape is not chat-completions (image/video
+    prompts, embedding inputs, rerank documents) the ``SecretRedactionGuard``
+    message walker does not apply. This seals every string leaf so those
+    routes get the same request-side protection; the response side restores
+    the tokens for the client.
+
+    Returns the original object unchanged when ``tokenizer`` is None (key
+    absent: fail-open) or when nothing matched.
+    """
+    if tokenizer is None:
+        return body
+
+    def walk(node: Any) -> Any:
+        if isinstance(node, str):
+            return tokenizer.tokenize_text(node)
+        if isinstance(node, dict):
+            return {k: walk(v) for k, v in node.items()}
+        if isinstance(node, list):
+            return [walk(v) for v in node]
+        return node
+
+    return walk(body)
+
+
 _DEFAULT_INJECTION_PATTERNS: list[str] = [
     r"^(?:please\s+|kindly\s+)?ignore\s+(?:previous|all)\s+instructions",
     r"^you\s+are\s+(?:now\s+)?(?:a|an)\s+\w+",
@@ -523,6 +551,7 @@ def load_guardrails_config_from_env(env: dict[str, str] | None = None) -> dict[s
         "redaction_email": _flag("TUSKER_REDACTION_EMAIL", True),
         "redaction_credit_card": _flag("TUSKER_REDACTION_CREDIT_CARD", True),
         "redact_api_keys": _flag("TUSKER_REDACTION_API_KEYS", True),
+        "redact_entropy_fallback": _flag("TUSKER_REDACTION_ENTROPY_FALLBACK", False),
         "_env": e,
     }
 
@@ -546,6 +575,7 @@ def init_guard_pipeline(config: dict[str, Any]) -> GuardPipeline:
                 redact_emails=config.get("redaction_email", True),
                 redact_credit_cards=config.get("redaction_credit_card", True),
                 redact_api_keys=config.get("redact_api_keys", True),
+                redact_entropy_fallback=config.get("redact_entropy_fallback", False),
             )
             guards.append(SecretRedactionGuard(
                 tokenizer=Tokenizer(key=key, rules=rules),

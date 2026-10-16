@@ -1,0 +1,32 @@
+{
+  "model_revisions": {
+    "embedding": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
+    "reranker": "233902d25c440f23af6f7d6e94d2946bac0bee0a"
+  },
+  "cuda": {
+    "device": "Quadro K2200",
+    "capability": [
+      5,
+      0
+    ]
+  },
+  "correctness": {
+    "embedding_dimension": 384,
+    "embedding_finite": true,
+    "embedding_cpu_gpu_min_cosine": 1.0,
+    "embedding_api_gpu_min_cosine": 0.9999999531406791,
+    "rerank_finite": true,
+    "rerank_max_abs_cpu_gpu": 1.430511474609375e-06,
+    "rerank_max_abs_direct_api": 0.0,
+    "rerank_cpu_gpu_same_order": true
+  },
+  "http": {
+    "health": "ok",
+    "embedding_requests": 1,
+    "embedding_batch": 2,
+    "embedding_ms": 11.57831800810527,
+    "rerank_requests": 1,
+    "rerank_candidates": 3,
+    "rerank_ms": 6.897533006849699
+  }
+}

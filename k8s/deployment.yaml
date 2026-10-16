@@ -262,6 +262,10 @@ spec:
           value: 'true'
         - name: TUSKER_REDACTION_API_KEYS
           value: 'true'
+        # Entropy-gated fallback for unprefixed secrets: opt-in, because the
+        # rule can false-positive on long identifiers in code.
+        - name: TUSKER_REDACTION_ENTROPY_FALLBACK
+          value: 'false'
         - name: TUSKER_REDACTION_KEY
           valueFrom:
             secretKeyRef:
