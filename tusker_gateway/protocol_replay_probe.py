@@ -7,6 +7,7 @@ against a different model. Never store model-generated reasoning or tool data.
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -75,7 +76,7 @@ async def probe_reasoning_replay(
                 call = calls[0]
                 function = call.get("function") if isinstance(call, dict) else None
                 call_id = call.get("id") if isinstance(call, dict) else None
-                if not isinstance(call_id, str) or not call_id or not isinstance(function, dict) or function.get("name") != "protocol_probe_echo":
+                if not isinstance(call_id, str) or not call_id or not isinstance(function, dict) or function.get("name") != "protocol_probe_echo" or not _matches_probe(function.get("arguments")):
                     result = ProbeAssessment("reasoning_replay", "unknown", "invalid_call")
                 else:
                     # Preserve all provider-supplied replay fields, including
@@ -101,3 +102,13 @@ async def probe_reasoning_replay(
         result = ProbeAssessment("reasoning_replay", "unavailable", "transport")
     store.record(provider, endpoint_id, model, "reasoning_replay", result.status)
     return result
+
+
+def _matches_probe(raw: Any) -> bool:
+    if not isinstance(raw, str):
+        return False
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return False
+    return isinstance(parsed, dict) and parsed.get('value') == 'ok'
