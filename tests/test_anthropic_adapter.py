@@ -1058,3 +1058,78 @@ async def test_messages_empty_pool_selection_is_retryable(app, client, monkeypat
         },
     }
     mock_chat.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_messages_pool_failover_strips_cross_provider_replay_state(app):
+    """Anthropic pool failover must not ship provider-A replay state to B.
+
+    Exercises the fallback loop directly so the assertion is on the actual
+    message payload: the first candidate sees the conversation as supplied,
+    the cross-provider candidate gets a sanitized copy, and the shared
+    history the caller holds is never mutated.
+    """
+    from tusker_gateway.anthropic_adapter import _call_with_pool_fallback_anthropic
+
+    class _PoolManager:
+        def __init__(self, config):
+            pass
+
+        def fallback_pools(self, pool_name):
+            return ()
+
+        def select(self, pool_name, **kwargs):
+            excluded = kwargs.get("excluded") or set()
+            for candidate in (("zai", "glm-4.7"), ("openai", "gpt-4o")):
+                if candidate not in excluded:
+                    return candidate
+            return None
+
+    messages = [
+        {"role": "user", "content": "hi"},
+        {
+            "role": "assistant",
+            "content": "answer",
+            "reasoning_content": "provider-A private reasoning",
+            "thought_signature": "opaque-a",
+            "tool_calls": [{
+                "id": "call_1", "type": "function",
+                "function": {"name": "bash", "arguments": "{}"},
+                "thought_signature": "tool-opaque-a",
+            }],
+        },
+    ]
+    body = {"model": "hermes-code", "messages": messages, "stream": False}
+    seen: list[list[dict]] = []
+
+    class _Client:
+        async def chat(self, provider, model, msgs, **kwargs):
+            seen.append(msgs)
+            if provider == "zai":
+                raise RuntimeError("zai failed")
+            return {"choices": [{"message": {"content": "done"},
+                                 "finish_reason": "stop"}], "usage": {}}
+
+    with (
+        patch("tusker_gateway.anthropic_adapter._prepare_stream_result",
+              new_callable=AsyncMock, side_effect=lambda result, **kw: result),
+        patch("tusker_gateway.anthropic_adapter.PoolManager", _PoolManager),
+    ):
+        provider, model, _ = await _call_with_pool_fallback_anthropic(
+            app["config"], body, _Client(),
+        )
+
+    assert (provider, model) == ("openai", "gpt-4o")
+    # First (same-as-source) candidate: reasoning state intact.
+    assert seen[0][1]["reasoning_content"] == "provider-A private reasoning"
+    assert seen[0][1]["thought_signature"] == "opaque-a"
+    # Cross-provider candidate: opaque provider state stripped.
+    assert seen[1] is not seen[0]
+    assert "reasoning_content" not in seen[1][1]
+    assert "thought_signature" not in seen[1][1]
+    assert seen[1][1]["tool_calls"][0].get("thought_signature") is None
+    # Ordinary content and the tool call survive for provider B.
+    assert seen[1][1]["content"] == "answer"
+    assert seen[1][1]["tool_calls"][0]["function"]["name"] == "bash"
+    # The caller's conversation is untouched.
+    assert messages[1]["reasoning_content"] == "provider-A private reasoning"

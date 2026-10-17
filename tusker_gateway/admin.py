@@ -427,6 +427,42 @@ async def admin_keys(request: web.Request) -> web.Response:
     })
 
 
+async def admin_protocol_probe(request: web.Request) -> web.Response:
+    """POST /admin/protocol/probe — run approved protocol probes.
+
+    Requires ``admin:write`` (enforced by the admin access middleware for
+    POST), the ``TUSKER_PROTOCOL_PROBES_ENABLED`` operator gate, and an
+    explicit ``approved: true`` in the body. Probes are bound to the
+    provider's configured endpoint with its production auth strategy: no
+    client-controlled URLs, no pool fallback. Only classified
+    feature/status evidence is returned and recorded — never raw bodies.
+    """
+    from tusker_gateway.protocol_probe_service import ProtocolProbeError, run_probe
+
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = None
+    if not isinstance(payload, dict):
+        return web.json_response(
+            openai_error_shape("JSON body required", "invalid_request"), status=400,
+        )
+    try:
+        result = await run_probe(request.app, payload)
+    except ProtocolProbeError as exc:
+        return web.json_response(
+            openai_error_shape(str(exc), exc.code), status=exc.status,
+        )
+    return web.json_response(result)
+
+
+async def admin_protocol_evidence(request: web.Request) -> web.Response:
+    """GET /admin/protocol/evidence — stored probe evidence (read-only)."""
+    from tusker_gateway.protocol_probe_service import evidence_snapshot
+
+    return web.json_response(evidence_snapshot(request.app["config"]))
+
+
 async def admin_usage(request: web.Request) -> web.Response:
     """GET /admin/usage — per-provider usage counters and capacity state."""
     from tusker_gateway.config import load_config
@@ -1650,6 +1686,8 @@ def register_admin_config_routes(app: web.Application) -> None:
     """
     app.router.add_post("/admin/audit/review", admin_audit_review)
     app.router.add_post("/admin/audit/execution", admin_audit_execution)
+    app.router.add_post("/admin/protocol/probe", admin_protocol_probe)
+    app.router.add_get("/admin/protocol/evidence", admin_protocol_evidence)
     app.router.add_get("/admin/config", admin_config)
     app.router.add_get("/admin/captures", admin_captures)
     app.router.add_get("/admin/captures/{capture_id}", admin_capture_detail)

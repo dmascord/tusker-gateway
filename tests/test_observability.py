@@ -395,3 +395,56 @@ class TestWeightedPoolSelection:
         # Verify weight is stored correctly on each spec
         assert spec1.weight == 0.7
         assert spec2.weight == 0.3
+
+
+class TestProtocolDiagnosticsFields:
+    """Per-attempt protocol diagnostics surface to the access log."""
+
+    @pytest.mark.asyncio
+    async def test_set_access_log_context_accepts_protocol_fields(self):
+        app = web.Application()
+        access_log = Mock()
+        app["access_log"] = access_log
+
+        async def handler(request):
+            set_access_log_context(
+                request,
+                provider="openrouter",
+                model="deepseek-r1",
+                pool="code",
+                protocol_family="deepseek",
+                protocol_confidence="heuristic",
+                endpoint_id="abc123def456abc123def456",
+                evidence_version="protocol-contract-v1",
+                selected_adapter="OpenCodeCLIAdapter",
+                fallback_reason="previous_attempt:ProviderError",
+            )
+            return web.Response(text="ok")
+
+        app.router.add_get("/diag", handler)
+        attach_request_id_middleware(app)
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.get("/diag")
+            assert response.status == 200
+            kwargs = access_log.log.call_args.kwargs
+            assert kwargs["protocol_family"] == "deepseek"
+            assert kwargs["endpoint_id"] == "abc123def456abc123def456"
+            assert kwargs["evidence_version"] == "protocol-contract-v1"
+            assert kwargs["selected_adapter"] == "OpenCodeCLIAdapter"
+            assert kwargs["protocol_confidence"] == "heuristic"
+            assert kwargs["fallback_reason"] == "previous_attempt:ProviderError"
+        finally:
+            await client.close()
+
+    def test_unknown_field_is_silently_ignored(self):
+        """Operator-facing fields are an allowlist; unknown names don't leak."""
+        request = Mock()
+        request.get.return_value = {}
+        set_access_log_context(
+            request, provider="p", model="m", not_a_field="leak me",
+        )
+        # The unknown field is dropped — the context dict only has
+        # entries from the allowlist.
+        assert "not_a_field" not in request.get.return_value

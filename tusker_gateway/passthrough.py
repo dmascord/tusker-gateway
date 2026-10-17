@@ -2655,6 +2655,12 @@ class PassthroughClient:
             effort = body.get("reasoning_effort")
             if isinstance(effort, str):
                 body["reasoning_effort"] = _normalize_reasoning_effort(effort)
+        from tusker_gateway.protocol_compat import adapt_upstream_chat
+        from tusker_gateway.protocol_runtime import verified_features_for_endpoint
+        adapt_upstream_chat(
+            body, provider, model,
+            verified_features=verified_features_for_endpoint(provider, model, endpoint),
+        )
         _adapt_apim_tool_reasoning(body, provider)
         _rename_max_tokens_for_provider(body, provider)
         _strip_apim_luna_temperature(body, provider)

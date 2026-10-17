@@ -71,6 +71,22 @@ PROD_DB_NAME = "tusker_gateway"
 
 CANARY_PORT = 8642
 
+# Background loops that make upstream calls. The canary copies the live env
+# verbatim, so these would inherit production's enabled state and run
+# unattended against the *shared* provider credentials in tusker-env-vault --
+# unbounded spend the operator never approved for a canary.
+SPEND_GUARD_ENV = (
+    # Recertifies models on an interval against every configured provider.
+    ("TUSKER_QUALIFICATION_MAINTENANCE_ENABLED", "false"),
+    # Same, restricted to response_format=json_schema contracts.
+    ("TUSKER_STRUCTURED_QUALIFICATION_ENABLED", "false"),
+    # Input-modality probes: one upstream round trip per candidate model,
+    # rotating through the code/premium/swarm pools.
+    ("TUSKER_MODALITY_QUALIFICATION_ENABLED", "false"),
+    # Generates media against image/video providers.
+    ("TUSKER_MEDIA_QUALIFICATION_ENABLED", "false"),
+)
+
 # Env vars that must NOT be copied verbatim into the canary deployment
 # because they carry live prod OAuth state or per-pod values the canary
 # must not share.
@@ -79,6 +95,10 @@ DROP_ENV_VARS = frozenset({
     "TUSKER_STATE_DATABASE_URL",
     # Encryption key is canary-specific; prod's key is not reused.
     "TUSKER_KEY_ENCRYPTION_KEY",
+    # Upstream-calling background loops: dropped here and re-added as the
+    # disabled values in SPEND_GUARD_ENV, so the render carries exactly one
+    # entry per name instead of shadowing the copied production value.
+    *(name for name, _ in SPEND_GUARD_ENV),
 })
 
 
@@ -253,6 +273,11 @@ def _build_canary_deployment(live: dict[str, Any], image_with_digest: str) -> di
     # rotation, marks pod as canary for config store activation/logging.
     canary_env.append({"name": "TUSKER_CONFIG_CANARY", "value": "true"})
 
+    # Bounded spend: disable upstream-calling background loops that prod leaves
+    # enabled. Placed after the copied env so these values win.
+    for guard_name, guard_value in SPEND_GUARD_ENV:
+        canary_env.append({"name": guard_name, "value": guard_value})
+
     # envFrom stays shared for tusker-env-vault provider keys.
     canary_env_from: list[dict[str, Any]] = []
     for ef in env_from:
@@ -413,7 +438,12 @@ def _image_with_digest(live: dict[str, Any], digest: str) -> str:
     import re as _re
     if _re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
         live_image = live["spec"]["template"]["spec"]["containers"][0].get("image", "")
-        base = live_image.rsplit("@", 1)[0].rsplit(":", 1)[0]
+        base = live_image.split("@", 1)[0]
+        # Drop a tag, but only from the last path component: an earlier
+        # component may carry a registry port ("registry:5000/repo"), and
+        # splitting on the first colon would delete the registry host.
+        if ":" in base.rsplit("/", 1)[-1]:
+            base = base.rsplit(":", 1)[0]
         return f"{base}@{digest}"
     # A bare tag; accept it, but warn it is not immutable.
     return digest

@@ -13,7 +13,7 @@ import time
 import uuid
 from typing import Any, AsyncIterator
 
-from aiohttp import ClientError, web
+from aiohttp import ClientError, ClientPayloadError, web
 from aiohttp.http_exceptions import TransferEncodingError
 from tusker_gateway.redaction import _BufferedRestorer
 
@@ -799,18 +799,11 @@ async def _normalize_stream_legacy(
                 saw_finish_reason = True
             raw_content = delta.get("content")
             reasoning_content = delta.get("reasoning_content")
-            # Some reasoning models (qwen, etc.) emit reasoning/thinking in
-            # `reasoning_content` while leaving `content` null or empty.
-            # OMP treats content=null as "no text" and ends the turn early.
-            # Promote reasoning_content to content when content is absent so
-            # clients see real text and keep the conversation alive.
-            if raw_content is None and reasoning_content is not None:
-                raw_content = reasoning_content
-                delta["content"] = reasoning_content
-                # OMP client compatibility: sometimes reasoning models omit "content"
-                # when "reasoning_content" is present.
-                if "reasoning_content" in delta:
-                    del delta["reasoning_content"]
+            # Preserve the OpenAI-compatible reasoning channel for modern OMP.
+            # OMP consumes reasoning_content as thinking and may replay it for
+            # DeepSeek/tool-call continuations. Never duplicate it into content.
+            # The main stream normalizer also sanitizes tool markup in both
+            # channels; this legacy path only preserves the wire boundary.
             has_content = isinstance(raw_content, str) and bool(raw_content)
             tc = delta.get("tool_calls")
             if not tc:
@@ -838,8 +831,8 @@ async def _normalize_stream_legacy(
             new_choice = {**choice, "delta": delta}
             new_obj = {**obj, "choices": [new_choice, *choices[1:]]}
             # Split if chunk has BOTH content/tools AND finish_reason
-            if fr and (bool(delta.get("content")) or has_tools):
-                if bool(delta.get("content")):
+            if fr and (bool(delta.get("content")) or bool(delta.get("reasoning_content")) or has_tools):
+                if bool(delta.get("content")) or bool(delta.get("reasoning_content")):
                     content_delta = {
                         k: v for k, v in delta.items() if k not in ("role", "tool_calls")
                     }
@@ -986,8 +979,12 @@ def _normalize_native_stream_tool_calls(
         if not effective_call_id:
             # Some OpenAI-compatible providers omit ids and names on the
             # first native delta. OMP requires an id or name on every delta;
-            # keep the synthesized id stable by stream index.
-            effective_call_id = f"call_stream_{choice_index}_{index}"
+            # keep the synthesized id stable by stream index. When the index
+            # already belongs to an identified call, reuse that id so a
+            # continuation delta cannot re-identify the call mid-stream.
+            effective_call_id = index_owners.get(
+                (choice_index, index)
+            ) or f"call_stream_{choice_index}_{index}"
             call["id"] = effective_call_id
 
         used_in_frame.add(index)
@@ -1360,7 +1357,7 @@ async def _normalize_stream(
                 len(buffer),
             )
             # Re-raise transport-level failures (peer reset, broken pipe,
-            # incomplete read) as ProviderStreamClosedError so the outer
+            # truncated body) as ProviderStreamClosedError so the outer
             # stream-loop catch distinguishes "upstream closed" (vLLM /
             # OpenRouter-style error frame + [DONE]) from "client
             # disconnected" (silent teardown + budget refund). Domain
@@ -1375,10 +1372,22 @@ async def _normalize_stream(
             # asyncio.TimeoutError is an OSError subclass in Python 3.11+
             # but it has its own call site in the per-attempt idle budget,
             # so it must not be wrapped here. OSError is also intentionally
-            # excluded: aiohttp's ClientPayloadError is what we really want,
-            # but a bare OSError from a downstream adapter carries a
-            # different meaning and should pass through to its handler.
-            if isinstance(exc, (ConnectionResetError, ConnectionError, BrokenPipeError)):
+            # excluded as a *class*: a bare OSError from a downstream
+            # adapter carries a different meaning and should pass through
+            # to its handler. aiohttp.ClientPayloadError is the exception
+            # aiohttp actually raises for a truncated SSE body (both a TCP
+            # abort and an RST surface as it, verified against aiohttp
+            # 3.13.3), so it is wrapped explicitly — it is not a
+            # ConnectionError subclass.
+            if isinstance(
+                exc,
+                (
+                    ConnectionResetError,
+                    ConnectionError,
+                    BrokenPipeError,
+                    ClientPayloadError,
+                ),
+            ):
                 raise ProviderStreamClosedError(
                     provider=provider or "unknown",
                     model=model or "unknown",
@@ -1474,18 +1483,24 @@ async def _normalize_stream(
             promoted_reasoning = (
                 reasoning_content if isinstance(reasoning_content, str) else ""
             )
-            # OpenRouter's newer reasoning stream uses `reasoning` (and often
-            # duplicates it in `reasoning_details`) rather than the older
-            # `reasoning_content` field. OMP renders that field as a thinking
-            # block, so tool markup there bypassed the content-only stripper
-            # and arrived as visible, unstructured text.
-            if (raw_content is None or raw_content == "") and isinstance(reasoning_content, str):
-                raw_content = reasoning_content
-                promoted_reasoning_chars += len(reasoning_content)
-                stream_diag["content_chars"] += len(reasoning_content)
-                delta["content"] = reasoning_content
-                delta.pop("reasoning_content", None)
-                reasoning_content = None
+            # Normalize provider reasoning aliases into one stable OMP-facing
+            # reasoning_content channel, never ordinary assistant content.
+            # OMP handles this channel as thinking and retains it for tool
+            # replay. Keep the original raw content independent.
+            if not isinstance(reasoning_content, str) or not reasoning_content:
+                for alias in ("reasoning", "reasoning_text"):
+                    candidate = delta.get(alias)
+                    if isinstance(candidate, str) and candidate:
+                        reasoning_content = candidate
+                        delta["reasoning_content"] = candidate
+                        break
+            # OMP prefers reasoning_content; remove duplicated aliases so it
+            # cannot render the same thinking twice. The raw value remains
+            # available to the sanitizer through reasoning_content.
+            if isinstance(reasoning_content, str) and reasoning_content:
+                for alias in ("reasoning", "reasoning_text"):
+                    if delta.get(alias) == reasoning_content:
+                        delta.pop(alias, None)
 
             auxiliary_sources: list[tuple[str, str]] = []
             if isinstance(reasoning_content, str) and reasoning_content:
@@ -3917,6 +3932,30 @@ def _cooldown_for_exc(exc: GatewayError) -> float | None:
         return None
 
 
+def _sanitize_cross_provider_messages(messages: Any) -> list[dict[str, Any]]:
+    """Strip opaque provider replay state for cross-provider failover.
+
+    Assistant turns produced by upstream A can carry reasoning channels and
+    opaque signatures that only A can consume. When a failover selects a
+    different upstream B, that state is removed from a deep copy (the
+    caller's conversation history is never mutated). Ordinary content and
+    tool calls survive so B can still answer the same turn.
+    """
+    from tusker_gateway.protocol_signatures import strip_cross_provider_replay
+
+    if not isinstance(messages, list):
+        return messages
+    sanitized: list[dict[str, Any]] = []
+    for message in messages:
+        if isinstance(message, dict) and message.get("role") == "assistant":
+            sanitized.append(strip_cross_provider_replay(message, same_upstream=False))
+        else:
+            import copy as _copy
+
+            sanitized.append(_copy.deepcopy(message))
+    return sanitized
+
+
 def _max_pool_provider_attempts() -> int:
     """Bound per-request fallback work so one outage cannot stall OMP."""
     try:
@@ -4355,6 +4394,11 @@ _STREAM_RECOVERY_CODES = frozenset({
     "provider_error",
     "upstream_timeout",
     "upstream_stream_incomplete",
+    # A truncated upstream body (aiohttp.ClientPayloadError, wrapped as
+    # ProviderStreamClosedError). Carries no assistant-visible output, so it
+    # is eligible for the same single pre-visible failover it had before the
+    # wrap, when it surfaced as a bare ClientError.
+    "stream_closed_prematurely",
     "upstream_stream_invalid",
     "invalid_upstream_response",
     "cli_failed",
@@ -4571,6 +4615,49 @@ def _requires_structured_output(body: dict[str, Any], pool_name: str | None) -> 
     }
 
 
+def _protocol_attempt_diagnostics(
+    config: dict[str, Any], provider: str, model: str,
+) -> dict[str, str]:
+    """Per-attempt protocol diagnostics for the access log (runbook 1.6).
+
+    Returns the resolver's family/confidence verdict plus the opaque endpoint
+    fingerprint, the probe-evidence contract version, and which transport
+    served the attempt. Every value is a short label or hash derived from
+    configured metadata: no prompt, reasoning text, tool arguments, tokens or
+    credentials are reachable from here.
+    """
+    diagnostics: dict[str, str] = {}
+    try:
+        from tusker_gateway.protocol_compat import resolve_protocol
+        profile = resolve_protocol(provider, model)
+        if profile.family:
+            diagnostics["protocol_family"] = profile.family
+        if profile.confidence:
+            diagnostics["protocol_confidence"] = profile.confidence
+    except Exception:
+        logger.debug("protocol profile resolution failed", exc_info=True)
+    try:
+        from tusker_gateway.protocol_evidence import PROTOCOL_PROBE_VERSION
+        from tusker_gateway.protocol_runtime import endpoint_identity
+        from tusker_gateway.passthrough import _configured_endpoint
+
+        diagnostics["evidence_version"] = PROTOCOL_PROBE_VERSION
+        resolved_endpoint = _configured_endpoint(config, provider)
+        if resolved_endpoint:
+            diagnostics["endpoint_id"] = endpoint_identity(resolved_endpoint)
+    except Exception:
+        logger.debug("endpoint diagnostics resolution failed", exc_info=True)
+    try:
+        from tusker_gateway.provider_adapters import provider_adapters
+
+        adapter = provider_adapters.get(provider)
+        diagnostics["selected_adapter"] = type(adapter).__name__ if adapter else "http"
+    except Exception:
+        logger.debug("adapter diagnostics resolution failed", exc_info=True)
+    return diagnostics
+
+
+
 async def _call_with_pool_fallback(
     config: dict[str, Any],
     body: dict[str, Any],
@@ -4613,6 +4700,7 @@ async def _call_with_pool_fallback(
                 provider=provider,
                 model=model,
                 candidate_attempts=1,
+                **_protocol_attempt_diagnostics(config, provider, model),
             )
         decision = (
             await asyncio.to_thread(breaker.check, provider, model)
@@ -4788,6 +4876,7 @@ async def _call_with_pool_fallback(
     active_pool = pool_names[pool_index]
     pending_selection = initial_selection
     attempts = max(0, attempt_offset)
+    first_provider: str | None = None
     max_attempts = _max_pool_provider_attempts()
     recovery_probe = False
     tool_compatibility_probe = False
@@ -4941,13 +5030,35 @@ async def _call_with_pool_fallback(
                 excluded.add(selected)
                 continue
         provider, model = selected
+        if first_provider is None:
+            first_provider = provider
         attempts += 1
+        # Per-attempt operator diagnostics (runbook 1.6): resolver verdict,
+        # endpoint fingerprint, evidence version and selected transport.
+        # ``fallback_reason`` below records why the previous attempt was
+        # excluded, if any.
+        diagnostics = (
+            _protocol_attempt_diagnostics(config, provider, model)
+            if request is not None else {}
+        )
+        fallback_reason = ""
+        if attempts > 1:
+            # ``last_error`` is set when the previous attempt failed; the
+            # specific reason is captured in the dispatch loop above. We
+            # surface a short, safe summary so operators can see *why*
+            # the router kept moving.
+            if last_error is not None:
+                fallback_reason = f"previous_attempt:{type(last_error).__name__}"
+            else:
+                fallback_reason = "previous_attempt:excluded"
         if request is not None:
             set_access_log_context(
                 request,
                 provider=provider,
                 model=model,
                 candidate_attempts=attempts,
+                fallback_reason=fallback_reason or None,
+                **diagnostics,
             )
         logger.info(
             "pool fallback attempt rid=%s requested_pool=%s active_pool=%s "
@@ -4968,10 +5079,23 @@ async def _call_with_pool_fallback(
                 nonlocal result
                 # Runs in its own task, so the binding is scoped to this attempt.
                 bind_upstream_progress(activity.touch)
+                # Cross-provider failover must not ship opaque provider
+                # continuation state (reasoning channels, thought signatures)
+                # to a different upstream. Same-provider retries keep it;
+                # copy-on-write so the shared history is never mutated.
+                candidate_messages = body["messages"]
+                if (
+                    attempts > 1
+                    and first_provider is not None
+                    and provider != first_provider
+                ):
+                    candidate_messages = _sanitize_cross_provider_messages(
+                        candidate_messages
+                    )
                 result = await client.chat(
                     provider,
                     model,
-                    body["messages"],
+                    candidate_messages,
                     stream=bool(body.get("stream")),
                     tools=tools,
                     tool_choice=body.get("tool_choice"),

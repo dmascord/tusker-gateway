@@ -1,0 +1,827 @@
+{
+  "client": "opencode",
+  "captured_at": "2026-10-17T04:23:08Z",
+  "note": "sanitized: no credentials, prompts, tool arguments, reasoning text or absolute paths",
+  "requests": [
+    {
+      "path": "/v1/chat/completions",
+      "headers": {
+        "authorization": "<redacted>",
+        "content-type": "application/json",
+        "user-agent": "opencode/latest/2.0.30/cli",
+        "b3": "<redacted>",
+        "traceparent": "<redacted>",
+        "x-opencode-client": "cli",
+        "x-opencode-project": "<redacted>",
+        "x-opencode-session": "<redacted>",
+        "x-opencode-session-id": "<redacted>",
+        "x-session-affinity": "<redacted>",
+        "x-session-id": "<redacted>",
+        "connection": "<present>",
+        "accept": "*/*",
+        "host": "<present>",
+        "accept-encoding": "gzip, deflate, br, zstd",
+        "content-length": "<present>"
+      },
+      "message_roles": [
+        "system",
+        "user"
+      ],
+      "messages": [
+        {
+          "role": "system",
+          "content": "<redacted>"
+        },
+        {
+          "role": "user",
+          "content": "<redacted>"
+        }
+      ],
+      "tools": [],
+      "body_keys": [
+        "messages",
+        "model",
+        "store",
+        "stream",
+        "stream_options"
+      ],
+      "stream": true,
+      "store": false,
+      "stream_options": {
+        "include_usage": true
+      },
+      "model": "capture/capture-model"
+    },
+    {
+      "path": "/v1/chat/completions",
+      "headers": {
+        "authorization": "<redacted>",
+        "content-type": "application/json",
+        "user-agent": "opencode/latest/2.0.30/cli",
+        "b3": "<redacted>",
+        "traceparent": "<redacted>",
+        "x-opencode-client": "cli",
+        "x-opencode-project": "<redacted>",
+        "x-opencode-session": "<redacted>",
+        "x-opencode-session-id": "<redacted>",
+        "x-session-affinity": "<redacted>",
+        "x-session-id": "<redacted>",
+        "connection": "<present>",
+        "accept": "*/*",
+        "host": "<present>",
+        "accept-encoding": "gzip, deflate, br, zstd",
+        "content-length": "<present>"
+      },
+      "message_roles": [
+        "system",
+        "user"
+      ],
+      "messages": [
+        {
+          "role": "system",
+          "content": "<redacted>"
+        },
+        {
+          "role": "user",
+          "content": "<redacted>"
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "edit",
+            "parameters": {
+              "type": "object",
+              "properties": [
+                "newString",
+                "oldString",
+                "path",
+                "replaceAll"
+              ],
+              "required": [
+                "newString",
+                "oldString",
+                "path"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "glob",
+            "parameters": {
+              "type": "object",
+              "properties": [
+                "hidden",
+                "limit",
+                "path",
+                "pattern"
+              ],
+              "required": [
+                "pattern"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "grep",
+            "parameters": {
+              "type": "object",
+              "properties": [
+                "caseSensitive",
+                "include",
+                "limit",
+                "literal",
+                "path",
+                "pattern"
+              ],
+              "required": [
+                "pattern"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "hindsight_capture_initiative",
+            "parameters": {
+              "type": "object",
+              "properties": [
+                "relates_to_page_id",
+                "summary",
+                "title"
+              ],
+              "required": [
+                "summary",
+                "title"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "hindsight_diagnose",
+            "parameters": {
+              "type": "object",
+              "properties": [],
+              "required": []
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "hindsight_ingest_document",
+            "parameters": {
+              "type": "object",
+              "properties": [
+                "content",
+                "title"
+              ],
+              "required": [
+                "content",
+                "title"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "hindsight_list_knowledge_pages",
+            "parameters": {
+              "type": "object",
+              "properties": [],
+              "required": []
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "hindsight_read_knowledge_page",
+            "parameters": {
+              "type": "object",
+              "properties": [
+                "page_id"
+              ],
+              "required": [
+                "page_id"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "hindsight_reflect",
+            "parameters": {
+              "type": "object",
+              "properties": [
+                "query"
+              ],
+              "required": [
+                "query"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "hindsight_search_knowledge_pages",
+            "parameters": {
+              "type": "object",
+              "properties": [
+                "query"
+              ],
+              "required": [
+                "query"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "hindsight_sync_status",
+            "parameters": {
+              "type": "object",
+              "properties": [],
+              "required": []
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "question",
+            "parameters": {
+              "type": "object",
+              "properties": [
+                "questions"
+              ],
+              "required": [
+                "questions"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "read",
+            "parameters": {
+              "type": "object",
+              "properties": [
+                "limit",
+                "offset",
+                "path"
+              ],
+              "required": [
+                "path"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "shell",
+            "parameters": {
+              "type": "object",
+              "properties": [
+                "background",
+                "command",
+                "timeout",
+                "workdir"
+              ],
+              "required": [
+                "command"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "skill",
+            "parameters": {
+              "type": "object",
+              "properties": [
+                "id"
+              ],
+              "required": [
+                "id"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "subagent",
+            "parameters": {
+              "type": "object",
+              "properties": [
+                "agent",
+                "background",
+                "description",
+                "model",
+                "prompt",
+                "sessionID"
+              ],
+              "required": [
+                "agent",
+                "description",
+                "prompt"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "webfetch",
+            "parameters": {
+              "type": "object",
+              "properties": [
+                "format",
+                "timeout",
+                "url"
+              ],
+              "required": [
+                "url"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "websearch",
+            "parameters": {
+              "type": "object",
+              "properties": [
+                "query"
+              ],
+              "required": [
+                "query"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "write",
+            "parameters": {
+              "type": "object",
+              "properties": [
+                "content",
+                "path"
+              ],
+              "required": [
+                "content",
+                "path"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "execute",
+            "parameters": {
+              "type": "object",
+              "properties": [
+                "code"
+              ],
+              "required": [
+                "code"
+              ]
+            }
+          }
+        }
+      ],
+      "body_keys": [
+        "max_completion_tokens",
+        "messages",
+        "model",
+        "store",
+        "stream",
+        "stream_options",
+        "tools"
+      ],
+      "stream": true,
+      "store": false,
+      "stream_options": {
+        "include_usage": true
+      },
+      "max_completion_tokens": 32000,
+      "model": "capture/capture-model"
+    },
+    {
+      "path": "/v1/chat/completions",
+      "headers": {
+        "authorization": "<redacted>",
+        "content-type": "application/json",
+        "user-agent": "opencode/latest/2.0.30/cli",
+        "b3": "<redacted>",
+        "traceparent": "<redacted>",
+        "x-opencode-client": "cli",
+        "x-opencode-project": "<redacted>",
+        "x-opencode-session": "<redacted>",
+        "x-opencode-session-id": "<redacted>",
+        "x-session-affinity": "<redacted>",
+        "x-session-id": "<redacted>",
+        "connection": "<present>",
+        "accept": "*/*",
+        "host": "<present>",
+        "accept-encoding": "gzip, deflate, br, zstd",
+        "content-length": "<present>"
+      },
+      "message_roles": [
+        "system",
+        "user",
+        "assistant",
+        "tool"
+      ],
+      "messages": [
+        {
+          "role": "system",
+          "content": "<redacted>"
+        },
+        {
+          "role": "user",
+          "content": "<redacted>"
+        },
+        {
+          "role": "assistant",
+          "content": "<redacted>",
+          "tool_calls": [
+            {
+              "id": "call_golden_1",
+              "type": "function",
+              "function": {
+                "name": "glob",
+                "arguments": "<redacted>"
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "call_golden_1",
+          "content": "<redacted>"
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "edit",
+            "parameters": {
+              "type": "object",
+              "properties": [
+                "newString",
+                "oldString",
+                "path",
+                "replaceAll"
+              ],
+              "required": [
+                "newString",
+                "oldString",
+                "path"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "glob",
+            "parameters": {
+              "type": "object",
+              "properties": [
+                "hidden",
+                "limit",
+                "path",
+                "pattern"
+              ],
+              "required": [
+                "pattern"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "grep",
+            "parameters": {
+              "type": "object",
+              "properties": [
+                "caseSensitive",
+                "include",
+                "limit",
+                "literal",
+                "path",
+                "pattern"
+              ],
+              "required": [
+                "pattern"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "hindsight_capture_initiative",
+            "parameters": {
+              "type": "object",
+              "properties": [
+                "relates_to_page_id",
+                "summary",
+                "title"
+              ],
+              "required": [
+                "summary",
+                "title"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "hindsight_diagnose",
+            "parameters": {
+              "type": "object",
+              "properties": [],
+              "required": []
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "hindsight_ingest_document",
+            "parameters": {
+              "type": "object",
+              "properties": [
+                "content",
+                "title"
+              ],
+              "required": [
+                "content",
+                "title"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "hindsight_list_knowledge_pages",
+            "parameters": {
+              "type": "object",
+              "properties": [],
+              "required": []
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "hindsight_read_knowledge_page",
+            "parameters": {
+              "type": "object",
+              "properties": [
+                "page_id"
+              ],
+              "required": [
+                "page_id"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "hindsight_reflect",
+            "parameters": {
+              "type": "object",
+              "properties": [
+                "query"
+              ],
+              "required": [
+                "query"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "hindsight_search_knowledge_pages",
+            "parameters": {
+              "type": "object",
+              "properties": [
+                "query"
+              ],
+              "required": [
+                "query"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "hindsight_sync_status",
+            "parameters": {
+              "type": "object",
+              "properties": [],
+              "required": []
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "question",
+            "parameters": {
+              "type": "object",
+              "properties": [
+                "questions"
+              ],
+              "required": [
+                "questions"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "read",
+            "parameters": {
+              "type": "object",
+              "properties": [
+                "limit",
+                "offset",
+                "path"
+              ],
+              "required": [
+                "path"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "shell",
+            "parameters": {
+              "type": "object",
+              "properties": [
+                "background",
+                "command",
+                "timeout",
+                "workdir"
+              ],
+              "required": [
+                "command"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "skill",
+            "parameters": {
+              "type": "object",
+              "properties": [
+                "id"
+              ],
+              "required": [
+                "id"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "subagent",
+            "parameters": {
+              "type": "object",
+              "properties": [
+                "agent",
+                "background",
+                "description",
+                "model",
+                "prompt",
+                "sessionID"
+              ],
+              "required": [
+                "agent",
+                "description",
+                "prompt"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "webfetch",
+            "parameters": {
+              "type": "object",
+              "properties": [
+                "format",
+                "timeout",
+                "url"
+              ],
+              "required": [
+                "url"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "websearch",
+            "parameters": {
+              "type": "object",
+              "properties": [
+                "query"
+              ],
+              "required": [
+                "query"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "write",
+            "parameters": {
+              "type": "object",
+              "properties": [
+                "content",
+                "path"
+              ],
+              "required": [
+                "content",
+                "path"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "execute",
+            "parameters": {
+              "type": "object",
+              "properties": [
+                "code"
+              ],
+              "required": [
+                "code"
+              ]
+            }
+          }
+        }
+      ],
+      "body_keys": [
+        "max_completion_tokens",
+        "messages",
+        "model",
+        "store",
+        "stream",
+        "stream_options",
+        "tools"
+      ],
+      "stream": true,
+      "store": false,
+      "stream_options": {
+        "include_usage": true
+      },
+      "max_completion_tokens": 32000,
+      "model": "capture/capture-model"
+    }
+  ]
+}
