@@ -1,0 +1,587 @@
+{
+ "total": 58,
+ "passed": 15,
+ "failed": 43,
+ "results": [
+  {
+   "pool": "privacy",
+   "provider": "apim",
+   "model": "gpt-5.6-luna",
+   "ok": true,
+   "http": 200,
+   "class": "",
+   "finish": "stop",
+   "latency": 1.1
+  },
+  {
+   "pool": "code",
+   "provider": "claude-code-cli",
+   "model": "sonnet",
+   "ok": true,
+   "http": 200,
+   "class": "",
+   "finish": "stop",
+   "latency": 3.2
+  },
+  {
+   "pool": "code",
+   "provider": "kilo-cli",
+   "model": "kilo/kilo-auto/free",
+   "ok": true,
+   "http": 200,
+   "class": "",
+   "finish": "stop",
+   "latency": 12.5
+  },
+  {
+   "pool": "code",
+   "provider": "minimax",
+   "model": "MiniMax-M2",
+   "ok": true,
+   "http": 200,
+   "class": "",
+   "finish": "stop",
+   "latency": 2.2
+  },
+  {
+   "pool": "code",
+   "provider": "minimax",
+   "model": "MiniMax-M2.1",
+   "ok": true,
+   "http": 200,
+   "class": "",
+   "finish": "stop",
+   "latency": 2.4
+  },
+  {
+   "pool": "code",
+   "provider": "minimax",
+   "model": "MiniMax-M2.1-highspeed",
+   "ok": true,
+   "http": 200,
+   "class": "",
+   "finish": "stop",
+   "latency": 1.7
+  },
+  {
+   "pool": "code",
+   "provider": "minimax",
+   "model": "MiniMax-M2.5",
+   "ok": true,
+   "http": 200,
+   "class": "",
+   "finish": "stop",
+   "latency": 4.3
+  },
+  {
+   "pool": "code",
+   "provider": "minimax",
+   "model": "MiniMax-M2.5-highspeed",
+   "ok": true,
+   "http": 200,
+   "class": "",
+   "finish": "stop",
+   "latency": 2.6
+  },
+  {
+   "pool": "code",
+   "provider": "minimax",
+   "model": "MiniMax-M2.7",
+   "ok": true,
+   "http": 200,
+   "class": "",
+   "finish": "stop",
+   "latency": 2.6
+  },
+  {
+   "pool": "code",
+   "provider": "minimax",
+   "model": "MiniMax-M2.7-highspeed",
+   "ok": true,
+   "http": 200,
+   "class": "",
+   "finish": "stop",
+   "latency": 2.5
+  },
+  {
+   "pool": "code",
+   "provider": "minimax",
+   "model": "MiniMax-M3",
+   "ok": true,
+   "http": 200,
+   "class": "",
+   "finish": "stop",
+   "latency": 2.7
+  },
+  {
+   "pool": "privacy",
+   "provider": "mlx-mac",
+   "model": "qwen3.8-27b",
+   "ok": true,
+   "http": 200,
+   "class": "",
+   "finish": "stop",
+   "latency": 7.6
+  },
+  {
+   "pool": "swarm",
+   "provider": "xiaomi",
+   "model": "mimo-v2.5",
+   "ok": true,
+   "http": 200,
+   "class": "",
+   "finish": "length",
+   "latency": 1.7
+  },
+  {
+   "pool": "code",
+   "provider": "zai",
+   "model": "glm-4.7",
+   "ok": true,
+   "http": 200,
+   "class": "",
+   "finish": "stop",
+   "latency": 2.9
+  },
+  {
+   "pool": "code",
+   "provider": "zai",
+   "model": "glm-5.3-flash",
+   "ok": true,
+   "http": 200,
+   "class": "",
+   "finish": "stop",
+   "latency": 4.9
+  },
+  {
+   "pool": "code",
+   "provider": "alibaba",
+   "model": "deepseek-v4-flash-0731",
+   "ok": false,
+   "http": 400,
+   "class": "circuit_open",
+   "finish": null,
+   "latency": 0.1
+  },
+  {
+   "pool": "code",
+   "provider": "alibaba",
+   "model": "deepseek-v4-pro",
+   "ok": false,
+   "http": 429,
+   "class": "rate_limit_exceeded",
+   "finish": null,
+   "latency": 1.1
+  },
+  {
+   "pool": "code",
+   "provider": "alibaba",
+   "model": "deepseek-v4.1-flash",
+   "ok": false,
+   "http": 400,
+   "class": "circuit_open",
+   "finish": null,
+   "latency": 0.1
+  },
+  {
+   "pool": "premium",
+   "provider": "alibaba",
+   "model": "glm-5.2",
+   "ok": false,
+   "http": 429,
+   "class": "rate_limit_exceeded",
+   "finish": null,
+   "latency": 0.2
+  },
+  {
+   "pool": "premium",
+   "provider": "alibaba",
+   "model": "glm-5.3",
+   "ok": false,
+   "http": 429,
+   "class": "rate_limit_exceeded",
+   "finish": null,
+   "latency": 0.3
+  },
+  {
+   "pool": "code",
+   "provider": "alibaba",
+   "model": "qwen3.6-flash",
+   "ok": false,
+   "http": 429,
+   "class": "rate_limit_exceeded",
+   "finish": null,
+   "latency": 0.9
+  },
+  {
+   "pool": "premium",
+   "provider": "alibaba",
+   "model": "qwen3.7-max",
+   "ok": false,
+   "http": 429,
+   "class": "rate_limit_exceeded",
+   "finish": null,
+   "latency": 0.3
+  },
+  {
+   "pool": "code",
+   "provider": "alibaba",
+   "model": "qwen3.7-plus",
+   "ok": false,
+   "http": 429,
+   "class": "rate_limit_exceeded",
+   "finish": null,
+   "latency": 0.6
+  },
+  {
+   "pool": "code",
+   "provider": "alibaba",
+   "model": "qwen3.8-flash",
+   "ok": false,
+   "http": 429,
+   "class": "rate_limit_exceeded",
+   "finish": null,
+   "latency": 0.3
+  },
+  {
+   "pool": "premium",
+   "provider": "alibaba",
+   "model": "qwen3.8-max",
+   "ok": false,
+   "http": 429,
+   "class": "rate_limit_exceeded",
+   "finish": null,
+   "latency": 0.3
+  },
+  {
+   "pool": "code",
+   "provider": "github-copilot",
+   "model": "gpt-5.6-luna",
+   "ok": false,
+   "http": 400,
+   "class": "provider_route_disabled",
+   "finish": null,
+   "latency": 0.1
+  },
+  {
+   "pool": "premium",
+   "provider": "github-copilot-enterprise",
+   "model": "claude-opus-4.6",
+   "ok": false,
+   "http": 502,
+   "class": "http_502",
+   "finish": null,
+   "latency": 0.5
+  },
+  {
+   "pool": "premium",
+   "provider": "github-copilot-enterprise",
+   "model": "claude-sonnet-4.6",
+   "ok": false,
+   "http": 502,
+   "class": "http_502",
+   "finish": null,
+   "latency": 1.1
+  },
+  {
+   "pool": "premium",
+   "provider": "github-copilot-enterprise",
+   "model": "gpt-5.4",
+   "ok": false,
+   "http": 429,
+   "class": "rate_limit_exceeded",
+   "finish": null,
+   "latency": 1.1
+  },
+  {
+   "pool": "premium",
+   "provider": "github-copilot-enterprise",
+   "model": "gpt-5.5",
+   "ok": false,
+   "http": 429,
+   "class": "rate_limit_exceeded",
+   "finish": null,
+   "latency": 0.6
+  },
+  {
+   "pool": "code",
+   "provider": "github-copilot-enterprise",
+   "model": "gpt-5.6-luna",
+   "ok": false,
+   "http": 400,
+   "class": "circuit_open",
+   "finish": null,
+   "latency": 0.1
+  },
+  {
+   "pool": "premium",
+   "provider": "google",
+   "model": "gemini-3-pro",
+   "ok": false,
+   "http": 502,
+   "class": "http_502",
+   "finish": null,
+   "latency": 0.4
+  },
+  {
+   "pool": "code",
+   "provider": "google",
+   "model": "gemini-3.1-flash-lite",
+   "ok": false,
+   "http": 502,
+   "class": "http_502",
+   "finish": null,
+   "latency": 1.2
+  },
+  {
+   "pool": "code",
+   "provider": "google",
+   "model": "gemini-3.1-flash-lite-preview",
+   "ok": false,
+   "http": 502,
+   "class": "http_502",
+   "finish": null,
+   "latency": 1.8
+  },
+  {
+   "pool": "code",
+   "provider": "google",
+   "model": "gemini-3.5-flash",
+   "ok": false,
+   "http": 200,
+   "class": "empty_response",
+   "finish": "length",
+   "latency": 1.7
+  },
+  {
+   "pool": "code",
+   "provider": "groq",
+   "model": "openai/gpt-oss-20b",
+   "ok": false,
+   "http": 200,
+   "class": "empty_response",
+   "finish": "length",
+   "latency": 0.3
+  },
+  {
+   "pool": "code",
+   "provider": "groq",
+   "model": "qwen/qwen3.6-27b",
+   "ok": false,
+   "http": 502,
+   "class": "http_502",
+   "finish": null,
+   "latency": 0.2
+  },
+  {
+   "pool": "premium",
+   "provider": "openai-codex",
+   "model": "gpt-5.4",
+   "ok": false,
+   "http": 502,
+   "class": "http_502",
+   "finish": null,
+   "latency": 0.1
+  },
+  {
+   "pool": "code",
+   "provider": "openai-codex",
+   "model": "gpt-5.4-mini",
+   "ok": false,
+   "http": 400,
+   "class": "circuit_open",
+   "finish": null,
+   "latency": 0.1
+  },
+  {
+   "pool": "premium",
+   "provider": "openai-codex",
+   "model": "gpt-5.5",
+   "ok": false,
+   "http": 502,
+   "class": "http_502",
+   "finish": null,
+   "latency": 0.1
+  },
+  {
+   "pool": "code",
+   "provider": "openai-codex",
+   "model": "gpt-5.6-luna",
+   "ok": false,
+   "http": 400,
+   "class": "circuit_open",
+   "finish": null,
+   "latency": 0.1
+  },
+  {
+   "pool": "premium",
+   "provider": "openai-codex",
+   "model": "gpt-5.6-sol",
+   "ok": false,
+   "http": 502,
+   "class": "http_502",
+   "finish": null,
+   "latency": 0.1
+  },
+  {
+   "pool": "premium",
+   "provider": "openai-codex",
+   "model": "gpt-5.6-terra",
+   "ok": false,
+   "http": 502,
+   "class": "http_502",
+   "finish": null,
+   "latency": 0.1
+  },
+  {
+   "pool": "code",
+   "provider": "opencode-cli",
+   "model": "big-pickle",
+   "ok": false,
+   "http": 503,
+   "class": "service_unavailable",
+   "finish": null,
+   "latency": 0.2
+  },
+  {
+   "pool": "code",
+   "provider": "opencode-cli",
+   "model": "cat-jam-free",
+   "ok": false,
+   "http": 503,
+   "class": "service_unavailable",
+   "finish": null,
+   "latency": 0.2
+  },
+  {
+   "pool": "code",
+   "provider": "opencode-cli",
+   "model": "longcat-2.5-preview-free",
+   "ok": false,
+   "http": 503,
+   "class": "service_unavailable",
+   "finish": null,
+   "latency": 0.1
+  },
+  {
+   "pool": "code",
+   "provider": "opencode-cli",
+   "model": "mimo-v2.6-flash-free",
+   "ok": false,
+   "http": 503,
+   "class": "service_unavailable",
+   "finish": null,
+   "latency": 0.1
+  },
+  {
+   "pool": "code",
+   "provider": "opencode-cli",
+   "model": "muse-spark-1.3-contributor-free",
+   "ok": false,
+   "http": 503,
+   "class": "service_unavailable",
+   "finish": null,
+   "latency": 0.2
+  },
+  {
+   "pool": "code",
+   "provider": "opencode-cli",
+   "model": "nemotron-3.5-lightning-free",
+   "ok": false,
+   "http": 503,
+   "class": "service_unavailable",
+   "finish": null,
+   "latency": 0.2
+  },
+  {
+   "pool": "code",
+   "provider": "opencode-cli",
+   "model": "space-bunny-free",
+   "ok": false,
+   "http": 503,
+   "class": "service_unavailable",
+   "finish": null,
+   "latency": 0.1
+  },
+  {
+   "pool": "code",
+   "provider": "opencode-cli",
+   "model": "step-5-preview-free",
+   "ok": false,
+   "http": 503,
+   "class": "service_unavailable",
+   "finish": null,
+   "latency": 0.2
+  },
+  {
+   "pool": "swarm",
+   "provider": "opencode-go",
+   "model": "deepseek-v4-flash",
+   "ok": false,
+   "http": 502,
+   "class": "http_502",
+   "finish": null,
+   "latency": 0.4
+  },
+  {
+   "pool": "premium",
+   "provider": "opencode-go",
+   "model": "deepseek-v4-pro",
+   "ok": false,
+   "http": 502,
+   "class": "http_502",
+   "finish": null,
+   "latency": 0.5
+  },
+  {
+   "pool": "code",
+   "provider": "opencode-go",
+   "model": "qwen3.6-plus",
+   "ok": false,
+   "http": 502,
+   "class": "http_502",
+   "finish": null,
+   "latency": 0.8
+  },
+  {
+   "pool": "code",
+   "provider": "synthetic",
+   "model": "syn:large:text",
+   "ok": false,
+   "http": 200,
+   "class": "empty_response",
+   "finish": "length",
+   "latency": 2.9
+  },
+  {
+   "pool": "premium",
+   "provider": "synthetic",
+   "model": "syn:large:vision",
+   "ok": false,
+   "http": 200,
+   "class": "empty_response",
+   "finish": "length",
+   "latency": 2.1
+  },
+  {
+   "pool": "code",
+   "provider": "synthetic",
+   "model": "syn:small:text",
+   "ok": false,
+   "http": 200,
+   "class": "empty_response",
+   "finish": "length",
+   "latency": 2.4
+  },
+  {
+   "pool": "code",
+   "provider": "synthetic",
+   "model": "syn:small:vision",
+   "ok": false,
+   "http": 200,
+   "class": "empty_response",
+   "finish": "length",
+   "latency": 3.7
+  }
+ ]
+}

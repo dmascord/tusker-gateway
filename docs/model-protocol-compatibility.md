@@ -344,25 +344,54 @@ change on their own; only fresh probe evidence or an operator override does
 |Provider|Route shape|Family|Confidence|Evidence status|
 |---|---|---|---|---|
 |`deepseek`|native|`deepseek`|`provider`|**NOT TESTED live** — no probe run; matrix replays the shape offline|
-|`zai`|native|`glm`|`provider`|**NOT TESTED live**|
-|`minimax`|native|`minimax`|`provider`|**NOT TESTED live**|
-|`moonshot`|native|`kimi`|`provider`|**NOT TESTED live**|
-|`xiaomi`|native|`mimo`|`heuristic`|**NOT TESTED live**|
-|`openai` / `apim`|native|`openai`|`heuristic`|**NOT TESTED live**|
+|`zai`|native|`glm`|`provider`|**TESTED live 2026-10-18** — `glm-4.7`, `glm-5.3-flash` real turns, 200, content present|
+|`minimax`|native|`minimax`|`provider`|**TESTED live 2026-10-18** — M2/M2.1/M2.5/M2.7/M3 incl. highspeed, 8/8 real turns 200|
+|`moonshot`|native|`kimi`|`provider`|**NOT TESTED live** (not configured in any pool)|
+|`xiaomi`|native|`mimo`|`heuristic`|**TESTED live 2026-10-18** — `mimo-v2.5` real turn 200 (`mimo-v2.6` upstream-side quota/cooldown)|
+|`openai` / `apim`|native|`openai`|`heuristic`|**TESTED live 2026-10-18** — `apim/gpt-5.6-luna` real turn 200. `groq gpt-oss-20b` 200 (reasoning consumed the 16-token budget; content confirmed at 64 tokens)|
 |`openrouter` → `deepseek/*`|third-party host|`deepseek`|`heuristic`|**NOT TESTED** — a family hint is not proof the host implements the dialect|
 |`openrouter` → `qwen*`|third-party host|`qwen`|`heuristic`|**NOT TESTED**|
 |`openrouter` → `moonshotai/kimi*`|third-party host|`kimi`|`heuristic`|**NOT TESTED**|
-|`openrouter` → `google/gemini*`|third-party host|`gemini`|`heuristic`|**NOT TESTED**|
+|`openrouter` → `google/gemini*`|third-party host|`gemini`|`heuristic`|`gemini-3.5-flash` and `flash-lite` reached the real API: `flash` returned a correct turn; `flash-lite` models got upstream 503 high-demand. `gemini-3-pro` slug does not exist upstream (`not found for API version v1main` → config drift)|
 |`openrouter` → `anthropic/claude*`|third-party host|`claude`|`heuristic`|**NOT TESTED**|
 |`openrouter` → `mistralai/*`|third-party host|`unknown`|`unknown`|**NOT TESTED** — unknown is the honest verdict|
 
+### Full live sweep (2026-10-18, one minimal turn per configured candidate)
+
+58 unique `(provider, model)` candidates across the `code`/`premium`/
+`privacy`/`swarm` pools, routed via qualified slug through production,
+`max_tokens=16`, no retries. First pass 15/58 HTTP 200 with content; the
+failure classes decompose as follows and none are protocol regressions:
+
+|Failure class|Count|Verified root cause|
+|---|---|---|
+|`rate_limit_exceeded` / 429|10|alibaba month quota exhausted (resets 2026-11-10); github-copilot-enterprise + xiaomi + ollama-cloud quota windows|
+|HTTP 502 (upstream refused)|13|openai-codex + ollama-cloud `no usable OAuth credential` (all pool credentials cooling); github-copilot-enterprise `model not available for integrator`; google 503 high-demand surfaced as 502; groq `qwen3.6-27b does not exist` (config drift); opencode-go `api_key_expired` (needs a new OpenCode Console key)|
+|`service_unavailable` 503|8|opencode-cli upstream capacity (all free models)|
+|`circuit_open` 400|5 (+ later retests)|opened by the sweep itself against already-failing upstreams; expected protection, not a fault|
+|`empty_response` 200|6|**false alarm** — reasoning-first models consumed the 16-token completion budget; all 6 return correct content at `max_tokens=64`|
+|`provider_route_disabled`|1|github-copilot `gpt-5.6-luna` route disabled in config|
+
+Working end-to-end on the day: minimax (8/8), zai (2/2), xiaomi mimo-v2.5,
+kilo-cli free tier, claude-code-cli sonnet, apim gpt-5.6-luna,
+mlx-mac qwen3.8-27b (privacy + swarm per-model), google gemini-3.5-flash,
+groq gpt-oss-20b, synthetic (all 4 variants at 64 tokens), plus the
+operator-authorized billable probes above.
+
+Action items surfaced (config/credential, not code): renew the opencode-go
+API key, re-enrol an openai-codex/ollama-cloud OAuth credential, fix or
+remove the stale `groq/qwen3.6-27b` and `google/gemini-3-pro` slugs, review
+the disabled github-copilot `gpt-5.6-luna` route, and expect alibaba to
+recover at its monthly quota reset.
+
 `NOT TESTED live` means exactly that: the request/response shapes are
-replayed deterministically against the simulator, but no billable probe has
-been run against the provider, so the gateway treats the route as
-unverified (no replay adaptation, no parameter injection). Live probing is
-the authorised-operator step described under *Operator overrides and
-per-attempt diagnostics*; the results land in the evidence store and are
-readable at `GET /admin/protocol/evidence`.
+replayed deterministically against the simulator, and no live probe has been
+run for that specific route, so the gateway treats the route as
+unverified (no replay adaptation, no parameter injection). The live probes
+that have run (sweep above) exercise the configured candidates through
+production and record the per-provider evidence in *Operator overrides and
+per-attempt diagnostics*; results remain readable at
+`GET /admin/protocol/evidence`.
 
 The distinction that matters is **native vs third-party host**. A native
 provider's family hint can be trusted (the gateway knows which API the
