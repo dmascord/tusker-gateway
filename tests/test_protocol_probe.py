@@ -39,7 +39,7 @@ def test_failover_does_not_mutate_original_history():
     from tusker_gateway.protocol_compat import adapt_upstream_chat
     messages = [{"role": "assistant", "reasoning": "original", "content": None}]
     native = {"messages": messages}
-    adapt_upstream_chat(native, "deepseek", "deepseek-chat")
+    adapt_upstream_chat(native, "deepseek", "deepseek-chat", verified_features=frozenset({"reasoning_replay"}))
     assert native["messages"] is not messages
     assert native["messages"][0]["reasoning_content"] == "original"
     assert "reasoning_content" not in messages[0]
