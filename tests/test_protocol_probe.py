@@ -5,7 +5,7 @@ from tusker_gateway.protocol_probe import classify_probe
 def _response(arguments='{"query":"hello"}', finish="tool_calls"):
     return {"choices": [{"finish_reason": finish, "message": {
         "tool_calls": [{"id": "call_1", "type": "function",
-                        "function": {"name": "search", "arguments": arguments}}],
+                        "function": {"name": "protocol_probe_echo", "arguments": arguments}}],
     }}]}
 
 
