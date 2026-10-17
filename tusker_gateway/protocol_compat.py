@@ -51,14 +51,24 @@ def adapt_upstream_chat(body: dict[str, Any], provider: str, model: str) -> Prot
     existing provider-specific transformations remain authoritative.
     """
     profile = resolve_protocol(provider, model)
-    if profile.replay_reasoning:
-        # Retain original assistant reasoning_content on continuation turns.
-        # Do not synthesize absent thinking or duplicate it into content.
-        for message in body.get("messages", []):
-            if not isinstance(message, dict) or message.get("role") != "assistant":
-                continue
-            if message.get("reasoning_content") is None and isinstance(message.get("reasoning"), str):
-                message["reasoning_content"] = message["reasoning"]
+    if profile.replay_reasoning and isinstance(body.get("messages"), list):
+        # Copy-on-write: candidate failover must not mutate the shared
+        # conversation history for a different provider's replay dialect.
+        changed = False
+        mapped = []
+        for message in body["messages"]:
+            if (
+                isinstance(message, dict)
+                and message.get("role") == "assistant"
+                and message.get("reasoning_content") is None
+                and isinstance(message.get("reasoning"), str)
+            ):
+                mapped.append({**message, "reasoning_content": message["reasoning"]})
+                changed = True
+            else:
+                mapped.append(message)
+        if changed:
+            body["messages"] = mapped
     return profile
 
 
