@@ -80,6 +80,9 @@ SPEND_GUARD_ENV = (
     ("TUSKER_QUALIFICATION_MAINTENANCE_ENABLED", "false"),
     # Same, restricted to response_format=json_schema contracts.
     ("TUSKER_STRUCTURED_QUALIFICATION_ENABLED", "false"),
+    # Input-modality probes: one upstream round trip per candidate model,
+    # rotating through the code/premium/swarm pools.
+    ("TUSKER_MODALITY_QUALIFICATION_ENABLED", "false"),
     # Generates media against image/video providers.
     ("TUSKER_MEDIA_QUALIFICATION_ENABLED", "false"),
 )

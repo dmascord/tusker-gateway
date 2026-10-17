@@ -145,3 +145,31 @@ def test_unrelated_env_passes_through() -> None:
     dep = _canary._build_canary_deployment(_live(), f"registry.tusker.net.au:5000/tusker-gateway@{_DIGEST}")
     env = dep["spec"]["template"]["spec"]["containers"][0]["env"]
     assert {"name": "TUSKER_OPENCODE_WARM_ENABLED", "value": "1"} in env
+
+
+
+def test_spend_guard_covers_every_qualification_loop_toggle() -> None:
+    """Every interval-driven qualification toggle the code reads must be guarded.
+
+    Regression: ``TUSKER_MODALITY_QUALIFICATION_ENABLED`` was missing from the
+    guard while production ran it ``true``, so the canary would have probed
+    every candidate model upstream on a 12h timer against shared credentials.
+    Derive the required set from the gateway source (not the guard literal) so a
+    newly added loop cannot silently escape the guard.
+    """
+    import re
+
+    src_root = Path(__file__).resolve().parent.parent / "tusker_gateway"
+    pattern = re.compile(
+        r'os\.environ\.get\(\s*"'
+        r'(TUSKER_[A-Z0-9_]*QUALIFICATION[A-Z0-9_]*ENABLED)'
+        r'"'
+    )
+    toggles: set[str] = set()
+    for path in src_root.rglob("*.py"):
+        toggles.update(pattern.findall(path.read_text(encoding="utf-8")))
+
+    assert toggles, "expected to discover qualification toggles in tusker_gateway/"
+    guarded = {name for name, _ in _canary.SPEND_GUARD_ENV}
+    missing = toggles - guarded
+    assert not missing, f"qualification loops not spend-guarded: {sorted(missing)}"
