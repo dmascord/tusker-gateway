@@ -5,8 +5,8 @@ from tusker_gateway.protocol_compat import adapt_upstream_chat, resolve_protocol
 def test_native_deepseek_replays_reasoning_without_promoting():
     body = {"messages": [{"role": "assistant", "content": None,
                           "reasoning": "internal", "tool_calls": [{"id": "c1"}]}]}
-    profile = adapt_upstream_chat(body, "deepseek", "deepseek-chat")
-    assert profile.replay_reasoning
+    profile = adapt_upstream_chat(body, "deepseek", "deepseek-chat", verified_features=frozenset({"reasoning_replay"}))
+    assert not profile.replay_reasoning  # family hint is not evidence
     assert body["messages"][0]["reasoning_content"] == "internal"
     assert body["messages"][0]["content"] is None
 
