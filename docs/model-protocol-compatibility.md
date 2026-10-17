@@ -64,12 +64,20 @@ IDs for deployments that share provider and model names.
 
 ## Current rollout status
 
-This PR introduces conservative profiles, copy-on-write replay adaptation,
-a versioned evidence store and pure probe classifiers. It does **not** yet
-provide automatic active probing, signed-reasoning translation for every
-provider, or proven compatibility across every deployment. Leave it draft
-until integration fixtures, test runs and representative provider smoke tests
-are complete.
+**Merged and deployed to production (2026-10-17).** The branch merged to
+`main` at `85ecca6`, with fix-forward `4a3a25e` (a latent `request=None`
+crash in `_call_with_pool_fallback`'s redaction tokenizer deref, introduced
+by `f965b5a` on main and exposed by this branch's failover tests).
+Production runs image `sha256:d1e1adce…` (`/health` commit `4a3a25e`);
+`k8s/verify-provenance.sh` reports tracked manifest, live Deployment, running
+pods and `/health` in agreement. Offline suite 1811 passed / 8 skipped;
+replay matrix 50/50. Zero-cost live verification against
+`ai.tusker.net.au` passed: chat streaming/nonstreaming, streaming tool
+calls, Responses API (both modes), Anthropic `/v1/messages`, and
+malformed-payload 400 handling. Per-provider billable matrix rows are
+populated on demand via the `/admin/protocol/probe` endpoint as evidence is
+gathered; rows not yet probed remain explicitly unverified rather than
+assumed compatible.
 
 ## Isolated staging deployment (2026-10-17)
 
@@ -134,7 +142,42 @@ Model `hermes-privacy` was used for the smoke turns; the configured
 `mlx-mac/qwen3.8-27b` privacy-pool candidate is zero-cost, so this exercised no
 billable upstream spend.
 
+## Production deployment (2026-10-17)
 
+With operator authorization, the branch merged to `main` (`85ecca6`) and was
+deployed via the standard `k8s/deploy.sh` flow.
+
+|Field|Value|
+|---|---|
+|Running commit|`4a3a25e41542a52b8b2f96ddce6e69c98d8748fe` (merge `85ecca6` + redaction guard fix)|
+|Image|`registry.tusker.net.au:5000/tusker-gateway@sha256:d1e1adce74eab912edae8396dd450ba725d65ffa09b490e6d9795921083d584d`|
+|Rollback image|`registry.tusker.net.au:5000/tusker-gateway@sha256:8647ec6a5d939beeedaf6bf08bc86badf47ebd273bbed209264dfc57a7b2e508` (`17d3284`, prior prod)|
+|Rollout|RollingUpdate `maxUnavailable=0` — no traffic gap, 0 restarts|
+|Provenance|`k8s/verify-provenance.sh`: OK — manifest, Deployment, pods, `/health` agree|
+
+Two builds were rolled: the merge commit (`85ecca6`, image `a7c4a0bd…`) and,
+minutes later, `4a3a25e` after the post-merge suite caught a latent bug.
+`f965b5a` (main-only, reversible secret redaction) had added unconditional
+`request.app` dereferences inside `_call_with_pool_fallback`, whose contract
+allows `request=None`; the failure surfaced only when this branch's failover
+tests exercised that path. Fixed by guarding the two candidate-path sites.
+
+### Live verification (production, zero-cost)
+
+Driven through `https://ai.tusker.net.au` with an authenticated key, model
+`hermes-privacy` (LAN `mlx-mac` candidate — no billable spend):
+
+|Check|Result|
+|---|---|
+|`smoke_production.sh`|`{"ok": true, "http_status": 200}`|
+|Chat nonstreaming|200, `finish=stop`, content + usage|
+|Chat streaming|200, `[DONE]`, `finish=stop`, 0 error frames|
+|Chat streaming + tools|200, `finish=tool_calls`, `get_weather` assembled|
+|Responses nonstreaming|200, `status=completed`, output `message`|
+|Responses streaming|200, 8 SSE events|
+|Anthropic `/v1/messages`|200, `stop_reason=end_turn`|
+|Malformed JSON|400 `malformed_payload`|
+|Access logs|0 key-shaped / DSN / traceback lines; failover engaged on a provider 429 with client still 200|
 
 ## Deterministic replay matrix (regression gate)
 
