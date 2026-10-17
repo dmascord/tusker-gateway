@@ -7,6 +7,7 @@ unrelated upstream providers.
 from __future__ import annotations
 
 from typing import Any
+from copy import deepcopy
 
 # Fields known to carry opaque provider continuation state.
 _OPAQUE_KEYS = frozenset({
@@ -21,18 +22,7 @@ _REASONING_KEYS = frozenset({
 
 def copy_replay_message(message: dict[str, Any]) -> dict[str, Any]:
     """Preserve provider-owned reasoning payloads without mutating history."""
-    copied = dict(message)
-    if isinstance(message.get("tool_calls"), list):
-        copied["tool_calls"] = [
-            dict(call) if isinstance(call, dict) else call
-            for call in message["tool_calls"]
-        ]
-    if isinstance(message.get("content"), list):
-        copied["content"] = [
-            dict(part) if isinstance(part, dict) else part
-            for part in message["content"]
-        ]
-    return copied
+    return deepcopy(message)
 
 
 def strip_cross_provider_replay(
