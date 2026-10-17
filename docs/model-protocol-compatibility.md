@@ -71,6 +71,70 @@ provider, or proven compatibility across every deployment. Leave it draft
 until integration fixtures, test runs and representative provider smoke tests
 are complete.
 
+## Isolated staging deployment (2026-10-17)
+
+The PR commit was deployed to an isolated staging deployment
+(`tusker-gateway-config-canary`, namespace `hermes`) via
+`k8s/config-canary.py`, which clones the live production pod spec, remaps the
+state DSN and encryption key to canary-specific secrets, and pins an immutable
+image digest. Production was not modified.
+
+|Field|Value|
+|---|---|
+|PR branch|`feat/model-protocol-compatibility-20261017`|
+|Deployed commit|`68acf91ee8282b6708be68ade7eb301a0f54e805`|
+|Image|`registry.tusker.net.au:5000/tusker-gateway@sha256:fb87e7ae1036a24aae5beda8a1984eb1e2ef7a72f126e5b7b03c2dbe19a051e5`|
+|Rollback image|`registry.tusker.net.au:5000/tusker-gateway@sha256:8647ec6a5d939beeedaf6bf08bc86badf47ebd273bbed209264dfc57a7b2e508` (production, unchanged)|
+|State store|isolated canary Postgres `tusker_gateway_config_canary` (`degraded=false`)|
+|Config generation|`/health` → `config_runtime_status.generation` live-reloaded, no restart|
+
+`/health` reports `commit == 68acf91…` and `/ready` returns `status=ok`, so the
+running pod is the intended source revision. Rollout: 1/1 ready, 0 restarts.
+
+### Spend guard
+
+The renderer copies production env verbatim, so upstream-calling background
+loops would otherwise inherit production's `true` and run unattended against
+the shared provider credentials. `SPEND_GUARD_ENV` drops and re-appends the
+interval-driven qualification loops disabled, and
+`tests/test_config_canary_renderer.py` asserts the guarded set covers every
+`TUSKER_*QUALIFICATION*_ENABLED` toggle the gateway source reads. Verified in
+the running pod's `/proc/1/environ`:
+
+```
+TUSKER_CONFIG_CANARY=true
+TUSKER_QUALIFICATION_MAINTENANCE_ENABLED=false
+TUSKER_STRUCTURED_QUALIFICATION_ENABLED=false
+TUSKER_MODALITY_QUALIFICATION_ENABLED=false
+TUSKER_MEDIA_QUALIFICATION_ENABLED=false
+```
+
+### Live verification
+
+All calls authenticated with a production API key read server-side inside the
+canary pod (never written to a file, argv, or logs) and driven against
+`127.0.0.1:8642`.
+
+|Check|Result|
+|---|---|
+|`/health`, `/ready`|200; commit matches; state store `postgres`, not degraded|
+|Chat (streaming)|200; `finish_reason=stop`; `[DONE]`; 0 error frames|
+|Chat (streaming, tool call)|200; `finish_reason=tool_calls`; `get_weather` assembled|
+|Chat (nonstreaming)|200; `finish_reason=stop`; usage present|
+|Responses API (nonstreaming)|200; `status=completed`; output type `message`|
+|Responses API (streaming)|200; 8 SSE events|
+|Malformed JSON body|400 `malformed_payload`|
+|Unknown model slug|200 (pool routing selects a configured candidate)|
+|Admin `POST /admin/protocol/probe` (no auth)|401 `invalid_api_key`|
+|Admin routes (non-admin key)|403 `insufficient_scope`|
+|Admin routes registered in image|probe + evidence present with access middleware|
+|Logs (204 lines)|0 key-shaped, 0 DSN-shaped, 0 tracebacks; fingerprints hashed|
+
+Model `hermes-privacy` was used for the smoke turns; the configured
+`mlx-mac/qwen3.8-27b` privacy-pool candidate is zero-cost, so this exercised no
+billable upstream spend.
+
+
 
 ## Deterministic replay matrix (regression gate)
 
