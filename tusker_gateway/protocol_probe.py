@@ -59,7 +59,8 @@ def classify_probe(
             and isinstance(call.get("function"), dict)
             and isinstance(call["function"].get("name"), str)
             and isinstance(call["function"].get("arguments"), str)
-            and _json_valid(call["function"]["arguments"])
+            and call["function"]["name"] == "protocol_probe_echo"
+            and _echo_arguments_valid(call["function"]["arguments"])
             for call in calls
         )
     )
@@ -86,3 +87,11 @@ def _json_valid(value: str) -> bool:
         return True
     except (ValueError, TypeError):
         return False
+
+
+def _echo_arguments_valid(value: str) -> bool:
+    try:
+        parsed = json.loads(value)
+    except (ValueError, TypeError):
+        return False
+    return isinstance(parsed, dict) and parsed.get("value") == "ok"
