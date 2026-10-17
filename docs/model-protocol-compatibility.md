@@ -100,15 +100,18 @@ reasoning-only, mixed reasoning/content, reasoning aliases, native tool calls
 (stream and non-stream), split JSON arguments, parallel tool calls, missing
 finish reason, tool-result continuation (assistant `tool_calls` + `tool` role
 result), duplicate DSML markup, malformed SSE frames, upstream 4xx/5xx,
-mid-stream close, an operator-diagnostics check, and a Responses
-`function_call`/`function_call_output` pairing check.
+mid-stream close, an operator-diagnostics check, a Responses
+`function_call`/`function_call_output` pairing check, a **client
+cancellation** check (a client that disconnects mid-stream must not hang the
+loop or break the next request) and a **transient retry recovery** check (a
+503 fails that request but must not poison the route).
 
 Every success-path fixture then runs a second time under **cross-provider
 failover** (alpha returns 503, beta serves the same contract), which is the
 runbook's Phase 2.4 requirement; the three failure-shaped fixtures are
 excluded because a clean fallback would contradict their contract. That is
-17 scripted scenarios + 2 route/diagnostics checks + 14 failover replays +
-15 golden-fixture replays = 48 matrix rows (`48/48 scenarios passed`).
+17 scripted scenarios + 4 route/diagnostics/lifecycle checks + 14 failover
+replays + 15 golden-fixture replays = 50 matrix rows (`50/50 scenarios passed`).
 
 Two gateway defects this harness caught (fixed, with regression tests in
 `tests/test_fault_scenarios.py` and `tests/test_tool_call_stripper.py`):

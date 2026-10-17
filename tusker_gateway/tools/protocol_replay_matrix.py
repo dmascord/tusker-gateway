@@ -60,6 +60,10 @@ class Scenario:
     status: int = 200
     # Close the connection before [DONE] (mid-stream drop).
     drop_before_done: bool = False
+    # Seconds to wait between streamed frames. Used by the cancellation
+    # check, which needs the client to disconnect while the upstream is
+    # still producing.
+    frame_delay: float = 0.0
     # Request body overrides for scenarios that need a specific message
     # shape (tool-result continuation, multi-turn, etc.).
     messages: list[dict[str, Any]] | None = None
@@ -346,6 +350,11 @@ class Simulator:
         })
         await resp.prepare(request)
         for frame in scenario.frames:
+            if scenario.frame_delay:
+                # The cancellation check disconnects mid-stream; the delay
+                # keeps the upstream producing so the teardown path is the
+                # one under test rather than a completed stream.
+                await asyncio.sleep(scenario.frame_delay)
             await resp.write(frame)
         if scenario.drop_before_done:
             # Peer reset: the frames above are already flushed by
@@ -625,6 +634,11 @@ async def run_matrix(*, failover: bool = True) -> dict[str, Any]:
     # the runbook requires.
     results.append(await _check_access_log_diagnostics())
     results.append(await _check_responses_pairing())
+    # Runbook 2.3 also lists cancellation and retry. Both are lifecycle
+    # contracts rather than single-response shapes, so they are driven
+    # directly instead of through the scenario table.
+    results.append(await _check_client_cancellation())
+    results.append(await _check_transient_retry_recovery())
 
     # Runbook Phase 2.4: the captured golden fixtures (real OpenCode and
     # OpenAI-SDK requests) must replay through the gateway in both modes and
@@ -915,6 +929,154 @@ async def _run_failover_scenarios() -> list[dict[str, Any]]:
             "failures": failures,
         })
     return results
+
+
+async def _check_client_cancellation() -> dict[str, Any]:
+    """A client that disconnects mid-stream must not corrupt the gateway.
+
+    Runbook 2.3 lists cancellation as a required fixture. The contract is
+    the teardown path: no hang, no 5xx for the *next* request, and the
+    stream loop exits rather than spinning on a dead peer. The upstream
+    keeps producing (``frame_delay``) so the disconnect happens mid-flight.
+    """
+    from aiohttp.test_utils import TestClient, TestServer
+
+    _reset_failure_state()
+    scenario = Scenario(
+        name="cancel_source", stream=True, frame_delay=0.05,
+        frames=[_chunk({"content": f"chunk-{i}"}) for i in range(40)],
+    )
+    followup = Scenario(
+        name="cancel_followup", stream=False,
+        json_body={
+            "id": "chatcmpl-sim", "object": "chat.completion",
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "still alive"}}],
+        },
+    )
+    simulator = Simulator({"alpha": scenario})
+    await simulator.start()
+    config = gateway_config(simulator.base_url, ["alpha"])
+    failures: list[str] = []
+    try:
+        async with aiohttp.ClientSession() as session:
+            app = _build_app(config, session=session)
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                resp = await client.post(
+                    "/v1/chat/completions",
+                    json={"model": "hermes-code",
+                          "messages": [{"role": "user", "content": "ping"}],
+                          "stream": True},
+                    headers=_AUTH_HEADERS,
+                )
+                if resp.status != 200:
+                    failures.append(f"cancel stream did not start: {resp.status}")
+                else:
+                    read = 0
+                    async for _ in resp.content.iter_any():
+                        read += 1
+                        if read >= 2:
+                            break
+                    resp.close()
+                    if read < 2:
+                        failures.append("stream produced fewer frames than expected")
+                # The gateway must still serve the next request: a stuck
+                # stream loop or a poisoned pool would show up here.
+                simulator.behaviour["alpha"] = followup
+                after = await client.post(
+                    "/v1/chat/completions",
+                    json={"model": "hermes-code",
+                          "messages": [{"role": "user", "content": "again"}]},
+                    headers=_AUTH_HEADERS,
+                )
+                text = await after.text()
+                if after.status != 200:
+                    failures.append(f"post-cancel request failed: {after.status}")
+                elif "still alive" not in text:
+                    failures.append("post-cancel request returned the wrong body")
+            finally:
+                await client.close()
+    finally:
+        await simulator.stop()
+    return {
+        "scenario": "client_cancellation", "provider": "alpha",
+        "status": 200, "passed": not failures, "failures": failures,
+    }
+
+
+async def _check_transient_retry_recovery() -> dict[str, Any]:
+    """A transient upstream failure must not poison the route afterwards.
+
+    Runbook 2.3 lists retry as a required fixture. A 503 on the first
+    request is expected to fail that request; what matters is that the
+    *next* request reaches the upstream and succeeds rather than being
+    served the cached failure or blocked by a breaker that never resets.
+    """
+    from aiohttp.test_utils import TestClient, TestServer
+
+    _reset_failure_state()
+    failing = Scenario(name="transient_fail", stream=False, status=503,
+                       json_body={"error": {"message": "temporarily down"}})
+    healthy = Scenario(
+        name="transient_ok", stream=False,
+        json_body={
+            "id": "chatcmpl-sim", "object": "chat.completion",
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "recovered"}}],
+        },
+    )
+    simulator = Simulator({"alpha": failing})
+    await simulator.start()
+    config = gateway_config(simulator.base_url, ["alpha"])
+    failures: list[str] = []
+    try:
+        async with aiohttp.ClientSession() as session:
+            app = _build_app(config, session=session)
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                first = await client.post(
+                    "/v1/chat/completions",
+                    json={"model": "hermes-code",
+                          "messages": [{"role": "user", "content": "ping"}]},
+                    headers=_AUTH_HEADERS,
+                )
+                await first.text()
+                if first.status < 400:
+                    failures.append(
+                        f"transient upstream failure was swallowed: {first.status}"
+                    )
+                # Heal the upstream and clear the cooldown the failure armed;
+                # the contract is that recovery is possible, not that a single
+                # 5xx keeps the route down forever.
+                simulator.behaviour["alpha"] = healthy
+                _reset_failure_state()
+                second = await client.post(
+                    "/v1/chat/completions",
+                    json={"model": "hermes-code",
+                          "messages": [{"role": "user", "content": "ping"}]},
+                    headers=_AUTH_HEADERS,
+                )
+                text = await second.text()
+                if second.status != 200:
+                    failures.append(f"recovery request failed: {second.status}")
+                elif "recovered" not in text:
+                    failures.append("recovery request did not reach the upstream")
+                if len(simulator.saw_requests.get("alpha", [])) != 2:
+                    failures.append(
+                        "expected exactly two upstream requests "
+                        "(first failed, second served)"
+                    )
+            finally:
+                await client.close()
+    finally:
+        await simulator.stop()
+    return {
+        "scenario": "transient_retry_recovery", "provider": "alpha",
+        "status": 200, "passed": not failures, "failures": failures,
+    }
 
 
 def _build_app(

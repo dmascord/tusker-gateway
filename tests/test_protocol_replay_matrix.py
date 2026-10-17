@@ -42,6 +42,10 @@ REQUIRED_SCENARIOS = {
 REQUIRED_EXTRA_SCENARIOS = {
     "operator_diagnostics",
     "responses_pairing",
+    # Runbook 2.3 lists cancellation and retry alongside the response-shape
+    # fixtures. Both are lifecycle contracts driven directly by the matrix.
+    "client_cancellation",
+    "transient_retry_recovery",
 }
 
 # Failure-shaped fixtures: their contract is the failure surface itself, so
