@@ -3820,6 +3820,30 @@ def _cooldown_for_exc(exc: GatewayError) -> float | None:
         return None
 
 
+def _sanitize_cross_provider_messages(messages: Any) -> list[dict[str, Any]]:
+    """Strip opaque provider replay state for cross-provider failover.
+
+    Assistant turns produced by upstream A can carry reasoning channels and
+    opaque signatures that only A can consume. When a failover selects a
+    different upstream B, that state is removed from a deep copy (the
+    caller's conversation history is never mutated). Ordinary content and
+    tool calls survive so B can still answer the same turn.
+    """
+    from tusker_gateway.protocol_signatures import strip_cross_provider_replay
+
+    if not isinstance(messages, list):
+        return messages
+    sanitized: list[dict[str, Any]] = []
+    for message in messages:
+        if isinstance(message, dict) and message.get("role") == "assistant":
+            sanitized.append(strip_cross_provider_replay(message, same_upstream=False))
+        else:
+            import copy as _copy
+
+            sanitized.append(_copy.deepcopy(message))
+    return sanitized
+
+
 def _max_pool_provider_attempts() -> int:
     """Bound per-request fallback work so one outage cannot stall OMP."""
     try:
@@ -4690,6 +4714,7 @@ async def _call_with_pool_fallback(
     active_pool = pool_names[pool_index]
     pending_selection = initial_selection
     attempts = max(0, attempt_offset)
+    first_provider: str | None = None
     max_attempts = _max_pool_provider_attempts()
     recovery_probe = False
     tool_compatibility_probe = False
@@ -4843,6 +4868,8 @@ async def _call_with_pool_fallback(
                 excluded.add(selected)
                 continue
         provider, model = selected
+        if first_provider is None:
+            first_provider = provider
         attempts += 1
         if request is not None:
             set_access_log_context(
@@ -4870,10 +4897,23 @@ async def _call_with_pool_fallback(
                 nonlocal result
                 # Runs in its own task, so the binding is scoped to this attempt.
                 bind_upstream_progress(activity.touch)
+                # Cross-provider failover must not ship opaque provider
+                # continuation state (reasoning channels, thought signatures)
+                # to a different upstream. Same-provider retries keep it;
+                # copy-on-write so the shared history is never mutated.
+                candidate_messages = body["messages"]
+                if (
+                    attempts > 1
+                    and first_provider is not None
+                    and provider != first_provider
+                ):
+                    candidate_messages = _sanitize_cross_provider_messages(
+                        candidate_messages
+                    )
                 result = await client.chat(
                     provider,
                     model,
-                    body["messages"],
+                    candidate_messages,
                     stream=bool(body.get("stream")),
                     tools=tools,
                     tool_choice=body.get("tool_choice"),

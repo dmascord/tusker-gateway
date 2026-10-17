@@ -10,6 +10,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from tusker_gateway.storage import shared_database
 
@@ -88,3 +89,19 @@ class ProtocolEvidenceStore:
                 (provider.lower(), endpoint_id, model, feature),
             ).fetchone()
         return ProtocolEvidence(*row) if row else None
+
+    def all(self) -> list[dict[str, Any]]:
+        """Every stored evidence row (operator diagnostics only)."""
+        with self.db.connection() as conn:
+            rows = conn.execute(
+                "SELECT provider, endpoint_id, model, feature, status, probe_version, checked_at "
+                "FROM protocol_evidence ORDER BY provider, model, feature"
+            ).fetchall()
+        return [
+            {
+                "provider": row[0], "endpoint_id": row[1], "model": row[2],
+                "feature": row[3], "status": row[4], "probe_version": row[5],
+                "checked_at": row[6],
+            }
+            for row in rows
+        ]
