@@ -6,6 +6,7 @@ Only a complete function-call round trip can establish support.
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -46,7 +47,9 @@ async def probe_responses_roundtrip(
             call = next(item for item in first["output"] if isinstance(item, dict)
                         and item.get("type") == "function_call"
                         and item.get("name") == "protocol_probe_echo"
-                        and isinstance(item.get("call_id"), str) and item["call_id"])
+                        and isinstance(item.get("call_id"), str) and item["call_id"]
+                        and isinstance(item.get("arguments"), str)
+                        and _is_expected_arguments(item["arguments"]))
             # Preserve the native output item and call_id; do not invent
             # response IDs or mutate the upstream model's tool call.
             continuation = {
@@ -76,3 +79,11 @@ async def probe_responses_roundtrip(
         result = ProbeAssessment("responses_function_calls", "unavailable", "transport")
     store.record(provider, endpoint_id, model, result.feature, result.status)
     return result
+
+
+def _is_expected_arguments(raw: str) -> bool:
+    try:
+        value = json.loads(raw)
+    except (ValueError, TypeError):
+        return False
+    return isinstance(value, dict) and value.get("value") == "ok"
