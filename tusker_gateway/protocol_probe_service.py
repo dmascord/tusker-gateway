@@ -18,7 +18,6 @@ import aiohttp
 from tusker_gateway.protocol_evidence import ProtocolEvidenceStore
 from tusker_gateway.protocol_parameter_probe import probe_parameter
 from tusker_gateway.protocol_probe_coordinator import ProbeCoordinator
-from tusker_gateway.protocol_probe_policy import authorize_probe_target
 from tusker_gateway.protocol_probe_runner import probe_chat_contract
 from tusker_gateway.protocol_replay_probe import probe_reasoning_replay
 from tusker_gateway.protocol_responses_roundtrip import probe_responses_roundtrip

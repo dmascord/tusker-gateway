@@ -34,15 +34,16 @@ Wired at runtime:
 - `protocol_evidence.ProtocolEvidenceStore` → runtime store (Postgres/SQLite).
 - Stream normalizer alias normalization → `endpoints.py` `_normalize_stream`/`_normalize_stream_legacy`.
 
-Test-only (no runtime caller yet):
+Reachable by callers (no separate runtime caller; invoked by the admin probe
+surface built in Phase 1, which passes the resolved endpoint in explicitly):
 - `protocol_probe_runner.probe_chat_contract`
 - `protocol_replay_probe.probe_reasoning_replay`
 - `protocol_stream_probe.probe_streaming_tool_fragments`
 - `protocol_responses_roundtrip.probe_responses_roundtrip`
 - `protocol_responses_probe.classify_responses_function_call` (used by roundtrip)
-- `protocol_parameter_probe.probe_parameter` (no test, no caller)
-- `protocol_probe_policy.authorize_probe_target`, `protocol_probe_coordinator.ProbeCoordinator`
-- `protocol_signatures.strip_cross_provider_replay` (not called by failover path yet)
+- `protocol_parameter_probe.probe_parameter`
+- `protocol_probe_coordinator.ProbeCoordinator`
+- `protocol_signatures.strip_cross_provider_replay` (called from the failover path)
 
 ## Phase 1 work items derived from audit
 1. Admin-only probe HTTP surface: `/admin/protocol/probe` (session/Bearer auth via

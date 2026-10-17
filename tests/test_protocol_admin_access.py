@@ -214,3 +214,49 @@ async def test_probe_write_scope_passes_middleware_then_service_refuses(
         assert data["error"]["code"] == "unknown_provider"
     finally:
         await client.close()
+
+
+@pytest.mark.asyncio
+async def test_probe_routes_exist_in_the_production_app(monkeypatch, tmp_path):
+    """The routes must be registered by the real factory, not only by tests.
+
+    Every other test here hand-builds an app and calls
+    ``app.router.add_post`` itself, so all of them stay green if
+    ``register_admin_config_routes`` never runs in production — e.g. if the
+    import in ``create_app``'s startup raised, or the ``config_runtime`` gate
+    went false. ``POST /admin/protocol/probe`` would then 404 in every real
+    deployment while the whole suite passed. This drives ``create_app()``
+    with DB-backed config enabled (the production registration path) and
+    asserts both routes resolve and remain access-controlled.
+    """
+    monkeypatch.setenv("API_KEYS", "sk-prod-gateway-key")
+    monkeypatch.setenv("TUSKER_CONFIG_DATABASE_ENABLED", "1")
+    monkeypatch.setenv("TUSKER_QUALITY_DB_PATH", str(tmp_path / "quality.db"))
+    monkeypatch.delenv("TUSKER_PROTOCOL_PROBES_ENABLED", raising=False)
+
+    from tusker_gateway.app import create_app
+
+    app = create_app()
+    client = TestClient(TestServer(app))
+    try:
+        await client.start_server()
+
+        paths = {
+            (route.method, route.resource.canonical)
+            for route in app.router.routes()
+            if route.resource is not None
+        }
+        assert ("POST", "/admin/protocol/probe") in paths
+        assert ("GET", "/admin/protocol/evidence") in paths
+
+        # Registered-and-guarded: an unauthenticated caller is rejected by
+        # the admin middleware, which only happens if the route exists.
+        resp = await client.post(
+            "/admin/protocol/probe",
+            json={"provider": "openrouter", "model": "x", "approved": True},
+        )
+        assert resp.status == 401
+        resp = await client.get("/admin/protocol/evidence")
+        assert resp.status == 401
+    finally:
+        await client.close()

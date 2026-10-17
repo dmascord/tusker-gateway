@@ -10,7 +10,10 @@ from typing import Any
 
 import pytest
 
-from tusker_gateway.protocol_evidence import ProtocolEvidenceStore
+from tusker_gateway.protocol_evidence import (
+    PROTOCOL_PROBE_VERSION,
+    ProtocolEvidenceStore,
+)
 from tusker_gateway.protocol_probe_service import (
     PROBES_ENABLED_ENV,
     ProtocolProbeError,
@@ -42,16 +45,26 @@ def _config() -> dict[str, Any]:
 
 
 def test_probe_target_requires_configured_provider():
+    from tusker_gateway.protocol_runtime import endpoint_identity
+
     cfg = _config()
     provider, model, endpoint, endpoint_id = probe_target_from_request(
         cfg, {"provider": "minimax", "model": "MiniMax-M2"},
     )
     assert provider == "minimax"
+    assert model == "MiniMax-M2"
     assert endpoint["base_url"] == "https://api.minimax.io"
-    assert endpoint_id
+    # Pin the identity to its definition, not to truthiness: the id is the
+    # endpoint fingerprint, and credentials are excluded from it, so adding
+    # one must not move the id (a key rotation cannot orphan evidence).
+    assert endpoint_id == endpoint_identity(endpoint)
+    assert endpoint_id == endpoint_identity(
+        {**endpoint, "api_key": "sk-leaked", "auth_type": "bearer"}
+    )
     with pytest.raises(ProtocolProbeError) as exc:
         probe_target_from_request(cfg, {"provider": "nope", "model": "x"})
     assert exc.value.status == 404
+    assert exc.value.code == "unknown_provider"
 
 
 def test_probe_target_rejects_unknown_model():
@@ -132,16 +145,14 @@ def test_run_probe_executes_bound_executor_and_records_evidence(
         def __init__(self, *a, **k):
             pass
 
-    monkeypatch.setattr(service, "PassthroughClient", _FakeClient, raising=False)
-    monkeypatch.setattr(
-        service, "QualityDB", _FakeQuality, raising=False,
-    )
-    # The service imports these inside run_probe; patch the source modules.
+    # ``PassthroughClient``/``QualityDB`` are imported *inside* run_probe, so
+    # patching ``service`` cannot affect it; patch the source modules with
+    # ``raising=True`` so a rename fails loudly instead of silently no-op'ing.
     import tusker_gateway.passthrough as passthrough_module
     import tusker_gateway.quality as quality_module
 
     monkeypatch.setattr(passthrough_module, "PassthroughClient", _FakeClient)
-    monkeypatch.setattr(quality_module, "QualityDB", _FakeQuality, raising=False)
+    monkeypatch.setattr(quality_module, "QualityDB", _FakeQuality)
 
     app = {
         "config": _config(),
@@ -248,8 +259,72 @@ def test_evidence_snapshot_shape(tmp_path, monkeypatch):
     store = ProtocolEvidenceStore(str(tmp_path / "ev.db"))
     store.record("minimax", "ep1", "MiniMax-M2", "structured_tool_calls", "passed")
     snap = evidence_snapshot(_config())
-    assert snap["probe_version"]
+    # Pin the version to its constant, not truthiness.
+    assert snap["probe_version"] == PROTOCOL_PROBE_VERSION
     rows = [r for r in snap["evidence"] if r["model"] == "MiniMax-M2"]
     assert rows and rows[0]["status"] == "passed" and rows[0]["verified"] is True
-    # No payload fields anywhere in the snapshot.
-    assert all("payload" not in r and "body" not in r for r in snap["evidence"])
+    # "No prompts, arguments, reasoning, tool outputs or credentials" is a
+    # structural claim: assert the exact key set, so a future field that
+    # carried a body under any other name (response/raw/text/arguments)
+    # fails here rather than sailing past a two-name substring check.
+    expected_keys = {
+        "provider", "endpoint_id", "model", "feature", "status",
+        "checked_at", "verified",
+    }
+    assert snap["evidence"], "fixture recorded evidence"
+    for row in snap["evidence"]:
+        assert set(row) == expected_keys
+        assert all(isinstance(v, (str, int, float, bool)) for v in row.values())
+
+
+@pytest.mark.parametrize("bad_timeout", [0, 0.5, 61, 600])
+def test_run_probe_rejects_out_of_bounds_timeout(monkeypatch, bad_timeout):
+    """The cost bound is enforced before any upstream call is made.
+
+    Without this the runbook's "bounded cost/timeout" criterion rests only
+    on the inner probe helpers: an admin body asking for a 600s billable
+    probe would reach the executor.
+    """
+    from tusker_gateway.protocol_probe_service import run_probe
+
+    monkeypatch.setenv(PROBES_ENABLED_ENV, "1")
+    app = {"config": _config(), "http_session": object(),
+           "protocol_probe_coordinator": None}
+    with pytest.raises(ProtocolProbeError) as exc:
+        asyncio.run(run_probe(app, {
+            "provider": "minimax", "model": "MiniMax-M2", "approved": True,
+            "features": ["structured_tool_calls"], "timeout_seconds": bad_timeout,
+        }))
+    assert "timeout_seconds must be between 1 and 60" in str(exc.value)
+
+
+@pytest.mark.parametrize("bad_timeout", ["abc", None, [], {}])
+def test_run_probe_rejects_non_numeric_timeout(monkeypatch, bad_timeout):
+    """A non-numeric timeout is refused, not coerced into a default."""
+    from tusker_gateway.protocol_probe_service import run_probe
+
+    monkeypatch.setenv(PROBES_ENABLED_ENV, "1")
+    app = {"config": _config(), "http_session": object(),
+           "protocol_probe_coordinator": None}
+    with pytest.raises(ProtocolProbeError) as exc:
+        asyncio.run(run_probe(app, {
+            "provider": "minimax", "model": "MiniMax-M2", "approved": True,
+            "features": ["structured_tool_calls"], "timeout_seconds": bad_timeout,
+        }))
+    assert "timeout_seconds must be a number" in str(exc.value)
+
+
+def test_run_probe_bounds_features_to_known_set(monkeypatch):
+    """An unknown or empty feature list is refused, not silently ignored."""
+    from tusker_gateway.protocol_probe_service import run_probe
+
+    monkeypatch.setenv(PROBES_ENABLED_ENV, "1")
+    app = {"config": _config(), "http_session": object(),
+           "protocol_probe_coordinator": None}
+    for features in ([], ["not_a_feature"], "structured_tool_calls"):
+        with pytest.raises(ProtocolProbeError) as exc:
+            asyncio.run(run_probe(app, {
+                "provider": "minimax", "model": "MiniMax-M2",
+                "approved": True, "features": features,
+            }))
+        assert "features must be a non-empty subset" in str(exc.value)

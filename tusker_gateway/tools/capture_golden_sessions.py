@@ -384,7 +384,16 @@ def write_fixture(client: str, record: dict[str, Any]) -> Path:
 
 
 def check_fixtures() -> int:
-    """Fail if a committed fixture still contains private content."""
+    """Fail if a committed fixture still contains private content.
+
+    Two independent checks, because the regex scan alone cannot see the
+    axis the privacy claim rests on: header *values*. A bearer token or a
+    session id is not an email, a long hex run, or an absolute path, so a
+    regression in ``sanitize_headers`` (dropping the sensitive branch)
+    would commit a live credential and still pass a text-only scan. The
+    header check re-derives the contract from ``SENSITIVE_HEADERS`` and
+    ``CLIENT_HEADER_ALLOW`` rather than restating it.
+    """
     problems: list[str] = []
     for path in sorted(FIXTURE_DIR.glob("*.json")):
         text = path.read_text()
@@ -394,11 +403,40 @@ def check_fixtures() -> int:
         ):
             for match in pattern.findall(text):
                 problems.append(f"{path.name}: {label} {match[:40]!r}")
+        problems.extend(_check_fixture_headers(path))
     if problems:
         print("\n".join(problems), file=sys.stderr)
         return 1
     print(f"{len(list(FIXTURE_DIR.glob('*.json')))} fixture(s) clean")
     return 0
+
+
+def _check_fixture_headers(path: Path) -> list[str]:
+    """Every recorded header value must match its sanitizer contract."""
+    try:
+        record = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        return [f"{path.name}: not valid JSON ({exc})"]
+    problems: list[str] = []
+    for index, request in enumerate(record.get("requests") or []):
+        headers = request.get("headers")
+        if not isinstance(headers, dict):
+            problems.append(f"{path.name}: request {index} has no headers map")
+            continue
+        for name, value in headers.items():
+            low = str(name).lower()
+            if low in SENSITIVE_HEADERS:
+                if value != _PLACEHOLDER:
+                    problems.append(
+                        f"{path.name}: request {index} leaks secret header "
+                        f"{low!r} (value not {_PLACEHOLDER!r})"
+                    )
+            elif low not in CLIENT_HEADER_ALLOW and value != "<present>":
+                problems.append(
+                    f"{path.name}: request {index} records unvetted header "
+                    f"{low!r} value; only presence is allowed"
+                )
+    return problems
 
 
 def main(argv: list[str] | None = None) -> int:

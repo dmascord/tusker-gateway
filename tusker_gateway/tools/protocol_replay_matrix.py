@@ -30,6 +30,15 @@ from typing import Any
 import aiohttp
 from aiohttp import web
 
+# Keys that would mean request content reached telemetry. The access-log
+# field allowlist in ``observability.py`` already excludes these; naming them
+# here lets the matrix fail loudly if one is ever added to a record.
+_CONTENT_BEARING_LOG_KEYS = frozenset({
+    "messages", "message", "body", "payload", "prompt", "content",
+    "arguments", "tool_calls", "tools", "input", "reasoning",
+    "reasoning_content", "response", "output",
+})
+
 # ─── provider simulator ──────────────────────────────────────────────────────
 
 def _sse(payload: dict[str, Any]) -> bytes:
@@ -743,27 +752,50 @@ async def _check_access_log_diagnostics() -> dict[str, Any]:
         # (``hermes-code``) attempt and the direct (``alpha/sim-model``)
         # attempt. Asserting every routed record pins both paths.
         for record in routed:
-            label = record.get("route_kind") or "unknown"
-            for field in (
-                "protocol_family", "protocol_confidence", "endpoint_id",
-                "evidence_version", "selected_adapter",
-            ):
-                if not record.get(field):
-                    failures.append(f"access log missing {field} (route {label})")
-            # The runbook forbids prompt/reasoning/tool-argument text in
-            # telemetry: assert the record carries none of the request content.
-            blob = json.dumps(record)
-            if "ping" in blob:
-                failures.append(f"access log leaked prompt content (route {label})")
-            # No secret material may leak alongside the diagnostics.
-            if "sk-test" in blob or "Authorization" in blob:
-                failures.append(f"access log leaked credential material (route {label})")
+            failures.extend(_access_log_record_failures(record))
         if {r.get("route_kind") for r in routed} != {"pool", "direct"}:
             failures.append("expected exactly one pooled and one direct record")
     return {
         "scenario": "operator_diagnostics", "provider": "alpha",
         "status": 200, "passed": not failures, "failures": failures,
     }
+
+
+def _access_log_record_failures(record: dict[str, Any]) -> list[str]:
+    """Return the diagnostics/leak violations for one access-log record.
+
+    Pure so it can be exercised directly: driving a real leak through the
+    HTTP stack would require mutating the gateway's own logger, and an
+    assertion that cannot be made to fail is not a check. The runbook
+    forbids prompt/reasoning/tool-argument text in telemetry, so the shape
+    is pinned: every value must be a scalar label (no field can carry a
+    serialized body) and no key may name request content.
+    """
+    failures: list[str] = []
+    label = record.get("route_kind") or "unknown"
+    for field in (
+        "protocol_family", "protocol_confidence", "endpoint_id",
+        "evidence_version", "selected_adapter",
+    ):
+        if not record.get(field):
+            failures.append(f"access log missing {field} (route {label})")
+    blob = json.dumps(record)
+    for key, value in record.items():
+        if isinstance(value, (dict, list, tuple)):
+            failures.append(
+                f"access log field {key!r} carries a structured body "
+                f"(route {label})"
+            )
+        if key in _CONTENT_BEARING_LOG_KEYS:
+            failures.append(
+                f"access log carries content key {key!r} (route {label})"
+            )
+    if "ping" in blob:
+        failures.append(f"access log leaked prompt content (route {label})")
+    if "sk-test" in blob or "Authorization" in blob:
+        failures.append(f"access log leaked credential material (route {label})")
+    return failures
+
 
 async def _check_responses_pairing() -> dict[str, Any]:
     """Drive the Responses route end-to-end through a call/output pair.

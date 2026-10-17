@@ -68,11 +68,44 @@ def test_fixtures_contain_no_private_content():
     assert check_fixtures() == 0
 
 
-def test_capture_tool_loads():
-    """Smoke: the tool module imports and exposes the public surface."""
+def test_validator_rejects_a_leaked_header_value(monkeypatch, tmp_path):
+    """A credential in a header value must not survive validation.
+
+    The regex scan cannot see this axis: a bearer token or session id is
+    not an email, a long hex run or an absolute path. Without this test a
+    regression in ``sanitize_headers`` would commit a live credential
+    while every other assertion stayed green.
+    """
     from tusker_gateway.tools import capture_golden_sessions as mod
 
-    assert callable(mod.sanitize_request)
-    assert callable(mod.sanitize_message)
-    assert callable(mod.sanitize_tools)
-    assert callable(mod.sanitize_headers)
+    (tmp_path / "leaky.json").write_text(json.dumps({
+        "client": "leaky",
+        "requests": [{"headers": {
+            "authorization": "Bearer sk-live-9f3a2b7c8d1e",
+            "user-agent": "opencode/2.0.30",
+        }}],
+    }))
+    monkeypatch.setattr(mod, "FIXTURE_DIR", tmp_path)
+    assert check_fixtures() == 1
+
+
+def test_sanitize_then_check_roundtrip_passes(monkeypatch, tmp_path):
+    """The sanitizer's own output must satisfy the validator.
+
+    This is the invariant the two functions share: whatever
+    ``sanitize_headers`` produces, ``check_fixtures`` must accept. Pinning
+    the roundtrip means the two cannot drift apart unnoticed.
+    """
+    from tusker_gateway.tools import capture_golden_sessions as mod
+
+    record = {"client": "roundtrip", "requests": [{
+        "headers": mod.sanitize_headers({
+            "Authorization": "Bearer sk-live-9f3a2b7c8d1e",
+            "x-opencode-session": "sess_Zm9vYmFyYmF6cXV4",
+            "User-Agent": "opencode/2.0.30",
+            "x-unknown-thing": "some-secret",
+        }),
+    }]}
+    (tmp_path / "roundtrip.json").write_text(json.dumps(record))
+    monkeypatch.setattr(mod, "FIXTURE_DIR", tmp_path)
+    assert check_fixtures() == 0

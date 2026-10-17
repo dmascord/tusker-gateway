@@ -95,3 +95,60 @@ async def test_replay_matrix_passes_all_contracts():
             assert expected in matrix_names, (
                 f"golden replayed row missing: {expected}"
             )
+
+
+def test_access_log_record_check_passes_on_a_clean_record():
+    """A well-formed diagnostics record produces no violations."""
+    from tusker_gateway.tools.protocol_replay_matrix import (
+        _access_log_record_failures,
+    )
+
+    clean = {
+        "provider": "alpha", "model": "sim-model", "route_kind": "pool",
+        "protocol_family": "openai", "protocol_confidence": "provider",
+        "endpoint_id": "abc123", "evidence_version": "protocol-contract-v1",
+        "selected_adapter": "openai", "candidate_attempts": 1, "status": 200,
+    }
+    assert _access_log_record_failures(clean) == []
+
+
+def test_access_log_record_check_catches_content_and_secrets():
+    """The leak assertion must fail on the shapes it exists to catch.
+
+    Exercised directly: driving a real leak through the HTTP stack would
+    mean mutating the gateway's own logger, and an assertion that can never
+    be made to fail is not a check.
+    """
+    from tusker_gateway.tools.protocol_replay_matrix import (
+        _access_log_record_failures,
+    )
+
+    base = {
+        "provider": "alpha", "model": "sim-model", "route_kind": "pool",
+        "protocol_family": "openai", "protocol_confidence": "provider",
+        "endpoint_id": "abc123", "evidence_version": "protocol-contract-v1",
+        "selected_adapter": "openai",
+    }
+    # A content-bearing key.
+    assert any(
+        "content key" in f
+        for f in _access_log_record_failures(
+            {**base, "messages": [{"role": "user", "content": "hi"}]}
+        )
+    )
+    # Same key spelled as a scalar body string is still a named content key.
+    assert any(
+        "content key" in f
+        for f in _access_log_record_failures({**base, "body": '{"a":1}'})
+    )
+    # Prompt text smuggled through an otherwise-scalar field.
+    assert any(
+        "prompt content" in f
+        for f in _access_log_record_failures({**base, "error_detail": "ping"})
+    )
+    # A dropped diagnostics field.
+    missing = {k: v for k, v in base.items() if k != "endpoint_id"}
+    assert any(
+        "missing endpoint_id" in f
+        for f in _access_log_record_failures(missing)
+    )
