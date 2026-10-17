@@ -28,6 +28,7 @@ def endpoint_identity(endpoint: dict[str, Any]) -> str:
         "base_url": str(endpoint.get("base_url") or "").rstrip("/").lower(),
         "chat_path": str(endpoint.get("chat_path") or ""),
         "provider": str(endpoint.get("provider") or ""),
+        "chat_api": str(endpoint.get("chat_api") or ""),
     }
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
