@@ -226,3 +226,39 @@ These are computed from the resolved provider/model only. No prompt,
 reasoning text, tool arguments, tokens or credentials reach the access log,
 span, or evidence store — the store's schema has no column that could hold
 them.
+
+## Provider matrix (runbook 2.5)
+
+The resolver maps a route to a protocol family and a confidence. **Family
+and confidence are diagnostics only** — they never authorise a behavioural
+change on their own; only fresh probe evidence or an operator override does
+(see the precedence rules above).
+
+|Provider|Route shape|Family|Confidence|Evidence status|
+|---|---|---|---|---|
+|`deepseek`|native|`deepseek`|`provider`|**NOT TESTED live** — no probe run; matrix replays the shape offline|
+|`zai`|native|`glm`|`provider`|**NOT TESTED live**|
+|`minimax`|native|`minimax`|`provider`|**NOT TESTED live**|
+|`moonshot`|native|`kimi`|`provider`|**NOT TESTED live**|
+|`xiaomi`|native|`mimo`|`heuristic`|**NOT TESTED live**|
+|`openai` / `apim`|native|`openai`|`heuristic`|**NOT TESTED live**|
+|`openrouter` → `deepseek/*`|third-party host|`deepseek`|`heuristic`|**NOT TESTED** — a family hint is not proof the host implements the dialect|
+|`openrouter` → `qwen*`|third-party host|`qwen`|`heuristic`|**NOT TESTED**|
+|`openrouter` → `moonshotai/kimi*`|third-party host|`kimi`|`heuristic`|**NOT TESTED**|
+|`openrouter` → `google/gemini*`|third-party host|`gemini`|`heuristic`|**NOT TESTED**|
+|`openrouter` → `anthropic/claude*`|third-party host|`claude`|`heuristic`|**NOT TESTED**|
+|`openrouter` → `mistralai/*`|third-party host|`unknown`|`unknown`|**NOT TESTED** — unknown is the honest verdict|
+
+`NOT TESTED live` means exactly that: the request/response shapes are
+replayed deterministically against the simulator, but no billable probe has
+been run against the provider, so the gateway treats the route as
+unverified (no replay adaptation, no parameter injection). Live probing is
+the authorised-operator step described under *Operator overrides and
+per-attempt diagnostics*; the results land in the evidence store and are
+readable at `GET /admin/protocol/evidence`.
+
+The distinction that matters is **native vs third-party host**. A native
+provider's family hint can be trusted (the gateway knows which API the
+company ships); a model served through an aggregator is only a hint, which
+is why the default confidence there is `heuristic` and never `provider`,
+and why no adaptation is applied without evidence.
