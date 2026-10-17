@@ -201,10 +201,6 @@ async def _rejected_stream() -> AsyncIterator[bytes]:
     yield b"data: [DONE]\n\n"
 
 
-async def _error_stream(status: int) -> AsyncIterator[bytes]:
-    yield f'data: {{"__http_status__": {status}}}\n\n'.encode()
-
-
 async def run_probe(
     app: Any, payload: dict[str, Any]
 ) -> dict[str, Any]:

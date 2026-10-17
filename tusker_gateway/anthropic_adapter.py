@@ -328,6 +328,7 @@ async def _call_with_pool_fallback_anthropic(
         pool_names = [pool_name, *configured_fallbacks]
         pool_index = 0
         active_pool = pool_names[pool_index]
+        anthropic_first_provider: str | None = None
         while True:
             select_kwargs: dict[str, Any] = {
                 "excluded": set(excluded),
@@ -382,8 +383,18 @@ async def _call_with_pool_fallback_anthropic(
                     raise last_error
                 raise NoHealthyModelsError(pool=pool_name)
             prov, mdl = selected
+            # Cross-provider failover: strip opaque replay state on a copy
+            # (see _sanitize_cross_provider_messages in endpoints).
+            from tusker_gateway.endpoints import _sanitize_cross_provider_messages
+
+            if anthropic_first_provider is not None and prov != anthropic_first_provider:
+                candidate_messages = _sanitize_cross_provider_messages(body["messages"])
+            else:
+                candidate_messages = body["messages"]
+            if anthropic_first_provider is None:
+                anthropic_first_provider = prov
             try:
-                result = await client.chat(prov, mdl, body["messages"],
+                result = await client.chat(prov, mdl, candidate_messages,
                                           stream=bool(body.get("stream")), tools=tools,
                                           tool_choice=body.get("tool_choice"),
                                           extra_body=_build_extra_body(body) or None,

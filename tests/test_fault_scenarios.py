@@ -19,6 +19,7 @@ import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import aiohttp
 import pytest
 
 from tusker_gateway import cooldown as cooldown_module
@@ -313,3 +314,100 @@ async def test_provider_stream_closed_error_is_not_classified_as_client_disconne
     assert not isinstance(exc, ConnectionError)
     assert not isinstance(exc, BrokenPipeError)
     assert exc.code == "stream_closed_prematurely"
+
+
+async def test_truncated_sse_body_surfaces_stream_closed_envelope(client):
+    """A truncated upstream SSE body must reach the vLLM/OpenRouter-shape
+    ``error`` + ``[DONE]`` envelope rather than the generic provider-error
+    text frame.
+
+    aiohttp raises ``ClientPayloadError`` (not ``ConnectionResetError``) for
+    a body that ends before its chunked terminator — verified for both a TCP
+    abort and an RST against aiohttp 3.13.3. Before it was added to the
+    wrap set at ``endpoints.diagnostic_raw_stream``, the documented
+    ``stream_closed_prematurely`` envelope was unreachable for the exact
+    production shape it exists to cover (AGENTS.md: 2026-10-14 00:17Z).
+    """
+    async def truncated_stream(*args, **kwargs):
+        yield _sse({"choices": [{"index": 0, "delta": {"content": "partial"}, "finish_reason": None}]})
+        raise aiohttp.ClientPayloadError(
+            "Response payload is not completed: <TransferEncodingError: 400, "
+            "message='Not enough data to satisfy transfer length header.'>"
+        )
+
+    with patch(
+        "tusker_gateway.endpoints.PassthroughClient.chat",
+        new_callable=AsyncMock,
+        return_value=truncated_stream(),
+    ):
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-code",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+            },
+            headers=HEADERS_AUTH,
+        )
+        body = await response.read()
+
+    assert response.status == 200
+    # Partial content still reaches the client.
+    assert b"partial" in body
+    # The OpenAI SDK raises APIError on the top-level error object.
+    assert b'"error":' in body
+    assert b'"code": "stream_closed_prematurely"' in body
+    assert b'"type": "upstream_stream_error"' in body
+    assert b"data: [DONE]" in body
+
+
+async def test_truncated_sse_body_fails_over_before_visible_output(app, client):
+    """A truncated body with no assistant content yet must still try one
+    alternative candidate.
+
+    Wrapping the aiohttp exception as ``ProviderStreamClosedError`` removed
+    it from the ``ClientError`` branch of
+    ``_stream_failure_can_fail_over``; ``stream_closed_prematurely`` must
+    therefore be a declared recovery code or the pre-visible failover is
+    silently lost.
+    """
+    pool_manager = MagicMock()
+    pool_manager.select.side_effect = [
+        ("alpha", "truncating-model"),
+        ("beta", "healthy-model"),
+    ]
+    pool_manager.fallback_pools.return_value = ()
+    app["pool_manager"] = pool_manager
+
+    async def truncating_stream(*args, **kwargs):
+        yield _sse({"choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]})
+        raise aiohttp.ClientPayloadError("Response payload is not completed")
+
+    async def healthy_stream(*args, **kwargs):
+        for frame in _ok_content_frames("recovered output"):
+            yield frame
+        yield b"data: [DONE]\n\n"
+
+    with patch(
+        "tusker_gateway.endpoints.PassthroughClient.chat",
+        new_callable=AsyncMock,
+    ) as mock_chat:
+        mock_chat.side_effect = [truncating_stream(), healthy_stream()]
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-code",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+            },
+            headers=HEADERS_AUTH,
+        )
+        body = await response.read()
+
+    assert response.status == 200
+    assert b"recovered output" in body
+    assert b"stream_closed_prematurely" not in body
+    assert pool_manager.select.call_count == 2
+    assert pool_manager.select.call_args_list[1].kwargs["excluded"] == {
+        ("alpha", "truncating-model")
+    }

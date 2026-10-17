@@ -13,7 +13,7 @@ import time
 import uuid
 from typing import Any, AsyncIterator
 
-from aiohttp import ClientError, web
+from aiohttp import ClientError, ClientPayloadError, web
 from aiohttp.http_exceptions import TransferEncodingError
 
 from tusker_gateway.cache import ResponseCache, make_cache_key, make_caller_scope
@@ -969,8 +969,12 @@ def _normalize_native_stream_tool_calls(
         if not effective_call_id:
             # Some OpenAI-compatible providers omit ids and names on the
             # first native delta. OMP requires an id or name on every delta;
-            # keep the synthesized id stable by stream index.
-            effective_call_id = f"call_stream_{choice_index}_{index}"
+            # keep the synthesized id stable by stream index. When the index
+            # already belongs to an identified call, reuse that id so a
+            # continuation delta cannot re-identify the call mid-stream.
+            effective_call_id = index_owners.get(
+                (choice_index, index)
+            ) or f"call_stream_{choice_index}_{index}"
             call["id"] = effective_call_id
 
         used_in_frame.add(index)
@@ -1293,7 +1297,7 @@ async def _normalize_stream(
                 len(buffer),
             )
             # Re-raise transport-level failures (peer reset, broken pipe,
-            # incomplete read) as ProviderStreamClosedError so the outer
+            # truncated body) as ProviderStreamClosedError so the outer
             # stream-loop catch distinguishes "upstream closed" (vLLM /
             # OpenRouter-style error frame + [DONE]) from "client
             # disconnected" (silent teardown + budget refund). Domain
@@ -1308,10 +1312,22 @@ async def _normalize_stream(
             # asyncio.TimeoutError is an OSError subclass in Python 3.11+
             # but it has its own call site in the per-attempt idle budget,
             # so it must not be wrapped here. OSError is also intentionally
-            # excluded: aiohttp's ClientPayloadError is what we really want,
-            # but a bare OSError from a downstream adapter carries a
-            # different meaning and should pass through to its handler.
-            if isinstance(exc, (ConnectionResetError, ConnectionError, BrokenPipeError)):
+            # excluded as a *class*: a bare OSError from a downstream
+            # adapter carries a different meaning and should pass through
+            # to its handler. aiohttp.ClientPayloadError is the exception
+            # aiohttp actually raises for a truncated SSE body (both a TCP
+            # abort and an RST surface as it, verified against aiohttp
+            # 3.13.3), so it is wrapped explicitly — it is not a
+            # ConnectionError subclass.
+            if isinstance(
+                exc,
+                (
+                    ConnectionResetError,
+                    ConnectionError,
+                    BrokenPipeError,
+                    ClientPayloadError,
+                ),
+            ):
                 raise ProviderStreamClosedError(
                     provider=provider or "unknown",
                     model=model or "unknown",
@@ -4282,6 +4298,11 @@ _STREAM_RECOVERY_CODES = frozenset({
     "provider_error",
     "upstream_timeout",
     "upstream_stream_incomplete",
+    # A truncated upstream body (aiohttp.ClientPayloadError, wrapped as
+    # ProviderStreamClosedError). Carries no assistant-visible output, so it
+    # is eligible for the same single pre-visible failover it had before the
+    # wrap, when it surfaced as a bare ClientError.
+    "stream_closed_prematurely",
     "upstream_stream_invalid",
     "invalid_upstream_response",
     "cli_failed",
@@ -4498,6 +4519,49 @@ def _requires_structured_output(body: dict[str, Any], pool_name: str | None) -> 
     }
 
 
+def _protocol_attempt_diagnostics(
+    config: dict[str, Any], provider: str, model: str,
+) -> dict[str, str]:
+    """Per-attempt protocol diagnostics for the access log (runbook 1.6).
+
+    Returns the resolver's family/confidence verdict plus the opaque endpoint
+    fingerprint, the probe-evidence contract version, and which transport
+    served the attempt. Every value is a short label or hash derived from
+    configured metadata: no prompt, reasoning text, tool arguments, tokens or
+    credentials are reachable from here.
+    """
+    diagnostics: dict[str, str] = {}
+    try:
+        from tusker_gateway.protocol_compat import resolve_protocol
+        profile = resolve_protocol(provider, model)
+        if profile.family:
+            diagnostics["protocol_family"] = profile.family
+        if profile.confidence:
+            diagnostics["protocol_confidence"] = profile.confidence
+    except Exception:
+        logger.debug("protocol profile resolution failed", exc_info=True)
+    try:
+        from tusker_gateway.protocol_evidence import PROTOCOL_PROBE_VERSION
+        from tusker_gateway.protocol_runtime import endpoint_identity
+        from tusker_gateway.passthrough import _configured_endpoint
+
+        diagnostics["evidence_version"] = PROTOCOL_PROBE_VERSION
+        resolved_endpoint = _configured_endpoint(config, provider)
+        if resolved_endpoint:
+            diagnostics["endpoint_id"] = endpoint_identity(resolved_endpoint)
+    except Exception:
+        logger.debug("endpoint diagnostics resolution failed", exc_info=True)
+    try:
+        from tusker_gateway.provider_adapters import provider_adapters
+
+        adapter = provider_adapters.get(provider)
+        diagnostics["selected_adapter"] = type(adapter).__name__ if adapter else "http"
+    except Exception:
+        logger.debug("adapter diagnostics resolution failed", exc_info=True)
+    return diagnostics
+
+
+
 async def _call_with_pool_fallback(
     config: dict[str, Any],
     body: dict[str, Any],
@@ -4540,6 +4604,7 @@ async def _call_with_pool_fallback(
                 provider=provider,
                 model=model,
                 candidate_attempts=1,
+                **_protocol_attempt_diagnostics(config, provider, model),
             )
         decision = (
             await asyncio.to_thread(breaker.check, provider, model)
@@ -4871,12 +4936,32 @@ async def _call_with_pool_fallback(
         if first_provider is None:
             first_provider = provider
         attempts += 1
+        # Per-attempt operator diagnostics (runbook 1.6): resolver verdict,
+        # endpoint fingerprint, evidence version and selected transport.
+        # ``fallback_reason`` below records why the previous attempt was
+        # excluded, if any.
+        diagnostics = (
+            _protocol_attempt_diagnostics(config, provider, model)
+            if request is not None else {}
+        )
+        fallback_reason = ""
+        if attempts > 1:
+            # ``last_error`` is set when the previous attempt failed; the
+            # specific reason is captured in the dispatch loop above. We
+            # surface a short, safe summary so operators can see *why*
+            # the router kept moving.
+            if last_error is not None:
+                fallback_reason = f"previous_attempt:{type(last_error).__name__}"
+            else:
+                fallback_reason = "previous_attempt:excluded"
         if request is not None:
             set_access_log_context(
                 request,
                 provider=provider,
                 model=model,
                 candidate_attempts=attempts,
+                fallback_reason=fallback_reason or None,
+                **diagnostics,
             )
         logger.info(
             "pool fallback attempt rid=%s requested_pool=%s active_pool=%s "

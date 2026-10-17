@@ -76,9 +76,24 @@ _ACCESS_LOG_FIELDS = frozenset({
     "candidate_attempts",
     "failure_class",
     "cache_status",
-        "tokens_in",
-        "tokens_out",
-        "error_detail",
+    "tokens_in",
+    "tokens_out",
+    "error_detail",
+    # Per-attempt protocol diagnostics. Computed cheaply from
+    # tusker_gateway.protocol_compat at candidate-select time so operators
+    # can read the resolver's verdict without enabling probes.
+    "protocol_family",
+    "protocol_confidence",
+    # Which configured endpoint served the attempt, and which probe-evidence
+    # version the resolver consulted. Both are opaque fingerprints: the
+    # endpoint identity hashes base_url/chat_path and carries no credentials,
+    # and the version is a constant contract label. The runbook's operator
+    # diagnostics (Phase 1.6) require both alongside the provider/model.
+    "endpoint_id",
+    "evidence_version",
+    "selected_adapter",
+    # ``excluded_breaker`` / ``excluded_attempt_failure`` / ``excluded_no_pool``
+    "fallback_reason",
 })
 
 
@@ -154,6 +169,12 @@ class AccessLog:
         error: str | None = None,
         error_detail: str | None = None,
         failure_class: str | None = None,
+        protocol_family: str | None = None,
+        protocol_confidence: str | None = None,
+        endpoint_id: str | None = None,
+        evidence_version: str | None = None,
+        selected_adapter: str | None = None,
+        fallback_reason: str | None = None,
     ) -> None:
         """Log a structured access record for one request.
 
@@ -215,7 +236,18 @@ class AccessLog:
             record["requested_model"] = requested_model
         if candidate_attempts is not None:
             record["candidate_attempts"] = candidate_attempts
-
+        if protocol_family:
+            record["protocol_family"] = protocol_family
+        if protocol_confidence:
+            record["protocol_confidence"] = protocol_confidence
+        if endpoint_id:
+            record["endpoint_id"] = endpoint_id
+        if evidence_version:
+            record["evidence_version"] = evidence_version
+        if selected_adapter:
+            record["selected_adapter"] = selected_adapter[:64]
+        if fallback_reason:
+            record["fallback_reason"] = fallback_reason[:256]
         # Token usage (from response body or context)
         if tokens_in is not None or tokens_out is not None:
             usage = {}

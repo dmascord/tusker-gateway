@@ -1352,3 +1352,64 @@ async def test_stream_normalizer_discards_unterminated_done_sentinel(caplog):
     assert b'"content": "complete"' in body
     assert b'"finish_reason": "stop"' in body
     assert any("dropping unterminated upstream SSE tail" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_stream_normalizer_preserves_opening_id_on_idless_continuation():
+    """A provider that opens a tool call with an id and then sends further
+    deltas with no id must keep the opening id on every subsequent delta.
+
+    Before the fix to ``_normalize_native_stream_tool_calls``, the
+    continuation delta received a fresh synthesized id (``call_stream_0_N``)
+    because the wrap only checked the *current* delta's id field. A
+    downstream eventsource client assembling by (choice, index) would then
+    see one call with two ids and reject the stream as malformed.
+    """
+    from tusker_gateway.endpoints import _assemble_stream_tool_calls, _normalize_stream
+
+    def make_frame(call):
+        payload = {
+            "choices": [{
+                "index": 0,
+                "delta": {"tool_calls": [call]},
+                "finish_reason": None,
+            }],
+        }
+        return f"data: {json.dumps(payload)}\n\n".encode()
+
+    async def native_stream():
+        # Opening delta carries id and the first half of the arguments.
+        yield make_frame({
+            "index": 0,
+            "id": "call_split_a",
+            "type": "function",
+            "function": {"name": "bash", "arguments": '{"command":"'},
+        })
+        # Continuation delta: same index, no id, no name, the rest of the args.
+        yield make_frame({
+            "index": 0,
+            "function": {"arguments": 'ls"}'},
+        })
+        yield b'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    frames = [
+        frame
+        async for frame in _normalize_stream(native_stream(), provider="test", model="test")
+    ]
+    ids_seen = []
+    for frame in frames:
+        if not frame.startswith(b"data: {"):
+            continue
+        payload = json.loads(frame[len(b"data: "):])
+        for choice in payload.get("choices", []):
+            for call in (choice.get("delta") or {}).get("tool_calls") or []:
+                ids_seen.append(call.get("id"))
+
+    # Every delta of the same call must carry the opening id, never a
+    # synthesized ``call_stream_*`` substitution.
+    assert all(i == "call_split_a" for i in ids_seen), ids_seen
+
+    assembled = _assemble_stream_tool_calls(frames)
+    assert [call["id"] for call in assembled] == ["call_split_a"]
+    assert json.loads(assembled[0]["function"]["arguments"]) == {"command": "ls"}

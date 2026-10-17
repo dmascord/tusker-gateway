@@ -36,3 +36,65 @@ def test_unknown_model_passthrough():
 def test_qwen_and_kimi_family_detection():
     assert resolve_protocol("openrouter", "qwen3-coder").family == "qwen"
     assert resolve_protocol("moonshot", "kimi-k2").family == "kimi"
+
+def test_operator_override_grants_passed_when_no_evidence(monkeypatch):
+    from tusker_gateway.protocol_evidence import ProtocolEvidenceStore
+    from tusker_gateway.protocol_compat import verified_protocol_features
+
+    monkeypatch.setenv(
+        "TUSKER_PROTOCOL_OVERRIDES_JSON",
+        '{"deepseek": {"reasoning_replay": "passed"},'
+        ' "deepseek/deepseek-r1": {"structured_tool_calls": "passed"}}',
+    )
+    store = ProtocolEvidenceStore(":memory:")
+    passed = verified_protocol_features(
+        "deepseek", "endpoint-x", "deepseek-r1", store=store,
+    )
+    assert "reasoning_replay" in passed
+    assert "structured_tool_calls" in passed
+
+
+def test_fresh_probe_evidence_outranks_override(monkeypatch):
+    from tusker_gateway.protocol_evidence import ProtocolEvidenceStore
+    from tusker_gateway.protocol_compat import verified_protocol_features
+
+    monkeypatch.setenv(
+        "TUSKER_PROTOCOL_OVERRIDES_JSON",
+        '{"deepseek": {"reasoning_replay": "passed"}}',
+    )
+    store = ProtocolEvidenceStore(":memory:")
+    store.record(
+        "deepseek", "endpoint-x", "deepseek-r1",
+        "reasoning_replay", "unavailable",
+    )
+    assert "reasoning_replay" not in verified_protocol_features(
+        "deepseek", "endpoint-x", "deepseek-r1", store=store,
+    )
+
+
+def test_unsupported_override_is_not_a_pass(monkeypatch):
+    from tusker_gateway.protocol_evidence import ProtocolEvidenceStore
+    from tusker_gateway.protocol_compat import verified_protocol_features
+
+    monkeypatch.setenv(
+        "TUSKER_PROTOCOL_OVERRIDES_JSON",
+        '{"custom-host": {"structured_tool_calls": "unsupported"}}',
+    )
+    store = ProtocolEvidenceStore(":memory:")
+    assert verified_protocol_features(
+        "custom-host", "endpoint-x", "m", store=store,
+    ) == frozenset()
+
+
+def test_invalid_override_is_ignored(monkeypatch):
+    from tusker_gateway.protocol_evidence import ProtocolEvidenceStore
+    from tusker_gateway.protocol_compat import verified_protocol_features
+
+    monkeypatch.setenv(
+        "TUSKER_PROTOCOL_OVERRIDES_JSON",
+        '{"deepseek": {"structured_tool_calls": "banana"}}',
+    )
+    store = ProtocolEvidenceStore(":memory:")
+    assert verified_protocol_features(
+        "deepseek", "endpoint-x", "deepseek-r1", store=store,
+    ) == frozenset()
