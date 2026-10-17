@@ -2,7 +2,7 @@
 from tusker_gateway.protocol_probe import classify_probe
 
 
-def _response(arguments='{"query":"hello"}', finish="tool_calls"):
+def _response(arguments='{"value":"ok"}', finish="tool_calls"):
     return {"choices": [{"finish_reason": finish, "message": {
         "tool_calls": [{"id": "call_1", "type": "function",
                         "function": {"name": "protocol_probe_echo", "arguments": arguments}}],
@@ -12,6 +12,12 @@ def _response(arguments='{"query":"hello"}', finish="tool_calls"):
 def test_structured_tool_probe_requires_valid_json():
     assert classify_probe("structured_tool_calls", response=_response()).status == "passed"
     assert classify_probe("structured_tool_calls", response=_response("{")).status == "unknown"
+
+
+def test_probe_rejects_wrong_echo_arguments():
+    """A structurally valid call with unrelated arguments is NOT compliance."""
+    assert classify_probe("structured_tool_calls", response=_response('{"query":"hi"}')).status == "unknown"
+    assert classify_probe("structured_tool_calls", response=_response('{"value":"wrong"}')).status == "unknown"
 
 
 def test_tool_finish_probe_does_not_assume_stop_is_compliant():
