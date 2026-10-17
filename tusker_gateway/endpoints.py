@@ -821,8 +821,8 @@ async def _normalize_stream_legacy(raw_stream: AsyncIterator[bytes]) -> AsyncIte
             new_choice = {**choice, "delta": delta}
             new_obj = {**obj, "choices": [new_choice, *choices[1:]]}
             # Split if chunk has BOTH content/tools AND finish_reason
-            if fr and (bool(delta.get("content")) or has_tools):
-                if bool(delta.get("content")):
+            if fr and (bool(delta.get("content")) or bool(delta.get("reasoning_content")) or has_tools):
+                if bool(delta.get("content")) or bool(delta.get("reasoning_content")):
                     content_delta = {
                         k: v for k, v in delta.items() if k not in ("role", "tool_calls")
                     }
