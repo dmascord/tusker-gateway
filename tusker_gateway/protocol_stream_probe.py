@@ -45,7 +45,8 @@ async def probe_streaming_tool_fragments(
             total += len(chunk)
             if total > max_bytes:
                 return ProbeAssessment("streaming_tool_fragments", "unknown", "size_limit")
-            buffer += chunk.replace(b"\r\n", b"\n")
+            buffer += chunk
+            buffer = buffer.replace(b"\r\n", b"\n")
             while b"\n\n" in buffer:
                 frame, buffer = buffer.split(b"\n\n", 1)
                 lines = [line[5:].strip() for line in frame.splitlines()
@@ -60,11 +61,19 @@ async def probe_streaming_tool_fragments(
                     event = json.loads(payload)
                 except (ValueError, UnicodeDecodeError):
                     return ProbeAssessment("streaming_tool_fragments", "unknown", "invalid_sse")
-                for choice in event.get("choices", []):
+                if not isinstance(event, dict) or not isinstance(event.get("choices"), list):
+                    return ProbeAssessment("streaming_tool_fragments", "unknown", "invalid_envelope")
+                for choice in event["choices"]:
+                    if not isinstance(choice, dict):
+                        return ProbeAssessment("streaming_tool_fragments", "unknown", "invalid_choice")
                     if choice.get("finish_reason") in {"tool_calls", "stop"}:
                         finished = True
                     delta = choice.get("delta") or {}
+                    if not isinstance(delta, dict):
+                        return ProbeAssessment("streaming_tool_fragments", "unknown", "invalid_delta")
                     for call in delta.get("tool_calls") or []:
+                        if not isinstance(call, dict):
+                            return ProbeAssessment("streaming_tool_fragments", "unknown", "invalid_call")
                         index = call.get("index", 0)
                         if not isinstance(index, int) or index < 0:
                             return ProbeAssessment("streaming_tool_fragments", "unknown", "invalid_index")
