@@ -37,21 +37,24 @@ def resolve_protocol(provider: str, model: str) -> ProtocolProfile:
     native = (p in {"deepseek", "zai", "z.ai", "zhipu", "moonshot", "minimax"})
     return ProtocolProfile(
         provider=p, model=m, family=family,
-        replay_reasoning=native and family in {"deepseek", "glm", "kimi"},
+        replay_reasoning=False,  # Never infer replay requirements from model names.
         thinking_parameter="thinking" if p in {"zai", "z.ai", "zhipu"} else None,
         supports_reasoning_effort=p in {"openai", "apim", "opencode-go"},
         confidence="provider" if native else "heuristic" if family != "unknown" else "unknown",
     )
 
 
-def adapt_upstream_chat(body: dict[str, Any], provider: str, model: str) -> ProtocolProfile:
+def adapt_upstream_chat(
+    body: dict[str, Any], provider: str, model: str, *,
+    verified_features: frozenset[str] = frozenset(),
+) -> ProtocolProfile:
     """Apply only safe, provider-scoped changes. Never discard reasoning.
 
     Unknown and third-party-hosted models are left untouched; the gateway's
     existing provider-specific transformations remain authoritative.
     """
     profile = resolve_protocol(provider, model)
-    if profile.replay_reasoning and isinstance(body.get("messages"), list):
+    if "reasoning_replay" in verified_features and isinstance(body.get("messages"), list):
         # Copy-on-write: candidate failover must not mutate the shared
         # conversation history for a different provider's replay dialect.
         changed = False
