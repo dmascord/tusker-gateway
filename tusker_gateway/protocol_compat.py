@@ -60,3 +60,26 @@ def adapt_upstream_chat(body: dict[str, Any], provider: str, model: str) -> Prot
             if message.get("reasoning_content") is None and isinstance(message.get("reasoning"), str):
                 message["reasoning_content"] = message["reasoning"]
     return profile
+
+
+def verified_protocol_features(
+    provider: str, endpoint_id: str, model: str, *,
+    store: Any,
+) -> frozenset[str]:
+    """Only fresh, version-matched probe evidence may enable features."""
+    from tusker_gateway.protocol_evidence import PROTOCOL_FEATURES
+    passed = set()
+    for feature in PROTOCOL_FEATURES:
+        evidence = store.get(provider, endpoint_id, model, feature)
+        if evidence is not None and evidence.verified:
+            passed.add(feature)
+    return frozenset(passed)
+
+
+def resolve_with_evidence(
+    provider: str, model: str, endpoint_id: str, *, store: Any,
+) -> tuple[ProtocolProfile, frozenset[str]]:
+    """Resolve a model family hint and separately verified capabilities."""
+    return resolve_protocol(provider, model), verified_protocol_features(
+        provider, endpoint_id, model, store=store,
+    )
