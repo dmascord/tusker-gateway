@@ -351,13 +351,24 @@ def _warm_control_recorder(url: str = "http://127.0.0.1:4096"):
 
 @pytest.fixture
 def warm_state(monkeypatch, tmp_path):
-    """Isolate warm module state, the broker directory, and warm env flags."""
+    """Isolate warm module state, the broker directory, and warm env flags.
+
+    Executable discovery is mocked alongside the control-plane calls so the
+    warm-service contract is tested hermetically: these tests must pass on
+    machines without an ``opencode`` binary installed.
+    """
     from tusker_gateway.provider_adapters import opencode_cli as module
 
     monkeypatch.setenv("TUSKER_OPENCODE_CLI_ENABLED", "true")
     monkeypatch.setenv("TUSKER_OPENCODE_WARM_ENABLED", "1")
     monkeypatch.setenv("TUSKER_OPENCODE_WARM_BROKER_DIR", str(tmp_path / "broker"))
     monkeypatch.setenv("TUSKER_OPENCODE_WARM_IDLE_SECS", "0")
+    # chat() resolves the executable through shutil.which before the warm
+    # path runs; without this patch the seven warm-service tests demand a
+    # real `opencode` binary even though all warm behaviour is faked below.
+    monkeypatch.setattr(
+        module.shutil, "which", lambda executable: f"/opt/fake/{executable}"
+    )
     monkeypatch.setattr(module, "_WARM_SERVICE_URL", None)
     monkeypatch.setattr(module, "_WARM_LAST_USE", 0.0)
     monkeypatch.setattr(module, "_WARM_IDLE_TASK", None)
