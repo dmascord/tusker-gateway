@@ -14,7 +14,7 @@ import re
 import time
 import fnmatch
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from tusker_gateway.catalog import (
     AUTO_DISCOVERED_HEAVYWEIGHT_WEIGHT,
@@ -1116,6 +1116,8 @@ class PoolManager:
         allow_tool_compatibility_fallback: bool = False,
         allowed_providers: tuple[str, ...] | None = None,
         allowed_models: tuple[str, ...] | None = None,
+        payload_bytes: int = 0,
+        payload_ceiling_of: Callable[[str, str], int | None] | None = None,
     ) -> tuple[str, str] | None:
         """Select the best (provider, model) from a pool.
 
@@ -1299,6 +1301,17 @@ class PoolManager:
                             # Context doesn't fit; clear stickiness
                             self._drop_stickiness(key)
                             break
+                        if payload_bytes > 0 and payload_ceiling_of is not None:
+                            sticky_ceiling = payload_ceiling_of(s.provider, s.model)
+                            if (
+                                sticky_ceiling is not None
+                                and sticky_ceiling < payload_bytes
+                            ):
+                                # This body cannot fit the sticky route; drop
+                                # it so the normal filter loop can pick one
+                                # that can.
+                                self._drop_stickiness(key)
+                                break
                         modalities, tool_support = self._model_capabilities(
                             s, capability_cache, model_capability_records
                         )
@@ -1369,9 +1382,11 @@ class PoolManager:
             "cooldown": 0,
             "zdr_policy": 0,
             "llm_stats_rank": 0,
+            "payload_size": 0,
         }
         filtered_zdr_models: list[str] = []
         filtered_context_models: list[str] = []
+        filtered_payload_models: list[str] = []
         for s in specs:
             if self._model_is_blacklisted(s.provider, s.model):
                 filter_counts["blacklisted_model"] += 1
@@ -1410,6 +1425,18 @@ class PoolManager:
                     filter_counts["context_window"] += 1
                     if len(filtered_context_models) < 12:
                         filtered_context_models.append(f"{s.provider}/{s.model}:{window}")
+                    continue
+            # Learned payload ceiling: skip a route we have positive
+            # evidence cannot accept this body. ``None`` (no evidence yet)
+            # never filters, so a fresh route is always tried.
+            if payload_bytes > 0 and payload_ceiling_of is not None:
+                ceiling = payload_ceiling_of(s.provider, s.model)
+                if ceiling is not None and ceiling < payload_bytes:
+                    filter_counts["payload_size"] += 1
+                    if len(filtered_payload_models) < 12:
+                        filtered_payload_models.append(
+                            f"{s.provider}/{s.model}:{ceiling}"
+                        )
                     continue
             if not heavyweight_ok and s.heavyweight:
                 filter_counts["heavyweight"] += 1
@@ -1503,6 +1530,14 @@ class PoolManager:
                 context_tokens,
                 filter_counts["context_window"],
                 ",".join(filtered_context_models),
+            )
+        if filtered_payload_models:
+            logger.info(
+                "pool '%s' payload ceiling filter payload_bytes=%d filtered=%d models=%s",
+                pool_name,
+                payload_bytes,
+                filter_counts["payload_size"],
+                ",".join(filtered_payload_models),
             )
         if filtered_zdr_models:
             logger.info(

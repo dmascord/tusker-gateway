@@ -3012,3 +3012,137 @@ async def test_chat_stream_rejected_turn_capture_records_provider_bytes(
     assert verdict["saw_done"] is False
     assert verdict["finish_reason"] is None
     assert verdict["tools_requested"] is True
+
+
+@pytest.mark.asyncio
+async def test_pool_skips_route_with_known_payload_ceiling(tmp_path):
+    """The chat path must pass the payload filter kwargs to the pool selector.
+
+    The actual filter lives in ``PoolManager.select``; here we pin that
+    the chat path forwards the body size and the breaker's ceiling
+    accessor so the selector can apply them. The filter itself is
+    covered by ``tests/test_pools.py::test_pool_filter_skips_routes_with_known_payload_ceiling``.
+    """
+    from tusker_gateway.circuit_breaker import BreakerConfig, CircuitBreaker
+
+    breaker = CircuitBreaker(
+        BreakerConfig(enabled=True, path=str(tmp_path / "ceiling.db"))
+    )
+    # The route rejected a 100 KiB body; the ceiling is recorded as 99 KiB
+    # minus the 1 KiB margin. The chat path only needs to pass this to the
+    # pool selector; the selector decides whether to filter.
+    breaker.record_rejected_payload("openai-codex", "gpt-5.6-luna", 100_000)
+
+    pool_manager = MagicMock()
+    pool_manager.select.return_value = ("openai-codex", "gpt-5.6-luna")
+
+    upstream = MagicMock()
+    upstream.chat = AsyncMock(
+        return_value={"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+    )
+
+    request = SimpleNamespace(
+        app={"pool_manager": pool_manager},
+        _tusker_payload_bytes=100_000,
+    )
+    await _call_with_pool_fallback(
+        {"pools": {}},
+        {"model": "hermes-code", "messages": [{"role": "user", "content": "x"}]},
+        upstream,
+        request=request,
+        breaker=breaker,
+    )
+    select_kwargs = pool_manager.select.call_args_list[0].kwargs
+    assert select_kwargs["payload_bytes"] == 100_000
+    # Bound methods compare unequal across accesses; compare the underlying
+    # function and receiver instead.
+    ceiling_of = select_kwargs["payload_ceiling_of"]
+    assert ceiling_of.__func__ is CircuitBreaker.payload_ceiling_bytes
+    assert ceiling_of.__self__ is breaker
+
+
+@pytest.mark.asyncio
+async def test_pool_does_not_cool_breaker_on_upstream_413(tmp_path):
+    """An upstream 413 must not record a breaker failure.
+
+    413 is request-level ("the body was too big for this route"), not a
+    provider health signal. The breaker must not cool the route so the next
+    request can try it again with a smaller body.
+    """
+    from tusker_gateway.circuit_breaker import BreakerConfig, CircuitBreaker
+
+    breaker = CircuitBreaker(
+        BreakerConfig(enabled=True, path=str(tmp_path / "breaker.db"))
+    )
+
+    pool_manager = MagicMock()
+    _selections = iter(
+        [("openai-codex", "gpt-5.6-luna"), ("alibaba", "qwen3.6-flash")]
+    )
+    pool_manager.select.side_effect = lambda *_a, **_k: next(_selections, None)
+
+    from tusker_gateway.errors import ProviderError
+
+    big_413 = ProviderError("upstream rejected")
+    big_413.upstream_status = 413
+    big_413.upstream_body = '{"error": "payload too large"}'
+
+    upstream = MagicMock()
+    upstream.chat = AsyncMock(
+        side_effect=[big_413, {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}]
+    )
+
+    request = SimpleNamespace(
+        app={"pool_manager": pool_manager},
+        _tusker_payload_bytes=200_000,
+    )
+    provider, model, _ = await _call_with_pool_fallback(
+        {"pools": {}},
+        {"model": "hermes-code", "messages": [{"role": "user", "content": "x"}]},
+        upstream,
+        request=request,
+        breaker=breaker,
+    )
+    # The 413 route was rejected; the next candidate succeeded.
+    assert (provider, model) == ("alibaba", "qwen3.6-flash")
+    # The breaker should have learned the ceiling for the 413 route but
+    # recorded NO failure and no consecutive-failure increment.
+    row = breaker._read("openai-codex", "gpt-5.6-luna")
+    assert row is not None
+    assert row.get("payload_ceiling_bytes") is not None
+    assert row.get("consecutive_failures") in (0, None)
+    assert row.get("state") in (None, "closed")
+    assert breaker.consecutive_failures("openai-codex", "gpt-5.6-luna") == 0
+
+
+@pytest.mark.asyncio
+async def test_pool_records_accepted_payload_after_success(tmp_path):
+    """A successful dispatch of N bytes raises the route's payload ceiling."""
+    from tusker_gateway.circuit_breaker import BreakerConfig, CircuitBreaker
+
+    breaker = CircuitBreaker(
+        BreakerConfig(enabled=True, path=str(tmp_path / "breaker.db"))
+    )
+
+    pool_manager = MagicMock()
+    pool_manager.select.return_value = ("openai-codex", "gpt-5.6-luna")
+
+    upstream = MagicMock()
+    upstream.chat = AsyncMock(
+        return_value={"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+    )
+
+    request = SimpleNamespace(
+        app={"pool_manager": pool_manager},
+        _tusker_payload_bytes=80_000,
+    )
+    await _call_with_pool_fallback(
+        {"pools": {}},
+        {"model": "hermes-code", "messages": [{"role": "user", "content": "x"}]},
+        upstream,
+        request=request,
+        breaker=breaker,
+    )
+    assert (
+        breaker.payload_ceiling_bytes("openai-codex", "gpt-5.6-luna") == 80_000
+    )

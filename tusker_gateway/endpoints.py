@@ -15,6 +15,7 @@ from typing import Any, AsyncIterator, Iterator
 
 from aiohttp import ClientError, ClientPayloadError, web
 from aiohttp.http_exceptions import TransferEncodingError
+from aiohttp.web_exceptions import HTTPRequestEntityTooLarge
 from tusker_gateway.redaction import _BufferedRestorer
 
 from tusker_gateway.cache import ResponseCache, make_cache_key, make_caller_scope
@@ -41,6 +42,7 @@ from tusker_gateway.errors import (
     InvalidToolCallArgumentsError,
     MalformedToolCallError,
     NoHealthyModelsError,
+    PayloadTooLargeError,
     ProviderCapacityError,
     ProviderEmptyStreamError,
     ProviderError,
@@ -4722,6 +4724,17 @@ async def _call_with_pool_fallback(
     than 429 rate-limit, which uses the cooldown path) record failure.
     """
     extra_body = _build_extra_body(body)
+    # Wire-level body size, captured by _json_request_body. Drives the
+    # learned payload ceiling: routes proven unable to accept this many
+    # bytes are skipped rather than tried and rejected. Fall back to 0
+    # when the request is a SimpleNamespace in tests or otherwise does
+    # not carry the storage key.
+    payload_bytes = 0
+    if request is not None:
+        payload_bytes = int(getattr(request, "_tusker_payload_bytes", 0) or 0)
+    payload_ceiling_of = (
+        breaker.payload_ceiling_bytes if breaker is not None else None
+    )
     prompt_estimate = estimate_prompt_tokens(body.get("messages"), tools)
     required_input_modalities = _required_input_modalities(body.get("messages"))
     requires_tools = bool(tools)
@@ -4816,6 +4829,11 @@ async def _call_with_pool_fallback(
             )
             if breaker is not None:
                 await asyncio.to_thread(breaker.record_success, provider, model)
+                if payload_bytes > 0:
+                    await asyncio.to_thread(
+                        breaker.record_accepted_payload,
+                        provider, model, payload_bytes,
+                    )
             _clear_permanently_failed(provider, model)
             return provider, model, result
         except asyncio.TimeoutError as exc:
@@ -4883,12 +4901,20 @@ async def _call_with_pool_fallback(
             _quarantine_tool_response_failure(config, provider, model, exc)
             _quarantine_stream_loop(config, provider, model, exc)
             if breaker is not None:
-                await asyncio.to_thread(
-                    breaker.record_failure,
-                    provider,
-                    model,
-                    cooldown_secs=_cooldown_for_exc(exc),
-                )
+                if getattr(exc, "upstream_status", None) == 413:
+                    # Request-level: learn the ceiling, skip the cooldown.
+                    if payload_bytes > 0:
+                        await asyncio.to_thread(
+                            breaker.record_rejected_payload,
+                            provider, model, payload_bytes,
+                        )
+                else:
+                    await asyncio.to_thread(
+                        breaker.record_failure,
+                        provider,
+                        model,
+                        cooldown_secs=_cooldown_for_exc(exc),
+                    )
             _mark_permanently_failed(exc, provider, model)
             if request is not None:
                 set_access_log_context(
@@ -4965,6 +4991,11 @@ async def _call_with_pool_fallback(
                 "required_input_modalities": required_input_modalities,
                 "context_tokens": required_context_tokens(prompt_estimate),
             }
+            if payload_ceiling_of is not None and payload_bytes > 0:
+                # Only meaningful with a breaker to consult; without one the
+                # filter has no evidence source and the args stay inert.
+                select_kwargs["payload_bytes"] = payload_bytes
+                select_kwargs["payload_ceiling_of"] = payload_ceiling_of
             allowed_providers = provider_patterns_for_request(request)
             if allowed_providers is not None:
                 select_kwargs["allowed_providers"] = allowed_providers
@@ -5229,6 +5260,11 @@ async def _call_with_pool_fallback(
             )
             if breaker is not None:
                 await asyncio.to_thread(breaker.record_success, provider, model)
+                if payload_bytes > 0:
+                    await asyncio.to_thread(
+                        breaker.record_accepted_payload,
+                        provider, model, payload_bytes,
+                    )
             _clear_permanently_failed(provider, model)
             return provider, model, result
         except asyncio.TimeoutError as exc:
@@ -5361,14 +5397,24 @@ async def _call_with_pool_fallback(
                 prior_failures = await asyncio.to_thread(
                     breaker.consecutive_failures, provider, model
                 )
-                await asyncio.to_thread(
-                    breaker.record_failure,
-                    provider,
-                    model,
-                    cooldown_secs=_cooldown_for_exc(
-                        exc, consecutive_failures=prior_failures
-                    ),
-                )
+                if getattr(exc, "upstream_status", None) == 413:
+                    # 413 is request-level: the body was too big for this
+                    # route. Learn the ceiling and skip the cooldown so the
+                    # next request can try a route that fits.
+                    if payload_bytes > 0:
+                        await asyncio.to_thread(
+                            breaker.record_rejected_payload,
+                            provider, model, payload_bytes,
+                        )
+                else:
+                    await asyncio.to_thread(
+                        breaker.record_failure,
+                        provider,
+                        model,
+                        cooldown_secs=_cooldown_for_exc(
+                            exc, consecutive_failures=prior_failures
+                        ),
+                    )
             _mark_permanently_failed(exc, provider, model)
             last_error = exc
             excluded.add(selected)
@@ -6595,13 +6641,29 @@ async def metrics_handler(request: web.Request) -> web.Response:
 async def _json_request_body(request: web.Request) -> Any:
     """Parse a JSON request body, reporting caller mistakes as 400.
 
+    A body over aiohttp's ``client_max_size`` raises
+    ``HTTPRequestEntityTooLarge``; it becomes a ``PayloadTooLargeError``
+    (413) so the client sees an OpenAI-shaped error instead of aiohttp's
+    default plain text. The exact byte size is stored on the request as
+    ``_tusker_payload_bytes`` so the caller can learn a per-route payload
+    ceiling from it.
+
     A body that is neither valid JSON nor UTF-8 text raises ``ValueError``
-    (``json.JSONDecodeError``), ``UnicodeDecodeError`` or ``TypeError``. All are
-    client errors: letting them reach a handler's generic failure path reports
-    an upstream provider failure (502) for a bad request and hides the cause.
+    (``json.JSONDecodeError``), ``UnicodeDecodeError`` or ``TypeError``. All
+    are client errors: letting them reach a handler's generic failure path
+    reports an upstream provider failure (502) for a bad request and hides
+    the cause.
     """
     try:
-        return await request.json()
+        raw = await request.read()
+    except HTTPRequestEntityTooLarge as exc:
+        raise PayloadTooLargeError(
+            f"Request body is too large (limit "
+            f"{getattr(exc, 'text', None) or 'see client_max_size'})"
+        ) from exc
+    request["_tusker_payload_bytes"] = len(raw)
+    try:
+        return json.loads(raw)
     except (ValueError, UnicodeDecodeError, TypeError) as exc:
         raise BadRequestError(
             "Request body must be valid JSON", code="malformed_payload"
@@ -8585,6 +8647,7 @@ async def rerank_handler(request: web.Request) -> web.Response:
             body,
             session=request.app.get("http_session"),
             breaker=request.app.get("breaker"),
+            payload_bytes=int(request.get("_tusker_payload_bytes") or 0),
         )
         set_access_log_context(
             request,
@@ -8685,6 +8748,7 @@ async def embeddings_handler(request: web.Request) -> web.Response:
             body,
             session=request.app.get("http_session"),
             breaker=request.app.get("breaker"),
+            payload_bytes=int(request.get("_tusker_payload_bytes") or 0),
         )
         set_access_log_context(
             request,

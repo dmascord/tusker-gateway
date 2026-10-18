@@ -38,6 +38,29 @@ class BadRequestError(GatewayError):
     error_type = "invalid_request_error"
 
 
+class PayloadTooLargeError(GatewayError):
+    """The request body exceeds a wire-level limit.
+
+    Raised at the gateway edge when the client body exceeds aiohttp's
+    ``client_max_size`` (10 MiB by default), and by the media handlers when
+    an upstream rejects a body as too large. The request was malformed, not
+    the provider; callers must not cool down or trip the breaker for it.
+    """
+
+    status = 413
+    error_type = "invalid_request_error"
+
+    def __init__(
+        self,
+        message: str = "Request body is too large",
+        *,
+        code: str | None = "payload_too_large",
+    ):
+        super().__init__(message, code=code)
+
+
+
+
 class HighImpactApprovalRequiredError(GatewayError):
     """A proposed consequential tool action needs explicit user approval."""
 
