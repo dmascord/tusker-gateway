@@ -70,6 +70,18 @@ def test_invalid_token_passes_through():
     assert t.restore_text(garbage) == garbage
 
 
+def test_restore_authenticated_payload_when_model_drops_token_wrapper():
+    t = _tokenizer()
+    email = _make_email()
+    token = t.tokenize_text(email)
+    payload = token[len("[TUSKER:email:"):-1]
+
+    # The failed OMP turn stripped the token wrapper and treated this payload
+    # as a mailbox identifier. Recover only because its ciphertext authenticates.
+    assert t.restore_text("search for " + payload) == "search for " + email
+    assert t.restore_text("search for " + "A" * len(payload)) == "search for " + "A" * len(payload)
+
+
 def test_response_context_cannot_open_request_context():
     t = _tokenizer()
     # context separation: a token opened with wrong AD fails -> passthrough
@@ -135,6 +147,16 @@ def test_streaming_restore_mid_token_split():
     out += r.feed(tokenized[cut:])
     out += r.flush()
     assert out == plain
+
+
+@pytest.mark.parametrize("chunk", [1, 7, 31, 4096])
+def test_streaming_restore_bare_payload_split_across_deltas(chunk):
+    t = _tokenizer()
+    email = _make_email()
+    payload = t.tokenize_text(email)[len("[TUSKER:email:"):-1]
+    plain = '"command":"search ' + payload + '"'
+    restored = _feed_all(plain, chunk)
+    assert restored == '"command":"search ' + email + '"'
 
 
 def test_streaming_flush_clears_pending():
@@ -364,6 +386,22 @@ def test_streaming_tool_call_arguments_restore(chunking):
     text = _stream_tool_args(parts, t)
     args = _reassemble_tool_arguments(text)
     assert args == '{"command":"' + secret + '"}'
+    assert "[TUSKER:" not in args
+
+
+def test_streaming_tool_call_restores_wrapper_stripped_email_payload():
+    t = _tokenizer()
+    email = _make_email()
+    payload = t.tokenize_text(email)[len("[TUSKER:email:"):-1]
+    halfway = len(payload) // 2
+    parts = [
+        '{"command":"search ' + payload[:halfway],
+        payload[halfway:] + '"}',
+    ]
+
+    response = _stream_tool_args(parts, t)
+    args = _reassemble_tool_arguments(response)
+    assert args == '{"command":"search ' + email + '"}'
     assert "[TUSKER:" not in args
 
 
