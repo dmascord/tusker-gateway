@@ -153,7 +153,12 @@ class IdempotencyStore:
                 """
             )
 
-    def claim(self, record_key: str, request_hash: str) -> Claim:
+    def claim(
+        self,
+        record_key: str,
+        request_hash: str,
+        lease_token: str | None = None,
+    ) -> Claim:
         now = time.time()
         assert self._db is not None
         with self._db.connection() as conn:
@@ -168,7 +173,7 @@ class IdempotencyStore:
                 (record_key,),
             ).fetchone()
             if row is None:
-                lease_token = secrets.token_hex(16)
+                lease_token = lease_token or secrets.token_hex(16)
                 conn.execute(
                     """
                     INSERT INTO idempotency_records
@@ -202,7 +207,7 @@ class IdempotencyStore:
                 conn.commit()
                 return Claim("in_progress")
 
-            lease_token = secrets.token_hex(16)
+            lease_token = lease_token or secrets.token_hex(16)
             conn.execute(
                 """
                 UPDATE idempotency_records
@@ -323,6 +328,72 @@ async def _abandon_safely(
     except _STORAGE_ERRORS:
         logger.exception("could not release idempotency reservation")
 
+async def _abandon_orphaned_claim(
+    store: IdempotencyStore,
+    record_key: str,
+    request_hash: str,
+    lease_token: str,
+) -> None:
+    """Release the reservation a cancelled ``claim`` may still be committing.
+
+    ``store.claim`` runs in a worker thread, so a client deadline that cancels
+    the awaiting coroutine mid-claim leaves that thread running. Whatever it
+    commits afterwards would block retries for ``config.lock_secs``. Poll
+    briefly for the row here — bounded, so an unrelated 504 is never delayed
+    materially — then hand a row that still has not appeared to a background
+    task that keeps trying until the lease window lapses. A second
+    cancellation (client disconnect racing the deadline) must not skip the
+    hand-off, so the background task is spawned on every non-released exit.
+    """
+    deadline = time.monotonic() + _ORPHAN_POLL_BUDGET_SECS
+    try:
+        while time.monotonic() < deadline:
+            try:
+                abandoned = await asyncio.shield(
+                    asyncio.to_thread(
+                        store.abandon, record_key, request_hash, lease_token
+                    )
+                )
+            except _STORAGE_ERRORS:
+                logger.exception("could not release cancelled idempotency claim")
+                return
+            if abandoned:
+                return
+            await asyncio.sleep(_ORPHAN_POLL_INTERVAL_SECS)
+    except asyncio.CancelledError:
+        pass
+    task = asyncio.create_task(
+        _abandon_when_committed(store, record_key, request_hash, lease_token),
+        name="idempotency-orphan-abandon",
+    )
+    _ORPHAN_CLEANUP_TASKS.add(task)
+    task.add_done_callback(_ORPHAN_CLEANUP_TASKS.discard)
+
+
+async def _abandon_when_committed(
+    store: IdempotencyStore,
+    record_key: str,
+    request_hash: str,
+    lease_token: str,
+) -> None:
+    deadline = time.monotonic() + max(store.config.lock_secs, 1.0)
+    while time.monotonic() < deadline:
+        try:
+            if await asyncio.to_thread(
+                store.abandon, record_key, request_hash, lease_token
+            ):
+                return
+        except _STORAGE_ERRORS:
+            logger.exception("could not release cancelled idempotency claim")
+            return
+        await asyncio.sleep(_ORPHAN_BACKGROUND_INTERVAL_SECS)
+
+
+_ORPHAN_POLL_INTERVAL_SECS = 0.025
+_ORPHAN_POLL_BUDGET_SECS = 0.5
+_ORPHAN_BACKGROUND_INTERVAL_SECS = 0.25
+_ORPHAN_CLEANUP_TASKS: set[asyncio.Task] = set()
+
 
 def attach_idempotency_middleware(
     app: web.Application, store: IdempotencyStore
@@ -365,8 +436,19 @@ def attach_idempotency_middleware(
 
         record_key = _record_key(request, key)
         request_hash = _canonical_request_hash(request, body)
+        # The lease token is chosen before claiming so a client deadline that
+        # cancels this coroutine while the worker thread is inside claim() can
+        # still identify and release the row that thread may commit afterwards.
+        escrow_token = secrets.token_hex(16)
         try:
-            claim = await asyncio.to_thread(store.claim, record_key, request_hash)
+            claim = await asyncio.to_thread(
+                store.claim, record_key, request_hash, escrow_token
+            )
+        except asyncio.CancelledError:
+            await _abandon_orphaned_claim(
+                store, record_key, request_hash, escrow_token
+            )
+            raise
         except _STORAGE_ERRORS:
             return web.json_response(
                 openai_error(
