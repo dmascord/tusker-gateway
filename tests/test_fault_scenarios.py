@@ -157,10 +157,11 @@ async def test_request_level_413_does_not_poison_the_route(app, client):
     """
     pool_manager = MagicMock()
     pool_manager.fallback_pools.return_value = ()
-    pool_manager.select.side_effect = [
+    _candidates = iter([
         ("alibaba", "fits-no-windows"),
         ("openrouter", "also-fits-no-windows"),
-    ]
+    ])
+    pool_manager.select.side_effect = lambda *_a, **_k: next(_candidates, None)
     app["pool_manager"] = pool_manager
 
     failure = ProviderError("prompt too large")

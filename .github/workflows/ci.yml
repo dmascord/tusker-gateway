@@ -36,7 +36,22 @@ jobs:
       - name: Architecture hotspot growth check
         run: python tools/check_module_size.py
       - name: Deterministic test suite
-        run: pytest tests/ -p no:cacheprovider --durations=50 --ignore=tests/test_passthrough_providers.py
+        run: |
+          set -o pipefail
+          pytest tests/ -p no:cacheprovider --durations=50 \
+            --ignore=tests/test_passthrough_providers.py \
+            --junitxml=test-results-${{ matrix.python-version }}.xml \
+            2>&1 | tee pytest-${{ matrix.python-version }}.log
+      - name: Retain slowest-50 timings and JUnit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-report-${{ matrix.python-version }}
+          path: |
+            pytest-${{ matrix.python-version }}.log
+            test-results-${{ matrix.python-version }}.xml
+          if-no-files-found: warn
+
 
   dependency-audit:
     name: Dependency audit
