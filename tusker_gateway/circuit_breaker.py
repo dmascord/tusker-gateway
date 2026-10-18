@@ -80,6 +80,18 @@ class BreakerConfig:
     overrides: dict[str, BreakerPolicy] = field(default_factory=dict)
 
 
+# Margin below a rejected size for the ceiling we record. The real cap is
+# somewhere between ``size - margin`` and ``size`` (e.g. an ingress proxy
+# in front of the provider may have rounded its cap), so we conservatively
+# pick the lower bound.
+PAYLOAD_CEILING_MARGIN_BYTES = 1024
+# A 413 on a tiny body must not be able to lower the ceiling to zero and
+# filter every request. Pick a value that comfortably covers a normal
+# OpenAI-shaped chat payload (~10 KiB) so the filter never trips on
+# ordinary traffic.
+MIN_PAYLOAD_CEILING_BYTES = 32 * 1024
+
+
 @dataclass
 class BreakerStats:
     trips: int = 0
@@ -169,6 +181,16 @@ class CircuitBreaker:
                     "ALTER TABLE breakers ADD COLUMN "
                     + ("IF NOT EXISTS " if self._db.is_postgres else "")
                     + "half_open_probes INTEGER NOT NULL DEFAULT 0"
+                )
+            # Migration: add payload_ceiling_bytes for learned per-route
+            # request-body limits. A successful dispatch of N bytes raises
+            # the ceiling to N; an upstream 413 at N lowers it below N.
+            # NULL means "no evidence yet" (never filtered).
+            if "payload_ceiling_bytes" not in cols:
+                conn.execute(
+                    "ALTER TABLE breakers ADD COLUMN "
+                    + ("IF NOT EXISTS " if self._db.is_postgres else "")
+                    + "payload_ceiling_bytes INTEGER"
                 )
             # A half-open reservation belongs to the process that made the
             # probe. If that process was restarted or killed while the
@@ -451,6 +473,98 @@ class CircuitBreaker:
     def stats_snapshot(self) -> dict[str, int]:
         return self.stats.snapshot()
 
+    def consecutive_failures(self, provider: str, model: str) -> int:
+        """Return the current consecutive-failure count, or 0.
+
+        Lets callers compute an escalating cooldown (5xx → 60s → 300s → 3600s)
+        *before* recording the new failure, so the first 60s probe is not
+        already at the 3600s step. Returns 0 when the breaker is disabled
+        or the row does not yet exist.
+        """
+        if not self._config.enabled:
+            return 0
+        row = self._read(provider, model)
+        if row is None:
+            return 0
+        return int(row.get("consecutive_failures") or 0)
+
+    def payload_ceiling_bytes(self, provider: str, model: str) -> int | None:
+        """Return the largest request body known to be accepted, or ``None``.
+
+        ``None`` means "no evidence yet" and must not filter the route. The
+        value is raised by successful dispatches and lowered by upstream
+        413s, so it is monotonically safe in the direction that matters:
+        a route is only skipped for a payload we have positive evidence it
+        cannot take.
+        """
+        if not self._config.enabled:
+            return None
+        row = self._read(provider, model)
+        if row is None:
+            return None
+        value = row.get("payload_ceiling_bytes")
+        return int(value) if value is not None else None
+
+    def record_accepted_payload(self, provider: str, model: str, size: int) -> None:
+        """Raise the route's accepted-payload ceiling after a success.
+
+        Only ever widens: a later smaller success does not lower a ceiling
+        proven by a larger one.
+        """
+        if not self._config.enabled:
+            return
+        try:
+            size = int(size)
+        except (TypeError, ValueError):
+            return
+        if size <= 0:
+            return
+        row = self._read(provider, model)
+        if row is None:
+            self._upsert(
+                provider,
+                model,
+                state=BreakerState.CLOSED.value,
+                payload_ceiling_bytes=size,
+            )
+            return
+        current = row.get("payload_ceiling_bytes")
+        if current is not None and int(current) >= size:
+            return
+        self._update(provider, model, payload_ceiling_bytes=size)
+
+    def record_rejected_payload(self, provider: str, model: str, size: int) -> None:
+        """Lower the route's accepted-payload ceiling after an upstream 413.
+
+        Only ever narrows: a later larger rejection does not raise a ceiling
+        that a smaller rejection already lowered. The recorded value is one
+        margin below the rejected size, clamped at
+        ``MIN_PAYLOAD_CEILING_BYTES`` so a 413 on a tiny body cannot drive
+        the ceiling to zero and filter every request.
+        """
+        if not self._config.enabled:
+            return
+        try:
+            size = int(size)
+        except (TypeError, ValueError):
+            return
+        if size <= 0:
+            return
+        candidate = max(MIN_PAYLOAD_CEILING_BYTES, size - PAYLOAD_CEILING_MARGIN_BYTES)
+        row = self._read(provider, model)
+        if row is None:
+            self._upsert(
+                provider,
+                model,
+                state=BreakerState.CLOSED.value,
+                payload_ceiling_bytes=candidate,
+            )
+            return
+        current = row.get("payload_ceiling_bytes")
+        if current is not None and int(current) <= candidate:
+            return
+        self._update(provider, model, payload_ceiling_bytes=candidate)
+
     # -- internals -------------------------------------------------------
 
     def _read(self, provider: str, model: str) -> dict[str, Any] | None:
@@ -458,7 +572,7 @@ class CircuitBreaker:
         columns = (
             "provider, model, state, consecutive_failures, window_failures, "
             "window_total, window_started_at, opened_at, cooldown_secs, "
-            "half_open_probe_inflight, half_open_probes"
+            "half_open_probe_inflight, half_open_probes, payload_ceiling_bytes"
         )
         with self._db.connection() as conn:
             row = conn.execute(

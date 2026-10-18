@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import json
 import tempfile
+import pytest
 
 from tusker_gateway.config import PoolConfig, _load_pools, load_config
 from tusker_gateway.cooldown import CooldownTracker, _cooldown_seconds_for_429
@@ -1893,3 +1894,86 @@ def test_catalog_refresh_cannot_restore_permanently_failed_model(tmp_path):
     clear_permanently_failed(*route)
     manager.extend_pools_with_auto_catalog()
     assert manager.select("code") == route
+
+def test_pool_filter_skips_routes_with_known_payload_ceiling():
+    """A learned payload ceiling filters a route that cannot accept the body."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Two candidates, both fresh. The first has been seen to reject a
+        # 100 KiB body (so its ceiling is ~99 KiB); the second has no
+        # evidence yet and remains eligible for any size.
+        from tusker_gateway.circuit_breaker import BreakerConfig, CircuitBreaker
+
+        breaker = CircuitBreaker(
+            BreakerConfig(enabled=True, path=os.path.join(tmpdir, "breaker.db"))
+        )
+        breaker.record_rejected_payload("groq", "small-model", 100_000)
+
+        manager = PoolManager(
+            {
+                "pools": {
+                    "test": PoolConfig(
+                        name="test",
+                        models=[
+                            {"provider": "groq", "model": "small-model"},
+                            {"provider": "openai", "model": "big-model"},
+                        ],
+                    )
+                },
+                "quality_db_path": os.path.join(tmpdir, "quality.db"),
+                "provider_api_keys": {"groq": "k", "openai": "k"},
+            }
+        )
+        # A 200 KiB body: the small route's ceiling filters it; only big remains.
+        result = manager.select(
+            "test", payload_bytes=200_000, payload_ceiling_of=breaker.payload_ceiling_bytes
+        )
+        assert result == ("openai", "big-model")
+
+        # A 10 KiB body: below the ceiling; the small route stays eligible.
+        result = manager.select(
+            "test", payload_bytes=10_000, payload_ceiling_of=breaker.payload_ceiling_bytes
+        )
+        assert result in [("groq", "small-model"), ("openai", "big-model")]
+
+        # A tiny body: no payload filter is applied at all (payload_bytes=0).
+        result = manager.select(
+            "test", payload_bytes=0, payload_ceiling_of=breaker.payload_ceiling_bytes
+        )
+        assert result in [("groq", "small-model"), ("openai", "big-model")]
+
+
+def test_pool_filter_logs_payload_skip_event(caplog):
+    """A filtered payload candidate must be observable in the filter log."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        from tusker_gateway.circuit_breaker import BreakerConfig, CircuitBreaker
+
+        breaker = CircuitBreaker(
+            BreakerConfig(enabled=True, path=os.path.join(tmpdir, "breaker.db"))
+        )
+        breaker.record_rejected_payload("groq", "small-model", 100_000)
+
+        manager = PoolManager(
+            {
+                "pools": {
+                    "test": PoolConfig(
+                        name="test",
+                        models=[
+                            {"provider": "groq", "model": "small-model"},
+                            {"provider": "openai", "model": "big-model"},
+                        ],
+                    )
+                },
+                "quality_db_path": os.path.join(tmpdir, "quality.db"),
+                "provider_api_keys": {"groq": "k", "openai": "k"},
+            }
+        )
+        with caplog.at_level("INFO"):
+            manager.select(
+                "test",
+                payload_bytes=200_000,
+                payload_ceiling_of=breaker.payload_ceiling_bytes,
+            )
+        records = [r for r in caplog.records if "payload ceiling filter" in r.message]
+        assert len(records) == 1
+        assert "payload_bytes=200000" in records[0].message
+        assert "small-model" in records[0].message

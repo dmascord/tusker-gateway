@@ -321,7 +321,6 @@ def test_probe_success_resets_counter(tmp_breaker_path):
 
 
 def test_probe_failure_reopens(tmp_breaker_path):
-    """After a half-open probe records failure, the breaker reopens."""
     cb = CircuitBreaker(_cfg(tmp_breaker_path, consecutive_failures=1, cooldown_secs=0.05))
     cb.record_failure("p", "m")
     time.sleep(0.1)
@@ -331,3 +330,96 @@ def test_probe_failure_reopens(tmp_breaker_path):
     cb.record_failure("p", "m")
     d2 = cb.check("p", "m")
     assert not d2.allowed and d2.state == BreakerState.OPEN
+
+
+def test_consecutive_failures_reader_tracks_count(tmp_breaker_path):
+    """The escalation ladder needs the count *before* the new failure lands."""
+    cb = CircuitBreaker(_cfg(tmp_breaker_path, consecutive_failures=10))
+    assert cb.consecutive_failures("p", "m") == 0
+    cb.record_failure("p", "m")
+    assert cb.consecutive_failures("p", "m") == 1
+    cb.record_failure("p", "m")
+    assert cb.consecutive_failures("p", "m") == 2
+    # Success resets it, so escalation does not outlive the outage.
+    cb.record_success("p", "m")
+    assert cb.consecutive_failures("p", "m") == 0
+
+
+def test_consecutive_failures_reader_is_zero_when_disabled(tmp_breaker_path):
+    cb = CircuitBreaker(BreakerConfig(enabled=False, path=tmp_breaker_path))
+    assert cb.consecutive_failures("p", "m") == 0
+
+
+def test_escalated_cooldown_is_stored_on_the_route_row(tmp_breaker_path):
+    """A 3600s escalation must survive into the persisted breaker row, not be
+    replaced by the 60s policy cooldown on the next check."""
+    cb = CircuitBreaker(_cfg(tmp_breaker_path, consecutive_failures=1, cooldown_secs=60.0))
+    cb.record_failure("p", "m", cooldown_secs=3600.0)
+    d = cb.check("p", "m")
+    assert not d.allowed and d.state == BreakerState.OPEN
+    # Past the 60s policy window but inside the 3600s escalation, the route
+    # must still be short-circuited.
+    time.sleep(0.05)
+    row = cb._read("p", "m")
+    assert row is not None
+    assert row["cooldown_secs"] == 3600.0
+
+def test_payload_ceiling_is_none_until_first_evidence(tmp_breaker_path):
+    cb = CircuitBreaker(_cfg(tmp_breaker_path, consecutive_failures=5))
+    assert cb.payload_ceiling_bytes("p", "m") is None
+    cb.record_accepted_payload("p", "m", 1024)
+    assert cb.payload_ceiling_bytes("p", "m") == 1024
+
+
+def test_record_accepted_payload_only_widens(tmp_breaker_path):
+    """A later smaller success must not lower a ceiling proven by a larger one."""
+    cb = CircuitBreaker(_cfg(tmp_breaker_path, consecutive_failures=5))
+    cb.record_accepted_payload("p", "m", 100_000)
+    cb.record_accepted_payload("p", "m", 50_000)
+    assert cb.payload_ceiling_bytes("p", "m") == 100_000
+
+
+def test_record_rejected_payload_only_narrows(tmp_breaker_path):
+    """A later larger rejection must not raise a ceiling already lowered."""
+    cb = CircuitBreaker(_cfg(tmp_breaker_path, consecutive_failures=5))
+    cb.record_rejected_payload("p", "m", 100_000)
+    # 1 KiB margin below 100_000 -> 98_976.
+    first = cb.payload_ceiling_bytes("p", "m")
+    assert first is not None and first < 100_000
+    cb.record_rejected_payload("p", "m", 200_000)
+    second = cb.payload_ceiling_bytes("p", "m")
+    assert second == first
+
+
+def test_rejected_payload_clamps_to_minimum_ceiling(tmp_breaker_path):
+    """A 413 on a tiny body must not drive the ceiling to zero."""
+    from tusker_gateway.circuit_breaker import MIN_PAYLOAD_CEILING_BYTES
+    cb = CircuitBreaker(_cfg(tmp_breaker_path, consecutive_failures=5))
+    cb.record_rejected_payload("p", "m", 64)
+    assert cb.payload_ceiling_bytes("p", "m") == MIN_PAYLOAD_CEILING_BYTES
+
+
+def test_accepted_and_rejected_evidence_together(tmp_breaker_path):
+    """A success at 100k, then a 413 at 50k: ceiling moves to 50k - margin."""
+    from tusker_gateway.circuit_breaker import (
+        MIN_PAYLOAD_CEILING_BYTES,
+        PAYLOAD_CEILING_MARGIN_BYTES,
+    )
+    cb = CircuitBreaker(_cfg(tmp_breaker_path, consecutive_failures=5))
+    cb.record_accepted_payload("p", "m", 100_000)
+    assert cb.payload_ceiling_bytes("p", "m") == 100_000
+    cb.record_rejected_payload("p", "m", 50_000)
+    expected = max(MIN_PAYLOAD_CEILING_BYTES, 50_000 - PAYLOAD_CEILING_MARGIN_BYTES)
+    assert cb.payload_ceiling_bytes("p", "m") == expected
+    # A later smaller success (3k) must not raise the lowered ceiling.
+    cb.record_accepted_payload("p", "m", 3_000)
+    assert cb.payload_ceiling_bytes("p", "m") == expected
+
+
+def test_disabled_breaker_returns_none_for_ceiling(tmp_breaker_path):
+    cb = CircuitBreaker(BreakerConfig(enabled=False, path=tmp_breaker_path))
+    assert cb.payload_ceiling_bytes("p", "m") is None
+    # No-op writes must not raise either.
+    cb.record_accepted_payload("p", "m", 1024)
+    cb.record_rejected_payload("p", "m", 1024)
+    assert cb.payload_ceiling_bytes("p", "m") is None

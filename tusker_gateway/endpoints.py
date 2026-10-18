@@ -15,6 +15,7 @@ from typing import Any, AsyncIterator, Iterator
 
 from aiohttp import ClientError, ClientPayloadError, web
 from aiohttp.http_exceptions import TransferEncodingError
+from aiohttp.web_exceptions import HTTPRequestEntityTooLarge
 from tusker_gateway.redaction import _BufferedRestorer
 
 from tusker_gateway.cache import ResponseCache, make_cache_key, make_caller_scope
@@ -41,6 +42,7 @@ from tusker_gateway.errors import (
     InvalidToolCallArgumentsError,
     MalformedToolCallError,
     NoHealthyModelsError,
+    PayloadTooLargeError,
     ProviderCapacityError,
     ProviderEmptyStreamError,
     ProviderError,
@@ -3912,12 +3914,22 @@ def _select_cache_route_target(
         excluded.add(selected)
 
 
-def _cooldown_for_exc(exc: GatewayError) -> float | None:
+def _cooldown_for_exc(
+    exc: Exception,
+    *,
+    consecutive_failures: int = 0,
+) -> float | None:
     """Derive a circuit-breaker cooldown from a provider error.
 
     Returns the backoff seconds (e.g. a long value for quota-exhaustion or a
-    permanent 401/403/404) or ``None`` when it cannot be determined / the
-    error is transient, so the breaker falls back to its policy cooldown.
+    permanent 401/403/404) or ``None`` when the error is transient and the
+    breaker should fall back to its policy cooldown.
+
+    Accepts any exception carrying provider attributes (``upstream_status``,
+    ``upstream_body``, ``code``, ``retry_after_secs``). A provider failure
+    that surfaces as a raw exception rather than a ``GatewayError`` still
+    earns the cooldown its status implies; gating on the type silently
+    downgraded a 4xx whose 3600s window had already been computed.
     """
     from tusker_gateway.cooldown import (
         _cooldown_seconds_for_429,
@@ -3927,7 +3939,9 @@ def _cooldown_for_exc(exc: GatewayError) -> float | None:
     try:
         if isinstance(exc, RateLimitError):
             return _cooldown_seconds_for_429({"body": exc.body or "", "headers": exc.headers})
-        return _cooldown_seconds_for_provider_error(exc)
+        return _cooldown_seconds_for_provider_error(
+            exc, consecutive_failures=consecutive_failures
+        )
     except Exception:
         return None
 
@@ -4033,15 +4047,42 @@ def _provider_attempt_timeout_overrides() -> dict[str, float]:
     return parsed
 
 
+def _provider_total_attempt_budget_secs() -> float | None:
+    """Return the aggregate wall-clock budget for all pool attempts, or None.
+
+    The per-candidate idle budget bounds one attempt; it does not bound the
+    sum. A chain of stalled candidates can therefore consume the whole
+    request deadline before the loop reaches its remaining routes. This cap
+    stops trying once the aggregate budget is spent so a request fails over
+    (or fails) promptly instead of burning the caller's full timeout.
+
+    ``0`` disables the cap. Unset defaults to ``None`` for backwards
+    compatibility with existing deployments until enabled deliberately.
+    """
+    raw = os.environ.get("TUSKER_PROVIDER_TOTAL_ATTEMPT_BUDGET_SECS", "").strip()
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if value <= 0:
+        return None
+    return value
+
+
 def _provider_attempt_timeout_secs(
     request: web.Request | None,
     provider: str | None = None,
     model: str | None = None,
+    *,
+    attempts_started_at: float | None = None,
 ) -> float:
     """Return the bounded idle budget for one pool candidate.
 
-    A ``provider/model`` override takes precedence over a provider override;
-    both are capped by the request deadline when one is present.
+    A ``provider/model`` override takes precedence over a provider override.
+    The result is capped by, in order: the request deadline, and the
+    aggregate attempt budget measured from ``attempts_started_at``.
     """
     try:
         configured = max(
@@ -4059,11 +4100,15 @@ def _provider_attempt_timeout_secs(
             override = overrides.get(provider_key)
         if override is not None:
             configured = max(configured, override)
+    total_budget = _provider_total_attempt_budget_secs()
+    if total_budget is not None and attempts_started_at is not None:
+        elapsed = asyncio.get_running_loop().time() - attempts_started_at
+        configured = min(configured, max(0.0, total_budget - elapsed))
     if request is None or not hasattr(request, "get"):
-        return configured
+        return max(0.0, configured)
     deadline_at = request.get("_deadline_at")
     if deadline_at is None:
-        return configured
+        return max(0.0, configured)
     remaining = max(0.0, deadline_at - asyncio.get_running_loop().time())
     return max(0.0, min(configured, remaining - 0.25))
 
@@ -4679,6 +4724,17 @@ async def _call_with_pool_fallback(
     than 429 rate-limit, which uses the cooldown path) record failure.
     """
     extra_body = _build_extra_body(body)
+    # Wire-level body size, captured by _json_request_body. Drives the
+    # learned payload ceiling: routes proven unable to accept this many
+    # bytes are skipped rather than tried and rejected. Fall back to 0
+    # when the request is a SimpleNamespace in tests or otherwise does
+    # not carry the storage key.
+    payload_bytes = 0
+    if request is not None:
+        payload_bytes = int(getattr(request, "_tusker_payload_bytes", 0) or 0)
+    payload_ceiling_of = (
+        breaker.payload_ceiling_bytes if breaker is not None else None
+    )
     prompt_estimate = estimate_prompt_tokens(body.get("messages"), tools)
     required_input_modalities = _required_input_modalities(body.get("messages"))
     requires_tools = bool(tools)
@@ -4773,6 +4829,11 @@ async def _call_with_pool_fallback(
             )
             if breaker is not None:
                 await asyncio.to_thread(breaker.record_success, provider, model)
+                if payload_bytes > 0:
+                    await asyncio.to_thread(
+                        breaker.record_accepted_payload,
+                        provider, model, payload_bytes,
+                    )
             _clear_permanently_failed(provider, model)
             return provider, model, result
         except asyncio.TimeoutError as exc:
@@ -4840,14 +4901,20 @@ async def _call_with_pool_fallback(
             _quarantine_tool_response_failure(config, provider, model, exc)
             _quarantine_stream_loop(config, provider, model, exc)
             if breaker is not None:
-                await asyncio.to_thread(
-                    breaker.record_failure,
-                    provider,
-                    model,
-                    cooldown_secs=(
-                        _cooldown_for_exc(exc) if isinstance(exc, GatewayError) else None
-                    ),
-                )
+                if getattr(exc, "upstream_status", None) == 413:
+                    # Request-level: learn the ceiling, skip the cooldown.
+                    if payload_bytes > 0:
+                        await asyncio.to_thread(
+                            breaker.record_rejected_payload,
+                            provider, model, payload_bytes,
+                        )
+                else:
+                    await asyncio.to_thread(
+                        breaker.record_failure,
+                        provider,
+                        model,
+                        cooldown_secs=_cooldown_for_exc(exc),
+                    )
             _mark_permanently_failed(exc, provider, model)
             if request is not None:
                 set_access_log_context(
@@ -4880,6 +4947,11 @@ async def _call_with_pool_fallback(
     max_attempts = _max_pool_provider_attempts()
     recovery_probe = False
     tool_compatibility_probe = False
+    attempts_started_at = (
+        asyncio.get_running_loop().time()
+        if _provider_total_attempt_budget_secs() is not None
+        else None
+    )
     while True:
         if attempts >= max_attempts:
             if request is not None:
@@ -4919,6 +4991,11 @@ async def _call_with_pool_fallback(
                 "required_input_modalities": required_input_modalities,
                 "context_tokens": required_context_tokens(prompt_estimate),
             }
+            if payload_ceiling_of is not None and payload_bytes > 0:
+                # Only meaningful with a breaker to consult; without one the
+                # filter has no evidence source and the args stay inert.
+                select_kwargs["payload_bytes"] = payload_bytes
+                select_kwargs["payload_ceiling_of"] = payload_ceiling_of
             allowed_providers = provider_patterns_for_request(request)
             if allowed_providers is not None:
                 select_kwargs["allowed_providers"] = allowed_providers
@@ -5071,6 +5148,41 @@ async def _call_with_pool_fallback(
             attempts,
             max_attempts,
         )
+        # If the aggregate attempt budget is spent, stop dispatching
+        # candidates. The per-attempt budget would clamp to 0 and the
+        # dispatch would record a confusing "timed out" log for a
+        # candidate that never started; that hides the real reason.
+        if (
+            attempts_started_at is not None
+            and _provider_attempt_timeout_secs(
+                request,
+                provider=provider,
+                model=model,
+                attempts_started_at=attempts_started_at,
+            )
+            <= 0
+        ):
+            if request is not None:
+                set_access_log_context(
+                    request,
+                    failure_class="aggregate_attempt_budget_exhausted",
+                    error_detail="pool aggregate attempt budget exhausted",
+                    candidate_attempts=attempts,
+                )
+            logger.warning(
+                "pool aggregate attempt budget exhausted rid=%s requested_pool=%s "
+                "active_pool=%s candidate=%s/%s attempt=%d",
+                request_id or "unknown",
+                pool_name,
+                active_pool,
+                provider,
+                model,
+                attempts,
+            )
+            raise ProviderError(
+                "pool aggregate attempt budget exhausted",
+                code="aggregate_attempt_budget",
+            )
         try:
             result = None
             activity = _AttemptActivity()
@@ -5138,13 +5250,21 @@ async def _call_with_pool_fallback(
             result = await _await_attempt(
                 asyncio.create_task(call_candidate()),
                 budget=_provider_attempt_timeout_secs(
-                    request, provider=provider, model=model
+                    request,
+                    provider=provider,
+                    model=model,
+                    attempts_started_at=attempts_started_at,
                 ),
                 deadline_at=_request_deadline_at(request),
                 activity=activity,
             )
             if breaker is not None:
                 await asyncio.to_thread(breaker.record_success, provider, model)
+                if payload_bytes > 0:
+                    await asyncio.to_thread(
+                        breaker.record_accepted_payload,
+                        provider, model, payload_bytes,
+                    )
             _clear_permanently_failed(provider, model)
             return provider, model, result
         except asyncio.TimeoutError as exc:
@@ -5184,7 +5304,10 @@ async def _call_with_pool_fallback(
                 attempts,
                 max_attempts,
                 _provider_attempt_timeout_secs(
-                    request, provider=provider, model=model
+                    request,
+                    provider=provider,
+                    model=model,
+                    attempts_started_at=attempts_started_at,
                 ),
             )
         except asyncio.CancelledError:
@@ -5269,14 +5392,29 @@ async def _call_with_pool_fallback(
             _quarantine_tool_response_failure(config, provider, model, exc)
             _quarantine_stream_loop(config, provider, model, exc)
             if breaker is not None:
-                await asyncio.to_thread(
-                    breaker.record_failure,
-                    provider,
-                    model,
-                    cooldown_secs=(
-                        _cooldown_for_exc(exc) if isinstance(exc, GatewayError) else None
-                    ),
+                # Read the count *before* recording so the first repeats sit
+                # at the start of the escalation ladder, not already past it.
+                prior_failures = await asyncio.to_thread(
+                    breaker.consecutive_failures, provider, model
                 )
+                if getattr(exc, "upstream_status", None) == 413:
+                    # 413 is request-level: the body was too big for this
+                    # route. Learn the ceiling and skip the cooldown so the
+                    # next request can try a route that fits.
+                    if payload_bytes > 0:
+                        await asyncio.to_thread(
+                            breaker.record_rejected_payload,
+                            provider, model, payload_bytes,
+                        )
+                else:
+                    await asyncio.to_thread(
+                        breaker.record_failure,
+                        provider,
+                        model,
+                        cooldown_secs=_cooldown_for_exc(
+                            exc, consecutive_failures=prior_failures
+                        ),
+                    )
             _mark_permanently_failed(exc, provider, model)
             last_error = exc
             excluded.add(selected)
@@ -6503,13 +6641,29 @@ async def metrics_handler(request: web.Request) -> web.Response:
 async def _json_request_body(request: web.Request) -> Any:
     """Parse a JSON request body, reporting caller mistakes as 400.
 
+    A body over aiohttp's ``client_max_size`` raises
+    ``HTTPRequestEntityTooLarge``; it becomes a ``PayloadTooLargeError``
+    (413) so the client sees an OpenAI-shaped error instead of aiohttp's
+    default plain text. The exact byte size is stored on the request as
+    ``_tusker_payload_bytes`` so the caller can learn a per-route payload
+    ceiling from it.
+
     A body that is neither valid JSON nor UTF-8 text raises ``ValueError``
-    (``json.JSONDecodeError``), ``UnicodeDecodeError`` or ``TypeError``. All are
-    client errors: letting them reach a handler's generic failure path reports
-    an upstream provider failure (502) for a bad request and hides the cause.
+    (``json.JSONDecodeError``), ``UnicodeDecodeError`` or ``TypeError``. All
+    are client errors: letting them reach a handler's generic failure path
+    reports an upstream provider failure (502) for a bad request and hides
+    the cause.
     """
     try:
-        return await request.json()
+        raw = await request.read()
+    except HTTPRequestEntityTooLarge as exc:
+        raise PayloadTooLargeError(
+            f"Request body is too large (limit "
+            f"{getattr(exc, 'text', None) or 'see client_max_size'})"
+        ) from exc
+    request["_tusker_payload_bytes"] = len(raw)
+    try:
+        return json.loads(raw)
     except (ValueError, UnicodeDecodeError, TypeError) as exc:
         raise BadRequestError(
             "Request body must be valid JSON", code="malformed_payload"
@@ -7386,9 +7540,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                             breaker.record_failure,
                             provider,
                             target_model,
-                            cooldown_secs=(
-                                _cooldown_for_exc(exc) if isinstance(exc, GatewayError) else None
-                            ),
+                            cooldown_secs=_cooldown_for_exc(exc),
                         )
                     logger.warning(
                         "stream pump failed rid=%s session=%s provider=%s model=%s "
@@ -8495,6 +8647,7 @@ async def rerank_handler(request: web.Request) -> web.Response:
             body,
             session=request.app.get("http_session"),
             breaker=request.app.get("breaker"),
+            payload_bytes=int(request.get("_tusker_payload_bytes") or 0),
         )
         set_access_log_context(
             request,
@@ -8595,6 +8748,7 @@ async def embeddings_handler(request: web.Request) -> web.Response:
             body,
             session=request.app.get("http_session"),
             breaker=request.app.get("breaker"),
+            payload_bytes=int(request.get("_tusker_payload_bytes") or 0),
         )
         set_access_log_context(
             request,

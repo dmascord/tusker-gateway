@@ -117,3 +117,84 @@ def test_5xx_and_permanent_status_semantics_unchanged():
     permanent = _provider_error("gone", code="not_found")
     permanent.upstream_status = 404
     assert _cooldown_seconds_for_provider_error(permanent) == PERMANENT_ERROR_COOLDOWN_SECS
+
+
+def test_repeated_5xx_escalates_past_the_policy_cooldown():
+    """A route failing 5xx hundreds of times must not be re-probed on the
+    same 60s cadence as one that failed once."""
+    from tusker_gateway.cooldown import _cooldown_seconds_for_provider_error
+
+    error = _provider_error("overloaded", code="upstream_error")
+    error.upstream_status = 503
+
+    # First few failures stay on the breaker policy cooldown.
+    for count in (0, 1, 2, 3):
+        assert _cooldown_seconds_for_provider_error(
+            error, consecutive_failures=count
+        ) is None
+    # Then the window grows along the ladder.
+    assert _cooldown_seconds_for_provider_error(error, consecutive_failures=4) == 60.0
+    assert _cooldown_seconds_for_provider_error(error, consecutive_failures=5) == 300.0
+    assert _cooldown_seconds_for_provider_error(error, consecutive_failures=6) == 3600.0
+    # And saturates at the longest step rather than growing without bound.
+    assert _cooldown_seconds_for_provider_error(error, consecutive_failures=500) == 3600.0
+
+
+def test_status_less_transport_failure_escalates_too():
+    """CLI/transport errors carry no upstream status; repeated failures still
+    escalate instead of probing forever on the policy cooldown."""
+    from tusker_gateway.cooldown import _cooldown_seconds_for_provider_error
+
+    error = _provider_error("Claude Code CLI request failed", code="claude_code_cli_failed")
+    assert _cooldown_seconds_for_provider_error(error) is None
+    assert _cooldown_seconds_for_provider_error(error, consecutive_failures=4) == 60.0
+    assert _cooldown_seconds_for_provider_error(error, consecutive_failures=6) == 3600.0
+
+
+def test_quota_hint_on_5xx_still_earns_the_quota_window():
+    """A quota exhaustion surfaced on a 5xx is not a transient blip."""
+    from tusker_gateway.cooldown import _cooldown_seconds_for_provider_error
+
+    error = _provider_error("upstream error", code="upstream_error")
+    error.upstream_status = 503
+    error.upstream_body = '{"error":{"message":"monthly limit reached"}}'
+
+    assert _cooldown_seconds_for_provider_error(error, consecutive_failures=99) == 3600.0
+
+
+def test_transient_escalation_ladder_is_configurable():
+    from tusker_gateway.cooldown import (
+        _cooldown_seconds_for_provider_error,
+        _transient_escalation_ladder,
+    )
+
+    error = _provider_error("overloaded", code="upstream_error")
+    error.upstream_status = 502
+    monkey_env = {"TUSKER_RETRY_TRANSIENT_ESCALATION_SECS": "90,900"}
+    original = __import__("os").environ.copy()
+    try:
+        __import__("os").environ.update(monkey_env)
+        assert _transient_escalation_ladder() == (90.0, 900.0)
+        assert _cooldown_seconds_for_provider_error(error, consecutive_failures=4) == 90.0
+        assert _cooldown_seconds_for_provider_error(error, consecutive_failures=5) == 900.0
+        assert _cooldown_seconds_for_provider_error(error, consecutive_failures=9) == 900.0
+    finally:
+        __import__("os").environ.clear()
+        __import__("os").environ.update(original)
+
+
+def test_malformed_escalation_ladder_falls_back_to_defaults():
+    from tusker_gateway.cooldown import (
+        DEFAULT_TRANSIENT_ESCALATION_SECS,
+        _transient_escalation_ladder,
+    )
+
+    original = __import__("os").environ.copy()
+    try:
+        __import__("os").environ["TUSKER_RETRY_TRANSIENT_ESCALATION_SECS"] = "60,not-a-number"
+        assert _transient_escalation_ladder() == DEFAULT_TRANSIENT_ESCALATION_SECS
+        __import__("os").environ["TUSKER_RETRY_TRANSIENT_ESCALATION_SECS"] = "0,60"
+        assert _transient_escalation_ladder() == DEFAULT_TRANSIENT_ESCALATION_SECS
+    finally:
+        __import__("os").environ.clear()
+        __import__("os").environ.update(original)
