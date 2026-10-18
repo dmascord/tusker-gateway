@@ -321,7 +321,6 @@ def test_probe_success_resets_counter(tmp_breaker_path):
 
 
 def test_probe_failure_reopens(tmp_breaker_path):
-    """After a half-open probe records failure, the breaker reopens."""
     cb = CircuitBreaker(_cfg(tmp_breaker_path, consecutive_failures=1, cooldown_secs=0.05))
     cb.record_failure("p", "m")
     time.sleep(0.1)
@@ -331,3 +330,36 @@ def test_probe_failure_reopens(tmp_breaker_path):
     cb.record_failure("p", "m")
     d2 = cb.check("p", "m")
     assert not d2.allowed and d2.state == BreakerState.OPEN
+
+
+def test_consecutive_failures_reader_tracks_count(tmp_breaker_path):
+    """The escalation ladder needs the count *before* the new failure lands."""
+    cb = CircuitBreaker(_cfg(tmp_breaker_path, consecutive_failures=10))
+    assert cb.consecutive_failures("p", "m") == 0
+    cb.record_failure("p", "m")
+    assert cb.consecutive_failures("p", "m") == 1
+    cb.record_failure("p", "m")
+    assert cb.consecutive_failures("p", "m") == 2
+    # Success resets it, so escalation does not outlive the outage.
+    cb.record_success("p", "m")
+    assert cb.consecutive_failures("p", "m") == 0
+
+
+def test_consecutive_failures_reader_is_zero_when_disabled(tmp_breaker_path):
+    cb = CircuitBreaker(BreakerConfig(enabled=False, path=tmp_breaker_path))
+    assert cb.consecutive_failures("p", "m") == 0
+
+
+def test_escalated_cooldown_is_stored_on_the_route_row(tmp_breaker_path):
+    """A 3600s escalation must survive into the persisted breaker row, not be
+    replaced by the 60s policy cooldown on the next check."""
+    cb = CircuitBreaker(_cfg(tmp_breaker_path, consecutive_failures=1, cooldown_secs=60.0))
+    cb.record_failure("p", "m", cooldown_secs=3600.0)
+    d = cb.check("p", "m")
+    assert not d.allowed and d.state == BreakerState.OPEN
+    # Past the 60s policy window but inside the 3600s escalation, the route
+    # must still be short-circuited.
+    time.sleep(0.05)
+    row = cb._read("p", "m")
+    assert row is not None
+    assert row["cooldown_secs"] == 3600.0

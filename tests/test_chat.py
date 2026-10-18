@@ -522,6 +522,155 @@ async def test_pool_fallback_bounded_per_attempt_timeout():
 
 
 @pytest.mark.asyncio
+async def test_pool_stops_dispatching_when_aggregate_budget_is_spent():
+    """The aggregate attempt budget bounds the sum of candidate attempts.
+
+    A chain of candidates that stall consumes the per-attempt idle budget
+    each. Without an aggregate cap the loop keeps dispatching until the
+    request deadline, so the caller waits the full timeout to learn nothing
+    worked. This pins that once the aggregate budget is gone the loop stops
+    and raises rather than starting another attempt.
+    """
+    import os
+
+    pool_manager = MagicMock()
+    pool_manager.fallback_pools.return_value = ()
+    # More candidates than the loop can possibly reach inside the budget.
+    pool_manager.select.side_effect = [
+        ("ollama-cloud", f"silent-{index}") for index in range(6)
+    ]
+    upstream = MagicMock()
+
+    async def silent_stream(*args, **kwargs):
+        await asyncio.sleep(30)
+        yield b""  # pragma: no cover - never reached
+
+    upstream.chat = AsyncMock(return_value=silent_stream())
+
+    os.environ["TUSKER_PROVIDER_ATTEMPT_TIMEOUT_SECS"] = "5"
+    os.environ["TUSKER_PROVIDER_TOTAL_ATTEMPT_BUDGET_SECS"] = "0.5"
+    try:
+        from tusker_gateway.endpoints import _call_with_pool_fallback
+        from tusker_gateway.errors import ProviderError
+
+        with pytest.raises(ProviderError) as excinfo:
+            await _call_with_pool_fallback(
+                {"pools": {}},
+                {
+                    "model": "hermes-code",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": True,
+                },
+                upstream,
+                tools=[{"type": "function", "function": {"name": "read"}}],
+                request=SimpleNamespace(app={"pool_manager": pool_manager}),
+            )
+    finally:
+        os.environ.pop("TUSKER_PROVIDER_ATTEMPT_TIMEOUT_SECS", None)
+        os.environ.pop("TUSKER_PROVIDER_TOTAL_ATTEMPT_BUDGET_SECS", None)
+
+    # The loop stopped on the aggregate budget rather than walking all six
+    # candidates to the request deadline.
+    assert excinfo.value.code == "aggregate_attempt_budget"
+    assert pool_manager.select.call_count < 6
+
+
+def test_unset_aggregate_budget_leaves_behaviour_unchanged():
+    """No budget configured means no clamping (backwards compatible)."""
+    import os
+
+    from tusker_gateway.endpoints import (
+        _provider_attempt_timeout_secs,
+        _provider_total_attempt_budget_secs,
+    )
+
+    os.environ.pop("TUSKER_PROVIDER_TOTAL_ATTEMPT_BUDGET_SECS", None)
+    assert _provider_total_attempt_budget_secs() is None
+    assert _provider_attempt_timeout_secs(None, "p", "m") > 0
+
+
+@pytest.mark.asyncio
+async def test_aggregate_budget_clamps_the_per_attempt_budget():
+    """Once the aggregate budget is spent the per-attempt budget is zero, so
+    the loop stops dispatching instead of starting a doomed attempt."""
+    import os
+
+    from tusker_gateway.endpoints import (
+        _provider_attempt_timeout_secs,
+        _provider_total_attempt_budget_secs,
+    )
+
+    os.environ["TUSKER_PROVIDER_TOTAL_ATTEMPT_BUDGET_SECS"] = "10"
+    try:
+        assert _provider_total_attempt_budget_secs() == 10.0
+        loop_time = asyncio.get_running_loop().time()
+        # Started 100s ago: the 10s budget is long spent.
+        assert (
+            _provider_attempt_timeout_secs(
+                None, "p", "m", attempts_started_at=loop_time - 100.0
+            )
+            == 0.0
+        )
+        # Started now: the full per-attempt budget is available.
+        assert (
+            _provider_attempt_timeout_secs(
+                None, "p", "m", attempts_started_at=loop_time
+            )
+            > 0
+        )
+    finally:
+        os.environ.pop("TUSKER_PROVIDER_TOTAL_ATTEMPT_BUDGET_SECS", None)
+
+
+@pytest.mark.asyncio
+async def test_non_gateway_error_provider_failure_still_earns_status_cooldown(tmp_path):
+    """A provider failure that surfaces as a raw exception (not a
+    ``GatewayError`` subclass) must still earn the cooldown its
+    ``upstream_status`` implies, instead of silently falling back to the
+    60s policy cooldown. The breaker's recorded cooldown proves the path."""
+    from tusker_gateway.circuit_breaker import BreakerConfig, CircuitBreaker
+    from tusker_gateway.endpoints import _call_with_pool_fallback
+
+    pool_manager = MagicMock()
+    pool_manager.fallback_pools.return_value = ()
+    pool_manager.select.side_effect = [("alibaba", "raw-exception-model"), None]
+
+    raw_error = RuntimeError("upstream crash")  # not a GatewayError
+    raw_error.upstream_status = 401  # would earn 3600s if classified
+    raw_error.upstream_body = ""
+    raw_error.code = ""
+    upstream = MagicMock()
+    upstream.chat = AsyncMock(side_effect=raw_error)
+
+    breaker = CircuitBreaker(
+        BreakerConfig(enabled=True, path=str(tmp_path / "breaker.db"))
+    )
+    app = {"pool_manager": pool_manager, "breaker": breaker}
+    request = SimpleNamespace(app=app)
+
+    with pytest.raises(Exception):
+        await _call_with_pool_fallback(
+            {"pools": {}},
+            {
+                "model": "hermes-code",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": False,
+            },
+            upstream,
+            tools=None,
+            breaker=breaker,
+            request=request,
+        )
+
+    # The breaker stored the status-based cooldown (3600s for a 401), not
+    # the 60s policy default that the old isinstance(GatewayError) gate
+    # would have produced.
+    row = breaker._read("alibaba", "raw-exception-model")
+    assert row is not None
+    assert row["cooldown_secs"] == 3600.0
+
+
+@pytest.mark.asyncio
 async def test_pool_candidate_survives_slow_but_active_stream():
     """A stream that keeps producing bytes must not be killed by the budget.
 

@@ -451,6 +451,21 @@ class CircuitBreaker:
     def stats_snapshot(self) -> dict[str, int]:
         return self.stats.snapshot()
 
+    def consecutive_failures(self, provider: str, model: str) -> int:
+        """Return the current consecutive-failure count, or 0.
+
+        Lets callers compute an escalating cooldown (5xx → 60s → 300s → 3600s)
+        *before* recording the new failure, so the first 60s probe is not
+        already at the 3600s step. Returns 0 when the breaker is disabled
+        or the row does not yet exist.
+        """
+        if not self._config.enabled:
+            return 0
+        row = self._read(provider, model)
+        if row is None:
+            return 0
+        return int(row.get("consecutive_failures") or 0)
+
     # -- internals -------------------------------------------------------
 
     def _read(self, provider: str, model: str) -> dict[str, Any] | None:

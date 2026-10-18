@@ -23,6 +23,16 @@ MAX_COOLDOWN_SECS = 30 * 86400.0 # 30 days
 # windows are handled deliberately by the body heuristics below.
 MAX_RETRY_AFTER_SECS = 3600.0
 
+# Escalation ladder for transient provider failures (5xx, and transport
+# errors with no status). The first ``TRANSIENT_ESCALATE_AFTER`` consecutive
+# failures keep the breaker policy cooldown so a genuinely brief blip
+# recovers fast; beyond that the window grows so a route that has failed
+# hundreds of times is not re-probed on the same 60s cadence forever.
+# Override with TUSKER_RETRY_TRANSIENT_ESCALATION_SECS as a comma list.
+DEFAULT_TRANSIENT_ESCALATION_SECS = (60.0, 300.0, 3600.0)
+TRANSIENT_ESCALATE_AFTER = 3
+
+
 # Providers whose published rate limits are separated by model (or model
 # class). A 429 from one model on these providers must not evict the other
 # models from the same provider. Providers not listed here retain the more
@@ -600,7 +610,56 @@ def is_request_level_error(exc: Any) -> bool:
     return not any(hint in body for hint in _QUOTA_HINTS)
 
 
-def _cooldown_seconds_for_provider_error(exc: Any) -> float | None:
+def _transient_escalation_ladder() -> tuple[float, ...]:
+    """Return the transient-failure cooldown ladder, longest last.
+
+    Overridable with ``TUSKER_RETRY_TRANSIENT_ESCALATION_SECS`` as a
+    comma-separated list of seconds (e.g. ``"60,300,3600"``). Malformed
+    entries fall back to the defaults rather than disabling escalation.
+    """
+    raw = os.environ.get("TUSKER_RETRY_TRANSIENT_ESCALATION_SECS", "").strip()
+    if not raw:
+        return DEFAULT_TRANSIENT_ESCALATION_SECS
+    parsed: list[float] = []
+    for chunk in raw.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        try:
+            value = float(chunk)
+        except ValueError:
+            return DEFAULT_TRANSIENT_ESCALATION_SECS
+        if value <= 0:
+            return DEFAULT_TRANSIENT_ESCALATION_SECS
+        parsed.append(min(value, MAX_COOLDOWN_SECS))
+    if not parsed:
+        return DEFAULT_TRANSIENT_ESCALATION_SECS
+    return tuple(sorted(parsed))
+
+
+def transient_cooldown_secs(consecutive_failures: int) -> float | None:
+    """Cooldown for a transient (5xx / transport) failure, or ``None``.
+
+    ``None`` means "use the breaker policy cooldown" — correct while the
+    route is failing only a few times. Once the consecutive-failure count
+    passes ``TRANSIENT_ESCALATE_AFTER`` the window grows along the ladder so
+    a route that has failed hundreds of times stops being probed on the
+    same 60s cadence as one that failed once.
+    """
+    try:
+        count = int(consecutive_failures)
+    except (TypeError, ValueError):
+        return None
+    if count <= TRANSIENT_ESCALATE_AFTER:
+        return None
+    ladder = _transient_escalation_ladder()
+    index = min(count - TRANSIENT_ESCALATE_AFTER - 1, len(ladder) - 1)
+    return ladder[index]
+
+
+def _cooldown_seconds_for_provider_error(
+    exc: Any, *, consecutive_failures: int = 0
+) -> float | None:
     """Derive a circuit-breaker cooldown for a non-429 provider error.
 
     Returns the number of seconds to back off, or ``None`` to fall back to
@@ -613,8 +672,15 @@ def _cooldown_seconds_for_provider_error(exc: Any) -> float | None:
       (CLI adapter) may know the exact reset time (``resets 4am (UTC)``).
     - Local transports carry no upstream status; a quota-shaped error code or
       quota/usage-limit body still earns the long quota window.
-    - 401 / 403 / 404 (and a quota/usage-limit body) → long cooldown.
-    - 5xx (transient overload) → ``None`` (let the policy cooldown apply).
+    - 401 / 403 / 404 / other 4xx (and a quota/usage-limit body) → long
+      cooldown.
+    - 5xx and status-less transport failures → the escalating transient
+      ladder, or ``None`` while the failure count is still low.
+
+    Classification is by exception *attributes* (``upstream_status``,
+    ``code``, ``upstream_body``, ``retry_after_secs``), not by type, so a
+    provider failure that surfaces as a raw exception still earns the
+    cooldown its status implies.
     """
     explicit = getattr(exc, "retry_after_secs", None)
     if isinstance(explicit, (int, float)) and not isinstance(explicit, bool) and explicit > 0:
@@ -624,24 +690,23 @@ def _cooldown_seconds_for_provider_error(exc: Any) -> float | None:
     code = str(getattr(exc, "code", "") or "")
     body = getattr(exc, "upstream_body", None) or ""
     body_lower = body.lower()
-    # Local (non-HTTP) transports such as the CLI adapters carry no upstream
-    # status. A reported usage/session limit is a long-lived window; the 60s
-    # policy cooldown would re-probe and burn quota until it resets.
-    if status is None:
-        if any(marker in code for marker in _QUOTA_CODE_MARKERS) or any(
-            hint in body_lower for hint in _QUOTA_HINTS
-        ):
-            return quota_cooldown
-        return None
-    # A transient 5xx may recover; use the policy cooldown.
-    if status >= 500:
-        return None
-    # A quota-exhausted body on a non-429 status is a long-lived daily/monthly
-    # window (e.g. OpenRouter "free-models-per-day-high-balance" surfaced as
-    # 404). Back off until it plausibly resets, not 60s.
-    if any(hint in body_lower for hint in _QUOTA_HINTS):
+    if any(hint in body_lower for hint in _QUOTA_HINTS) or any(
+        marker in code for marker in _QUOTA_CODE_MARKERS
+    ):
+        # A quota-exhausted body is a long-lived daily/monthly window even
+        # when it arrives on a 5xx or with no status at all.
         return quota_cooldown
-    # 401 auth / 403 forbidden / 404 not-found: permanent for this key/account.
+    # Local (non-HTTP) transports such as the CLI adapters carry no upstream
+    # status. Without quota evidence there is nothing to distinguish a
+    # transient blip from a dead route, so use the escalating ladder.
+    if status is None:
+        return transient_cooldown_secs(consecutive_failures)
+    # A transient 5xx may recover; escalate only once it has failed
+    # repeatedly.
+    if status >= 500:
+        return transient_cooldown_secs(consecutive_failures)
+    # 401 auth / 403 forbidden / 404 not-found / any other 4xx: permanent
+    # for this key/account or this route.
     return PERMANENT_ERROR_COOLDOWN_SECS
 
 

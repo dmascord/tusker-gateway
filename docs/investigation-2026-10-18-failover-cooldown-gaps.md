@@ -7,13 +7,14 @@ deployment `hermes/tusker-gateway`).
 
 ## Verdict
 
-Two real gaps, one non-gap.
+Three real gaps, one non-gap. All three are fixed; see "Fixes implemented".
 
-| # | Scenario | Symptom | Severity |
-|---|---|---|---|
-| 1 | 5xx on every request for a long-running outage | breaker re-probes every 60s indefinitely; no escalation by consecutive-failure count | medium |
-| 2 | A request with hung candidates | with `TUSKER_REQUEST_TIMEOUT_MS=240000` (production), up to 4 minutes per request, of which one stalled candidate costs up to 240s under the per-attempt overrides | high |
-| 3 | Inter-attempt delay | none — the loop fails over immediately | non-gap |
+| # | Scenario | Symptom | Severity | State |
+|---|---|---|---|---|
+| 1 | 5xx on every request for a long-running outage | breaker re-probed every 60s indefinitely, no escalation by consecutive-failure count | medium | fixed |
+| 2 | A request with hung candidates | up to 4 minutes per request; one stalled candidate costs up to 240s under the per-attempt overrides | high | fixed |
+| 3 | Inter-attempt delay | none — the loop fails over immediately | non-gap | — |
+| 4 | A provider 4xx surfacing as a raw (non-`GatewayError`) exception | cooldown silently downgraded to the 60s policy window | medium | fixed |
 
 ## Empirical classification
 
@@ -125,21 +126,51 @@ From the live deployment (`kubectl -n hermes get deployment tusker-gateway`):
 - `TUSKER_PROVIDER_CAPACITY_COOLDOWN_SECS=300` — capacity group cooldowns are
   the one path with an explicit non-default window.
 
-## Suggested direction (not implemented)
+## Fixes implemented
 
-1. **Aggregate attempt budget.** Add a per-request wall-clock cap over the sum
-   of candidate attempts (e.g. `TUSKER_PROVIDER_TOTAL_ATTEMPT_BUDGET_SECS`,
-   defaulting well under `TUSKER_REQUEST_TIMEOUT_MS`) so a chain of stalls
-   stops at the cap instead of absorbing the whole request deadline. Fast
-   4xx/5xx failures are unaffected.
-2. **Escalating 5xx cooldown.** Keep the first N 5xx on the 60s policy window,
-   then extend with consecutive-failure count (`60s → 300s → 3600s`),
-   preserving the immediate reset on success.
-3. **Make the exception→cooldown path uniform.** `_cooldown_for_exc` returns
-   `None` for any non-`GatewayError`, so a 400 surfacing as a raw exception
-   gets the 60s policy cooldown instead of the 3600s its status earns.
-   Classify or wrap non-`GatewayError` provider failures.
-4. **Optional: widen the permanent mark.** 405/409/413/422 currently earn the
-   3600s cooldown but are not added to the permanently-failed set, so the
-   auto-free pool re-ranks them after the window. Worth a deliberate decision
-   either way rather than the current implicit split.
+All three were fixed in this session; the sections above describe the
+behaviour that was corrected.
+
+1. **Escalating transient cooldown** (`cooldown.py`). New
+   `transient_cooldown_secs(consecutive_failures)` and
+   `DEFAULT_TRANSIENT_ESCALATION_SECS = (60, 300, 3600)`. The first
+   `TRANSIENT_ESCALATE_AFTER = 3` consecutive failures keep the breaker
+   policy cooldown so a brief blip still recovers fast; after that the
+   window grows along the ladder and saturates at the longest step.
+   Applies to 5xx and to status-less transport failures. Overridable with
+   `TUSKER_RETRY_TRANSIENT_ESCALATION_SECS` (comma list); malformed values
+   fall back to the defaults rather than disabling escalation. A quota
+   hint on a 5xx body still wins and earns the quota window.
+
+2. **Type-agnostic cooldown classification** (`cooldown.py`,
+   `endpoints.py`). `_cooldown_seconds_for_provider_error` now classifies by
+   exception attributes (`upstream_status`, `code`, `upstream_body`,
+   `retry_after_secs`) rather than by class, and `_cooldown_for_exc` no
+   longer returns `None` for non-`GatewayError` exceptions. All four
+   `breaker.record_failure(..., cooldown_secs=...)` call sites dropped the
+   `isinstance(exc, GatewayError)` gate, so a provider failure surfacing as
+   a raw exception still earns the cooldown its status implies.
+
+3. **Aggregate attempt budget** (`endpoints.py`). New
+   `TUSKER_PROVIDER_TOTAL_ATTEMPT_BUDGET_SECS` caps the *sum* of candidate
+   attempts, measured from the first dispatch. When the budget is spent the
+   loop stops dispatching and raises `ProviderError(code="aggregate_attempt_budget")`
+   instead of starting another doomed attempt. Unset means no cap
+   (backwards compatible); `_provider_attempt_timeout_secs` also clamps the
+   per-attempt budget to the remaining aggregate budget.
+
+`CircuitBreaker.consecutive_failures(provider, model)` was added so the
+caller can read the count *before* recording the new failure; using the
+post-increment count would start the ladder one step early.
+
+## Still open
+
+4. **Widen the permanent mark.** 405/409/413/422 currently earn the 3600s
+   cooldown but are not added to the permanently-failed set, so the
+   auto-free pool re-ranks them after the window. Worth a deliberate
+   decision either way rather than the current implicit split.
+
+5. **Aggregate budget default.** Production leaves
+   `TUSKER_PROVIDER_TOTAL_ATTEMPT_BUDGET_SECS` unset, so the cap is inert
+   until enabled deliberately. A sensible production value is some way
+   under `TUSKER_REQUEST_TIMEOUT_MS=240000`.
