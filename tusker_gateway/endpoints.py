@@ -220,11 +220,11 @@ _FULLWIDTH_DSML_PARTIAL_OPEN_RE = re.compile(
     re.IGNORECASE,
 )
 _WRAPPER_OPEN_RE = re.compile(
-    r"<\s*\|?\s*(?P<tag>(?:tool_call|function_call|tool_calls|function_calls|tool_use|tool_invocation|dots_function_call|dots_tool_call)(?::[^>\s]+)?)\s*\|?\s*>",
+    r"<\s*\|?\s*(?P<tag>(?:gateway_tool_call|tool_call|function_call|tool_calls|function_calls|tool_use|tool_invocation|dots_function_call|dots_tool_call)(?::[^>\s]+)?)\s*\|?\s*>",
     re.IGNORECASE,
 )
 _WRAPPER_CLOSE_RE = re.compile(
-    r"<\s*/\s*\|?\s*(?P<tag>(?:tool_call|function_call|tool_calls|function_calls|tool_use|tool_invocation|dots_function_call|dots_tool_call)(?::[^>\s]+)?)\s*\|?\s*>",
+    r"<\s*/\s*\|?\s*(?P<tag>(?:gateway_tool_call|tool_call|function_call|tool_calls|function_calls|tool_use|tool_invocation|dots_function_call|dots_tool_call)(?::[^>\s]+)?)\s*\|?\s*>",
     re.IGNORECASE,
 )
 
@@ -232,6 +232,8 @@ _WRAPPER_CLOSE_RE = re.compile(
 # the accumulated buffer matches one of these prefixes, we hold it back until
 # the full block has arrived (a block may span several streamed chunks).
 _TOOL_OPENERS = (
+    "<gateway_tool_call>",
+    "<gateway_tool_call",
     "<tool_call>",
     "<tool_call",
     "<tool_calls",
@@ -251,7 +253,7 @@ _TOOL_OPENERS = (
 
 _AUXILIARY_TEXT_FIELDS = ("reasoning", "thinking", "analysis")
 _TOOL_MARKUP_HINT_RE = re.compile(
-    r"\bTOOL_CALL\s*:\s*[\w.-]+\s*\(|<\s*(?:/?(?:tool_call|function_call|tool_calls|function_calls|tool_use|tool_invocation|dots_function_call|dots_tool_call|function|parameter|invoke|tool|arg_key|arg_value|tool_sep)|(?:dsml|mimoml):)",
+    r"\bTOOL_CALL\s*:\s*[\w.-]+\s*\(|<\s*(?:/?(?:gateway_tool_call|tool_call|function_call|tool_calls|function_calls|tool_use|tool_invocation|dots_function_call|dots_tool_call|function|parameter|invoke|tool|arg_key|arg_value|tool_sep)|(?:dsml|mimoml):)",
     re.IGNORECASE,
 )
 _REASONING_CYCLE_MIN_CHARS = 32
@@ -736,6 +738,11 @@ async def _normalize_stream_legacy(
             args = fn.get("arguments", "{}")
             if not isinstance(args, str):
                 args = json.dumps(args, ensure_ascii=False)
+            # Text-encoded calls bypass the native-delta restoration loop
+            # below. Restore sealed values before emitting the recovered
+            # arguments to OMP, just as we do for native tool-call deltas.
+            if restorer is not None and hasattr(restorer, "restore_text"):
+                args = restorer.restore_text(args)
             cid = call.get("id") or f"call_{index}_{hashlib.sha1(name.encode()).hexdigest()[:10]}"
             openai_calls.append(
                 {
@@ -1293,6 +1300,11 @@ async def _normalize_stream(
             args = fn.get("arguments", "{}")
             if not isinstance(args, str):
                 args = json.dumps(args, ensure_ascii=False)
+            # Text-encoded calls bypass the native-delta restoration loop
+            # below. Restore sealed values before emitting recovered
+            # arguments to OMP, just as we do for native tool-call deltas.
+            if restorer is not None and hasattr(restorer, "restore_text"):
+                args = restorer.restore_text(args)
             cid = call.get("id") or (
                 f"call_text_{synthetic_tool_call_sequence}_{hashlib.sha1(name.encode()).hexdigest()[:10]}"
             )

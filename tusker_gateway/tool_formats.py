@@ -23,11 +23,11 @@ _ANTHROPIC_IMAGE_DATA_URL_RE = re.compile(
 )
 
 _TOOL_WRAPPER_TAG_RE = re.compile(
-    r"<\s*\|?\s*/?\s*(?:[\w-]+:)?(?:tool_call|function_call|tool_calls|function_calls|tool_use|tool_invocation|dots_function_call|dots_tool_call)(?::[^>\s]+)?\s*\|?\s*>",
+    r"<\s*\|?\s*/?\s*(?:[\w-]+:)?(?:gateway_tool_call|tool_call|function_call|tool_calls|function_calls|tool_use|tool_invocation|dots_function_call|dots_tool_call)(?::[^>\s]+)?\s*\|?\s*>",
     re.IGNORECASE,
 )
 _JSON_TOOL_BLOCK_RE = re.compile(
-    r"<\s*\|?\s*(?:tool_call|function_call)\s*\|?\s*>.*?<\s*/\s*\|?\s*(?:tool_call|function_call)\s*\|?\s*>",
+    r"<\s*\|?\s*(?:gateway_tool_call|tool_call|function_call)\s*\|?\s*>.*?<\s*/\s*\|?\s*(?:gateway_tool_call|tool_call|function_call)\s*\|?\s*>",
     re.IGNORECASE | re.DOTALL,
 )
 _TOOL_CLOSE_TAG_RE = re.compile(
@@ -429,6 +429,22 @@ def parse_text_tool_calls(text: Any) -> list[dict[str, Any]]:
         return []
     text = _canonicalize_dsml_tags(text)
     calls: list[dict[str, Any]] = []
+    # The Claude Code adapter serializes completed calls in its prompt as
+    # <gateway_tool_call>{OpenAI tool call JSON}</gateway_tool_call>. Models
+    # sometimes echo that representation as output. Recover valid structured
+    # calls; malformed envelopes are still stripped and rejected by the
+    # stream preflight when tools were requested.
+    for match in re.finditer(
+        r"<\s*gateway_tool_call\s*>\s*([\s\S]*?)\s*</\s*gateway_tool_call\s*>",
+        text,
+        re.I,
+    ):
+        try:
+            value = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            continue
+        calls.extend(normalize_tool_calls([value]))
+
     # 1. OMP/DOTS' ID-suffixed tool envelope.
     for match in _CUSTOM_TOOL_BLOCK_RE.finditer(text):
         args = {

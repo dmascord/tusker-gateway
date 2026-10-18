@@ -11,6 +11,67 @@ from .conftest import HEADERS_AUTH
 from tusker_gateway.endpoints import _ToolCallStripper, _strip_xml_tool_calls
 
 
+def test_gateway_tool_call_json_envelope_is_recovered():
+    from tusker_gateway.tool_formats import parse_text_tool_calls, strip_tool_text
+
+    call = {
+        "id": "call_echoed",
+        "type": "function",
+        "function": {"name": "bash", "arguments": '{"command":"printf hi"}'},
+    }
+    text = "<gateway_tool_call>" + json.dumps(call) + "</gateway_tool_call>"
+
+    assert parse_text_tool_calls(text) == [call]
+    assert strip_tool_text(text) == ""
+
+
+@pytest.mark.asyncio
+async def test_stream_normalizer_recovers_gateway_tool_call_json():
+    from tusker_gateway.endpoints import _normalize_stream
+    from tusker_gateway.redaction import RedactionRuleSet, Tokenizer
+
+    email = "probe.user@example.com"
+    tokenizer = Tokenizer(key=b"0123456789abcdef0123456789abcdef", rules=RedactionRuleSet())
+    sealed_email = tokenizer.tokenize_text(email)
+    call = {
+        "id": "call_echoed",
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "arguments": json.dumps({"command": "printf " + sealed_email}),
+        },
+    }
+    text = "<gateway_tool_call>" + json.dumps(call) + "</gateway_tool_call>"
+
+    async def upstream():
+        yield f'data: {json.dumps({"choices": [{"delta": {"content": text}}]})}\n\n'.encode()
+        yield b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    frames = [
+        frame async for frame in _normalize_stream(
+            upstream(), provider="claude-code-cli", model="sonnet", tools_requested=True,
+            restorer=tokenizer,
+        )
+    ]
+    body = [
+        json.loads(frame.removeprefix(b"data: ").strip())
+        for frame in frames if frame.startswith(b"data: ") and frame.strip() != b"data: [DONE]"
+    ]
+    calls = [
+        call
+        for event in body
+        for choice in event.get("choices", [])
+        for call in (choice.get("delta", {}).get("tool_calls") or [])
+    ]
+    assert len(calls) == 1
+    assert calls[0]["id"] == "call_echoed"
+    assert calls[0]["function"]["name"] == "bash"
+    assert email in calls[0]["function"]["arguments"]
+    assert "[TUSKER:" not in calls[0]["function"]["arguments"]
+    assert "gateway_tool_call" not in b"".join(frames).decode()
+
+
 @pytest.mark.asyncio
 async def test_stream_normalizer_promotes_fullwidth_dsml_calls():
     """Fullwidth DSML must not leak into OMP as assistant text."""
