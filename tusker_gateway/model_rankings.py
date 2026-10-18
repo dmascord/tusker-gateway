@@ -65,6 +65,10 @@ DEFAULT_MAX_RANK = 25
 RANKINGS_WINDOW_LIMIT = 50
 DEFAULT_REFRESH_SECS = 86_400.0
 DEFAULT_PACING_SECS = 3.0
+# ``llm_stats_pacing_secs`` accepts 0 as a real value (no inter-request
+# delay: tests and one-shot tooling set it to keep runs fast). Both the
+# config loader and ``fetch_category_windows`` must therefore distinguish
+# "absent" from "0" — ``value or DEFAULT`` silently turns 0 back into 3s.
 # Maximum score bonus for a rank-1 model. Bounded so a well-ranked model
 # cannot outrank a healthy model whose learned quality is far higher:
 # rank orders candidates within a quality band, it does not override it.
@@ -562,7 +566,8 @@ async def fetch_category_windows(
     base_url = str(
         config.get("llm_stats_base_url") or DEFAULT_BASE_URL
     ).rstrip("/")
-    pacing = float(config.get("llm_stats_pacing_secs") or DEFAULT_PACING_SECS)
+    raw_pacing = config.get("llm_stats_pacing_secs")
+    pacing = DEFAULT_PACING_SECS if raw_pacing is None else float(raw_pacing)
     api_key = str(config.get("llm_stats_api_key") or "").strip()
     for category in sorted(categories):
         status, body = await _get_json(
@@ -613,7 +618,6 @@ async def sync_llm_stats_rankings(
         if str(cat).strip()
     )
     max_rank = int(config.get("llm_stats_max_rank") or DEFAULT_MAX_RANK)
-    pacing = float(config.get("llm_stats_pacing_secs") or DEFAULT_PACING_SECS)
     if not pairs:
         return {
             "models": 0,

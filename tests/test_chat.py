@@ -2126,10 +2126,11 @@ async def test_chat_stream_provider_setup_error_is_actionable_text_not_in_band_e
 ):
     """Setup/fallback failures after SSE commit use the same OMP-safe path."""
     pool_manager = MagicMock()
-    pool_manager.select.side_effect = [
+    _selections = iter([
         ("openrouter", "provider-that-times-out"),
         None,
-    ]
+    ])
+    pool_manager.select.side_effect = lambda *_a, **_k: next(_selections, None)
     app["pool_manager"] = pool_manager
     failure = ProviderError("socket timed out", code="upstream_error")
     failure.upstream_status = 502

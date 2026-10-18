@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from aiohttp import web
@@ -716,6 +717,101 @@ class TestIdempotency:
             )
 
             assert first.status == 504
+            assert second.status == 200
+            assert await second.json() == {"call": 2}
+        finally:
+            await client.close()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_claim_releases_row_committed_after_cancellation(
+        self, tmp_path
+    ):
+        """A deadline that fires during claim() must not poison the key.
+
+        claim() runs in a worker thread and cannot observe the awaiting
+        coroutine's cancellation: if the deadline fires while the thread is
+        mid-INSERT, the row is committed by an orphaned thread *after* the
+        504 was already returned. Before the escrow fix the retry then sat
+        behind ``idempotency_in_progress`` for ``lock_secs`` (300s in
+        production). The commit is gated on a threading event so the
+        orphaned-commit ordering is deterministic rather than timing luck.
+        """
+        store = IdempotencyStore(
+            IdempotencyConfig(
+                enabled=True,
+                path=str(tmp_path / "idempotency.db"),
+                lock_secs=30,
+            )
+        )
+        app = web.Application()
+        attach_deadline_middleware(
+            app, DeadlineConfig(default_timeout_ms=10, max_timeout_ms=10)
+        )
+
+        release_commit = threading.Event()
+        parked = threading.Event()
+        real_claim = IdempotencyStore.claim
+
+        def gated_claim(store_self, record_key, request_hash, lease_token=None):
+            # Park the worker thread mid-claim so the deadline fires while
+            # the INSERT has not run yet; the orphaned thread commits the
+            # row only after the coroutine was already cancelled.
+            parked.set()
+            assert release_commit.wait(timeout=10), "commit gate never opened"
+            return real_claim(store_self, record_key, request_hash, lease_token)
+
+        attach_idempotency_middleware(app, store)
+        calls = 0
+
+        async def handler(request):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                # Hold past the 10ms deadline after the claim succeeded, so
+                # the first turn is the one that must be abandoned.
+                await asyncio.sleep(0.05)
+            return web.json_response({"call": calls})
+
+        app.router.add_post("/v1/chat/completions", handler)
+        client = await _client(app)
+        try:
+            headers = {"Idempotency-Key": "orphaned-commit"}
+            with patch.object(
+                IdempotencyStore,
+                "claim",
+                autospec=True,
+                side_effect=gated_claim,
+            ):
+                first_task = asyncio.create_task(
+                    client.post(
+                        "/v1/chat/completions",
+                        headers=headers,
+                        json={"model": "hermes-code"},
+                    )
+                )
+                # Wait for the request to park inside the gated claim, then
+                # let the 10ms deadline cancel the awaiting coroutine while
+                # the worker thread is still blocked on the gate.
+                for _ in range(200):
+                    if parked.is_set() or first_task.done():
+                        break
+                    await asyncio.sleep(0.005)
+                assert parked.is_set(), "request never reached the gated claim"
+                assert not first_task.done(), (
+                    "first request finished before the deadline could fire"
+                )
+                release_commit.set()
+                first = await first_task
+                assert first.status == 504
+
+            # The orphaned worker thread's INSERT lands here, after the 504;
+            # without the escrow cleanup it stays a phantom 'processing'
+            # reservation and this retry would 409 for lock_secs.
+            second = await client.post(
+                "/v1/chat/completions",
+                headers=headers,
+                json={"model": "hermes-code"},
+            )
             assert second.status == 200
             assert await second.json() == {"call": 2}
         finally:

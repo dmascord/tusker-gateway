@@ -11,7 +11,7 @@ import re
 import secrets
 import time
 import uuid
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Iterator
 
 from aiohttp import ClientError, ClientPayloadError, web
 from aiohttp.http_exceptions import TransferEncodingError

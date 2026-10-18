@@ -847,6 +847,70 @@ async def test_sync_zero_seed_ttl_disables_retention(tmp_path):
     assert summary["seed_kept"] == 0
     assert summary["unknown"] == 1
 
+@pytest.mark.asyncio
+async def test_sync_zero_pacing_does_not_sleep_between_category_requests(
+    tmp_path, monkeypatch
+):
+    """``llm_stats_pacing_secs: 0`` must mean zero, not the 3s default.
+
+    ``config.get(...) or DEFAULT_PACING_SECS`` treats an explicit 0 as
+    absent and reinstates the 3s production pacing, so every sync test (and
+    any one-shot tooling that disables pacing) paid 3s per category — 9s
+    per sync across the three tracked categories, ~72s for this file. The
+    review run that flagged this test as "slow or blocked" was measuring
+    exactly that; it was slow, not blocked.
+    """
+    import tusker_gateway.model_rankings as module
+
+    slept: list[float] = []
+    real_sleep = module.asyncio.sleep
+
+    async def recording_sleep(seconds):
+        slept.append(seconds)
+        return await real_sleep(seconds)
+
+    monkeypatch.setattr(module.asyncio, "sleep", recording_sleep)
+    routes = {
+        f"https://llmstats.test/stats/v1/rankings?category={category}&limit=50": _Response(
+            200, _rankings_body([])
+        )
+        for category in ("code", "general", "reasoning")
+    }
+    summary = await sync_llm_stats_rankings(
+        _config(tmp_path),
+        [("ollama-cloud", "gpt-oss:20b")],
+        _FakeSession(routes),
+    )
+    assert summary["requests"] == 3
+    assert slept == [], f"pacing=0 still slept: {slept}"
+
+
+@pytest.mark.asyncio
+async def test_sync_absent_pacing_uses_the_default(tmp_path, monkeypatch):
+    """An absent key keeps the production 3s pacing between requests."""
+    import tusker_gateway.model_rankings as module
+
+    slept: list[float] = []
+    real_sleep = module.asyncio.sleep
+
+    async def recording_sleep(seconds):
+        slept.append(seconds)
+        return await real_sleep(0)
+
+    monkeypatch.setattr(module.asyncio, "sleep", recording_sleep)
+    config = _config(tmp_path)
+    del config["llm_stats_pacing_secs"]
+    routes = {
+        f"https://llmstats.test/stats/v1/rankings?category={category}&limit=50": _Response(
+            200, _rankings_body([])
+        )
+        for category in ("code", "general", "reasoning")
+    }
+    await sync_llm_stats_rankings(
+        config, [("ollama-cloud", "gpt-oss:20b")], _FakeSession(routes)
+    )
+    assert slept == [3.0, 3.0, 3.0]
+
 
 # ---------------------------------------------------------------------------
 # Tool: build_seed_rows + dry-run end-to-end
