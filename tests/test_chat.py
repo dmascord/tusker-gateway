@@ -535,10 +535,13 @@ async def test_pool_stops_dispatching_when_aggregate_budget_is_spent():
 
     pool_manager = MagicMock()
     pool_manager.fallback_pools.return_value = ()
-    # More candidates than the loop can possibly reach inside the budget.
-    pool_manager.select.side_effect = [
-        ("ollama-cloud", f"silent-{index}") for index in range(6)
-    ]
+    # More candidates than the loop can reach inside the budget; the
+    # iterator terminates so an exhausted MagicMock can never raise
+    # StopIteration into the event loop (a 3.11 hang).
+    _candidates = iter(
+        ("ollama-cloud", f"silent-{index}") for index in range(20)
+    )
+    pool_manager.select.side_effect = lambda *_a, **_k: next(_candidates, None)
     upstream = MagicMock()
 
     async def silent_stream(*args, **kwargs):
@@ -633,7 +636,8 @@ async def test_non_gateway_error_provider_failure_still_earns_status_cooldown(tm
 
     pool_manager = MagicMock()
     pool_manager.fallback_pools.return_value = ()
-    pool_manager.select.side_effect = [("alibaba", "raw-exception-model"), None]
+    _selections = iter([("alibaba", "raw-exception-model"), None])
+    pool_manager.select.side_effect = lambda *_a, **_k: next(_selections, None)
 
     raw_error = RuntimeError("upstream crash")  # not a GatewayError
     raw_error.upstream_status = 401  # would earn 3600s if classified
