@@ -1070,7 +1070,7 @@ def _emit_arg_tails(
     for (cidx, iidx), buf in restorers.items():
         if choice_index is not None and cidx != choice_index:
             continue
-        tail = buf.feed("")
+        tail = buf.flush()
         if not tail:
             continue
         by_choice.setdefault(cidx, []).append({"index": iidx, "function": {"arguments": tail}})
@@ -1286,8 +1286,11 @@ async def _normalize_stream(
             tail = buf.flush()
             if tail:
                 yield sse_frame(format_openai_chunk(
-                    delta={field: tail}, model=model
-                ))
+                    content=tail if field == "content" else None,
+                    model=model
+                )) if field == "content" else (
+                    f"data: {json.dumps({'object': 'chat.completion.chunk', 'model': model, 'choices': [{'index': idx, 'delta': {field: tail}, 'finish_reason': None}]}, ensure_ascii=False)}\\n\\n".encode()
+                )
 
     def finish_frame(reason: str) -> bytes:
         return sse_frame(format_openai_chunk(finish_reason=reason, model=model))
