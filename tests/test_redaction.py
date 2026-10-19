@@ -82,6 +82,41 @@ def test_restore_authenticated_payload_when_model_drops_token_wrapper():
     assert t.restore_text("search for " + "A" * len(payload)) == "search for " + "A" * len(payload)
 
 
+@pytest.mark.parametrize(
+    ("token_type", "value"),
+    [
+        ("email", _make_email()),
+        ("card", _make_card()),
+        ("key", "ghp_" + "a" * 30),
+        ("text", "opaque-identifier-0123456789abcdef"),
+    ],
+)
+def test_restore_bare_payload_for_each_authenticated_token_type(token_type, value):
+    t = _tokenizer()
+    payload = t._seal(value, token_type)[len(f"[TUSKER:{token_type}:"):-1]
+    assert t.restore_text("lookup " + payload + " now") == "lookup " + value + " now"
+
+
+def test_bare_payload_restore_isolation_between_interleaved_sessions():
+    """Per-stream carry state must not mix when sessions share a Tokenizer."""
+    t = _tokenizer()
+    first, second = _BufferedRestorer(t), _BufferedRestorer(t)
+    email, key = _make_email(), "ghp_" + "b" * 30
+    p1 = t._seal(email, "email")[len("[TUSKER:email:"):-1]
+    p2 = t._seal(key, "key")[len("[TUSKER:key:"):-1]
+    a1, a2 = p1[:len(p1)//2], p1[len(p1)//2:]
+    b1, b2 = p2[:len(p2)//2], p2[len(p2)//2:]
+
+    output1 = first.feed('query ' + a1)
+    output2 = second.feed('query ' + b1)
+    output1 += first.feed(a2 + ' end')
+    output2 += second.feed(b2 + ' end')
+    output1 += first.flush()
+    output2 += second.flush()
+    assert output1 == 'query ' + email + ' end'
+    assert output2 == 'query ' + key + ' end'
+
+
 def test_response_context_cannot_open_request_context():
     t = _tokenizer()
     # context separation: a token opened with wrong AD fails -> passthrough
@@ -149,14 +184,19 @@ def test_streaming_restore_mid_token_split():
     assert out == plain
 
 
+@pytest.mark.parametrize("token_type,value", [
+    ("email", _make_email()),
+    ("card", _make_card()),
+    ("key", "ghp_" + "a" * 30),
+    ("text", "opaque-identifier-0123456789abcdef"),
+])
 @pytest.mark.parametrize("chunk", [1, 7, 31, 4096])
-def test_streaming_restore_bare_payload_split_across_deltas(chunk):
+def test_streaming_restore_bare_payload_split_across_deltas(token_type, value, chunk):
     t = _tokenizer()
-    email = _make_email()
-    payload = t.tokenize_text(email)[len("[TUSKER:email:"):-1]
+    payload = t._seal(value, token_type)[len(f"[TUSKER:{token_type}:"):-1]
     plain = '"command":"search ' + payload + '"'
     restored = _feed_all(plain, chunk)
-    assert restored == '"command":"search ' + email + '"'
+    assert restored == '"command":"search ' + value + '"'
 
 
 def test_streaming_flush_clears_pending():

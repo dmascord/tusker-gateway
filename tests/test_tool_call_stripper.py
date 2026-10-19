@@ -25,14 +25,17 @@ def test_gateway_tool_call_json_envelope_is_recovered():
     assert strip_tool_text(text) == ""
 
 
+@pytest.mark.parametrize("drop_wrapper", [False, True])
 @pytest.mark.asyncio
-async def test_stream_normalizer_recovers_gateway_tool_call_json():
+async def test_stream_normalizer_recovers_gateway_tool_call_json(drop_wrapper):
     from tusker_gateway.endpoints import _normalize_stream
     from tusker_gateway.redaction import RedactionRuleSet, Tokenizer
 
     email = "probe.user@example.com"
     tokenizer = Tokenizer(key=b"0123456789abcdef0123456789abcdef", rules=RedactionRuleSet())
     sealed_email = tokenizer.tokenize_text(email)
+    if drop_wrapper:
+        sealed_email = sealed_email[len("[TUSKER:email:"):-1]
     call = {
         "id": "call_echoed",
         "type": "function",
