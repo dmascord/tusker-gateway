@@ -783,8 +783,12 @@ async def _normalize_stream_legacy(
             # Pass through [DONE] sentinel as-is
             if stripped == b"data: [DONE]":
                 tool_stripper.flush()
-                if _rest is not None:
-                    _rest.flush()
+                for tail_frame in _text_tail_frames():
+                    yield tail_frame
+                for tail_frame in _emit_arg_tails(
+                    _arg_restorers, choice_index=None, template=None, new_choice=None
+                ):
+                    yield tail_frame
                 saw_done = True
                 # Emit any pending blocks the upstream never got to close
                 # before [DONE]. If we accumulated an unclosed block, drop
@@ -1142,6 +1146,11 @@ async def _normalize_stream(
     # prefix is held back), and the held tail is emitted as one more
     # arguments fragment before the finish_reason chunk.
     _arg_restorers: dict[tuple[int, int], _BufferedRestorer] = {}
+    # Content and reasoning are independent OpenAI delta channels. Never
+    # share a carry buffer between them: a split token in one channel must
+    # not consume bytes from the other.
+    _field_restorers: dict[tuple[int, str], _BufferedRestorer] = {}
+    _last_field: dict[int, str] = {}
     saw_finish_reason = False
     saw_done = False
     saw_tool_call = False
@@ -1267,6 +1276,18 @@ async def _normalize_stream(
         )
 
     tool_markup_seen: set[str] = set()
+
+    def _text_tail_frames(choice: int | None = None):
+        # Drain in insertion order, before any terminal event. Never discard
+        # buffered plaintext or emit it after finish_reason.
+        for (idx, field), buf in list(_field_restorers.items()):
+            if choice is not None and idx != choice:
+                continue
+            tail = buf.flush()
+            if tail:
+                yield sse_frame(format_openai_chunk(
+                    delta={field: tail}, model=model
+                ))
 
     def finish_frame(reason: str) -> bytes:
         return sse_frame(format_openai_chunk(finish_reason=reason, model=model))
@@ -1598,20 +1619,25 @@ async def _normalize_stream(
             cleaned_content = ""
             cleaned_auxiliary: dict[str, str] = {}
 
-            def clean_text(value: str) -> str:
+            def clean_text(value: str, field: str) -> str:
                 cleaned = tool_stripper.feed(value)
                 # `strip_tool_text` strips outer whitespace, so only apply it
                 # when the stateful pass left an actual markup hint. This
                 # preserves token-boundary spaces in ordinary reasoning.
                 if _TOOL_MARKUP_HINT_RE.search(cleaned):
                     cleaned = strip_tool_text(cleaned)
-                if _rest is not None:
-                    cleaned = _rest.feed(cleaned)
+                if restorer is not None:
+                    key = (choice_index, field)
+                    buf = _field_restorers.get(key)
+                    if buf is None:
+                        buf = _BufferedRestorer(tokenizer=restorer)
+                        _field_restorers[key] = buf
+                    cleaned = buf.feed(cleaned)
                 return cleaned
 
             has_content = isinstance(raw_content, str) and bool(raw_content)
             if has_content:
-                cleaned_content = clean_text(raw_content)
+                cleaned_content = clean_text(raw_content, "content")
                 if cleaned_content:
                     delta["content"] = cleaned_content
                     if cleaned_content.strip():
@@ -1619,7 +1645,7 @@ async def _normalize_stream(
                 else:
                     delta.pop("content", None)
             for field, value in auxiliary_sources:
-                cleaned = clean_text(value)
+                cleaned = clean_text(value, field)
                 cleaned_auxiliary[field] = cleaned
                 reasoning_chars += len(value)
                 if field != "reasoning_details" and cleaned:
@@ -1876,6 +1902,8 @@ async def _normalize_stream(
                 # (an unterminated `[TUSKER:` prefix) as a final arguments
                 # fragment before the finish frame. Clients concatenate
                 # fragments, so restored text lines up with what they hold.
+                for tail_frame in _text_tail_frames(choice_index):
+                    yield tail_frame
                 for tail_frame in _emit_arg_tails(
                     _arg_restorers, choice_index=choice_index, template=new_obj, new_choice=new_choice
                 ):
@@ -1972,6 +2000,8 @@ async def _normalize_stream(
             raise unusable_tool_error("reasoning_only_or_empty")
     if not tools_requested and not saw_tool_call and not saw_visible_content:
         raise empty_stream_error()
+    for tail_frame in _text_tail_frames():
+        yield tail_frame
     for tail_frame in _emit_arg_tails(
         _arg_restorers, choice_index=None, template=None, new_choice=None
     ):
