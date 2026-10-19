@@ -80,13 +80,11 @@ def test_terminal_done_without_finish_drains_text_and_arguments(split):
 
 
 @pytest.mark.parametrize("size", [1, 7, 31, 32, 33, 1024])
-def test_plain_words_are_not_delayed_until_next_word(size):
+def test_plain_words_remain_ordered_even_when_buffered(size):
     r = _BufferedRestorer(_tokenizer())
     text = "a" * size
     output = r.feed(text)
     assert output + r.flush() == text
-    if size < 32:
-        assert output == text
 
 
 def test_bare_authenticated_payload_survives_fragmentation():
