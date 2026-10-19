@@ -37,6 +37,15 @@ _TOKEN_SUFFIX = "]"
 _TOKEN_CORE_RE = re.compile(
     r"\[TUSKER:([a-z0-9_-]+):([A-Za-z0-9_\-=]+)\]"
 )
+# Models sometimes preserve the opaque ciphertext from a redaction token but
+# drop its ``[TUSKER:<type>:`` wrapper while composing a tool argument (for
+# example, searching for the token's base64 payload as though it were an ID).
+# Bare payloads remain authenticated: restore only after AES-SIV verification
+# with one of our known token types. Requiring a long, standalone base64url
+# run keeps this from interpreting ordinary short identifiers as tokens.
+_BARE_TOKEN_CORE_RE = re.compile(
+    r"(?<![A-Za-z0-9_=-])([A-Za-z0-9_-]{32,}={0,2})(?![A-Za-z0-9_=-])"
+)
 
 _B64URL = base64.urlsafe_b64encode
 _B64URL_DE = base64.urlsafe_b64decode
@@ -196,7 +205,25 @@ class Tokenizer:
             value = self._open(m.group(1), m.group(2))
             return m.group(0) if value is None else value
 
-        return _TOKEN_CORE_RE.sub(_restore, text)
+        restored = _TOKEN_CORE_RE.sub(_restore, text)
+
+        def _restore_bare(m: re.Match[str]) -> str:
+            encoded = m.group(1)
+            # The type is authenticated as associated data. Trying each
+            # supported type cannot turn arbitrary text into a value: only a
+            # payload sealed by this key for one of these namespaces opens.
+            for token_type in (
+                TOKEN_TYPE_EMAIL,
+                TOKEN_TYPE_CC,
+                TOKEN_TYPE_KEY,
+                TOKEN_TYPE_TEXT,
+            ):
+                value = self._open(token_type, encoded)
+                if value is not None:
+                    return value
+            return m.group(0)
+
+        return _BARE_TOKEN_CORE_RE.sub(_restore_bare, restored)
 
     def has_pending_token(self, text: str) -> bool:
         """True if text ends mid-token (split carry needed while streaming)."""
@@ -238,6 +265,14 @@ class _BufferedRestorer:
             if _TOKEN_PREFIX.startswith(self._pending[len(self._pending) - j:]):
                 safe = len(self._pending) - j
                 break
+        # A model can omit the wrapper and emit only the base64url payload.
+        # Keep a trailing token-like run intact across SSE deltas so the
+        # authenticated bare-payload recovery in restore_text sees the whole
+        # ciphertext. Holding the final word until its delimiter arrives is
+        # bounded and preserves normal streaming for preceding text.
+        bare_tail = re.search(r"[A-Za-z0-9_-]+={0,2}$", self._pending)
+        if bare_tail is not None:
+            safe = min(safe, bare_tail.start())
         out = self._pending[:safe]
         self._pending = self._pending[safe:]
         return self.tokenizer.restore_text(out) if out else ""
