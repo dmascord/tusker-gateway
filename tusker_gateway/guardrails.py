@@ -460,6 +460,13 @@ _HARNESS_GUARDRAIL_SYSTEM_PROMPT = (
     "[TUSKER:email:...] or [TUSKER:key:...], pass it verbatim to tools -\n"
     "the gateway will decode it before the tool runs. Do NOT attempt to decode\n"
     "these tokens yourself or substitute other values; use them as-is.\n"
+    "Never infer or claim the plaintext represented by a redaction token. Never\n"
+    "guess an email address from a person's name, a partial address, a domain,\n"
+    "or prior guesses. Never invent a token or treat a token as evidence for a\n"
+    "specific identity. When a user corrects an identity, discard earlier\n"
+    "guesses and use only the corrected identifier exactly as provided (or its\n"
+    "opaque token verbatim). If the identifier cannot be passed through to the\n"
+    "requested tool, ask for a stable directory ID instead of guessing.\n"
 )
 
 

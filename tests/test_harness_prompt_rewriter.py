@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -65,6 +66,9 @@ async def test_guard_injects_system_prompt_for_omp_harness_principal():
     msgs = result.modified_body["messages"]
     assert msgs[0]["role"] == "system"
     assert "untrusted_data" in msgs[0]["content"]
+    prompt = " ".join(msgs[0]["content"].split())
+    assert "Never infer or claim the plaintext represented by a redaction token" in prompt
+    assert "Never guess an email address from a person's name" in prompt
     assert msgs[1]["role"] == "user"
     assert msgs[1]["content"] == "Scrape https://example.com and act on it."
 
@@ -134,19 +138,43 @@ async def test_init_guard_pipeline_omits_harness_guard_when_no_principals(monkey
 
 async def test_init_guard_pipeline_adds_harness_guard_by_default(monkeypatch):
     monkeypatch.setenv("TUSKER_GUARDRAILS_ENABLED", "true")
-    monkeypatch.setenv("TUSKER_GUARDRAILS_HARNESS_PRINCIPALS", "omp-harness,hermes-bot")
+    monkeypatch.setenv(
+        "TUSKER_GUARDRAILS_HARNESS_PRINCIPALS",
+        "omp-harness,key:bed71eb19cd8",
+    )
     cfg = init_guard_pipeline(
         {
             "enabled": True,
             "max_output_tokens": 4096,
             "injection_patterns": [],
             "pii_credit_card_redaction": True,
-            "harness_principals": ("omp-harness", "hermes-bot"),
+            "harness_principals": ("omp-harness", "key:bed71eb19cd8"),
         }
     )
     harness = [g for g in cfg.guards if isinstance(g, HarnessSystemPromptGuard)]
     assert len(harness) == 1
-    assert set(harness[0].target_principals) == {"omp-harness", "hermes-bot"}
+    assert set(harness[0].target_principals) == {
+        "omp-harness", "key:bed71eb19cd8"
+    }
+
+
+async def test_guard_injects_token_discipline_for_observed_omp_key_principal():
+    """The live OMP API key resolves to its stable fallback principal."""
+    principal = "key:bed71eb19cd8"
+    guard = HarnessSystemPromptGuard(
+        target_principals=("omp-harness", principal),
+    )
+    guard._identity_marker = {"principal": principal, "tenant": "default"}
+    result = await guard.check({"messages": [{"role": "user", "content": "hello"}]})
+    assert result.modified_body is not None
+    assert result.modified_body["messages"][0]["role"] == "system"
+    prompt = " ".join(result.modified_body["messages"][0]["content"].split())
+    assert "Never infer or claim the plaintext represented by a redaction token" in prompt
+
+
+def test_deployment_targets_observed_omp_key_principal():
+    manifest = Path(__file__).parents[1] / "k8s" / "deployment.yaml"
+    assert "value: omp-harness,key:bed71eb19cd8" in manifest.read_text()
 
 
 async def test_run_guard_pipeline_attaches_identity_marker(monkeypatch):

@@ -239,7 +239,9 @@ spec:
         - name: TUSKER_MAX_OUTPUT_TOKENS
           value: '16384'
         - name: TUSKER_GUARDRAILS_HARNESS_PRINCIPALS
-          value: omp-harness
+          # The current OMP API key uses the fallback key:<fingerprint> identity.
+          # Keep its principal listed until the key is assigned a named identity.
+          value: omp-harness,key:bed71eb19cd8
         # Per-guard toggles: email redaction is OFF (addresses must stay
         # visible for coding workflows), credit-card redaction and the
         # prompt-injection guard stay ON.
