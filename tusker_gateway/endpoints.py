@@ -711,9 +711,37 @@ async def _normalize_stream_legacy(
 
     buffer = b""
     tool_stripper = _ToolCallStripper()
-    _rest = _BufferedRestorer(tokenizer=restorer) if restorer is not None else None
+    _field_restorers: dict[tuple[int, str], _BufferedRestorer] = {}
+    _arg_restorers: dict[tuple[int, int], _BufferedRestorer] = {}
     saw_finish_reason = False
     saw_done = False
+
+    def _legacy_tail_frames():
+        """Drain per-choice text and argument carry before a terminal frame.
+
+        OpenAI clients treat the finish chunk as terminal, so every
+        still-held restorer is drained *before* a finish frame — matching
+        the modern path's ``_text_tail_frames``.
+        """
+        by_choice = {}
+        for (idx, field_name), buf in list(_field_restorers.items()):
+            tail = buf.flush()
+            if tail:
+                by_choice.setdefault(idx, []).append({field_name: tail})
+        for idx, parts in by_choice.items():
+            chunk = {
+                "id": f"chatcmpl-{secrets.token_hex(14)}",
+                "object": "chat.completion.chunk",
+                "model": "tusker-gateway",
+                "choices": [
+                    {"index": idx, "delta": {k: v for part in parts for k, v in part.items()}, "finish_reason": None}
+                ],
+            }
+            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode()
+        for tail_frame in _emit_arg_tails(
+            _arg_restorers, choice_index=None, template=None, new_choice=None
+        ):
+            yield tail_frame
 
     def _finish_frame() -> bytes:
         return sse_frame(format_openai_chunk(finish_reason="stop"))
@@ -783,12 +811,10 @@ async def _normalize_stream_legacy(
             # Pass through [DONE] sentinel as-is
             if stripped == b"data: [DONE]":
                 tool_stripper.flush()
-                for tail_frame in _text_tail_frames():
+                for tail_frame in _legacy_tail_frames():
                     yield tail_frame
-                for tail_frame in _emit_arg_tails(
-                    _arg_restorers, choice_index=None, template=None, new_choice=None
-                ):
-                    yield tail_frame
+                if not saw_finish_reason:
+                    yield _finish_frame()
                 saw_done = True
                 # Emit any pending blocks the upstream never got to close
                 # before [DONE]. If we accumulated an unclosed block, drop
@@ -834,12 +860,33 @@ async def _normalize_stream_legacy(
             # gets reassembled with this chunk's content.
             if has_content:
                 cleaned = tool_stripper.feed(raw_content)
-                if _rest is not None:
-                    cleaned = _rest.feed(cleaned)
+                # Content carries through its own per-choice restorer so a
+                # reasoning delta split across frames cannot consume a
+                # content-channel buffer.
+                key = (int(choice.get("index", 0) or 0), "content")
+                buf = _field_restorers.get(key)
+                if buf is None and restorer is not None:
+                    buf = _BufferedRestorer(tokenizer=restorer)
+                    _field_restorers[key] = buf
+                cleaned = buf.feed(cleaned) if buf is not None else cleaned
                 if not cleaned and has_tools:
                     delta = {k: v for k, v in delta.items() if k != "content"}
                 else:
                     delta = {**delta, "content": cleaned}
+            # Reasoning carries through its own per-choice restorer,
+            # independent of whether this frame also has content.
+            reasoning_key = (int(choice.get("index", 0) or 0), "reasoning_content")
+            reasoning_buf = _field_restorers.get(reasoning_key)
+            if isinstance(reasoning_content, str) and reasoning_content:
+                if reasoning_buf is None and restorer is not None:
+                    reasoning_buf = _BufferedRestorer(tokenizer=restorer)
+                    _field_restorers[reasoning_key] = reasoning_buf
+                if reasoning_buf is not None:
+                    delta["reasoning_content"] = reasoning_buf.feed(reasoning_content)
+            elif reasoning_buf is not None:
+                probe = reasoning_buf.feed("")
+                if probe:
+                    delta["reasoning_content"] = probe
             # Replace delta in choice and obj for downstream re-emission.
             new_choice = {**choice, "delta": delta}
             new_obj = {**obj, "choices": [new_choice, *choices[1:]]}
@@ -861,6 +908,10 @@ async def _normalize_stream_legacy(
                         "choices": [{**new_choice, "delta": tools_only, "finish_reason": None}],
                     }
                     yield f"data: {json.dumps(tools_obj, ensure_ascii=False)}\n\n".encode()
+                # Any tail held by this choice's restorers must precede the
+                # finish frame; clients treat finish as terminal.
+                for tail_frame in _legacy_tail_frames():
+                    yield tail_frame
                 finish_obj = {
                     **new_obj,
                     "choices": [{**new_choice, "delta": {}, "finish_reason": fr}],
@@ -898,6 +949,10 @@ async def _normalize_stream_legacy(
     # Flush any remaining partial frame in the buffer
     if buffer.strip():
         yield buffer
+    # Upstream ended without a finish chunk: drain every still-held restorer
+    # tail, then synthesize a stop frame.
+    for tail_frame in _legacy_tail_frames():
+        yield tail_frame
     # If the upstream ended without ever emitting a finish_reason, OMP
     # surfaces this as "stream closed before a finish_reason was received".
     # Synthesize a stop chunk so the client always has a clean termination.
@@ -1079,7 +1134,7 @@ def _emit_arg_tails(
             obj = template
             choice = new_choice
         else:
-            obj = {"id": f"chatcmpl-restore-{secrets.token_hex(8)}", "object": "chat.completion.chunk"}
+            obj = {"id": f"chatcmpl-restore-{secrets.token_hex(8)}", "object": "chat.completion.chunk", "model": "tusker-gateway"}
             choice = {"index": cidx, "delta": {}, "finish_reason": None}
         yield f"data: {json.dumps({**obj, 'choices': [{**choice, 'delta': {'role': 'assistant', 'tool_calls': calls}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n".encode()
 
@@ -1138,7 +1193,6 @@ async def _normalize_stream(
         "tool_call_deltas": 0,
     }
     tool_stripper = _ToolCallStripper()
-    _rest = _BufferedRestorer(tokenizer=restorer) if restorer is not None else None
     # Per-tool-call argument restorer: streamed arguments may be tokenized
     # upstream and split across many deltas. OpenAI clients concatenate the
     # `arguments` fragments they receive, so each fragment is replaced with
@@ -1150,7 +1204,6 @@ async def _normalize_stream(
     # share a carry buffer between them: a split token in one channel must
     # not consume bytes from the other.
     _field_restorers: dict[tuple[int, str], _BufferedRestorer] = {}
-    _last_field: dict[int, str] = {}
     saw_finish_reason = False
     saw_done = False
     saw_tool_call = False
@@ -1450,8 +1503,15 @@ async def _normalize_stream(
             stream_diag["data_events"] += 1
             if stripped == b"data: [DONE]":
                 tool_stripper.flush()
-                if _rest is not None:
-                    _rest.flush()
+                # Drain every per-field restorer before synthesizing the
+                # finish frame below; a tail emitted after finish would
+                # violate the OpenAI terminal-frame contract.
+                for tail_frame in _text_tail_frames():
+                    yield tail_frame
+                for tail_frame in _emit_arg_tails(
+                    _arg_restorers, choice_index=None, template=None, new_choice=None
+                ):
+                    yield tail_frame
                 if require_tool_call and not saw_tool_call:
                     raise required_tool_error()
                 if tools_requested and saw_tool_markup_opening and not saw_tool_call:
