@@ -270,6 +270,9 @@ class _BufferedRestorer:
         # authenticated bare-payload recovery in restore_text sees the whole
         # ciphertext. Holding the final word until its delimiter arrives is
         # bounded and preserves normal streaming for preceding text.
+        # A bare authenticated payload can arrive one character at a time.
+        # Buffer its complete trailing run, including the first 31 bytes;
+        # releasing those bytes early makes recovery impossible.
         bare_tail = re.search(r"[A-Za-z0-9_-]+={0,2}$", self._pending)
         if bare_tail is not None:
             safe = min(safe, bare_tail.start())
