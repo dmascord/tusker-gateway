@@ -1379,7 +1379,7 @@ async def _normalize_stream(
             # below. Restore sealed values before emitting recovered
             # arguments to OMP, just as we do for native tool-call deltas.
             if restorer is not None and hasattr(restorer, "restore_text"):
-                args = restorer.restore_text(args)
+                args = restorer.restore_text(args, json_escape=True)
             cid = call.get("id") or (
                 f"call_text_{synthetic_tool_call_sequence}_{hashlib.sha1(name.encode()).hexdigest()[:10]}"
             )
@@ -1659,7 +1659,7 @@ async def _normalize_stream(
                     key = (choice_index, int(call.get("index", -1)))
                     buf = _arg_restorers.get(key)
                     if buf is None:
-                        buf = _BufferedRestorer(tokenizer=restorer)
+                        buf = _BufferedRestorer(tokenizer=restorer, json_escape=True)
                         _arg_restorers[key] = buf
                     # Replace the fragment with restored text; an incomplete
                     # token tail stays buffered and ships in the tail frame.

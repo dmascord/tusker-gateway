@@ -196,14 +196,29 @@ class Tokenizer:
             out = pattern.sub(lambda m: self._seal(m.group(0), TOKEN_TYPE_TEXT), out)
         return out
 
-    def restore_text(self, text: str) -> str:
-        """Decrypt tokens back to values; unescape client literals; pass through the rest."""
+    def restore_text(self, text: str, *, json_escape: bool = False) -> str:
+        """Decrypt tokens back to values; unescape client literals; pass through the rest.
+
+        ``json_escape`` is for callers restoring inside a JSON document (a
+        tool-call ``arguments`` string): the plaintext is re-encoded with
+        JSON string escaping so a sealed value containing ``"``, ``\\`` or a
+        control character cannot terminate or corrupt the surrounding JSON.
+        Without it the substitution is raw, which is correct for content and
+        reasoning fields that are not JSON.
+        """
         if not isinstance(text, str) or not text:
             return text
 
+        def _emit(value: str) -> str:
+            if not json_escape:
+                return value
+            # Strip the surrounding quotes json.dumps adds; the escape
+            # sequences are exactly what a JSON string literal needs.
+            return json.dumps(value, ensure_ascii=False)[1:-1]
+
         def _restore(m: re.Match[str]) -> str:
             value = self._open(m.group(1), m.group(2))
-            return m.group(0) if value is None else value
+            return m.group(0) if value is None else _emit(value)
 
         restored = _TOKEN_CORE_RE.sub(_restore, text)
 
@@ -220,7 +235,7 @@ class Tokenizer:
             ):
                 value = self._open(token_type, encoded)
                 if value is not None:
-                    return value
+                    return _emit(value)
             return m.group(0)
 
         return _BARE_TOKEN_CORE_RE.sub(_restore_bare, restored)
@@ -239,9 +254,15 @@ class _BufferedRestorer:
     unterminated ``[TUSKER:`` prefix, hold the tail; otherwise flush. On the
     final flush the whole remaining buffer is restored at once, so tokens are
     never split across emissions and clients see clean text.
+
+    ``json_escape`` is set for buffers that carry a JSON document (a
+    tool-call ``arguments`` string). Restored plaintext is then re-encoded
+    as a JSON string body so a sealed value containing ``"`` or ``\\``
+    cannot corrupt the document it is embedded in.
     """
 
     tokenizer: Tokenizer
+    json_escape: bool = False
 
     def feed(self, delta: str) -> str:
         """Accumulate; emit only text that cannot still end inside a token."""
@@ -255,7 +276,7 @@ class _BufferedRestorer:
             if end == -1:
                 head = self._pending[:idx]
                 self._pending = self._pending[idx:]
-                return self.tokenizer.restore_text(head) if head else ""
+                return self._restore(head)
             idx = self._pending.find(_TOKEN_PREFIX, end + 1)
         # No unterminated token: flush everything except a short tail that
         # could be a partial "[TUSKER:" prefix split across chunks.
@@ -278,13 +299,18 @@ class _BufferedRestorer:
             safe = min(safe, bare_tail.start())
         out = self._pending[:safe]
         self._pending = self._pending[safe:]
-        return self.tokenizer.restore_text(out) if out else ""
+        return self._restore(out)
 
     def flush(self) -> str:
         """Restore and emit everything still held. Call once at stream end."""
-        out = self.tokenizer.restore_text(self._pending)
+        out = self._restore(self._pending)
         self._pending = ""
         return out
+
+    def _restore(self, text: str) -> str:
+        if not text:
+            return ""
+        return self.tokenizer.restore_text(text, json_escape=self.json_escape)
 
     _pending: str = field(default="", init=False)
 
@@ -300,17 +326,28 @@ def restore_response(result: Any, tokenizer: Tokenizer | None) -> Any:
     nested dict/list the provider added. Unknown token-like sequences that do
     not decrypt pass through unchanged; when the tokenizer is None this is a
     no-op returning the original object.
+
+    Tool-call ``function.arguments`` and ``function_call.arguments`` strings
+    are restored with JSON escaping so a sealed value containing ``"`` or
+    ``\\`` cannot corrupt the surrounding JSON document.
     """
     if tokenizer is None:
         return result
+
+    _JSON_STRING_KEYS = {"arguments"}
 
     def walk(node: Any) -> Any:
         if isinstance(node, str):
             return tokenizer.restore_text(node)
         if isinstance(node, dict):
-            return {k: walk(v) for k, v in node.items()}
+            return {k: walk_value(k, v) for k, v in node.items()}
         if isinstance(node, list):
             return [walk(v) for v in node]
         return node
+
+    def walk_value(key: str, value: Any) -> Any:
+        if isinstance(value, str) and key in _JSON_STRING_KEYS:
+            return tokenizer.restore_text(value, json_escape=True)
+        return walk(value)
 
     return walk(result)
