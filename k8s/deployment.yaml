@@ -5,6 +5,7 @@ metadata:
   namespace: hermes
   labels:
     app: tusker-gateway
+  annotations:
     tusker.net.au/commit: 64f32b5fa8d9eb26f5d38fb8805f2354c999b4fa
     tusker.net.au/image-tag: swarm-alpine-64f32b5fa8d9eb26f5d38fb8805f2354c999b4fa
     tusker.net.au/image-digest: sha256:65cad5693e26fcfd3099f9b019773766297af60cadd3ee61065d0e3da301ad46
