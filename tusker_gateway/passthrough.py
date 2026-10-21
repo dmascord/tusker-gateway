@@ -3301,6 +3301,7 @@ class PassthroughClient:
                         response=body.encode("utf-8", errors="replace"),
                         verdict={"non_stream": True, "status": resp.status},
                         pool=pool,
+                        request_payload=request_payload,
                     )
             except Exception:
                 logger.debug("non-stream capture failed", exc_info=True)
