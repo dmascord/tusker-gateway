@@ -13,8 +13,17 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from tusker_gateway.endpoints import _AttemptActivity, _await_attempt
-from tusker_gateway.passthrough import PassthroughClient, bind_upstream_progress
+from tusker_gateway.endpoints import (
+    _AttemptActivity,
+    _await_attempt,
+    _provider_attempt_timeout_secs,
+)
+from tusker_gateway.passthrough import (
+    PassthroughClient,
+    _stream_total_budget,
+    _upstream_idle_secs,
+    bind_upstream_progress,
+)
 
 
 class _SlowChunks:
@@ -82,3 +91,50 @@ async def test_unbound_buffered_attempt_still_times_out():
             deadline_at=None,
             activity=activity,
         )
+
+
+def test_upstream_idle_window_never_preempts_attempt_budget(monkeypatch):
+    """A read timer shorter than the attempt budget reports a timeout the
+    budget was configured to prevent.
+
+    Production evidence, req_e1d8a9fe5ade8736 (2026-10-21): ``mlx-mac``
+    carries a 240s attempt budget, but the flat 90s socket timer fired first
+    on a cold 240K-token prompt, so the operator-visible budget never
+    applied.
+    """
+    monkeypatch.setenv("TUSKER_UPSTREAM_SOCK_READ_SECS", "90")
+    monkeypatch.setenv(
+        "TUSKER_PROVIDER_ATTEMPT_TIMEOUT_OVERRIDES_JSON",
+        '{"mlx-mac": 240, "ollama-cloud": 180}',
+    )
+    monkeypatch.setenv(
+        "TUSKER_PROVIDER_STREAM_TIMEOUT_OVERRIDES_JSON", '{"xiaomi": 600}'
+    )
+
+    for provider in ("mlx-mac", "ollama-cloud", "xiaomi"):
+        attempt = _provider_attempt_timeout_secs(None, provider=provider, model="m")
+        idle = _upstream_idle_secs(provider, "m")
+        assert idle >= attempt, f"{provider}: idle {idle}s < attempt {attempt}s"
+        assert _stream_total_budget(provider=provider) >= attempt
+
+
+def test_upstream_idle_window_defaults_to_the_flat_socket_value(monkeypatch):
+    monkeypatch.setenv("TUSKER_UPSTREAM_SOCK_READ_SECS", "90")
+    monkeypatch.setenv("TUSKER_PROVIDER_ATTEMPT_TIMEOUT_OVERRIDES_JSON", "")
+    monkeypatch.setenv("TUSKER_PROVIDER_STREAM_TIMEOUT_OVERRIDES_JSON", "")
+
+    assert _upstream_idle_secs("google", "gemini") == 90.0
+    assert _stream_total_budget(provider="google") == 90.0
+
+
+def test_model_scoped_attempt_override_raises_the_upstream_window(monkeypatch):
+    monkeypatch.setenv("TUSKER_UPSTREAM_SOCK_READ_SECS", "90")
+    monkeypatch.setenv(
+        "TUSKER_PROVIDER_ATTEMPT_TIMEOUT_OVERRIDES_JSON",
+        '{"alibaba/qwen3.8-max": 120, "alibaba": 60}',
+    )
+
+    assert _upstream_idle_secs("alibaba", "qwen3.8-max") == 120.0
+    # A provider override below the socket floor does not shorten it.
+    assert _upstream_idle_secs("alibaba", "other") == 90.0
+    assert _upstream_idle_secs("google", "gemini") == 90.0
