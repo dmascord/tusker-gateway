@@ -6,9 +6,9 @@ metadata:
   labels:
     app: tusker-gateway
   annotations:
-    tusker.net.au/commit: ef209eeef59e0f471b5c0433fcde70c75e8f2c8a
-    tusker.net.au/image-tag: swarm-alpine-20261021142916
-    tusker.net.au/image-digest: sha256:d70884948f694d4d6ec9b3f8944eabf89cda5eb56b2a597d95770a22c9fa96c9
+    tusker.net.au/commit: 88a16e953863be3c04ae2d2c7051068a26f7aa1c
+    tusker.net.au/image-tag: swarm-alpine-20261021150325
+    tusker.net.au/image-digest: sha256:d5524ef56222161a930886e27993561c8d51237c21dd78f8c9a71aa63ccf8e68
 spec:
   replicas: 1
   selector:
