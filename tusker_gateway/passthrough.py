@@ -2410,7 +2410,9 @@ class PassthroughClient:
                 await self._record_stream_failure(provider, model, exc, start)
                 raise
             try:
-                await self._check_response(resp, provider=provider, model=model)
+                await self._check_response(
+                    resp, provider=provider, model=model, request_id=request_id, pool=pool
+                )
                 prefetched_chunks, upstream_iterator = await self._prefetch_stream(
                     resp,
                     provider=provider,
@@ -2474,7 +2476,14 @@ class PassthroughClient:
                 json=body,
                 timeout=aiohttp.ClientTimeout(total=120),
             ) as resp:
-                await self._check_response(resp, provider=provider, model=model)
+                await self._check_response(
+                    resp,
+                    provider=provider,
+                    model=model,
+                    request_id=request_id,
+                    pool=pool,
+                    request_payload=json.dumps(body).encode("utf-8"),
+                )
                 result = await resp.json()
                 if provider.lower() == "google":
                     # Store the native tool_call shape before generic response
@@ -2956,7 +2965,14 @@ class PassthroughClient:
                 "POST", url, headers=headers, json=body, timeout=aiohttp.ClientTimeout(total=120)
             )
             try:
-                await self._check_response(resp, provider=provider, model=model)
+                await self._check_response(
+                    resp,
+                    provider=provider,
+                    model=model,
+                    request_id=request_id,
+                    pool=pool,
+                    request_payload=json.dumps(body).encode("utf-8"),
+                )
             except RateLimitError as exc:
                 resp.release()
                 from tusker_gateway.cooldown import _cooldown_seconds_for_429
@@ -3250,6 +3266,9 @@ class PassthroughClient:
         *,
         provider: str | None = None,
         model: str | None = None,
+        request_id: str | None = None,
+        pool: str | None = None,
+        request_payload: bytes | None = None,
     ) -> None:
         if resp.status == 200:
             return
@@ -3261,6 +3280,30 @@ class PassthroughClient:
             resp.status,
             _safe_upstream_body(body),
         )
+        # Capture the request bytes behind a non-2xx rejection so the next
+        # `invalid_request_error` from a local upstream (e.g. mlx-mac Ollama)
+        # leaves evidence in the state DB instead of just a truncated log
+        # line. Gated on TUSKER_STREAM_CAPTURE (same switch as stream
+        # rejections); privacy/excluded pools still withhold prompt bytes,
+        # and a degraded write never affects the client outcome.
+        if request_id:
+            try:
+                from tusker_gateway.stream_diagnostics import (
+                    store_unusable_stream_capture,
+                    stream_capture_enabled as _stream_capture_enabled,
+                )
+                if _stream_capture_enabled():
+                    store_unusable_stream_capture(
+                        request_id=request_id,
+                        provider=provider or "unknown",
+                        model=model or "unknown",
+                        reason=f"http_{resp.status}",
+                        response=body.encode("utf-8", errors="replace"),
+                        verdict={"non_stream": True, "status": resp.status},
+                        pool=pool,
+                    )
+            except Exception:
+                logger.debug("non-stream capture failed", exc_info=True)
         if is_capacity_error(body):
             group = capacity_group_for_route(provider or "", model or "", body)
             if group is not None:
