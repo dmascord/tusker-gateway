@@ -511,6 +511,17 @@ actually reachable. Production evidence for the fix is
 `req_e1d8a9fe5ade8736` (2026-10-21), where a cold 240K-token `mlx-mac` prompt
 died at 90s under a 240s attempt budget.
 
+Non-streaming requests wait for the whole completion, so they have no idle
+timer to reset and aiohttp's `total` is the only upstream deadline. It must
+derive from the same attempt budget: both non-stream call sites use
+`passthrough._non_stream_total_secs()`, which returns
+`TUSKER_UPSTREAM_SOCK_READ_SECS` raised to the route's attempt override.
+A flat `120s` here is the same trap as a flat `sock_read` — before
+2026-10-21 the non-stream path passed a literal `120`, so a configured-240s
+`local-llm` request failed at 120.4s and again at 121.0s (reproducible)
+while the identical request took ~1s warm and ~6s cold directly against
+Ollama. Non-stream `local-llm`/`mlx-mac` now get the full `240s`.
+
 #### Process-backed CLI capacity gate
 
 `opencode-cli`, `claude-code-cli`, and `kilo-cli` (only when it is *not*

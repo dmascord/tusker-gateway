@@ -20,6 +20,7 @@ from tusker_gateway.endpoints import (
 )
 from tusker_gateway.passthrough import (
     PassthroughClient,
+    _non_stream_total_secs,
     _stream_total_budget,
     _upstream_idle_secs,
     bind_upstream_progress,
@@ -138,3 +139,70 @@ def test_model_scoped_attempt_override_raises_the_upstream_window(monkeypatch):
     # A provider override below the socket floor does not shorten it.
     assert _upstream_idle_secs("alibaba", "other") == 90.0
     assert _upstream_idle_secs("google", "gemini") == 90.0
+
+
+def test_non_stream_total_covers_the_configured_attempt_budget(monkeypatch):
+    """A non-stream route must not die before its attempt budget.
+
+    Production evidence (2026-10-21): non-stream ``local-llm/qwen3-vl:8b``
+    failed at 120.4s and again at 121.0s even though that provider carries a
+    240s attempt budget for cold model loads. The flat 120s ``total`` fired
+    first, so the configured budget never applied.
+    """
+    monkeypatch.setenv("TUSKER_UPSTREAM_SOCK_READ_SECS", "90")
+    monkeypatch.setenv(
+        "TUSKER_PROVIDER_ATTEMPT_TIMEOUT_OVERRIDES_JSON",
+        '{"local-llm": 240, "mlx-mac": 240, "zai": 90}',
+    )
+
+    assert _non_stream_total_secs("local-llm", "qwen3-vl:8b") == 240.0
+    assert _non_stream_total_secs("mlx-mac", "ornith-1.5:35b") == 240.0
+    # A route with no override keeps the socket floor, never a shorter one.
+    assert _non_stream_total_secs("google", "gemini") == 90.0
+
+
+def test_non_stream_chat_sends_the_configured_budget_to_aiohttp(monkeypatch):
+    """The resolved budget must reach aiohttp, not just the helper.
+
+    Guards the wiring: a correct helper is worthless if the request still
+    passes a literal 120.
+    """
+    monkeypatch.setenv("TUSKER_UPSTREAM_SOCK_READ_SECS", "90")
+    monkeypatch.setenv(
+        "TUSKER_PROVIDER_ATTEMPT_TIMEOUT_OVERRIDES_JSON", '{"local-llm": 240}'
+    )
+
+    seen: dict[str, object] = {}
+
+    class _Resp:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def json(self):
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+        @property
+        def status(self):
+            return 200
+
+        def release(self):
+            pass
+
+    class _Http:
+        def request(self, method, url, **kwargs):
+            seen["timeout"] = kwargs.get("timeout")
+            return _Resp()
+
+    client = PassthroughClient({}, MagicMock(), _Http())
+
+    async def _run():
+        await client.chat("local-llm", "qwen3-vl:8b", [{"role": "user", "content": "hi"}])
+
+    asyncio.run(_run())
+
+    timeout = seen["timeout"]
+    assert timeout is not None, "no ClientTimeout was passed to the upstream request"
+    assert timeout.total == 240.0, f"non-stream total {timeout.total}s pre-empts the budget"

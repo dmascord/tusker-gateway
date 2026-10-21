@@ -728,6 +728,24 @@ def _stream_total_budget(
     return _upstream_idle_secs(provider)
 
 
+def _non_stream_total_secs(provider: str | None, model: str | None = None) -> float:
+    """Return the wall-clock budget for one non-streaming upstream call.
+
+    Non-streaming routes get no per-chunk reset, so their ``total`` timeout is
+    the whole-completion deadline and MUST come from the route's configured
+    attempt budget. A flat value is the same trap the idle timers avoid: it
+    pre-empts a larger configured budget, so the operator-visible attempt
+    timeout never applies. Production evidence (2026-10-21): non-stream
+    ``local-llm/qwen3-vl:8b`` died at 120.4s despite the 240s budget in
+    ``TUSKER_PROVIDER_ATTEMPT_TIMEOUT_OVERRIDES_JSON``.
+    """
+    seconds = _UPSTREAM_STREAM_SOCK_READ_SECS
+    attempt = _attempt_idle_secs(provider, model)
+    if attempt is not None:
+        seconds = max(seconds, attempt)
+    return seconds
+
+
 # Build per-provider endpoints dict from the normalized registry in config.py
 # Falls back to legacy hard-coded mapping if the registry is unavailable.
 def _init_provider_endpoints() -> dict[str, dict[str, Any]]:
@@ -2474,7 +2492,15 @@ class PassthroughClient:
                 url,
                 headers=headers,
                 json=body,
-                timeout=aiohttp.ClientTimeout(total=120),
+                # Non-streaming routes wait for the whole completion, so the
+                # wall-clock total is the only upstream timeout. It must come
+                # from the route's configured attempt budget: a flat 120s
+                # pre-empted the 240s budget local-llm/mlx-mac carry for cold
+                # model loads (2026-10-21, local-llm/qwen3-vl:8b died at
+                # 120.4s while the same request took ~1s warm upstream).
+                timeout=aiohttp.ClientTimeout(
+                    total=_non_stream_total_secs(provider, model)
+                ),
             ) as resp:
                 await self._check_response(
                     resp,
@@ -2962,7 +2988,16 @@ class PassthroughClient:
                 headers["Copilot-Vision-Request"] = "true"
             start = time.monotonic()
             resp = await self._http.request(
-                "POST", url, headers=headers, json=body, timeout=aiohttp.ClientTimeout(total=120)
+                "POST",
+                url,
+                headers=headers,
+                json=body,
+                # Same rule as the non-stream chat path: the wall-clock total
+                # derives from the configured attempt budget rather than a
+                # flat 120s that pre-empts local cold loads.
+                timeout=aiohttp.ClientTimeout(
+                    total=_non_stream_total_secs(provider, model)
+                ),
             )
             try:
                 await self._check_response(
