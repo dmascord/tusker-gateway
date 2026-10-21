@@ -5,6 +5,19 @@ rejected provider's own bytes disappear once the turn resolves. Those bytes (the
 request the gateway actually sent and the upstream response frames) plus the
 verdict counters are the only evidence that the verdict was correct.
 
+Two rejections produce a row:
+
+- **Stream rejections** (post-commit): the turn streamed, the gateway judged it
+  unusable, and it fails over before the client sees real output.
+- **Pre-stream non-2xx** (e.g. a `400 invalid_request_error` from a local
+  upstream such as `mlx-mac` Ollama): no response bytes reached the client, so
+  the only evidence of what was sent is the outbound payload. `_check_response`
+  stores it directly with `reason="http_<status>"`, so a schema-compatibility
+  rejection stays diagnosable instead of leaving only a truncated log line.
+
+Both paths respect the same pool/body policy: a `privacy`-pool rejection keeps
+its verdict counters and stores no bytes.
+
 ## Why the store moved
 
 Captures used to be `unusable-*.json` files under the `tusker-home` PVC capture

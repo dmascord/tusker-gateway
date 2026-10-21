@@ -3,6 +3,9 @@ import json
 import stat
 from collections import OrderedDict
 
+import pytest
+
+from tusker_gateway.errors import ProviderError
 from tusker_gateway.stream_diagnostics import (
     append_response_capture,
     extract_cycle_text,
@@ -11,7 +14,7 @@ from tusker_gateway.stream_diagnostics import (
     store_unusable_stream_capture,
     take_upstream_request,
 )
-from tusker_gateway.turn_capture import fetch_turn_capture
+from tusker_gateway.turn_capture import fetch_turn_capture, list_turn_captures
 
 
 def test_reasoning_cycle_capture_is_private_and_contains_trigger_text(tmp_path, monkeypatch):
@@ -258,3 +261,120 @@ def test_response_capture_stops_at_the_bound():
 
     assert len(capture) == 65_536
     assert append_response_capture(None, b"z") is None
+
+
+class _FakeUpstreamResponse:
+    """Minimal stand-in for an ``aiohttp.ClientResponse`` error reply."""
+
+    def __init__(self, status: int, body: str) -> None:
+        self.status = status
+        self._body = body
+        self.headers: dict[str, str] = {}
+
+    async def text(self) -> str:
+        return self._body
+
+
+def test_non_2xx_response_captures_the_request_that_was_rejected(tmp_path, monkeypatch):
+    """A 400 leaves the exact outbound request in the state DB.
+
+    ``mlx-mac`` rejected two attempts with ``invalid tool call arguments`` and
+    the only trace was a truncated log line, so the request bytes that produced
+    the verdict were unrecoverable. ``_check_response`` now stores both sides
+    through the same rejected-turn capture used for stream failures.
+    """
+    import asyncio
+
+    from tusker_gateway.passthrough import PassthroughClient
+
+    _enable_capture(tmp_path, monkeypatch)
+    _isolate_pending(monkeypatch)
+    _remember(request_id="req-400", payload=b'{"model":"qwen3.8-27b","tools":[]}')
+
+    body = '{"error":{"message":"invalid tool call arguments"}}'
+    with pytest.raises(ProviderError):
+        asyncio.run(
+            PassthroughClient._check_response(
+                _FakeUpstreamResponse(400, body),
+                provider="mlx-mac",
+                model="qwen3.8-27b",
+                request_id="req-400",
+                pool="code",
+                request_payload=b'{"model":"qwen3.8-27b","tools":[]}',
+            )
+        )
+
+    captures = list_turn_captures(limit=10)
+    assert len(captures) == 1
+    record = fetch_turn_capture(captures[0]["capture_id"])
+    assert record["reason"] == "http_400"
+    assert record["provider"] == "mlx-mac"
+    assert record["body_policy"] == "captured"
+    assert json.loads(record["request_body"])["model"] == "qwen3.8-27b"
+    assert b"invalid tool call arguments" in record["response_body"]
+    # The hold is consumed, so a retry cannot attach the same bytes twice.
+    assert take_upstream_request("req-400") is None
+
+
+def test_non_2xx_capture_withholds_bytes_for_the_privacy_pool(tmp_path, monkeypatch):
+    """The ZDR pool keeps its verdict but never persists prompt bytes."""
+    import asyncio
+
+    from tusker_gateway.passthrough import PassthroughClient
+
+    _enable_capture(tmp_path, monkeypatch)
+    _isolate_pending(monkeypatch)
+    remember_upstream_request(
+        request_id="req-zdr",
+        provider="mlx-mac",
+        model="qwen3.8-27b",
+        pool="privacy",
+        stream=False,
+        source="chat_completions",
+        payload=b'{"messages":[{"content":"private"}]}',
+    )
+
+    with pytest.raises(ProviderError):
+        asyncio.run(
+            PassthroughClient._check_response(
+                _FakeUpstreamResponse(400, "{}"),
+                provider="mlx-mac",
+                model="qwen3.8-27b",
+                request_id="req-zdr",
+                pool="privacy",
+                request_payload=b'{"messages":[{"content":"private"}]}',
+            )
+        )
+
+    captures = list_turn_captures(limit=10)
+    assert len(captures) == 1
+    record = fetch_turn_capture(captures[0]["capture_id"])
+    assert record["body_policy"] == "excluded_pool"
+    assert record["request_body"] is None
+    assert record["response_body"] is None
+
+
+def test_non_2xx_capture_is_opt_in(tmp_path, monkeypatch):
+    """With the switch off a rejection writes nothing."""
+    import asyncio
+
+    from tusker_gateway.passthrough import PassthroughClient
+
+    monkeypatch.setenv("TUSKER_TURN_CAPTURE_PATH", str(tmp_path / "turn-captures.db"))
+    monkeypatch.setenv("TUSKER_STATE_DATABASE_URL", "")
+    monkeypatch.delenv("TUSKER_STREAM_CAPTURE", raising=False)
+    _isolate_pending(monkeypatch)
+    _remember(request_id="req-off-400")
+
+    with pytest.raises(ProviderError):
+        asyncio.run(
+            PassthroughClient._check_response(
+                _FakeUpstreamResponse(400, "{}"),
+                provider="mlx-mac",
+                model="m",
+                request_id="req-off-400",
+                pool="code",
+            )
+        )
+
+    assert not (tmp_path / "turn-captures.db").exists()

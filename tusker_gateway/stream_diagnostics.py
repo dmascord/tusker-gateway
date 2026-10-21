@@ -155,6 +155,10 @@ def remember_upstream_request(
     that bound is held without bytes, so its rejection still records the size
     and verdict. An entry is dropped when the rejection reads it, and otherwise
     expires, so a successful turn cannot pin prompt bytes in memory.
+
+    A pre-stream 4xx leaves no such hold: ``_check_response`` passes the exact
+    outbound bytes it already has to the capture store, so a successful
+    non-streaming turn never pins prompt bytes.
     """
     if not stream or not request_id or not stream_capture_enabled():
         return
@@ -205,6 +209,9 @@ def store_unusable_stream_capture(
     reason: str,
     response: bytes,
     verdict: dict[str, Any],
+    pool: str | None = None,
+    request_payload: bytes | None = None,
+    request_source: str | None = None,
 ) -> str | None:
     """Persist one rejected provider turn; return its capture id or ``None``.
 
@@ -212,21 +219,36 @@ def store_unusable_stream_capture(
     replayable. Prompt and response bytes are withheld when the pool is
     excluded (the ZDR boundary) or cannot be established at all; the verdict
     counters are kept in every case. See ``tusker_gateway.turn_capture``.
+
+    ``pool``/``request_payload`` let a caller that already holds the outbound
+    bytes (a pre-stream 4xx in ``_check_response``) attribute the pool without
+    going through the streaming hold. When omitted, the hold is consumed as
+    before.
     """
     if not stream_capture_enabled():
         return None
-    pending = take_upstream_request(request_id)
-    if pending is None:
-        # Process-backed adapters and the Anthropic entry point assemble their
-        # own provider payload, and an expired or evicted hold leaves nothing
-        # behind, so the pool that served this turn is not known here.
-        pool = None
-        request_source = "unavailable"
-        request_payload = None
+    if pool is None and request_payload is None:
+        pending = take_upstream_request(request_id)
+        if pending is None:
+            # Process-backed adapters and the Anthropic entry point assemble
+            # their own provider payload, and an expired or evicted hold leaves
+            # nothing behind, so the pool that served this turn is not known.
+            pool = None
+            request_source = "unavailable"
+            request_payload = None
+        else:
+            pool = pending["pool"]
+            request_source = pending["source"]
+            request_payload = pending["payload"]
     else:
-        pool = pending["pool"]
-        request_source = pending["source"]
-        request_payload = pending["payload"]
+        # A streaming turn may also carry a hold; use its bytes when the caller
+        # did not supply the outbound payload itself, then drop the hold so a
+        # later reader cannot attach stale bytes to a different rejection.
+        pending = take_upstream_request(request_id)
+        if request_payload is None and pending is not None:
+            request_payload = pending["payload"]
+        if request_source is None:
+            request_source = "chat_completions"
     return store_turn_capture(
         request_id=request_id,
         provider=provider,
