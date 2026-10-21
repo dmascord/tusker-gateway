@@ -139,70 +139,71 @@ synthetic/minimax. To restore Codex:
 
 ### Re-enroll each of the three OpenAI accounts
 
-`enroll_codex_credential.py` (in this repo, run on visor against the
-running pod) drives the OpenAI device-code flow and persists the
-result into `tusker_config_oauth_credentials` (DB-authoritative when
-`TUSKER_CONFIG_DATABASE_ENABLED=1`; otherwise it falls back to
-`auth.json`).
+`enroll_codex_credential` drives the OpenAI device-code flow and writes
+the result **straight into `tusker_config_oauth_credentials`**, then
+bumps the config generation and calls `_refresh_after_write()`. There is
+**no separate `migrate_config_to_db` step** — the tool is the write path.
 
-For each of the three accounts:
+It must run **inside the pod** (`TUSKER_CONFIG_DATABASE_ENABLED=1`);
+outside it `ConfigStore._managed` is False and the tool exits 1.
+
+Run it once per account. `--replace-email` overwrites the existing dead
+row in place instead of appending a fourth entry:
 
 ```bash
-# Run inside the gateway pod (carries the OAuth client_id/secret):
 kubectl -n hermes exec -it deploy/tusker-gateway -- \
-  python -m tusker_gateway.tools.enroll_codex_credential \
-    --label "codex-account-01" # repeat for -02 and -03
+  python3 -m tusker_gateway.tools.enroll_codex_credential \
+    --label "codex-01" --replace-email "<email-of-account-1>"
 ```
 
-The tool prints a `chatgpt.com/device` URL and a user code; open
-the URL in a browser, sign in as the right account, approve, and the
-script writes the rotated `access_token` + `refresh_token` to the
-DB. `ConfigRuntime` hot-reloads (generation N → N+1) within one
-poll cycle (≤ 60 s).
+Repeat with `--label codex-02 --replace-email <account-2>` and
+`--label codex-03 --replace-email <account-3>`.
 
-### Reconcile the auth.json
+The tool prints the current pool, then a `chatgpt.com/device` URL and a
+user code:
 
-`auth.json` is the legacy fallback file. Re-import it so the file
-fallback path matches the DB:
-
-```bash
-# Same as the bootstrap, but starting from the just-updated DB row:
-kubectl -n hermes exec deploy/tusker-gateway -- \
-  python -m tusker_gateway.tools.migrate_config_to_db --update \
-  --auth-file /home/tusker/.hermes/auth.json
+```
+  Open https://chatgpt.com/device and enter code: XXXX-XXXX
+  (minted …, valid until …)      # device codes live 15 minutes
 ```
 
-The migration tool writes a fresh `auth.json` keyed by the new
-`account_id` (one row per account, no duplicates).
+Open the URL, sign in **as the account being replaced**, and approve.
+The tool polls until authorization lands, prints
+`Authorization received: email=… account_id=…`, writes the row, and
+`ConfigRuntime` hot-reloads (generation N → N+1) within one poll cycle.
+
+| Flag | When |
+|---|---|
+| `--replace-email <email>` | Overwrite the named existing row (use this). |
+| `--slot <n>` | Overwrite by pool index instead of email. |
+| `--collapse-account` | Drop other entries sharing the same ChatGPT account. |
+| `--dry-run` | Run the device flow without writing — sanity-check if unsure. |
+
+Never pass `--allow-duplicate-account`: a second pool entry for the same
+account makes each entry's refresh invalidate the other.
 
 ### Verify
 
 ```bash
-kubectl -n hermes exec deploy/tusker-gateway -- \
-  python -c "
+kubectl -n hermes exec deploy/tusker-gateway -- python3 -c "
 from tusker_gateway.config import load_config
 from tusker_gateway.config_store import ConfigStore
 store = ConfigStore(database=None, fallback_config=load_config())
 cp = store.runtime_config(load_config()).get('credential_pools', {}).get('openai-codex', [])
 for i, c in enumerate(cp):
-    print(f'  [{i}] email={c.get(\"email\")!r} expires_at_ms={c.get(\"expires_at_ms\")}')
+    print(i, c.get('email'), c.get('expires_at_ms'))
 "
 ```
 
-All three rows should print with distinct emails and `expires_at_ms`
-in the future.
+All three rows should show distinct emails and `expires_at_ms` in the
+future.
 
-Then send a chat probe and watch the codex `passthrough` log line:
+Then watch the codex route recover:
 
 ```bash
-ssh visor 'kubectl -n hermes logs -f deploy/tusker-gateway | grep "passthrough openai-codex"'
+ssh visor 'kubectl -n hermes logs -f deploy/tusker-gateway \
+  | grep -E "passthrough openai-codex|oauth refresh|oauth credential selected"'
 ```
-
-The first attempt after the rotation will likely still hit
-`refresh_token_reused` for whichever account just had its
-`refresh_token` rotated by the re-enrollment; once the rotator's
-`_refresh_one` succeeds, the next request will pick up the rotated
-token from the DB and the breaker opens the pool within a few minutes.
 
 ### What NOT to do
 
