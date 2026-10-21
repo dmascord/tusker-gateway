@@ -23,6 +23,7 @@ from typing import Any
 
 from tusker_gateway.errors import (
     BadRequestError,
+    ProviderAuthError,
     ProviderError,
     ProviderModelRetiredError,
     ProviderRouteDisabledError,
@@ -168,19 +169,40 @@ _RATE_LIMIT_PATTERNS = (
 )
 _RATE_LIMIT_RE = re.compile("|".join(_RATE_LIMIT_PATTERNS), re.IGNORECASE)
 
+# Credential failures. The CLI reports them as a `provider.auth` error event
+# on stdout with an HTTP 401, and stderr stays empty, so the diagnostics never
+# mention auth in the obvious place. Production evidence (2026-10-21,
+# req_d021ef863a033d52): an expired key produced four identical rc=1 failures
+# that classified as generic and re-probed on the transient ladder forever.
+_AUTH_PATTERNS = (
+    r"provider\.auth",
+    r"api_key_expired",
+    r"api key (?:has )?expired",
+    r"authentication_error",
+    r"invalid api key",
+    # A bare 401 only counts next to an HTTP/status word: a stray number must
+    # not quarantine a route for an hour.
+    r"(?:http|status|error|code)\D{0,12}401",
+)
+_AUTH_RE = re.compile("|".join(_AUTH_PATTERNS), re.IGNORECASE)
+
 def _cli_failure_error(diagnostics: bytes) -> ProviderError:
-    """Map a non-zero CLI exit to a generic or model-retired provider error.
+    """Map a non-zero CLI exit to the matching provider error.
 
     ``diagnostics`` combines stderr with the raw stdout tail: in
-    ``--format json`` mode the CLI reports model-level rejections as a
-    stdout error event and leaves stderr empty.
+    ``--format json`` mode the CLI reports every failure as a stdout error
+    event and leaves stderr empty, so stdout is often the only evidence.
 
-    If the diagnostics name a rate limit, return a RateLimitError so the
-    gateway applies the correct cooldown and surfaces a generic message
-    instead of the raw CLI output.
+    Auth and model rejections are checked first because both are permanent
+    for the route; a rate limit next, so the gateway applies the stated retry
+    window; otherwise a generic provider failure.
     """
 
     text = diagnostics.decode("utf-8", errors="replace")
+    if _AUTH_RE.search(text):
+        return ProviderAuthError(
+            "OpenCode CLI credential was rejected; rotate the provider API key"
+        )
     if _MODEL_REJECTION_RE.search(text):
         return ProviderModelRetiredError(
             "OpenCode CLI rejected the model as deprecated or unavailable"

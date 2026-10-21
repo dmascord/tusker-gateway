@@ -214,9 +214,19 @@ entirely.
 
 ### CLI exit classification
 
-A non-zero CLI exit is classified from the stderr plus the raw stdout tail. Two
+A non-zero CLI exit is classified from the stderr plus the raw stdout tail. In
+`--format json` mode the CLI reports every failure as a stdout error event and
+leaves stderr empty, so the stdout tail is often the only evidence. Three
 outcomes have their own cooldown semantics, so they are matched before the
 generic failure:
+
+- an auth failure (`provider.auth`, `api_key_expired`, `authentication_error`,
+  "invalid api key", or an HTTP/status 401) returns `ProviderAuthError`, which
+  carries upstream status 401 and so earns the permanent-error cooldown
+  (`TUSKER_RETRY_PERMANENT_COOLDOWN`, default 3600s) instead of re-probing a
+  credential that cannot recover. A bare 401 only matches next to an HTTP,
+  status, error, or code word, so a session id or token count cannot quarantine
+  a route;
 
 - a model rejection ("has been deprecated", "model is unavailable", "invalid
   model reference") returns `ProviderModelRetiredError`, which the permanent

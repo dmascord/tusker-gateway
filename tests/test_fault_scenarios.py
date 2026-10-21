@@ -23,7 +23,7 @@ import aiohttp
 import pytest
 
 from tusker_gateway import cooldown as cooldown_module
-from tusker_gateway.errors import ProviderError
+from tusker_gateway.errors import ProviderError, RateLimitError
 
 from .conftest import HEADERS_AUTH
 
@@ -411,4 +411,61 @@ async def test_truncated_sse_body_fails_over_before_visible_output(app, client):
     assert pool_manager.select.call_count == 2
     assert pool_manager.select.call_args_list[1].kwargs["excluded"] == {
         ("alpha", "truncating-model")
+    }
+
+
+async def test_midstream_rate_limit_fails_over_before_visible_output(app, client):
+    """A 429 that arrives mid-commit must try one alternative candidate.
+
+    ``rate_limit_exceeded`` was absent from ``_STREAM_RECOVERY_CODES``, so the
+    pre-visible failover gate refused it and the generic
+    "Upstream provider rate limit exceeded; retry shortly." frame became the
+    client's terminal answer (2026-10-21) even though healthy candidates were
+    still eligible. The 429 carries no assistant-visible output, so it belongs
+    on the same single pre-visible failover as a truncated body.
+    """
+    pool_manager = MagicMock()
+    pool_manager.select.side_effect = [
+        ("alpha", "throttled-model"),
+        ("beta", "healthy-model"),
+    ]
+    pool_manager.fallback_pools.return_value = ()
+    app["pool_manager"] = pool_manager
+
+    async def throttled_stream(*args, **kwargs):
+        yield _sse({"choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]})
+        raise RateLimitError(
+            "Upstream 429",
+            code="rate_limit_exceeded",
+            body='{"statusCode":429,"message":"Token limit is exceeded. Try again in 8 seconds."}',
+            headers={"Retry-After": "8"},
+        )
+
+    async def healthy_stream(*args, **kwargs):
+        for frame in _ok_content_frames("recovered output"):
+            yield frame
+        yield b"data: [DONE]\n\n"
+
+    with patch(
+        "tusker_gateway.endpoints.PassthroughClient.chat",
+        new_callable=AsyncMock,
+    ) as mock_chat:
+        mock_chat.side_effect = [throttled_stream(), healthy_stream()]
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-code",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+            },
+            headers=HEADERS_AUTH,
+        )
+        body = await response.read()
+
+    assert response.status == 200
+    assert b"recovered output" in body
+    assert b"rate limit exceeded" not in body
+    assert pool_manager.select.call_count == 2
+    assert pool_manager.select.call_args_list[1].kwargs["excluded"] == {
+        ("alpha", "throttled-model")
     }

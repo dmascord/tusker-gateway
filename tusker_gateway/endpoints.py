@@ -4508,8 +4508,8 @@ def _public_provider_failure_response(
 # candidate: the client has received only the assistant role frame, so nothing
 # assistant-visible is lost by splicing in a different route. These are the
 # codes the chat streaming path (passthrough SSE envelopes, premature EOF,
-# idle reads) and the CLI adapters actually raise. Validation, approval, and
-# rate-limit failures keep their dedicated handling, and ``upstream_error`` is
+# idle reads) and the CLI adapters actually raise. Validation and approval
+# failures keep their dedicated handling, and ``upstream_error`` is
 # media-provider only.
 _STREAM_RECOVERY_CODES = frozenset({
     "provider_error",
@@ -4528,6 +4528,11 @@ _STREAM_RECOVERY_CODES = frozenset({
     "kilo_cli_failed",
     "kilo_worker_unavailable",
     "opencode_cli_failed",
+    # A provider 429 carries no assistant-visible output, so one alternative
+    # candidate can still absorb the turn. Without this code the pre-visible
+    # failover gate rejects it and the rate limit is the terminal answer the
+    # client sees (2026-10-21), even with healthy candidates still eligible.
+    "rate_limit_exceeded",
 })
 
 
@@ -7442,6 +7447,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                             break
                         except (
                             ProviderError,
+                            RateLimitError,
                             ClientError,
                             TransferEncodingError,
                             asyncio.TimeoutError,

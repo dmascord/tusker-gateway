@@ -12,6 +12,7 @@ import pytest
 from tusker_gateway.config import DEFAULT_PROVIDER_REGISTRY
 from tusker_gateway.errors import (
     BadRequestError,
+    ProviderAuthError,
     ProviderError,
     ProviderModelRetiredError,
     ProviderRouteDisabledError,
@@ -632,3 +633,31 @@ def test_unrelated_cli_failures_stay_generic(diagnostics):
     error = _cli_failure_error(diagnostics)
     assert not isinstance(error, RateLimitError)
     assert error.code == "opencode_cli_failed"
+
+
+@pytest.mark.parametrize("diagnostics", [
+    # The exact stdout event that broke req_d021ef863a033d52 (2026-10-21):
+    # the CLI reports auth failures on stdout, so stderr stayed empty.
+    b'{"type":"error","error":{"type":"provider.auth","status":401,'
+    b'"message":"This API key has expired. Create a new API key in OpenCode Console."}}',
+    b"HTTP 401 Unauthorized",
+    b"error: 401 Unauthorized",
+    b'{"error":{"type":"authentication_error","message":"Invalid API key"}}',
+])
+def test_cli_auth_diagnostics_map_to_provider_auth_error(diagnostics):
+    error = _cli_failure_error(diagnostics)
+    assert isinstance(error, ProviderAuthError)
+    # Carrying upstream 401 is what earns the permanent cooldown; without it
+    # the dead credential re-probed on the transient ladder indefinitely.
+    assert error.upstream_status == 401
+
+
+@pytest.mark.parametrize("diagnostics", [
+    b"Error: invalid tool call arguments",
+    b"model quota: 1.2M tokens/day remaining",
+    b"step 14012 completed",
+    b"token count 4012 exceeded",
+    b"session 4015 aborted",
+])
+def test_digits_that_merely_contain_401_are_not_auth(diagnostics):
+    assert not isinstance(_cli_failure_error(diagnostics), ProviderAuthError)

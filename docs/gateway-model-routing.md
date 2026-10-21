@@ -604,6 +604,20 @@ nothing had been streamed. Multi-candidate recovery is covered by
 which replays the captured upstream bytes for two unusable candidates before a
 usable one.
 
+A provider 429 raised mid-stream before any visible output takes the same gate.
+`RateLimitError` is not a `ProviderError` (it subclasses `GatewayError` so the
+pre-stream handlers can catch it ahead of the generic provider branch), which
+meant it missed the committed-stream recovery clause entirely and
+`rate_limit_exceeded` was absent from `_STREAM_RECOVERY_CODES`. Both omissions
+are fixed: a throttled candidate now yields to the next one instead of handing
+the client the terminal "Upstream provider rate limit exceeded; retry shortly."
+frame while healthy candidates were still eligible. Covered by
+`tests/test_fault_scenarios.py::test_midstream_rate_limit_fails_over_before_visible_output`.
+The message still reaches the client when every eligible candidate is
+throttled, and the visible-output guard still refuses to splice providers after
+assistant bytes have been written.
+
+
 A tool turn that ends `finish_reason=length` with no answer or tool call is
 classified as `output_budget_exhausted`. That depends on the request, not the
 model, so the route is never quarantined for this verdict. The client is told
