@@ -86,6 +86,39 @@ def test_public_stream_error_contains_correlation_and_redacts_upstream_body():
     assert "abc123" not in message
 
 
+def test_public_stream_error_suppresses_raw_provider_json_body():
+    """A provider JSON envelope must not reach the client as error text.
+
+    Incident req_933c67c7757bbde7 (2026-10-21): both privacy vision routes
+    answered 400 with ``{"error":{"message":"invalid tool call arguments",
+    ...}}`` and the client read that envelope verbatim, because
+    ``_pool_failure_summary`` favors ``upstream_body`` for operator logs.
+    The non-stream path already suppresses it; the stream path must too.
+    """
+    exc = ProviderError(
+        'Provider returned 400: {"error":{"message":"invalid tool call '
+        'arguments","type":"invalid_request_error","param":null,"code":null}}'
+    )
+    exc.upstream_status = 400
+    exc.upstream_body = (
+        '{"error":{"message":"invalid tool call arguments",'
+        '"type":"invalid_request_error","param":null,"code":null}}'
+    )
+
+    message, code = _public_stream_error(
+        exc,
+        request_id="req_933c67c7757bbde7",
+        provider="mlx-mac",
+        model="qwen3.8-27b",
+    )
+
+    assert "invalid tool call arguments" not in message
+    assert '"error"' not in message
+    assert "invalid_request_error" not in message
+    assert "req_933c67c7757bbde7" in message
+    assert code == "provider_error"
+
+
 def test_public_stream_error_explains_empty_provider_response():
     exc = ProviderEmptyStreamError(provider="provider-a", model="model-a")
     message, code = _public_stream_error(
