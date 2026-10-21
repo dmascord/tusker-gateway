@@ -6216,6 +6216,7 @@ def _responses_stream_from_chat(
     complete_result: dict[str, Any] | None = None,
     response_id: str | None = None,
     emit_created: bool = True,
+    redaction_tokenizer: Any | None = None,
 ) -> AsyncIterator[bytes]:
     """Adapt canonical Chat Completions SSE to Responses SSE.
 
@@ -6224,6 +6225,7 @@ def _responses_stream_from_chat(
     event lifecycle; returning a Chat JSON object for ``stream=true`` causes
     clients to lose text/tool deltas and is especially harmful to agent loops.
     """
+
 
     async def generate() -> AsyncIterator[bytes]:
         stream_response_id = response_id or f"resp_{uuid.uuid4().hex}"
@@ -6246,6 +6248,8 @@ def _responses_stream_from_chat(
         usage: dict[str, Any] = {}
         stream_buffer = bytearray()
         done_seen = False
+        field_restorers: dict[tuple[int, str], _BufferedRestorer] = {}
+        argument_restorers: dict[tuple[int, int], _BufferedRestorer] = {}
 
         def _tool_index(raw_call: dict[str, Any], position: int) -> int:
             value = raw_call.get("index", position)
@@ -6308,6 +6312,15 @@ def _responses_stream_from_chat(
                             },
                         )
                     output_index, item = message_state or message_items[choice_index]
+                    if redaction_tokenizer is not None:
+                        key = (choice_index, "content")
+                        buf = field_restorers.get(key)
+                        if buf is None:
+                            buf = _BufferedRestorer(tokenizer=redaction_tokenizer)
+                            field_restorers[key] = buf
+                        text = buf.feed(text)
+                    if not text:
+                        continue
                     content = item.setdefault("_text", "")
                     item["_text"] = content + text
                     yield _responses_sse_frame(
@@ -6365,6 +6378,17 @@ def _responses_stream_from_chat(
                         arguments = function.get("arguments")
                         if arguments not in (None, ""):
                             fragment = _arguments_text(arguments)
+                            if redaction_tokenizer is not None:
+                                buf = argument_restorers.get(call_key)
+                                if buf is None:
+                                    buf = _BufferedRestorer(
+                                        tokenizer=redaction_tokenizer,
+                                        json_escape=True,
+                                    )
+                                    argument_restorers[call_key] = buf
+                                fragment = buf.feed(fragment)
+                            if not fragment:
+                                continue
                             item["arguments"] += fragment
                             yield _responses_sse_frame(
                                 "response.function_call_arguments.delta",
@@ -6449,6 +6473,42 @@ def _responses_stream_from_chat(
                 {"output_index": 0, "item": dict(item)},
             )
 
+        for (choice_index, _field), buf in field_restorers.items():
+            tail = buf.flush()
+            if not tail:
+                continue
+            message_state = message_items.get(choice_index)
+            if message_state is None:
+                continue
+            output_index, item = message_state
+            item["_text"] = item.setdefault("_text", "") + tail
+            yield _responses_sse_frame(
+                "response.output_text.delta",
+                {
+                    "item_id": item["id"],
+                    "output_index": output_index,
+                    "content_index": 0,
+                    "delta": tail,
+                },
+            )
+        for call_key, buf in argument_restorers.items():
+            tail = buf.flush()
+            if not tail:
+                continue
+            tool_state = tool_items.get(call_key)
+            if tool_state is None:
+                continue
+            output_index, item = tool_state
+            item["arguments"] += tail
+            yield _responses_sse_frame(
+                "response.function_call_arguments.delta",
+                {
+                    "item_id": item["id"],
+                    "output_index": output_index,
+                    "call_id": item["call_id"],
+                    "delta": tail,
+                },
+            )
         for output_index, item in enumerate(output_items):
             if item.get("type") == "message":
                 text_value = str(item.pop("_text", ""))
@@ -8263,6 +8323,7 @@ async def _responses_handler_impl(request: web.Request) -> web.Response | web.St
                     complete_result=result,
                     response_id=response_id,
                     emit_created=False,
+                    redaction_tokenizer=request.app.get("redaction_tokenizer"),
                 )
             else:
                 raw_stream = result.iterator if isinstance(result, _PreparedStream) else result
@@ -8276,6 +8337,7 @@ async def _responses_handler_impl(request: web.Request) -> web.Response | web.St
                     model=body.get("model") or config["model_name"],
                     response_id=response_id,
                     emit_created=False,
+                    redaction_tokenizer=request.app.get("redaction_tokenizer"),
                 )
 
             try:
