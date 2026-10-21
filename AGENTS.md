@@ -20,6 +20,7 @@ Read in order when picking up the repo:
 | `docs/zero-downtime-deploys.md` | Why `strategy: Recreate` and the planned RWX migration. |
 | `docs/incidents/2026-08-26-usb-ssd-flap.md` | USB-SSD flap postmortem, storage migration, and Longhorn v1.12.1 upgrade notes. |
 | `docs/migrations/2026-09-09-config-db/` | DB-backed config store — shipped. Plan, schema, rollout. |
+| `docs/incidents/2026-10-21-codex-rotation-and-grok-429-leak.md` | Codex refresh-token rotation + xAI/Grok `{"statusCode":429,...}` envelope leak (req_50a994b481aa7fe3). Operator runbook + hardened cooldown suppression. |
 | `TODO.md` | Active cross-session work items. |
 
 

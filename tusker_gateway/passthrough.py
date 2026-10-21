@@ -363,19 +363,41 @@ def _stream_error_from_frame(
         )
     else:
         raw_lower = payload.lower()
-        # Do not interpret ordinary assistant content as an error. The hint
-        # fallback is only used for payloads without a normal choices array.
-        if isinstance(parsed.get("choices"), list) or not any(
-            hint.encode() in raw_lower for hint in _STREAM_ERROR_HINTS
-        ):
+        # Ordinary assistant content is never an error. Everything below is
+        # only reached for payloads without a normal choices array.
+        if isinstance(parsed.get("choices"), list):
             return None
-        message = (
-            parsed.get("message")
-            or parsed.get("detail")
-            or payload.decode("utf-8", errors="replace")
+        # A FastAPI-style proxy can report the failure at the TOP level
+        # instead of nesting it under an ``error`` key:
+        #   {"statusCode": 429, "message": "Token limit is exceeded. ..."}
+        # That shape carries no hint word from ``_STREAM_ERROR_HINTS``, so an
+        # unhandled variant treats the envelope as ordinary content: the
+        # committed 200 stream never fails over, no cooldown is recorded for
+        # the route, and the raw body is relayed to the client (2026-10-21,
+        # req_50a994b481aa7fe3). Classify any 4xx/5xx top-level status as an
+        # error envelope so the 429 becomes a RateLimitError downstream and
+        # the stated retry window feeds the cooldown parser.
+        top_status = _stream_status(parsed.get("statusCode")) or _stream_status(
+            parsed.get("status")
         )
-        code = parsed.get("code")
-        status = _stream_status(parsed.get("status")) or _stream_status(code)
+        if top_status is not None and top_status >= 400:
+            message = (
+                parsed.get("message")
+                or parsed.get("detail")
+                or payload.decode("utf-8", errors="replace")
+            )
+            code = parsed.get("code")
+            status = top_status
+        else:
+            if not any(hint.encode() in raw_lower for hint in _STREAM_ERROR_HINTS):
+                return None
+            message = (
+                parsed.get("message")
+                or parsed.get("detail")
+                or payload.decode("utf-8", errors="replace")
+            )
+            code = parsed.get("code")
+            status = _stream_status(parsed.get("status")) or _stream_status(code)
 
     if not error_present and not message:
         return None

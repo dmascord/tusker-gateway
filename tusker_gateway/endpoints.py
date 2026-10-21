@@ -4352,6 +4352,29 @@ def _pool_failure_summary(exc: BaseException) -> str:
 
 
 _RAW_JSON_BODY_RE = re.compile(r'^\s*[\{\[]')
+_RAW_JSON_OBJECT_RE = re.compile(r'^\s*\{[^{}]*"[^"]+"\s*:')
+_JSON_KEY_VALUE_LINE_RE = re.compile(r'\\?"[a-zA-Z0-9_]+\\?"\s*:')
+
+
+def _looks_like_provider_json_envelope(text: str) -> bool:
+    """Detect any provider-shaped JSON envelope, regardless of field names.
+
+    The existing suppression guarded only the OpenAI ``{"error": {...}}``
+    shape via ``"error" in text``. xAI/Grok and others emit
+    ``{"statusCode": ..., "message": ...}`` envelopes with no ``error`` key,
+    and those slipped through to the client as the rendered error string.
+    """
+    if not text:
+        return False
+    stripped = text.strip()
+    if not (stripped.startswith("{") and stripped.endswith("}")):
+        return False
+    if not _RAW_JSON_OBJECT_RE.match(stripped):
+        return False
+    # ``"key": `` shape check: any key-like quoted token followed by a
+    # colon is evidence of a JSON object. Guards against an upstream that
+    # accidentally returns a bare ``{...}`` substring without a real key.
+    return bool(_JSON_KEY_VALUE_LINE_RE.search(stripped))
 
 
 def _client_safe_failure_detail(exc: BaseException) -> str:
@@ -4368,17 +4391,30 @@ def _client_safe_failure_detail(exc: BaseException) -> str:
     upstream_body = getattr(exc, "upstream_body", None)
     if upstream_body:
         text = str(upstream_body).strip()
-        if _RAW_JSON_BODY_RE.match(text) or '"error"' in text:
+        if (
+            _RAW_JSON_BODY_RE.match(text)
+            or '"error"' in text
+            or _looks_like_provider_json_envelope(text)
+        ):
             return ""
     own_message = getattr(exc, "message", None) or str(exc)
     own_message = str(own_message).strip()
     if not own_message or _RAW_JSON_BODY_RE.match(own_message):
+        return ""
+    # Non-OpenAI envelopes such as ``{"statusCode": 429, "message": ...}``
+    # from xAI/Grok attach the entire JSON to ``exc.message`` (not
+    # ``upstream_body``), so the suppression needs to run on the message
+    # path too. Without this, a mid-stream 429 dumps the upstream envelope
+    # into the SSE ``data: {"error": {"message": "..."}}`` text the client
+    # reads verbatim (see incident req_50a994b481aa7fe3, 2026-10-21).
+    if _looks_like_provider_json_envelope(own_message):
         return ""
     # A provider message frequently embeds the body verbatim
     # (``Provider returned 400: {json}``). Drop just that tail.
     if '"error"' in own_message:
         own_message = own_message.split('{"error"')[0].rstrip(" :")
     return _safe_upstream_body(own_message, limit=200)
+
 
 
 def _is_capacity_failure(exc: BaseException | None) -> bool:

@@ -163,6 +163,57 @@ behaviour that was corrected.
 caller can read the count *before* recording the new failure; using the
 post-increment count would start the ladder one step early.
 
+## Top-level `statusCode` envelope (2026-10-21)
+
+Production report: the client received
+
+```
+Upstream provider error: { "statusCode": 429, "message": "Token limit is exceeded. Try again in 8 seconds." }. Request ID: req_50a994b481aa7fe3.
+```
+
+Root cause in `passthrough._stream_error_from_frame`. The detector already
+read `statusCode` inside a nested `{"error": {...}}` envelope (fixed
+2026-10-18), but a FastAPI-style proxy can report the failure at the **top
+level** instead:
+
+```json
+{"statusCode": 429, "message": "Token limit is exceeded. Try again in 8 seconds."}
+```
+
+That payload carries no `error` key and no `choices` array, so it fell into
+the `else` branch, whose only admission test was a `_STREAM_ERROR_HINTS`
+word match. `statusCode` and "try again in ..." are not in that hint set, so
+the frame was returned as **not an error** and streamed onward as if it were
+assistant content. Three consequences, in order:
+
+1. No failover — the committed 200 stream had no error to react to, so the
+   candidate was never swapped before visible output.
+2. No cooldown — the route kept being re-ranked and re-probed, paying the
+   upstream's rate-limit round trip on every request.
+3. Body leak — the envelope surfaced later through the generic
+   `_public_stream_error` branch, which has no `RateLimitError` to sanitize
+   and therefore echoed the upstream text.
+
+## Fix
+
+`_stream_error_from_frame`'s `else` branch now checks a **top-level**
+`statusCode` / `status` before the hint fallback: any value ≥ 400 on a
+payload without a `choices` array is an error envelope. The resulting
+`ProviderError.upstream_status` is 429, which `_stream_events.observe()`
+converts into `RateLimitError` with the raw body attached — so
+`_cooldown_seconds_for_429` reads the stated retry window and floors it to
+**60s** (TPM-flavoured bodies; asserted in the test) so the breaker waits
+out the whole-minute boundary, and `_public_stream_error` emits the
+sanitized
+`"Upstream provider rate limit exceeded; retry shortly."` with
+`code=rate_limit_exceeded`.
+
+Assistant content is unaffected: the `choices` guard returns early, and the
+existing `test_midstream_normal_assistant_content_passes_through` still
+passes. Regression coverage:
+`tests/test_reliability_hardening.py::test_midstream_toplevel_statuscode_429_raises_rate_limit_error`
+and `::test_midstream_toplevel_5xx_statuscode_raises_provider_error`.
+
 ## Still open
 
 4. **Widen the permanent mark.** 405/409/413/422 currently earn the 3600s

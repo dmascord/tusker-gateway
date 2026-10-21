@@ -134,6 +134,80 @@ def test_public_stream_error_explains_empty_provider_response():
     assert "Retry" in message
 
 
+def test_public_stream_error_suppresses_xai_grok_json_envelope_on_message():
+    """Non-OpenAI JSON envelopes on the message path must not reach clients.
+
+    Incident req_50a994b481aa7fe3 (2026-10-21): the client received
+    ``Upstream provider error: {"statusCode":429,"message":"Token limit
+    is exceeded. Try again in 8 seconds."}`` from a Grok response carried
+    on ``exc.message``. The existing ``"error" in text`` guard did not
+    match (no ``error`` key in the Grok envelope), so the JSON leaked.
+    """
+    body = (
+        '{ "statusCode": 429, "message": '
+        '"Token limit is exceeded. Try again in 8 seconds.", '
+        '"error": "Too Many Requests", "code": "token_limit_exceeded" }'
+    )
+    exc = ProviderError(message=body)
+
+    message, code = _public_stream_error(
+        exc,
+        request_id="req_50a994b481aa7fe3",
+        provider="xai-grok",
+        model="grok-3-mini",
+    )
+
+    assert "statusCode" not in message
+    assert "Token limit" not in message
+    assert body not in message
+    assert "req_50a994b481aa7fe3" in message
+    assert code == "provider_error"
+
+
+def test_public_stream_error_suppresses_non_openai_envelope_on_upstream_body():
+    """The same envelope shape on upstream_body must also be suppressed.
+
+    Some adapters place the provider JSON on ``upstream_body`` instead of
+    ``exc.message``. The hardened suppression needs to cover both paths.
+    """
+    body = (
+        '{ "statusCode": 429, "message": "Token limit is exceeded." }'
+    )
+    exc = ProviderError(message="upstream returned 429")
+    exc.upstream_body = body
+
+    message, code = _public_stream_error(
+        exc,
+        request_id="req_xai_body",
+        provider="xai-grok",
+        model="grok-3-mini",
+    )
+
+    assert body not in message
+    assert "statusCode" not in message
+    assert "Token limit" not in message
+    assert "req_xai_body" in message
+
+
+def test_public_stream_error_keeps_plain_text_messages():
+    """A plain upstream message (no JSON shape) is still relayed safely.
+
+    Guards against the new envelope detector mistaking normal provider
+    prose for a JSON envelope and swallowing operator-actionable
+    diagnostics.
+    """
+    exc = ProviderError(message="model overloaded, please retry")
+
+    message, _ = _public_stream_error(
+        exc,
+        request_id="req_plain",
+        provider="synthetic",
+        model="syn:large",
+    )
+
+    assert "model overloaded" in message
+    assert "req_plain" in message
+
 def test_approval_stream_message_is_actionable_for_omp_clients():
     exc = HighImpactApprovalRequiredError(
         provider="zai",
