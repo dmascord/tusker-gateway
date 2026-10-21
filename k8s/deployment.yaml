@@ -34,7 +34,7 @@ spec:
       terminationGracePeriodSeconds: 90
       containers:
       - name: tusker-gateway
-        image: registry.tusker.net.au:5000/tusker-gateway@sha256:d70884948f694d4d6ec9b3f8944eabf89cda5eb56b2a597d95770a22c9fa96c9
+        image: registry.tusker.net.au:5000/tusker-gateway@sha256:7894a87d9cbaa7c5ec5b4096aa13c0bc403761308e38836e909e8398da7d4624
         imagePullPolicy: Always
         envFrom:
         - secretRef:
