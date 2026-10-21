@@ -4351,6 +4351,36 @@ def _pool_failure_summary(exc: BaseException) -> str:
     return _safe_upstream_body(str(body), limit=300)
 
 
+_RAW_JSON_BODY_RE = re.compile(r'^\s*[\{\[]')
+
+
+def _client_safe_failure_detail(exc: BaseException) -> str:
+    """Return a client-safe failure detail, or "" when it must stay internal.
+
+    ``_pool_failure_summary`` is an operator-facing rendering: it prefers the
+    raw upstream body so logs are diagnosable. That is exactly what must not
+    reach a client. A body that is a provider JSON envelope (or any structure
+    carrying an ``error`` object) is suppressed; a message the gateway itself
+    authored - transport timeouts, local lease exhaustion - is still useful
+    and is returned.
+    """
+
+    upstream_body = getattr(exc, "upstream_body", None)
+    if upstream_body:
+        text = str(upstream_body).strip()
+        if _RAW_JSON_BODY_RE.match(text) or '"error"' in text:
+            return ""
+    own_message = getattr(exc, "message", None) or str(exc)
+    own_message = str(own_message).strip()
+    if not own_message or _RAW_JSON_BODY_RE.match(own_message):
+        return ""
+    # A provider message frequently embeds the body verbatim
+    # (``Provider returned 400: {json}``). Drop just that tail.
+    if '"error"' in own_message:
+        own_message = own_message.split('{"error"')[0].rstrip(" :")
+    return _safe_upstream_body(own_message, limit=200)
+
+
 def _is_capacity_failure(exc: BaseException | None) -> bool:
     """Return whether an exception represents provider/shared capacity.
 
@@ -4598,11 +4628,26 @@ def _public_stream_error(
         )
         code = "stream_validation_error"
     else:
-        detail = _pool_failure_summary(exc)
-        message = (
-            f"Upstream provider error: {detail}. "
-            f"Request ID: {request_id}."
-        )
+        # Prefer the gateway's own wording and never relay a raw provider
+        # body. ``_pool_failure_summary`` serves operational logs, so it
+        # happily returns the upstream JSON envelope (schema rejections like
+        # {"error":{"message":"invalid tool call arguments"}}, quota
+        # envelopes, stack traces). The non-stream path already treats that
+        # as unsafe to relay (``_public_provider_failure_response``); the
+        # stream path must match it. A message the gateway authored itself
+        # (transport timeouts, lease exhaustion) is still useful and stays.
+        detail = _client_safe_failure_detail(exc)
+        if detail:
+            message = (
+                f"Upstream provider error: {detail}. "
+                f"Request ID: {request_id}."
+            )
+        else:
+            message = (
+                "Upstream provider error: the upstream rejected the request "
+                "and the gateway suppressed its raw body. Retry shortly or "
+                f"contact the gateway operator with the request ID: {request_id}."
+            )
         code = str(getattr(exc, "code", None) or "provider_error")
     return message[:900], code
 
