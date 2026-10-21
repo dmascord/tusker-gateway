@@ -26,6 +26,7 @@ from tusker_gateway.errors import (
     ProviderError,
     ProviderModelRetiredError,
     ProviderRouteDisabledError,
+    RateLimitError,
 )
 from tusker_gateway.provider_adapters.claude_code import (
     _normalise_tools,
@@ -141,12 +142,24 @@ async def _run_cli_tool(
 # Deterministic model-level rejections: the CLI (or its upstream) says the
 # model itself is gone, identically on every request. Mapping these to a
 # retired-model error lets the gateway's permanent-failure marker prune the
-# route from pool rotation; anything else stays a generic provider failure.
 _MODEL_REJECTION_RE = re.compile(
     r"has been deprecated|model is unavailable|invalid model reference",
     re.IGNORECASE,
 )
-
+# CLI outputs that signal a provider-side rate limit (HTTP 429). The cooldown
+# parser (``_cooldown_seconds_for_429``) already understands JSON envelopes with
+# `statusCode` and prose like "Try again in N seconds"; the same heuristics
+# applied to the diagnostics below route the failure onto the 429 cooldown
+# path with the operator-stated retry window.
+_RATE_LIMIT_PATTERNS = (
+    r"statuscode[^\d]{0,8}4\d\d",
+    r"\b429\b",
+    r"too many requests",
+    r"rate[_ ]?limit",
+    r"quota",
+    r"try again in \d+ ?(seconds?|minutes?|hours?|days?)",
+)
+_RATE_LIMIT_RE = re.compile("|".join(_RATE_LIMIT_PATTERNS), re.IGNORECASE)
 
 def _cli_failure_error(diagnostics: bytes) -> ProviderError:
     """Map a non-zero CLI exit to a generic or model-retired provider error.
@@ -154,10 +167,22 @@ def _cli_failure_error(diagnostics: bytes) -> ProviderError:
     ``diagnostics`` combines stderr with the raw stdout tail: in
     ``--format json`` mode the CLI reports model-level rejections as a
     stdout error event and leaves stderr empty.
+
+    If the diagnostics contain 429/rate-limit wording, return a RateLimitError
+    so the gateway applies the correct cooldown and surfaces a generic message
+    instead of the raw CLI output.
     """
-    if _MODEL_REJECTION_RE.search(diagnostics.decode("utf-8", errors="replace")):
+    text = diagnostics.decode("utf-8", errors="replace")
+    if _MODEL_REJECTION_RE.search(text):
         return ProviderModelRetiredError(
             "OpenCode CLI rejected the model as deprecated or unavailable"
+        )
+    if _RATE_LIMIT_RE.search(text):
+        return RateLimitError(
+            "OpenCode CLI rate limit exceeded; retry shortly.",
+            code="rate_limit_exceeded",
+            body=text,
+            headers={},
         )
     return ProviderError("OpenCode CLI request failed", code="opencode_cli_failed")
 

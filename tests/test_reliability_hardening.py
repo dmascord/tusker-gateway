@@ -165,6 +165,43 @@ async def test_midstream_429_envelope_raises_rate_limit_error():
 
 
 @pytest.mark.asyncio
+async def test_midstream_statuscode_429_envelope_raises_rate_limit_error():
+    """An SSE envelope that spells the HTTP status ``statusCode`` (FastAPI-style
+    proxies) must still classify as 429. An unread variant misclassifies as a
+    generic 502 and leaks the raw upstream JSON body to the client instead of
+    taking the sanitized 429 + cooldown path.
+    """
+    client = object.__new__(PassthroughClient)
+    client._record_stream_failure = AsyncMock()
+    client._record_quality = AsyncMock()
+    client._release_capacity = MagicMock()
+
+    async def rate_limited():
+        yield (
+            b'data: {"error":{"statusCode":429,'
+            b'"message":"Token limit is exceeded. Try again in 8 seconds."}}\n\n'
+        )
+
+    stream = client._stream_events(
+        _Response(),
+        provider="test",
+        model="model",
+        stream_iterator=rate_limited(),
+    )
+    with pytest.raises(RateLimitError) as exc_info:
+        _ = [chunk async for chunk in stream]
+    assert exc_info.value.upstream_status == 429
+    assert "Token limit is exceeded" in (exc_info.value.body or "")
+    # The stated retry interval must feed the cooldown parser, not the
+    # status-less permanent-failure classification.
+    from tusker_gateway.cooldown import _cooldown_seconds_for_429
+    assert _cooldown_seconds_for_429(
+        {"body": exc_info.value.body or "", "headers": {}}
+    ) == 8.0
+    client._record_stream_failure.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_midstream_5xx_envelope_raises_provider_error():
     """An upstream that returns HTTP 200 with a 5xx envelope mid-stream should
     still raise ProviderError with the propagated upstream_status so the breaker

@@ -4588,7 +4588,13 @@ def _public_stream_error(
     model: str,
 ) -> tuple[str, str]:
     """Return safe, actionable details for a prepared SSE error frame."""
-    if _is_capacity_failure(exc):
+    if isinstance(exc, RateLimitError):
+        # RateLimitError carries the upstream Retry-After hint. Surface it as
+        # a generic 429 signal so clients back off, without echoing the raw
+        # upstream body.
+        message = "Upstream provider rate limit exceeded; retry shortly."
+        code = "rate_limit_exceeded"
+    elif _is_capacity_failure(exc):
         message = "Upstream provider capacity is unavailable; retry shortly."
         code = "service_unavailable"
     elif isinstance(exc, ProviderEmptyStreamError):

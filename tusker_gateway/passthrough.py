@@ -344,11 +344,23 @@ def _stream_error_from_frame(
             or json.dumps(error_obj, ensure_ascii=False)
         )
         code = error_obj.get("code")
-        status = _stream_status(error_obj.get("status")) or _stream_status(code)
+        # Some proxies spell the HTTP status "statusCode" (e.g. FastAPI-style
+        # envelopes: {"error": {"statusCode": 429, ...}}). An unread variant
+        # misclassifies as 502 and leaks the raw upstream body to the client
+        # instead of taking the sanitized 429 path.
+        status = (
+            _stream_status(error_obj.get("status"))
+            or _stream_status(error_obj.get("statusCode"))
+            or _stream_status(code)
+        )
     elif error_obj is not None:
         message = str(error_obj)
         code = parsed.get("code")
-        status = _stream_status(parsed.get("status")) or _stream_status(code)
+        status = (
+            _stream_status(parsed.get("status"))
+            or _stream_status(parsed.get("statusCode"))
+            or _stream_status(code)
+        )
     else:
         raw_lower = payload.lower()
         # Do not interpret ordinary assistant content as an error. The hint
