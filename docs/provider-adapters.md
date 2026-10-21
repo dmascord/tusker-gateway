@@ -212,6 +212,36 @@ streaming failure after the first frame propagates, because the client already
 holds partial output. `TUSKER_OPENCODE_WARM_ENABLED=0` disables the path
 entirely.
 
+### CLI exit classification
+
+A non-zero CLI exit is classified from the stderr plus the raw stdout tail. Two
+outcomes have their own cooldown semantics, so they are matched before the
+generic failure:
+
+- a model rejection ("has been deprecated", "model is unavailable", "invalid
+  model reference") returns `ProviderModelRetiredError`, which the permanent
+  failure marker prunes from the catalog;
+- diagnostics naming a rate limit return `RateLimitError`, which applies the
+  429 cooldown path (stated window when the CLI prints one, otherwise 60s) and
+  surfaces a generic message instead of raw CLI output.
+
+The rate-limit match requires the CLI to say so outright: a `statusCode` of 429,
+an HTTP/status 429, "too many requests", the words "rate limit", or "try again in
+N (seconds/minutes/hours/days)". A quota that is merely mentioned, or digits that
+happen to contain 429 (an exit code, a session id, a token count), do not match.
+That distinction is the whole point of the narrower pattern. A `RateLimitError`
+takes the 429 cooldown path, which trusts the CLI's own wording and its stated
+window - `Try again in 8 seconds` becomes an 8s backoff, an unstated one becomes
+60s, and a stated absolute reset date wins over both. A generic
+`opencode_cli_failed` has no upstream status, so it returns no cooldown at all
+and the breaker applies its policy while the failure count is low, escalating to
+the transient ladder once the route has failed repeatedly. Reading an unrelated
+failure as a rate limit therefore stamps a window the operator never stated on a
+route whose real problem may be something else entirely.
+
+Everything else returns `ProviderError` with code `opencode_cli_failed`, which
+the pool failover treats as a provider error and retries on the next candidate.
+
 ### Which adapters can keep a server warm
 
 | Adapter | Warm path | Basis |

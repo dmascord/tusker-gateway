@@ -151,12 +151,19 @@ _MODEL_REJECTION_RE = re.compile(
 # `statusCode` and prose like "Try again in N seconds"; the same heuristics
 # applied to the diagnostics below route the failure onto the 429 cooldown
 # path with the operator-stated retry window.
+#
+# Every pattern must name a rate limit outright. Bare `quota`, a stray `429`,
+# or the phrase `rate limit` are rejected: they also appear in unrelated CLI
+# failures (a model priced by quota, a citation line, an exit code), and a
+# false match sends the route onto the 429 cooldown path - which classifies as
+# a permanent provider error and quarantines the candidate for the full
+# window - rather than the transient ladder that the real failure deserves.
 _RATE_LIMIT_PATTERNS = (
-    r"statuscode[^\d]{0,8}4\d\d",
-    r"\b429\b",
-    r"too many requests",
-    r"rate[_ ]?limit",
-    r"quota",
+    r"statuscode[^\d]{0,8}429",
+    r"(?:status|http(?:\s+status)?|error)\D{0,16}429",
+    r"429\s+too\s+many\s+requests",
+    r"too\s+many\s+requests",
+    r"rate[_ -]?limit(?:ed|ing|s)?\b",
     r"try again in \d+ ?(seconds?|minutes?|hours?|days?)",
 )
 _RATE_LIMIT_RE = re.compile("|".join(_RATE_LIMIT_PATTERNS), re.IGNORECASE)
@@ -168,10 +175,11 @@ def _cli_failure_error(diagnostics: bytes) -> ProviderError:
     ``--format json`` mode the CLI reports model-level rejections as a
     stdout error event and leaves stderr empty.
 
-    If the diagnostics contain 429/rate-limit wording, return a RateLimitError
-    so the gateway applies the correct cooldown and surfaces a generic message
+    If the diagnostics name a rate limit, return a RateLimitError so the
+    gateway applies the correct cooldown and surfaces a generic message
     instead of the raw CLI output.
     """
+
     text = diagnostics.decode("utf-8", errors="replace")
     if _MODEL_REJECTION_RE.search(text):
         return ProviderModelRetiredError(

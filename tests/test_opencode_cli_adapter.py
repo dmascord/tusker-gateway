@@ -10,9 +10,19 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from tusker_gateway.config import DEFAULT_PROVIDER_REGISTRY
-from tusker_gateway.errors import BadRequestError, ProviderError, ProviderRouteDisabledError
+from tusker_gateway.errors import (
+    BadRequestError,
+    ProviderError,
+    ProviderModelRetiredError,
+    ProviderRouteDisabledError,
+    RateLimitError,
+)
 from tusker_gateway.provider_adapters import provider_adapters
-from tusker_gateway.provider_adapters.opencode_cli import OpenCodeCLIAdapter, _model_for_cli
+from tusker_gateway.provider_adapters.opencode_cli import (
+    OpenCodeCLIAdapter,
+    _cli_failure_error,
+    _model_for_cli,
+)
 
 
 class _FakeProcess:
@@ -581,3 +591,34 @@ async def test_disabled_warm_path_leaves_the_service_untouched(warm_state, monke
     assert result["choices"][0]["message"]["content"] == "standalone"
     assert calls == []
     assert "--standalone" in spawn.await_args.args
+
+
+
+@pytest.mark.parametrize("diagnostics", [
+    b'{"error":{"statusCode":429,"message":"Token limit is exceeded. Try again in 8 seconds."}}',
+    b"opencode error: HTTP 429 Too Many Requests",
+    b"Error: 429 too many requests, retry later",
+    b"rate limit exceeded, try again",
+    b"Rate-Limit hit for model big-pickle",
+    b"rate_limited: please retry",
+])
+def test_cli_rate_limit_diagnostics_map_to_rate_limit_error(diagnostics):
+    error = _cli_failure_error(diagnostics)
+    assert isinstance(error, RateLimitError)
+
+
+@pytest.mark.parametrize("diagnostics", [
+    # A quota that is merely mentioned, not exhausted.
+    b"model quota: 1.2M tokens/day remaining",
+    # Digits that happen to contain 429 must not be read as a status.
+    b"exit code 429 references line 12 of config",
+    b"session 4291 aborted",
+    b"token count 429021 exceeds context",
+    # The real shape that reached the client on req_d021ef863a033d52.
+    b"Error: invalid tool call arguments",
+    b"",
+])
+def test_unrelated_cli_failures_stay_generic(diagnostics):
+    error = _cli_failure_error(diagnostics)
+    assert not isinstance(error, RateLimitError)
+    assert error.code == "opencode_cli_failed"
