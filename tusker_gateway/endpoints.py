@@ -4125,30 +4125,6 @@ def _candidate_extra_body(
     return fitted
 
 
-def _provider_attempt_timeout_overrides() -> dict[str, float]:
-    """Load provider and provider/model idle-budget overrides."""
-    raw = os.environ.get("TUSKER_PROVIDER_ATTEMPT_TIMEOUT_OVERRIDES_JSON", "").strip()
-    if not raw:
-        return {}
-    try:
-        data = json.loads(raw)
-    except (TypeError, ValueError):
-        logger.warning(
-            "ignoring TUSKER_PROVIDER_ATTEMPT_TIMEOUT_OVERRIDES_JSON: invalid JSON"
-        )
-        return {}
-    if not isinstance(data, dict):
-        return {}
-    parsed: dict[str, float] = {}
-    for provider, value in data.items():
-        try:
-            seconds = float(value)
-        except (TypeError, ValueError):
-            continue
-        if seconds > 0:
-            parsed[str(provider).lower()] = seconds
-    return parsed
-
 
 def _provider_total_attempt_budget_secs() -> float | None:
     """Return the aggregate wall-clock budget for all pool attempts, or None.
@@ -4195,12 +4171,9 @@ def _provider_attempt_timeout_secs(
     except (TypeError, ValueError):
         configured = 45.0
     if provider:
-        overrides = _provider_attempt_timeout_overrides()
-        provider_key = provider.lower()
-        model_key = f"{provider_key}/{model.lower()}" if model else None
-        override = overrides.get(model_key) if model_key else None
-        if override is None:
-            override = overrides.get(provider_key)
+        from tusker_gateway.passthrough import _attempt_idle_secs
+
+        override = _attempt_idle_secs(provider, model)
         if override is not None:
             configured = max(configured, override)
     total_budget = _provider_total_attempt_budget_secs()

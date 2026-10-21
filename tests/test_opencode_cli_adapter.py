@@ -217,22 +217,32 @@ async def test_cli_error_and_missing_binary_are_actionable(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_nonzero_exit_logs_bounded_stderr_preview(monkeypatch):
+async def test_nonzero_exit_logs_bounded_stderr_and_stdout(monkeypatch):
+    """A non-zero exit must leave a diagnostic trace.
+
+    Production evidence, req_d021ef863a033d52 (2026-10-21): four
+    opencode-cli candidates exited rc=1 with stderr_bytes=0, and stderr was
+    the only field logged, so the failure left nothing to diagnose. stdout
+    is bounded too - an unbounded preview is its own log-volume bug.
+    """
     monkeypatch.setenv("TUSKER_OPENCODE_CLI_ENABLED", "true")
     stderr = b"opencode: fatal auth error\n" + b"x" * 600
+    stdout = b"y" * 4000
     with patch("tusker_gateway.provider_adapters.opencode_cli.shutil.which", return_value="opencode"), \
          patch("tusker_gateway.provider_adapters.opencode_cli.asyncio.create_subprocess_exec",
-               new=AsyncMock(return_value=_FakeProcess(b"", stderr=stderr, returncode=1))), \
+               new=AsyncMock(return_value=_FakeProcess(stdout, stderr=stderr, returncode=1))), \
          patch("tusker_gateway.provider_adapters.opencode_cli.logger") as log:
         with pytest.raises(ProviderError) as exc:
             await OpenCodeCLIAdapter().chat(provider="opencode-cli", model="big-pickle", messages=[])
 
     assert exc.value.code == "opencode_cli_failed"
-    (message, rc, size, preview), _ = log.warning.call_args
-    assert message == "opencode-cli exited rc=%s stderr_bytes=%d stderr=%r"
+    (message, rc, size, preview, out), _ = log.warning.call_args
+    assert message == "opencode-cli exited rc=%s stderr_bytes=%d stderr=%r stdout=%r"
     assert (rc, size) == (1, len(stderr))
     assert preview == stderr.decode("utf-8")[:512]
     assert len(preview) == 512
+    assert len(out) == 1024
+    assert out == stdout.decode("utf-8")[:1024]
 
 
 @pytest.mark.asyncio

@@ -397,9 +397,10 @@ async def _warm_events(
             stderr = await stderr_task if stderr_task is not None else b""
             if proc.returncode != 0:
                 logger.warning(
-                    "opencode-cli warm exited rc=%s stderr_bytes=%d stderr=%r",
+                    "opencode-cli warm exited rc=%s stderr_bytes=%d stderr=%r stdout_tail=%r",
                     proc.returncode, len(stderr),
                     stderr.decode("utf-8", errors="replace")[:512],
+                    b"\n".join(raw_tail)[:1024].decode("utf-8", errors="replace"),
                 )
                 raise _cli_failure_error(stderr + b"\n" + b"\n".join(raw_tail))
             text = "".join(chunks)
@@ -638,8 +639,9 @@ class OpenCodeCLIAdapter:
         if proc.returncode != 0:
             stderr_preview = stderr.decode("utf-8", errors="replace")[:512]
             logger.warning(
-                "opencode-cli exited rc=%s stderr_bytes=%d stderr=%r",
+                "opencode-cli exited rc=%s stderr_bytes=%d stderr=%r stdout=%r",
                 proc.returncode, len(stderr), stderr_preview,
+                stdout[:1024].decode("utf-8", errors="replace"),
             )
             raise _cli_failure_error(stderr + b"\n" + stdout[:8192])
         text = self._extract_text(stdout)

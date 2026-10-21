@@ -623,11 +623,80 @@ def _quarantine_capacity_failure(
 # Per-read timeout for upstream SSE streams. The `total` budget below is a
 # per-chunk idle window, NOT a hard wall-clock cap. It resets on each chunk
 # received, so a provider streaming content never hits it unless it goes
-# silent. A per-provider override map can extend it for slow models (e.g.
-# xiaomi/mimo large contexts).
+# silent.
+#
+# A flat value is a trap: this socket timer fires first and pre-empts the
+# larger budgets configured for a provider, so the operator-visible
+# "attempt timeout" never applies. Production evidence (2026-10-21,
+# req_e1d8a9fe5ade8736): mlx-mac had a 240s attempt budget but died on a
+# cold 240K-token prompt after 90s because this timer was still 90s. Every
+# upstream read timer therefore derives from `_upstream_idle_secs` below.
 _UPSTREAM_STREAM_SOCK_READ_SECS = float(
     os.environ.get("TUSKER_UPSTREAM_SOCK_READ_SECS", "90")
 )
+
+
+def _provider_attempt_timeout_overrides() -> dict[str, float]:
+    """Load provider and provider/model idle-budget overrides.
+
+    Owned here rather than in ``endpoints`` because the upstream socket and
+    chunk timers must be raised to match the attempt budget; importing
+    ``endpoints`` from ``passthrough`` would be a cycle (``endpoints`` imports
+    this module).
+    """
+    raw = os.environ.get("TUSKER_PROVIDER_ATTEMPT_TIMEOUT_OVERRIDES_JSON", "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "ignoring TUSKER_PROVIDER_ATTEMPT_TIMEOUT_OVERRIDES_JSON: invalid JSON"
+        )
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    parsed: dict[str, float] = {}
+    for provider, value in data.items():
+        try:
+            seconds = float(value)
+        except (TypeError, ValueError):
+            continue
+        if seconds > 0:
+            parsed[str(provider).lower()] = seconds
+    return parsed
+
+
+def _attempt_idle_secs(provider: str | None, model: str | None = None) -> float | None:
+    """Return the configured attempt idle budget for a provider/model."""
+    if not provider:
+        return None
+    overrides = _provider_attempt_timeout_overrides()
+    provider_key = provider.lower()
+    model_key = f"{provider_key}/{model.lower()}" if model else None
+    override = overrides.get(model_key) if model_key else None
+    if override is None:
+        override = overrides.get(provider_key)
+    return override
+
+
+def _upstream_idle_secs(provider: str | None, model: str | None = None) -> float:
+    """Return the socket idle window for one upstream read.
+
+    The socket timer must never be shorter than the attempt budget the
+    operator configured for the route, or it fires first and reports a
+    timeout the attempt budget was written to prevent. Per-provider stream
+    overrides raise it further where a provider is known to go silent that
+    long mid-generation.
+    """
+    seconds = _UPSTREAM_STREAM_SOCK_READ_SECS
+    attempt = _attempt_idle_secs(provider, model)
+    if attempt is not None:
+        seconds = max(seconds, attempt)
+    stream = _stream_total_budget_overrides().get((provider or "").lower())
+    if stream is not None:
+        seconds = max(seconds, stream)
+    return seconds
 
 
 def _stream_total_budget_overrides() -> dict[str, float]:
@@ -650,24 +719,13 @@ def _stream_total_budget(
 ) -> float:
     """Per-chunk idle window for SSE streams. Resets on each chunk received.
 
+    Shares ``_upstream_idle_secs`` with the socket timer so a route's
+    configured attempt budget is not pre-empted by a shorter read timer.
     Per-provider override map from
     ``TUSKER_PROVIDER_STREAM_TIMEOUT_OVERRIDES_JSON`` allows outliers
     (e.g. xiaomi/mimo large contexts) to extend beyond the default.
     """
-    try:
-        configured = max(
-            5.0,
-            float(os.environ.get("TUSKER_STREAM_TIMEOUT_SECS", "120")),
-        )
-    except (TypeError, ValueError):
-        configured = 120.0
-    if provider:
-        override = _stream_total_budget_overrides().get(provider.lower())
-        if override is not None:
-            configured = max(configured, override)
-    if request is None or not hasattr(request, "get"):
-        return configured
-    return configured
+    return _upstream_idle_secs(provider)
 
 
 # Build per-provider endpoints dict from the normalized registry in config.py
@@ -2335,15 +2393,16 @@ class PassthroughClient:
                         # No hard wall-clock cap. The per-chunk idle window
                         # (sock_read) below is the only upstream timeout for
                         # streams — a provider streaming content never hits
-                        # it unless it goes silent. Per-provider overrides
-                        # via TUSKER_PROVIDER_STREAM_TIMEOUT_OVERRIDES_JSON.
+                        # it unless it goes silent. It derives from the
+                        # route's configured attempt budget so it cannot
+                        # pre-empt it (see `_upstream_idle_secs`).
                         total=None,
                         # Cap the *gap* between SSE bytes. If the provider goes
                         # silent for this long, aiohttp raises a clean
                         # asyncio.TimeoutError instead of letting the socket
                         # hang. Per-chunk reset applies naturally since
                         # sock_read is an idle timeout.
-                        sock_read=_UPSTREAM_STREAM_SOCK_READ_SECS,
+                        sock_read=_upstream_idle_secs(provider, model),
                     ),
                 )
             except Exception as exc:
@@ -3368,11 +3427,9 @@ class PassthroughClient:
                 await self._record_stream_failure(provider, model, exc, started or time.monotonic())
             raise
         except asyncio.TimeoutError:
-            timeout_source = (
-                f"chunk_budget>{chunk_budget_secs}s"
-                if chunk_budget_secs
-                else f"sock_read>{_UPSTREAM_STREAM_SOCK_READ_SECS}s"
-            )
+            # The chunk budget and the socket window now share one value, so
+            # either can fire; naming a single source would misattribute it.
+            timeout_source = f"upstream_idle>{_upstream_idle_secs(provider, model):.0f}s"
             logger.warning(
                 "upstream SSE read timeout (%s idle) provider=%s model=%s url=%s status=%s",
                 timeout_source,

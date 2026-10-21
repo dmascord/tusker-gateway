@@ -499,6 +499,18 @@ route is in capacity cooldown (`TUSKER_PROVIDER_CAPACITY_COOLDOWN_SECS=300`)
 so a hot backend can finish its current request and the gateway stops
 hammering it.
 
+The attempt budget is not the only idle timer on a stream. An upstream read
+has two more — aiohttp's `sock_read` and the SSE per-chunk budget — and a
+shorter one pre-empts the attempt budget, so the operator-visible timeout
+never applies. `passthrough._upstream_idle_secs()` derives both from
+`TUSKER_UPSTREAM_SOCK_READ_SECS` (default `90`) raised to the route's attempt
+override, then raised again by any
+`TUSKER_PROVIDER_STREAM_TIMEOUT_OVERRIDES_JSON` entry. So `mlx-mac` reads at
+`240s`, not `90s`, and the documented `xiaomi: 600` stream override is
+actually reachable. Production evidence for the fix is
+`req_e1d8a9fe5ade8736` (2026-10-21), where a cold 240K-token `mlx-mac` prompt
+died at 90s under a 240s attempt budget.
+
 #### Process-backed CLI capacity gate
 
 `opencode-cli`, `claude-code-cli`, and `kilo-cli` (only when it is *not*
