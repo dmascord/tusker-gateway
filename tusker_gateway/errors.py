@@ -197,6 +197,25 @@ class ClaudeAuthRequiredError(ProviderError):
         )
 
 
+
+class ProviderAuthError(ProviderError):
+    """The upstream rejected the gateway's credential.
+
+    A process-backed CLI reports auth failures as an ``error`` event on
+    stdout, so a dead key otherwise classified as a generic provider failure
+    and rode the transient escalation ladder, re-probing a credential that
+    cannot recover. Carrying upstream status 401 gives it the permanent-error
+    cooldown (``TUSKER_RETRY_PERMANENT_COOLDOWN``, default 3600s) instead; the
+    client-visible status stays 502 so pool retry semantics are unchanged.
+    """
+
+    def __init__(self, message: str, *, code: str = "provider_auth_failed") -> None:
+        super().__init__(message, code=code)
+        self.upstream_status = 401
+        self.upstream_body = message
+
+
+
 class ProviderStreamLoopError(ProviderError):
     """An upstream stream repeated reasoning/content and was terminated."""
 
