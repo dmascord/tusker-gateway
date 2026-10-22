@@ -331,6 +331,13 @@ class _BufferedRestorer:
         bare_tail = re.search(r"[A-Za-z0-9_-]+={0,2}$", self._pending)
         if bare_tail is not None:
             safe = min(safe, bare_tail.start())
+        # Hold partial authenticated aliases across SSE deltas.
+        email_tail = re.search(r"(?<![A-Za-z0-9._%+-])u@[A-Za-z2-7.]*$", self._pending, re.I)
+        if email_tail is not None:
+            safe = min(safe, email_tail.start())
+        key_tail = re.search(r"(?<![A-Za-z0-9_-])(?:github_pat_|ghp_|gho_|npm_|sk-|xox[baprs]-|AIza)z[A-Za-z0-9_-]*$", self._pending)
+        if key_tail is not None:
+            safe = min(safe, key_tail.start())
         out = self._pending[:safe]
         self._pending = self._pending[safe:]
         return self._restore(out)
