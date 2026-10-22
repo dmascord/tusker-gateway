@@ -58,6 +58,17 @@ TOKEN_TYPE_EMAIL = "email"
 TOKEN_TYPE_CC = "card"
 TOKEN_TYPE_KEY = "key"
 TOKEN_TYPE_TEXT = "text"
+_EMAIL_ALIAS_RE = re.compile(
+    r"(?<![A-Za-z0-9._%+-])u@((?:[a-z2-7]{1,63}\.)+)redact\.invalid"
+    r"(?![A-Za-z0-9.-])",
+    re.IGNORECASE,
+)
+_KEY_ALIAS_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])"
+    r"(github_pat_|ghp_|gho_|npm_|sk-|xox[baprs]-|AIza)"
+    r"(z[A-Za-z0-9_-]{32,})"
+    r"(?![A-Za-z0-9_-])"
+)
 
 _EMAIL_RE = re.compile(
     r"(?<![a-zA-Z0-9._%+-])"
@@ -69,9 +80,12 @@ _EMAIL_RE = re.compile(
 _CC_RE = re.compile(r"\b\d(?:[ -]?\d){12,18}\b")
 # High-entropy credential shapes: provider API keys and common token prefixes.
 _KEY_RE = re.compile(
-    r"\b(?:sk-[A-Za-z0-9_-]{20,}|ghp_[A-Za-z0-9]{20,}|gho_[A-Za-z0-9]{20,}"
-    r"|github_pat_[A-Za-z0-9_]{20,}|npm_[A-Za-z0-9]{30,}|xox[baprs]-[A-Za-z0-9-]{10,}"
-    r"|AIza[A-Za-z0-9_-]{30,})\b"
+    r"\b(?:sk-z[A-Za-z0-9_-]{32,}|ghp_z[A-Za-z0-9_-]{32,}|gho_z[A-Za-z0-9_-]{32,}"
+    r"|github_pat_z[A-Za-z0-9_-]{32,}|npm_z[A-Za-z0-9_-]{32,}"
+    r"|xox[baprs]-z[A-Za-z0-9_-]{32,}|AIzaz[A-Za-z0-9_-]{30,}"
+    r"|sk-[A-Za-z0-9_-]{20,}|ghp_[A-Za-z0-9]{20,}|gho_[A-Za-z0-9]{20,}"
+    r"|github_pat_[A-Za-z0-9_]{20,}|npm_[A-Za-z0-9]{30,}"
+    r"|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[A-Za-z0-9_-]{30,})\b"
 )
 
 # Entropy-gated fallback: an unprefixed high-entropy run near a credential
@@ -131,6 +145,7 @@ def load_redaction_key(env: dict[str, str] | None = None) -> bytes | None:
 @dataclass
 class RedactionRuleSet:
     redact_emails: bool = True
+    format_preserving_aliases: bool = False
     redact_credit_cards: bool = True
     redact_api_keys: bool = True
     # Entropy-gated fallback: a context-word ("key", "token", "secret", ...)
@@ -170,13 +185,60 @@ class Tokenizer:
         except Exception:
             return None
 
+    def _alias(self, value: str, kind: str) -> str:
+        """Return a syntax-shaped alias carrying authenticated ciphertext."""
+        core = self._seal(value, kind).split(":", 2)[2][:-1]
+        if kind == TOKEN_TYPE_EMAIL:
+            raw = _B64URL_DE(core + "=" * (-len(core) % 4))
+            encoded = base64.b32encode(raw).decode("ascii").rstrip("=").lower()
+            labels = ".".join(encoded[i : i + 63] for i in range(0, len(encoded), 63))
+            alias = "u@" + labels + ".redact.invalid"
+            return alias if len(alias) <= 253 else self._seal(value, kind)
+        for prefix in (
+            "github_pat_", "ghp_", "gho_", "npm_", "sk-",
+            "xoxb-", "xoxa-", "xoxp-", "xoxr-", "xoxs-", "AIza",
+        ):
+            if value.startswith(prefix):
+                return prefix + "z" + core
+        return self._seal(value, kind)
+
+    def _restore_aliases(self, text: str, emit: Any) -> str:
+        def email_restore(match: re.Match[str]) -> str:
+            try:
+                b32 = match.group(1).replace(".", "").upper()
+                raw = base64.b32decode(b32 + "=" * (-len(b32) % 8))
+                core = _B64URL(raw).rstrip(b"=").decode("ascii")
+                value = self._open(TOKEN_TYPE_EMAIL, core)
+            except (ValueError, UnicodeError):
+                value = None
+            return emit(value) if value is not None else match.group(0)
+
+        def key_restore(match: re.Match[str]) -> str:
+            value = self._open(TOKEN_TYPE_KEY, match.group(2)[1:])
+            return (
+                emit(value)
+                if value is not None and value.startswith(match.group(1))
+                else match.group(0)
+            )
+
+        return _KEY_ALIAS_RE.sub(key_restore, _EMAIL_ALIAS_RE.sub(email_restore, text))
+
     def tokenize_text(self, text: str) -> str:
         """Escape client tokens, then tokenize detected secrets."""
         if not isinstance(text, str) or not text:
             return text
         out = text
         if self.rules.redact_emails:
-            out = _EMAIL_RE.sub(lambda m: self._seal(m.group(0), TOKEN_TYPE_EMAIL), out)
+            out = _EMAIL_RE.sub(
+                lambda m: (
+                    m.group(0)
+                    if _EMAIL_ALIAS_RE.fullmatch(m.group(0))
+                    else self._alias(m.group(0), TOKEN_TYPE_EMAIL)
+                    if self.rules.format_preserving_aliases
+                    else self._seal(m.group(0), TOKEN_TYPE_EMAIL)
+                ),
+                out,
+            )
         if self.rules.redact_credit_cards:
             out = _CC_RE.sub(
                 lambda m: (
@@ -187,7 +249,16 @@ class Tokenizer:
                 out,
             )
         if self.rules.redact_api_keys:
-            out = _KEY_RE.sub(lambda m: self._seal(m.group(0), TOKEN_TYPE_KEY), out)
+            out = _KEY_RE.sub(
+                lambda m: (
+                    m.group(0)
+                    if _KEY_ALIAS_RE.fullmatch(m.group(0))
+                    else self._alias(m.group(0), TOKEN_TYPE_KEY)
+                    if self.rules.format_preserving_aliases
+                    else self._seal(m.group(0), TOKEN_TYPE_KEY)
+                ),
+                out,
+            )
         if self.rules.redact_entropy_fallback:
             out = _ENTROPY_CONTEXT_RE.sub(
                 lambda m: m.group(1) + self._seal(m.group(2), TOKEN_TYPE_TEXT), out
@@ -220,7 +291,7 @@ class Tokenizer:
             value = self._open(m.group(1), m.group(2))
             return m.group(0) if value is None else _emit(value)
 
-        restored = _TOKEN_CORE_RE.sub(_restore, text)
+        restored = self._restore_aliases(_TOKEN_CORE_RE.sub(_restore, text), _emit)
 
         def _restore_bare(m: re.Match[str]) -> str:
             encoded = m.group(1)
@@ -297,6 +368,20 @@ class _BufferedRestorer:
         bare_tail = re.search(r"[A-Za-z0-9_-]+={0,2}$", self._pending)
         if bare_tail is not None:
             safe = min(safe, bare_tail.start())
+        # Hold partial format-preserving aliases across SSE deltas.
+        email_tail = re.search(
+            r"(?<![A-Za-z0-9._%+-])u@[A-Za-z2-7.]*$",
+            self._pending,
+            re.IGNORECASE,
+        )
+        if email_tail is not None:
+            safe = min(safe, email_tail.start())
+        key_tail = re.search(
+            r"(?<![A-Za-z0-9_-])(?:github_pat_|ghp_|gho_|npm_|sk-|xox[baprs]-|AIza)z[A-Za-z0-9_-]*$",
+            self._pending,
+        )
+        if key_tail is not None:
+            safe = min(safe, key_tail.start())
         out = self._pending[:safe]
         self._pending = self._pending[safe:]
         return self._restore(out)

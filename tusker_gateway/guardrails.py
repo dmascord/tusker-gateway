@@ -564,7 +564,7 @@ def load_guardrails_config_from_env(env: dict[str, str] | None = None) -> dict[s
         "redaction_email": _flag("TUSKER_REDACTION_EMAIL", True),
         "redaction_credit_card": _flag("TUSKER_REDACTION_CREDIT_CARD", True),
         "redact_api_keys": _flag("TUSKER_REDACTION_API_KEYS", True),
-        "redact_entropy_fallback": _flag("TUSKER_REDACTION_ENTROPY_FALLBACK", False),
+        "redaction_format_preserving": _flag("TUSKER_REDACTION_FORMAT_PRESERVING", False),
         "_env": e,
     }
 
@@ -588,7 +588,7 @@ def init_guard_pipeline(config: dict[str, Any]) -> GuardPipeline:
                 redact_emails=config.get("redaction_email", True),
                 redact_credit_cards=config.get("redaction_credit_card", True),
                 redact_api_keys=config.get("redact_api_keys", True),
-                redact_entropy_fallback=config.get("redact_entropy_fallback", False),
+                format_preserving_aliases=config.get("redaction_format_preserving", False),
             )
             guards.append(SecretRedactionGuard(
                 tokenizer=Tokenizer(key=key, rules=rules),

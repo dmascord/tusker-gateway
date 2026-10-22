@@ -264,6 +264,10 @@ spec:
           value: 'true'
         - name: TUSKER_REDACTION_API_KEYS
           value: 'true'
+        # Preserve email/key syntax for OMP while retaining authenticated ciphertext.
+        # Keep disabled unless clients require syntax-shaped redaction aliases.
+        - name: TUSKER_REDACTION_FORMAT_PRESERVING
+          value: 'false'
         # Entropy-gated fallback for unprefixed secrets: opt-in, because the
         # rule can false-positive on long identifiers in code.
         - name: TUSKER_REDACTION_ENTROPY_FALLBACK
