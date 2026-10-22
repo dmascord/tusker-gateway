@@ -562,6 +562,7 @@ def load_guardrails_config_from_env(env: dict[str, str] | None = None) -> dict[s
         "injection_guard": _flag("TUSKER_GUARDRAILS_INJECTION", True),
         "redaction_enabled": _flag("TUSKER_REDACTION_ENABLED", True),
         "redaction_email": _flag("TUSKER_REDACTION_EMAIL", True),
+        "redaction_format_preserving": _flag("TUSKER_REDACTION_FORMAT_PRESERVING", False),
         "redaction_credit_card": _flag("TUSKER_REDACTION_CREDIT_CARD", True),
         "redact_api_keys": _flag("TUSKER_REDACTION_API_KEYS", True),
         "redact_entropy_fallback": _flag("TUSKER_REDACTION_ENTROPY_FALLBACK", False),
@@ -586,6 +587,7 @@ def init_guard_pipeline(config: dict[str, Any]) -> GuardPipeline:
         if key is not None:
             rules = RedactionRuleSet(
                 redact_emails=config.get("redaction_email", True),
+                format_preserving_aliases=config.get("redaction_format_preserving", False),
                 redact_credit_cards=config.get("redaction_credit_card", True),
                 redact_api_keys=config.get("redact_api_keys", True),
                 redact_entropy_fallback=config.get("redact_entropy_fallback", False),
