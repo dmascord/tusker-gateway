@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import time
+import weakref
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable
 
@@ -1949,27 +1950,97 @@ async def _stream_with_model_alias(
         if buffer:
             yield buffer
     finally:
-        await wrapped.aclose()
+        await _close_wrapped_stream(wrapped)
 
 
-async def _lease_released_stream(
+async def _close_wrapped_stream(wrapped: AsyncIterator[bytes]) -> None:
+    """Close a wrapped stream, tolerating objects without ``aclose``."""
+    close = getattr(wrapped, "aclose", None)
+    if close is not None:
+        try:
+            await close()
+        except Exception:
+            logger.debug("failed to close wrapped provider stream", exc_info=True)
+
+
+class _LeaseGuardedStream:
+    """Async iterator that releases a capacity lease on every close path."""
+
+    def __init__(
+        self,
+        wrapped: AsyncIterator[bytes],
+        lease: "CapacityLease | None",
+    ) -> None:
+        self._wrapped = wrapped
+        self._lease = lease
+        self._finalizer = _arm_lease_finalizer(lease, self)
+
+    def __aiter__(self) -> "_LeaseGuardedStream":
+        return self
+
+    async def __anext__(self) -> bytes:
+        try:
+            return await self._wrapped.__anext__()
+        except StopAsyncIteration:
+            self._release()
+            raise
+        except BaseException:
+            self._release()
+            raise
+
+    async def aclose(self) -> None:
+        self._release()
+        await _close_wrapped_stream(self._wrapped)
+
+    def _release(self) -> None:
+        self._finalizer.detach()
+        if self._lease is not None:
+            self._lease.release()
+
+
+def _lease_released_stream(
     wrapped: AsyncIterator[bytes],
     lease: "CapacityLease | None",
 ) -> AsyncIterator[bytes]:
-    """Yield a provider stream and release its capacity lease when it ends.
+    """Return a provider stream that releases its capacity lease when it ends.
 
     Process-backed providers hold a CLI child process for the whole stream, so
     the in-flight slot must survive until the last frame is delivered or the
-    consumer closes the stream - releasing it when the generator is merely
-    created would leave the memory bound unenforced.
+    consumer closes the stream. The guard also releases immediately when an
+    unstarted stream is explicitly closed; its finalizer covers a stream that
+    is simply discarded.
     """
+    return _LeaseGuardedStream(wrapped, lease)
+
+
+def _arm_lease_finalizer(
+    lease: "CapacityLease | None",
+    generator: AsyncIterator[bytes],
+) -> "weakref.finalize | _NullFinalizer":
+    """Arm a GC fallback that releases ``lease`` if ``generator`` is dropped."""
+    if lease is None:
+        return _NullFinalizer()
     try:
-        async for chunk in wrapped:
-            yield chunk
-    finally:
-        if lease is not None:
-            lease.release()
-        await wrapped.aclose()
+        return weakref.finalize(generator, lease.release)
+    except TypeError:
+        # Not weak-referenceable; the iterator's explicit close is the only
+        # path available beyond its own provider cleanup.
+        return _NullFinalizer()
+
+
+class _NullFinalizer:
+    """No-op stand-in used when there is no lease to guard."""
+
+    def detach(self) -> bool:
+        return False
+
+
+def _guard_stream_lease(
+    stream: AsyncIterator[bytes],
+    lease: "CapacityLease | None",
+) -> AsyncIterator[bytes]:
+    """Wrap a stream so explicit close releases its capacity lease eagerly."""
+    return _LeaseGuardedStream(stream, lease)
 
 
 class PassthroughClient:
@@ -2505,6 +2576,7 @@ class PassthroughClient:
                 started=start,
                 chunk_budget_secs=_stream_total_budget(provider=provider),
             )
+            stream_iter = _guard_stream_lease(stream_iter, capacity_lease)
             if upstream_model != model:
                 return _stream_with_model_alias(upstream_model, model, stream_iter)
             return stream_iter

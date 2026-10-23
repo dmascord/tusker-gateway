@@ -406,3 +406,76 @@ def test_code_pool_with_only_heavyweights_returns_none():
     ])
     selected = pm.select("code")
     assert selected is None  # caller must surface 400/503 to client
+
+
+def test_gpt_6_astra_classified_heavyweight():
+    """Codex flagship slug must be gated by the slug set.
+
+    Regression (2026-10-23): the Codex/Copilot catalogs advertise
+    ``gpt-6-astra`` with no pricing data, so the pricing heuristic returns
+    False and the slug set is the only gate keeping an expensive model out of
+    the cheap privacy rotation.
+    """
+    from tusker_gateway.heavyweight import is_heavyweight
+
+    assert is_heavyweight("gpt-6-astra") is True
+    s = ModelSpec.from_dict(
+        {"provider": "openai-codex", "model": "gpt-6-astra"},
+        default_window=128_000,
+        zdr=True,
+    )
+    assert s.heavyweight is True
+    # A heavyweight route is never ZDR-eligible, so it cannot back privacy.
+    assert s.zdr_ok is False
+
+
+def test_privacy_selection_never_returns_gpt_6_astra():
+    """The ZDR privacy rotation must not dispatch the Codex flagship slug.
+
+    Auto-catalog still *lists* the model (that is how discovery works); the
+    guarantee that matters is that selection refuses it, so no privacy
+    request can be routed to an expensive route.
+    """
+    from tusker_gateway.catalog import (
+        CatalogEntry,
+        CatalogRegistry,
+        CodexCatalog,
+    )
+
+    cfg = {
+        "pools": {
+            "privacy": PoolConfig(
+                name="privacy",
+                models=[{"provider": "openai-codex", "model": "gpt-5.6-luna"}],
+                zdr=True,
+                auto_catalog=True,
+                auto_catalog_providers=["openai-codex"],
+            ),
+        },
+        "provider_api_keys": {"openai-codex": "k"},
+        "quality_db_path": tempfile.mktemp(suffix=".db"),
+    }
+    pm = PoolManager(cfg)
+    registry = CatalogRegistry()
+    codex = CodexCatalog()
+    codex._entries = [
+        # No pricing: only the slug override can reject this.
+        CatalogEntry(provider="openai-codex", model="gpt-6-astra"),
+        CatalogEntry(provider="openai-codex", model="gpt-5.6-luna"),
+    ]
+    registry.register("openai-codex", codex)
+    pm.catalog_registry = registry
+    pm.extend_pools_with_auto_catalog()
+
+    # Discovery may list it, but it must be classified heavyweight.
+    specs = {(s.provider, s.model): s for s in pm.models["privacy"]}
+    if ("openai-codex", "gpt-6-astra") in specs:
+        assert specs[("openai-codex", "gpt-6-astra")].heavyweight is True
+
+    # Selection never dispatches it, on the default cheap-tier rule or when
+    # a caller explicitly overrides the tier gate.
+    assert pm.select("privacy") == ("openai-codex", "gpt-5.6-luna")
+    assert pm.select("privacy", heavyweight_ok=True) == (
+        "openai-codex",
+        "gpt-5.6-luna",
+    )

@@ -1,6 +1,8 @@
 """Tests for provider capacity protection and usage accounting."""
 from __future__ import annotations
 
+import asyncio
+import gc
 import json
 
 import pytest
@@ -304,4 +306,107 @@ async def test_process_backed_dispatch_releases_lease_on_failure(monkeypatch, tm
         )
 
     assert controller.snapshot().get(CLI_CAPACITY_GROUP, {}).get("active", 0) == 0
+    controller.reset()
+
+
+@pytest.mark.asyncio
+async def test_lease_released_stream_releases_when_created_but_never_iterated():
+    """A stream that is constructed and then discarded must free its slot.
+
+    Regression (2026-10-23): pool fallback creates a candidate stream and can
+    reject it before the first frame. An async generator that never starts
+    does not run its ``finally``, so the capacity lease used to be stranded
+    for the life of the process. With ``TUSKER_MLX_MAC_MAX_CONCURRENT=1``
+    that made every later mlx-mac request fail as permanently busy, which the
+    client saw as "Upstream provider capacity is unavailable".
+    """
+    import gc
+
+    from tusker_gateway.passthrough import _lease_released_stream
+
+    controller = capacity_controller()
+    controller.reset()
+    lease = controller.acquire("mlx-mac")
+    assert lease is not None
+    assert controller.snapshot()["mlx-mac"]["active"] == 1
+
+    async def _never_used():
+        yield b"data: {}\n\n"
+
+    stream = _lease_released_stream(_never_used(), lease)
+    assert controller.snapshot()["mlx-mac"]["active"] == 1  # held while in flight
+
+    del stream
+    gc.collect()
+    await asyncio.sleep(0.05)
+    gc.collect()
+
+    assert controller.snapshot().get("mlx-mac", {}).get("active", 0) == 0
+    controller.reset()
+
+
+@pytest.mark.asyncio
+async def test_lease_released_stream_releases_on_normal_completion_and_aclose():
+    """The guard must not regress the paths that already worked."""
+    from tusker_gateway.passthrough import _lease_released_stream
+
+    controller = capacity_controller()
+    controller.reset()
+
+    async def _frames():
+        for i in range(3):
+            yield f"data: {i}\n\n".encode()
+
+    # Full consumption.
+    lease = controller.acquire("mlx-mac")
+    assert lease is not None
+    async for _ in _lease_released_stream(_frames(), lease):
+        pass
+    assert controller.snapshot().get("mlx-mac", {}).get("active", 0) == 0
+
+    # Partial consumption then explicit close.
+    lease = controller.acquire("mlx-mac")
+    assert lease is not None
+    stream = _lease_released_stream(_frames(), lease)
+    async for _ in stream:
+        break
+    await stream.aclose()
+    assert controller.snapshot().get("mlx-mac", {}).get("active", 0) == 0
+
+    # Explicit close before the first frame must release immediately.
+    lease = controller.acquire("mlx-mac")
+    assert lease is not None
+    stream = _lease_released_stream(_frames(), lease)
+    await stream.aclose()
+    assert controller.snapshot().get("mlx-mac", {}).get("active", 0) == 0
+
+    controller.reset()
+
+
+
+@pytest.mark.asyncio
+async def test_guard_stream_lease_releases_for_unstarted_generator():
+    """``_stream_events``-shaped generators are guarded at construction time."""
+    import gc
+
+    from tusker_gateway.passthrough import _guard_stream_lease
+
+    controller = capacity_controller()
+    controller.reset()
+    lease = controller.acquire("mlx-mac")
+    assert lease is not None
+
+    async def _events():
+        try:
+            yield b"data: {}\n\n"
+        finally:
+            lease.release()
+
+    stream = _guard_stream_lease(_events(), lease)
+    del stream
+    gc.collect()
+    await asyncio.sleep(0.05)
+    gc.collect()
+
+    assert controller.snapshot().get("mlx-mac", {}).get("active", 0) == 0
     controller.reset()

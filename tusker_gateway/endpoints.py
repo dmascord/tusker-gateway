@@ -2081,6 +2081,18 @@ class _PreparedStream:
     def __aiter__(self) -> AsyncIterator[bytes]:
         return self.iterator
 
+    async def aclose(self) -> None:
+        """Propagate close to the wrapped iterator.
+
+        Candidate rejection paths (``_close_async_iterator``) look for
+        ``aclose``. Without this the wrapper silently swallows the close, so
+        a stream that was created but never iterated leaves its source
+        generator's ``finally`` block unrun — which leaks the provider
+        capacity lease and can strand a single-slot backend (mlx-mac) as
+        permanently busy for the life of the process.
+        """
+        await _close_async_iterator(self.iterator)
+
 
 async def _prepend_stream(
     prefix: list[bytes],

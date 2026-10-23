@@ -33,6 +33,12 @@ HEAVYWEIGHT_SLUG_OVERRIDES: frozenset[str] = frozenset({
     "gpt-5.6-terra",
     "gpt-5.5",
     "gpt-5.4",
+    # Codex flagship tier discovered via auto-catalog (2026-10-23). It has
+    # no static pool entry and no pricing in the Codex/Copilot catalog, so
+    # the slug set is the only gate that keeps it out of the cheap privacy
+    # rotation. Without it a single catalog refresh made an expensive model
+    # selectable for privacy traffic.
+    "gpt-6-astra",
     # Anthropic Claude (paid tiers)
     "claude-sonnet-4.6",
     "claude-opus-4.6",

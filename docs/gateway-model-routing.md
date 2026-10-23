@@ -62,10 +62,10 @@ A model is **heavyweight** when *either*:
 
 | Family | Heavy slugs |
 |---|---|
-| Codex (paid) | `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.5`, `gpt-5.4` |
-| Anthropic (paid) | `claude-sonnet-4.6`, `claude-opus-4.6`, `claude-sonnet-4.5`, `claude-opus-4.5` |
-| Google (paid) | `gemini-2.5-pro`, `gemini-3-pro` |
-| Cohere (paid) | `command-a-plus-05-2026`, `command-a-03-2025` |
+| OpenAI Codex | `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.5`, `gpt-5.4`, `gpt-6-astra` |
+| Anthropic Claude | `claude-sonnet-4.6`, `claude-opus-4.6`, `claude-sonnet-4.5`, `claude-opus-4.5` |
+| Google Gemini | `gemini-2.5-pro`, `gemini-3-pro` |
+| Cohere | `command-a-plus-05-2026`, `command-a-03-2025` |
 | Other | `mistral-large-3:675b`, `deepseek-v4-pro` |
 | Synthetic.new (usage-heavy) | `Kimi-K3`, `syn:large:vision` |
 | Ollama Cloud (usage-heavy) | `kimi-k2.6`, `kimi-k2.7-code`, `kimi-k3` |
