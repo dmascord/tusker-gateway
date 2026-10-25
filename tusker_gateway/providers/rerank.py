@@ -648,22 +648,13 @@ class RerankHandler:
         backend: RerankBackend,
         error: GatewayError,
         breaker: Any | None,
-        payload_bytes: int = 0,
     ) -> None:
         if is_request_level_error(error):
             # The request was unacceptable, not the provider: record no
             # failure and set no cooldown, so one bad model name or oversized
             # input cannot quarantine the route for every other caller.
-            # A 413 is still evidence about the route's payload ceiling, so
-            # learn from it before returning.
-            if (
-                getattr(error, "upstream_status", None) == 413
-                and breaker is not None
-                and payload_bytes > 0
-            ):
-                breaker.record_rejected_payload(
-                    backend.provider, backend.model, payload_bytes
-                )
+            # Rerank 413 responses are not reliable byte-size evidence: the
+            # provider may be enforcing document, token, or model limits.
             return
 
         if breaker is not None:
@@ -702,7 +693,6 @@ class RerankHandler:
         *,
         session: aiohttp.ClientSession | Any | None = None,
         breaker: Any | None = None,
-        payload_bytes: int = 0,
     ) -> tuple[str, str, dict[str, Any]]:
         request = self.validate_request(body)
         backends, _ = self.backends_for_model(body.get("model"))
@@ -727,14 +717,6 @@ class RerankHandler:
                 continue
             if global_tracker().is_cooldown(backend.provider, backend.model):
                 continue
-            if payload_bytes > 0 and breaker is not None:
-                ceiling = breaker.payload_ceiling_bytes(
-                    backend.provider, backend.model
-                )
-                if ceiling is not None and ceiling < payload_bytes:
-                    # A prior 413 on this route proved it cannot take this
-                    # body; skip it rather than pay the same rejection again.
-                    continue
             if breaker is not None and not breaker.check(
                 backend.provider,
                 backend.model,
@@ -749,10 +731,6 @@ class RerankHandler:
                 result = self._normalize_response(raw, request, backend.model)
                 if breaker is not None:
                     breaker.record_success(backend.provider, backend.model)
-                    if payload_bytes > 0:
-                        breaker.record_accepted_payload(
-                            backend.provider, backend.model, payload_bytes
-                        )
                 global_tracker().clear_failures(backend.provider)
                 with self._lock:
                     self._cursor = (start + position + 1) % len(backends)
@@ -766,7 +744,7 @@ class RerankHandler:
                 return backend.provider, backend.model, result
             except GatewayError as exc:
                 last_error = exc
-                self._mark_failure(backend, exc, breaker, payload_bytes)
+                self._mark_failure(backend, exc, breaker)
                 logger.warning(
                     "rerank backend failed provider=%s model=%s error=%s status=%s",
                     backend.provider,

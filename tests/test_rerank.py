@@ -416,6 +416,26 @@ def test_provider_health_failure_still_cools_and_records(tmp_path):
         tracker.clear("cohere", "rerank-v3.5")
         tracker.clear_failures("cohere")
         tracker._provider_default.pop("cohere", None)
+@pytest.mark.asyncio
+async def test_rerank_413_does_not_learn_payload_ceiling(tmp_path, monkeypatch):
+    """A rerank 413 may be token/document-specific, not a byte transport cap."""
+    monkeypatch.setenv("TUSKER_RERANKER_PROVIDERS", "cohere")
+    handler = RerankHandler(_config(tmp_path, ("cohere",)))
+    breaker = _RecordingBreaker()
+    session = _FakeSession(
+        [_FakeResponse({"message": "documents exceed token limit"}, status=413)]
+    )
+
+    with pytest.raises(ProviderError) as excinfo:
+        await handler.rerank(
+            {"query": "query", "documents": ["document"]},
+            session=session,
+            breaker=breaker,
+        )
+
+    assert excinfo.value.upstream_status == 413
+    assert breaker.failures == []
+
 
 @pytest.mark.asyncio
 async def test_pinned_rerank_reports_active_cooldown(tmp_path):

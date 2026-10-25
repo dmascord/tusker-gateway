@@ -8890,7 +8890,6 @@ async def rerank_handler(request: web.Request) -> web.Response:
             body,
             session=request.app.get("http_session"),
             breaker=request.app.get("breaker"),
-            payload_bytes=int(request.get("_tusker_payload_bytes") or 0),
         )
         set_access_log_context(
             request,
