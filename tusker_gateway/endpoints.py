@@ -4453,6 +4453,33 @@ def _is_capacity_failure(exc: BaseException | None) -> bool:
     return is_capacity_error(detail)
 
 
+_PROVIDER_WIDE_RATE_LIMIT_PROVIDERS = frozenset({
+    # Enterprise Copilot answers pooled requests with a provider-wide
+    # quota/rate-limit 429 that the calling tenant does not own. Surfacing it
+    # as a client 429 tells the caller that *its* quota is gone, so the
+    # gateway instead reports retryable upstream unavailability once failover
+    # has no candidates left.
+    "github-copilot-enterprise",
+})
+def _internalize_github_copilot_rate_limit(
+    provider: str,
+    exc: RateLimitError,
+) -> ProviderCapacityError | None:
+    """Convert Enterprise Copilot 429s into pool-internal unavailability."""
+    if str(provider or "").strip().lower() not in _PROVIDER_WIDE_RATE_LIMIT_PROVIDERS:
+        return None
+    return ProviderCapacityError(
+        group="github-copilot-enterprise",
+        detail=exc.body or "GitHub Copilot Enterprise returned HTTP 429",
+    )
+
+
+def _provider_rate_limit_is_external(exc: BaseException) -> bool:
+    """Whether a provider 429 may be reported to the client as a 429."""
+    provider = str(getattr(exc, "provider", "") or "").strip().lower()
+    return provider not in _PROVIDER_WIDE_RATE_LIMIT_PROVIDERS
+
+
 def _provider_rate_limit_response(exc: RateLimitError) -> web.Response:
     """Surface a provider 429 instead of collapsing it into a 502.
 
@@ -4514,6 +4541,23 @@ def _public_provider_failure_response(
     error code the caller can switch on.
     """
     if isinstance(exc, RateLimitError):
+        if not _provider_rate_limit_is_external(exc):
+            try:
+                retry_after = max(
+                    1,
+                    int(float(os.environ.get("TUSKER_PROVIDER_RETRY_AFTER_SECS", "5"))),
+                )
+            except (TypeError, ValueError):
+                retry_after = 5
+            return web.json_response(
+                openai_error(
+                    "Upstream provider capacity is unavailable; retry shortly.",
+                    code="service_unavailable",
+                    error_type="server_error",
+                ),
+                status=503,
+                headers={"Retry-After": str(retry_after)},
+            )
         return _provider_rate_limit_response(exc)
 
     if not _is_capacity_failure(exc):
@@ -4645,11 +4689,16 @@ def _public_stream_error(
 ) -> tuple[str, str]:
     """Return safe, actionable details for a prepared SSE error frame."""
     if isinstance(exc, RateLimitError):
-        # RateLimitError carries the upstream Retry-After hint. Surface it as
-        # a generic 429 signal so clients back off, without echoing the raw
-        # upstream body.
-        message = "Upstream provider rate limit exceeded; retry shortly."
-        code = "rate_limit_exceeded"
+        # Enterprise Copilot 429s are provider-wide pool failures, not a
+        # caller quota signal. The stream fallback path normally consumes
+        # them before this function; this keeps the terminal frame safe when
+        # no alternative candidate remains.
+        if _provider_rate_limit_is_external(exc):
+            message = "Upstream provider rate limit exceeded; retry shortly."
+            code = "rate_limit_exceeded"
+        else:
+            message = "Upstream provider capacity is unavailable; retry shortly."
+            code = "service_unavailable"
     elif _is_capacity_failure(exc):
         message = "Upstream provider capacity is unavailable; retry shortly."
         code = "service_unavailable"
@@ -5046,6 +5095,7 @@ async def _call_with_pool_fallback(
                 await asyncio.to_thread(breaker.release_probe, provider, model)
             raise
         except RateLimitError as exc:
+            exc.provider = provider
             if breaker is not None:
                 await asyncio.to_thread(
                     breaker.record_failure,
@@ -5495,6 +5545,9 @@ async def _call_with_pool_fallback(
                 await asyncio.to_thread(breaker.release_probe, provider, model)
             raise
         except RateLimitError as exc:
+            # Preserve the concrete provider for terminal-response policy.
+            # Pool selection already handles the failover itself.
+            exc.provider = provider
             if breaker is not None:
                 await asyncio.to_thread(
                     breaker.record_failure,
@@ -5502,13 +5555,18 @@ async def _call_with_pool_fallback(
                     model,
                     cooldown_secs=_cooldown_for_exc(exc),
                 )
-            last_error = exc
+            internal_failure = _internalize_github_copilot_rate_limit(provider, exc)
+            last_error = internal_failure or exc
             excluded.add(selected)
             if request is not None:
                 set_access_log_context(
                     request,
-                    failure_class=exc.code or type(exc).__name__,
-                    error_detail=_pool_failure_summary(exc),
+                    failure_class=(
+                        internal_failure.code
+                        if internal_failure is not None
+                        else exc.code or type(exc).__name__
+                    ),
+                    error_detail=_pool_failure_summary(last_error),
                     candidate_attempts=attempts,
                 )
             logger.warning(
@@ -7606,6 +7664,8 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                             asyncio.TimeoutError,
                             asyncio.IncompleteReadError,
                         ) as stream_recovery_exc:
+                            if isinstance(stream_recovery_exc, RateLimitError):
+                                stream_recovery_exc.provider = provider
                             # The role event and SSE headers are already sent,
                             # but a model can still be changed safely until an
                             # assistant data frame has reached the client.

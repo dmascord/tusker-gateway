@@ -2280,6 +2280,76 @@ async def test_chat_preserves_provider_429_with_retry_after(client):
     assert "custom-upstream-quota-token" not in payload["error"]["message"]
 
 @pytest.mark.asyncio
+async def test_pool_internalizes_github_enterprise_429_before_client_response(app, client):
+    """Enterprise Copilot 429s must select another privacy candidate."""
+    pool_manager = MagicMock()
+    pool_manager.fallback_pools.return_value = ()
+    pool_manager.select.side_effect = [
+        ("github-copilot-enterprise", "gpt-5.6-luna"),
+        ("apim", "gpt-5.6-luna"),
+    ]
+    app["pool_manager"] = pool_manager
+    enterprise_429 = RateLimitError(
+        body='{"statusCode":429,"message":"enterprise quota exhausted"}',
+        headers={"Retry-After": "60"},
+    )
+    fallback_result = {
+        "choices": [{"message": {"role": "assistant", "content": "fallback"}}],
+    }
+
+    with patch(
+        "tusker_gateway.endpoints.PassthroughClient.chat",
+        new_callable=AsyncMock,
+        side_effect=[enterprise_429, fallback_result],
+    ) as mock_chat:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-privacy",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            headers=HEADERS_AUTH,
+        )
+
+    assert response.status == 200
+    payload = await response.json()
+    assert payload["choices"][0]["message"]["content"] == "fallback"
+    assert mock_chat.await_count == 2
+    assert pool_manager.select.call_args_list[1].kwargs["excluded"] == {
+        ("github-copilot-enterprise", "gpt-5.6-luna")
+    }
+
+@pytest.mark.asyncio
+async def test_exhausted_github_enterprise_429_returns_gateway_503(app, client):
+    """An exhausted Enterprise Copilot pool must not expose provider 429."""
+    pool_manager = MagicMock()
+    pool_manager.fallback_pools.return_value = ()
+    pool_manager.select.return_value = ("github-copilot-enterprise", "gpt-5.6-luna")
+    app["pool_manager"] = pool_manager
+
+    with patch(
+        "tusker_gateway.endpoints.PassthroughClient.chat",
+        new_callable=AsyncMock,
+        side_effect=RateLimitError(
+            body='{"statusCode":429,"message":"enterprise quota exhausted"}',
+            headers={"Retry-After": "60"},
+        ),
+    ):
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-privacy",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            headers=HEADERS_AUTH,
+        )
+
+    assert response.status == 503
+    payload = await response.json()
+    assert payload["error"]["code"] == "service_unavailable"
+    assert "rate_limit_exceeded" not in payload["error"]["message"]
+
+@pytest.mark.asyncio
 async def test_chat_completions_streaming(client):
     # Mock streaming response. The endpoint sends [DONE] itself on EOF, so
     # the upstream mock only yields content chunks here.
