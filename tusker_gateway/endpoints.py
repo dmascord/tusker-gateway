@@ -4002,6 +4002,10 @@ def _select_cache_route_target(
     pool_name = route.pool_name or "code"
     pool_manager = request.app.get("pool_manager") or PoolManager(config)
     required_modalities = _required_input_modalities(body.get("messages"))
+    requires_tools = bool(body.get("tools"))
+    requires_image_tools = bool(
+        required_modalities and "image" in required_modalities and requires_tools
+    )
     requires_structured_output = _requires_structured_output(body, pool_name)
     excluded: set[tuple[str, str]] = set()
     while True:
@@ -4013,6 +4017,10 @@ def _select_cache_route_target(
                 estimate_prompt_tokens(body.get("messages"), body.get("tools"))
             ),
         }
+        if requires_tools:
+            select_kwargs["requires_tools"] = True
+        if requires_image_tools:
+            select_kwargs["requires_image_tools"] = True
         if requires_structured_output:
             select_kwargs["requires_structured_output"] = True
         allowed_providers = provider_patterns_for_request(request)
@@ -4967,6 +4975,11 @@ async def _call_with_pool_fallback(
     prompt_estimate = estimate_prompt_tokens(body.get("messages"), tools)
     required_input_modalities = _required_input_modalities(body.get("messages"))
     requires_tools = bool(tools)
+    requires_image_tools = bool(
+        required_input_modalities
+        and "image" in required_input_modalities
+        and requires_tools
+    )
     high_impact_tools = tools_include_high_impact(tools)
     pool_name = _pool_name(body)
     requires_structured_output = _requires_structured_output(body, pool_name)
@@ -5221,6 +5234,8 @@ async def _call_with_pool_fallback(
                 "required_input_modalities": required_input_modalities,
                 "context_tokens": required_context_tokens(prompt_estimate),
             }
+            if requires_image_tools:
+                select_kwargs["requires_image_tools"] = True
             if payload_ceiling_of is not None and payload_bytes > 0:
                 # Only meaningful with a breaker to consult; without one the
                 # filter has no evidence source and the args stay inert.
@@ -5262,13 +5277,12 @@ async def _call_with_pool_fallback(
             if (
                 not recovery_probe
                 and attempts < max_attempts
-                and not _is_capacity_failure(last_error)
             ):
                 # A prior request can quarantine every currently ranked
-                # candidate. Probe the same configured fallback chain once,
-                # ignoring only individual transient cooldowns. Shared/global
-                # capacity quarantines, policy, modalities, and known lack of
-                # tool support remain enforced by PoolManager.select().
+                # candidate, including after a capacity rejection. Probe the
+                # same configured fallback chain once; PoolManager still
+                # enforces policy, modalities, and known tool support during
+                # this pass.
                 recovery_probe = True
                 pool_index = 0
                 active_pool = pool_names[pool_index]
@@ -6797,12 +6811,18 @@ def _route_target(config: dict[str, Any], body: dict[str, Any]) -> tuple[str, st
             pool_name = "swarm"
         else:
             pool_name = route.pool_name or "code"
-        selected = PoolManager(config).select(
-            pool_name,
-            required_input_modalities=_required_input_modalities(body.get("messages")),
-            requires_structured_output=_requires_structured_output(body, pool_name),
-            high_impact_tools=tools_include_high_impact(body.get("tools")),
-        )
+        required_modalities = _required_input_modalities(body.get("messages"))
+        requires_tools = bool(body.get("tools"))
+        select_kwargs: dict[str, Any] = {
+            "required_input_modalities": required_modalities,
+            "requires_structured_output": _requires_structured_output(body, pool_name),
+            "high_impact_tools": tools_include_high_impact(body.get("tools")),
+        }
+        if requires_tools:
+            select_kwargs["requires_tools"] = True
+        if required_modalities and "image" in required_modalities and requires_tools:
+            select_kwargs["requires_image_tools"] = True
+        selected = PoolManager(config).select(pool_name, **select_kwargs)
         if not selected:
             raise NoHealthyModelsError(pool=pool_name)
         return selected

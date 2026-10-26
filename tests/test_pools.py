@@ -9,9 +9,9 @@ import pytest
 
 from tusker_gateway.config import PoolConfig, _load_pools, load_config
 from tusker_gateway.cooldown import CooldownTracker, _cooldown_seconds_for_429
-from tusker_gateway.model_capability import STRUCTURED_OUTPUT_PROBE_VERSION
 from tusker_gateway.pools import ModelSpec, PoolManager, is_general_chat_model
 from tusker_gateway.quality import QualityDB
+from tusker_gateway.tool_capability import ToolCapabilityLevel
 
 
 def test_default_code_pool_includes_current_provider_routes(monkeypatch):
@@ -386,6 +386,98 @@ def test_verified_modality_evidence_controls_pool_selection():
             "groq",
             "vision-candidate",
         )
+
+def test_image_tools_selection_requires_composite_probe(tmp_path):
+    manager = PoolManager(
+        {
+            "pools": {
+                "privacy": PoolConfig(
+                    name="privacy",
+                    zdr=True,
+                    require_tool_qualification=True,
+                    models=[
+                        {"provider": "synthetic", "model": "vision-tools-bad", "input_modalities": ["text", "image"]},
+                        {"provider": "synthetic", "model": "vision-tools-good", "input_modalities": ["text", "image"]},
+                    ],
+                ),
+            },
+            "quality_db_path": str(tmp_path / "quality.db"),
+            "model_capability_db_path": str(tmp_path / "model-capability.db"),
+            "excluded_providers": [],
+            "provider_api_keys": {"synthetic": "test"},
+        }
+    )
+    for provider, model in (
+        ("synthetic", "vision-tools-bad"),
+        ("synthetic", "vision-tools-good"),
+    ):
+        manager._tool_capabilities.record(
+            provider=provider,
+            model=model,
+            level=ToolCapabilityLevel.STRICT_STRUCTURED_STREAM,
+            status="passed",
+            http_status=200,
+            tool_call_count=1,
+            structured_stream=True,
+            arguments_valid=True,
+            arguments_match=True,
+            finish_reason="tool_calls",
+        )
+    manager._model_capability_db.record(
+        provider="synthetic",
+        model="vision-tools-bad",
+        capability="input_image_tools",
+        status="unsupported",
+        source="composite_probe",
+        probe_version="image-tool-contract-v1",
+    )
+    manager._model_capability_db.record(
+        provider="synthetic",
+        model="vision-tools-good",
+        capability="input_image_tools",
+        status="passed",
+        source="composite_probe",
+        probe_version="image-tool-contract-v1",
+    )
+
+    assert manager.select(
+        "privacy",
+        required_input_modalities={"image"},
+        requires_tools=True,
+        requires_image_tools=True,
+    ) == ("synthetic", "vision-tools-good")
+
+
+def test_text_tools_selection_does_not_require_composite_probe(tmp_path):
+    manager = PoolManager(
+        {
+            "pools": {
+                "privacy": PoolConfig(
+                    name="privacy",
+                    zdr=True,
+                    require_tool_qualification=True,
+                    models=[{"provider": "synthetic", "model": "text-tools"}],
+                ),
+            },
+            "quality_db_path": str(tmp_path / "quality.db"),
+            "tool_capability_db_path": str(tmp_path / "capability.db"),
+            "excluded_providers": [],
+            "provider_api_keys": {"synthetic": "test"},
+        }
+    )
+    manager._tool_capabilities.record(
+        provider="synthetic",
+        model="text-tools",
+        level=ToolCapabilityLevel.STRICT_STRUCTURED_STREAM,
+        status="passed",
+        http_status=200,
+        tool_call_count=1,
+        structured_stream=True,
+        arguments_valid=True,
+        arguments_match=True,
+        finish_reason="tool_calls",
+    )
+    assert manager.select("privacy", requires_tools=True) == ("synthetic", "text-tools")
 
 
 def test_privacy_structured_output_gate_prefers_passes_and_excludes_rejections(tmp_path):

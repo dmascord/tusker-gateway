@@ -110,8 +110,17 @@ For each request to `hermes-code`/`hermes-privacy`/etc:
    - Required input modalities (for example, image requests skip known text-only models)
    - Behavioral tool qualification for the privacy pool (a passing current
      streaming tool contract is required even for ordinary chat)
+   - Composite image-plus-tool qualification when an image-bearing request
+     also supplies tools (see below)
    - ZDR + EXCLUDED_PROVIDERS env var (privacy pool only)
    - Operator model blacklist (`TUSKER_BLACKLISTED_MODELS`)
+
+For an image-bearing request that also supplies tools, selection requires the
+model's latest `input_image_tools` capability record to be `passed` with probe
+version `image-tool-contract-v1`. Image-only and text-tool qualification are
+not combined implicitly: a route that passes only one half is excluded before
+the upstream call. The same requirement is applied on ordinary selection,
+fallback attempts, recovery probes, and session-sticky re-selection.
 3. **Rank by quality score** (descending) from `model_quality.db`. New models
    use an adaptive floor (median - 20.0 clamped to 20.0). Models with an LLM
    Stats rank receive an additional score bonus (see

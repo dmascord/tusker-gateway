@@ -45,6 +45,10 @@ from tusker_gateway.tool_capability import (
 logger = logging.getLogger(__name__)
 
 
+COMPOSITE_IMAGE_TOOLS_CAPABILITY = "input_image_tools"
+COMPOSITE_IMAGE_TOOLS_PROBE_VERSION = "image-tool-contract-v1"
+
+
 def _normalise_input_modality(value: Any) -> str:
     """Normalize configured modality names to the catalog/DB spelling."""
     return str(value).strip().lower().replace("-", "_")
@@ -1108,6 +1112,7 @@ class PoolManager:
         excluded: set[tuple[str, str]] | None = None,
         required_input_modalities: set[str] | frozenset[str] | None = None,
         requires_tools: bool = False,
+        requires_image_tools: bool = False,
         high_impact_tools: bool = False,
         requires_structured_output: bool = False,
         allow_cooldown_probe: bool = False,
@@ -1136,6 +1141,11 @@ class PoolManager:
         ``requires_tools`` applies the same rule to catalog-advertised tool
         support. Models that explicitly lack tools are excluded; models with
         unknown capability metadata remain eligible for compatibility.
+
+        ``requires_image_tools`` requires a recent passing composite probe when
+        an image-bearing request also supplies tools. Unknown and unavailable
+        evidence is excluded because image-only and tool-only support do not
+        prove the combined request contract.
 
         ``requires_structured_output`` applies the Hindsight JSON contract.
         Recent failed structured probes are excluded, while a recent passing
@@ -1256,6 +1266,21 @@ class PoolManager:
                 for record in self._tool_capabilities.records()
             }
 
+        # Image-plus-tool support is a separate contract from ordinary image
+        # input and ordinary tool calling. Read its latest probe once per
+        # selection so unsupported routes cannot be admitted by two partial
+        # successes.
+        composite_records = {
+            key: next(
+                (
+                    record for record in records
+                    if record.capability == COMPOSITE_IMAGE_TOOLS_CAPABILITY
+                ),
+                None,
+            )
+            for key, records in (model_capability_records or {}).items()
+        }
+
         # Resolve heavyweight gate from pool tier if not explicitly set.
         if heavyweight_ok is None:
             heavyweight_ok = self.pool_keeps_heavyweight(pool_name)
@@ -1320,6 +1345,15 @@ class PoolManager:
                         ):
                             self._drop_stickiness(key)
                             break
+                        if requires_image_tools and "image" in required_modalities:
+                            composite_record = composite_records.get((s.provider, s.model))
+                            if (
+                                composite_record is None
+                                or composite_record.status != "passed"
+                                or composite_record.probe_version != COMPOSITE_IMAGE_TOOLS_PROBE_VERSION
+                            ):
+                                self._drop_stickiness(key)
+                                break
                         if (
                             requires_structured_output
                             and self._structured_output_status(
@@ -1364,6 +1398,7 @@ class PoolManager:
         filtered_tool_capability_models: list[str] = []
         filtered_structured_models: list[str] = []
         filtered_modality_models: list[str] = []
+        filtered_composite_models: list[str] = []
         filtered_cooldown_models: list[str] = []
         filtered_rank_models: list[str] = []
         filter_counts = {
@@ -1379,6 +1414,7 @@ class PoolManager:
             "advertised_tools": 0,
             "behavioral_tools": 0,
             "structured_output": 0,
+            "image_tools": 0,
             "cooldown": 0,
             "zdr_policy": 0,
             "llm_stats_rank": 0,
@@ -1450,6 +1486,16 @@ class PoolManager:
                 filter_counts["input_modalities"] += 1
                 filtered_modality_models.append(f"{s.provider}/{s.model}")
                 continue
+            if requires_image_tools and "image" in required_modalities:
+                composite_record = composite_records.get((s.provider, s.model))
+                if (
+                    composite_record is None
+                    or composite_record.status != "passed"
+                    or composite_record.probe_version != COMPOSITE_IMAGE_TOOLS_PROBE_VERSION
+                ):
+                    filter_counts["image_tools"] += 1
+                    filtered_composite_models.append(f"{s.provider}/{s.model}")
+                    continue
             if requires_tools and tool_support is False and not (
                 allow_tool_compatibility_fallback and not s.auto_discovered
             ):
@@ -1553,6 +1599,13 @@ class PoolManager:
                 "+".join(sorted(required_modalities)),
                 len(filtered_modality_models),
                 ",".join(filtered_modality_models[:12]),
+            )
+        if requires_image_tools and filtered_composite_models:
+            logger.info(
+                "pool '%s' composite capability filter input_image_tools filtered=%d models=%s",
+                pool_name,
+                len(filtered_composite_models),
+                ",".join(filtered_composite_models[:12]),
             )
 
         if filtered_rank_models:
