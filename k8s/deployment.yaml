@@ -545,6 +545,18 @@ spec:
           value: '600'
         - name: TUSKER_MODALITY_QUALIFICATION_INTERVAL_SECS
           value: '43200'
+        # Composite image-plus-tool evidence is refreshed separately from ordinary
+        # tool and modality probes; routes are admitted only after both pass.
+        - name: TUSKER_COMPOSITE_QUALIFICATION_ENABLED
+          value: 'true'
+        - name: TUSKER_COMPOSITE_QUALIFICATION_LIMIT
+          value: '8'
+        - name: TUSKER_COMPOSITE_QUALIFICATION_TIMEOUT_SECS
+          value: '45'
+        - name: TUSKER_COMPOSITE_QUALIFICATION_MAX_AGE_SECS
+          value: '86400'
+        - name: TUSKER_COMPOSITE_QUALIFICATION_INTERVAL_SECS
+          value: '43200'
         # Media routes are qualified out of band; no cold probe is added to requests.
         - name: TUSKER_MEDIA_QUALIFICATION_ENABLED
           value: 'true'

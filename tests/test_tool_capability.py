@@ -322,6 +322,45 @@ def test_opencode_probe_sends_isolated_session_header():
     assert session.headers is not None
     assert session.headers["X-Opencode-Session"].startswith("probe-")
 
+def test_composite_runner_refreshes_stale_or_unavailable_records(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from tusker_gateway.model_capability import ModelCapabilityDB
+    from tusker_gateway.tool_qualification import run_image_tool_qualification
+
+    db = ModelCapabilityDB(str(tmp_path / "model-capability.db"))
+    db.record(
+        provider="ollama-cloud", model="fresh", capability=COMPOSITE_CAPABILITY,
+        status="passed", source="composite_probe",
+        probe_version=COMPOSITE_CAPABILITY_PROBE_VERSION,
+    )
+    db.record(
+        provider="ollama-cloud", model="unavailable", capability=COMPOSITE_CAPABILITY,
+        status="unavailable", source="composite_probe",
+        probe_version=COMPOSITE_CAPABILITY_PROBE_VERSION,
+    )
+    config = {
+        "quality_db_path": str(tmp_path / "quality.db"),
+        "model_capability_db_path": str(tmp_path / "model-capability.db"),
+        "pools": {},
+    }
+    monkeypatch.setattr("tusker_gateway.tool_qualification.load_config", lambda: config)
+    monkeypatch.setenv("API_KEYS", "test-key")
+    # The direct runner is exercised through its explicit-pair path; the
+    # freshness predicate is checked by replacing the network probe.
+    async def fake_probe(*args, **kwargs):
+        return {"provider": kwargs["provider"], "model": kwargs["model"], "status": "passed"}
+    monkeypatch.setattr("tusker_gateway.tool_qualification.probe_image_tool_model", fake_probe)
+
+    async def run():
+        return await run_image_tool_qualification(
+            base_url="http://gateway.test", model_pairs={
+                ("ollama-cloud", "fresh"), ("ollama-cloud", "unavailable")
+            }, max_age_secs=86_400.0,
+        )
+
+    results = asyncio.run(run())
+    assert [item["model"] for item in results] == ["unavailable"]
+
 
 def test_non_opencode_probe_omits_session_header():
     session = _ProbeSession()

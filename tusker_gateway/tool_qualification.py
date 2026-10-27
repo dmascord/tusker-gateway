@@ -765,8 +765,11 @@ async def run_image_tool_qualification(
     timeout_secs: float = 45.0,
     limit: int | None = None,
     model_pairs: set[tuple[str, str]] | None = None,
+    pool_names: tuple[str, ...] | None = None,
+    credential_rotators: dict[str, Any] | None = None,
+    max_age_secs: float | None = None,
 ) -> list[dict[str, Any]]:
-    """Run explicit composite probes and persist generic capability evidence."""
+    """Run explicit or catalog-selected composite probes and persist evidence."""
     config = load_config()
     api_key = os.environ.get("API_KEYS", "").split(",", 1)[0].strip()
     if not api_key:
@@ -775,18 +778,44 @@ async def run_image_tool_qualification(
     capability_db = ModelCapabilityDB(
         config.get("model_capability_db_path") or default_model_capability_db_path(quality_path)
     )
-    pairs = sorted(
-        {
-            (str(provider).strip(), str(model).strip())
-            for provider, model in (model_pairs or set())
-            if str(provider).strip() and str(model).strip()
-        }
-    )
-    if limit is not None:
-        pairs = pairs[: max(0, limit)]
     semaphore = asyncio.Semaphore(max(1, max_concurrency))
     timeout = aiohttp.ClientTimeout(total=timeout_secs, sock_read=timeout_secs)
     async with aiohttp.ClientSession(timeout=timeout) as session:
+        if model_pairs is None:
+            manager = PoolManager(config)
+            registry = _catalog_registry(
+                config, http_client=session, credential_rotators=credential_rotators
+            )
+            await registry.refresh_all(session)
+            manager.catalog_registry = registry
+            manager.extend_pools_with_auto_catalog()
+            selected_pools = pool_names or tuple(manager.models)
+            model_pairs = {
+                (spec.provider, spec.model)
+                for pool_name in selected_pools
+                for spec in manager.models.get(pool_name, ())
+                if is_general_chat_model(spec.provider, spec.model) and not spec.heavyweight
+            }
+        pairs = sorted(
+            {
+                (str(provider).strip(), str(model).strip())
+                for provider, model in model_pairs
+                if str(provider).strip() and str(model).strip()
+            }
+        )
+        if max_age_secs is not None:
+            now = time.time()
+            pairs = [
+                pair for pair in pairs
+                if (
+                    (record := capability_db.get(*pair, COMPOSITE_CAPABILITY)) is None
+                    or record.probe_version != COMPOSITE_CAPABILITY_PROBE_VERSION
+                    or now - record.checked_at >= max_age_secs
+                    or record.status == "unavailable"
+                )
+            ]
+        if limit is not None:
+            pairs = pairs[: max(0, limit)]
         async def one(pair: tuple[str, str]) -> dict[str, Any]:
             async with semaphore:
                 result = await probe_image_tool_model(

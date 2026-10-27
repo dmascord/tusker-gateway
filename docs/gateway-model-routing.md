@@ -436,6 +436,15 @@ them only for explicitly selected providers/models because generation requests
 can incur cost or create asynchronous jobs. A passing probe is evidence for
 the tested contract only, not a blanket multimodal capability claim.
 
+When `TUSKER_COMPOSITE_QUALIFICATION_ENABLED=true`, the background maintenance
+loop refreshes a bounded batch of lightweight chat routes every
+`TUSKER_COMPOSITE_QUALIFICATION_INTERVAL_SECS` (default 12 hours). It only
+persists route-level evidence and never admits a route from image support or
+ordinary tool support alone. The batch size, timeout, and evidence age are
+controlled by `TUSKER_COMPOSITE_QUALIFICATION_LIMIT`,
+`TUSKER_COMPOSITE_QUALIFICATION_TIMEOUT_SECS`, and
+`TUSKER_COMPOSITE_QUALIFICATION_MAX_AGE_SECS`.
+
 
 The privacy pool applies the provider policy before catalog pricing. The
 default registry currently allows local `local-llm`, Ollama Cloud, OpenCode

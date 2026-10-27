@@ -11,9 +11,43 @@ from tusker_gateway.maintenance import (
     _modality_qualification_enabled,
     run_maintenance_cycle,
     run_modality_maintenance_cycle,
+    run_composite_maintenance_cycle,
 )
 
 
+def test_composite_qualification_settings_default_off(monkeypatch):
+    from tusker_gateway.maintenance import _composite_qualification_settings
+
+    monkeypatch.delenv("TUSKER_COMPOSITE_QUALIFICATION_ENABLED", raising=False)
+    enabled, limit, timeout, max_age, interval = _composite_qualification_settings()
+    assert enabled is False
+    assert limit == 8
+    assert timeout == 45.0
+    assert max_age == 86_400.0
+    assert interval == 43_200.0
+
+
+@pytest.mark.asyncio
+async def test_composite_cycle_refreshes_only_requested_batch(monkeypatch, tmp_path):
+
+
+    captured = {}
+
+    async def fake_run(**kwargs):
+        captured.update(kwargs)
+        return [{"status": "passed"}, {"status": "unavailable"}]
+
+    monkeypatch.setattr("tusker_gateway.maintenance.load_config", lambda: {
+        "quality_db_path": str(tmp_path / "quality.db"),
+        "pools": {"privacy": object()},
+    })
+    monkeypatch.setattr("tusker_gateway.tool_qualification.run_image_tool_qualification", fake_run)
+
+    summary = await run_composite_maintenance_cycle(pool_names=("privacy",), limit=2)
+
+    assert captured["pool_names"] == ("privacy",)
+    assert captured["max_age_secs"] == 86_400.0
+    assert summary == {"pools": "privacy", "tested": 2, "passed": 1, "failed": 1}
 def test_maintenance_pools_use_stable_order_and_include_custom_pools(monkeypatch):
     monkeypatch.delenv("TUSKER_QUALIFICATION_MAINTENANCE_POOLS", raising=False)
 
