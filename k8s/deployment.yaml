@@ -614,11 +614,17 @@ spec:
           value: '1'
         - name: TUSKER_MLX_MAC_MAX_CONCURRENT
           value: '1'
-        # Ollama Cloud enforces tier-based concurrency (Free=1, Pro=3, Max=10).
         # Default to Pro (3) to avoid 429 "too many concurrent requests" while
         # still allowing reasonable parallelism.
         - name: TUSKER_OLLAMA_CLOUD_MAX_CONCURRENT
           value: '3'
+        # How long a locally-saturated capacity group is quarantined when
+        # admission is rejected. At 2s a burst re-tested every couple of
+        # seconds and repeatedly produced whole-pool "no eligible candidates"
+        # failures (2026-10-27); 15s lets the in-flight requests drain and
+        # pushes fallback to other providers for that window.
+        - name: TUSKER_PROVIDER_CAPACITY_BUSY_COOLDOWN_SECS
+          value: '15'
         # Synthetic (HF inference) has no documented concurrency limit; use a
         # conservative default to avoid hammering the upstream.
         - name: TUSKER_SYNTHETIC_MAX_CONCURRENT
