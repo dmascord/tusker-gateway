@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import time
+import weakref
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable
 
@@ -363,19 +364,41 @@ def _stream_error_from_frame(
         )
     else:
         raw_lower = payload.lower()
-        # Do not interpret ordinary assistant content as an error. The hint
-        # fallback is only used for payloads without a normal choices array.
-        if isinstance(parsed.get("choices"), list) or not any(
-            hint.encode() in raw_lower for hint in _STREAM_ERROR_HINTS
-        ):
+        # Ordinary assistant content is never an error. Everything below is
+        # only reached for payloads without a normal choices array.
+        if isinstance(parsed.get("choices"), list):
             return None
-        message = (
-            parsed.get("message")
-            or parsed.get("detail")
-            or payload.decode("utf-8", errors="replace")
+        # A FastAPI-style proxy can report the failure at the TOP level
+        # instead of nesting it under an ``error`` key:
+        #   {"statusCode": 429, "message": "Token limit is exceeded. ..."}
+        # That shape carries no hint word from ``_STREAM_ERROR_HINTS``, so an
+        # unhandled variant treats the envelope as ordinary content: the
+        # committed 200 stream never fails over, no cooldown is recorded for
+        # the route, and the raw body is relayed to the client (2026-10-21,
+        # req_50a994b481aa7fe3). Classify any 4xx/5xx top-level status as an
+        # error envelope so the 429 becomes a RateLimitError downstream and
+        # the stated retry window feeds the cooldown parser.
+        top_status = _stream_status(parsed.get("statusCode")) or _stream_status(
+            parsed.get("status")
         )
-        code = parsed.get("code")
-        status = _stream_status(parsed.get("status")) or _stream_status(code)
+        if top_status is not None and top_status >= 400:
+            message = (
+                parsed.get("message")
+                or parsed.get("detail")
+                or payload.decode("utf-8", errors="replace")
+            )
+            code = parsed.get("code")
+            status = top_status
+        else:
+            if not any(hint.encode() in raw_lower for hint in _STREAM_ERROR_HINTS):
+                return None
+            message = (
+                parsed.get("message")
+                or parsed.get("detail")
+                or payload.decode("utf-8", errors="replace")
+            )
+            code = parsed.get("code")
+            status = _stream_status(parsed.get("status")) or _stream_status(code)
 
     if not error_present and not message:
         return None
@@ -726,6 +749,24 @@ def _stream_total_budget(
     (e.g. xiaomi/mimo large contexts) to extend beyond the default.
     """
     return _upstream_idle_secs(provider)
+
+
+def _non_stream_total_secs(provider: str | None, model: str | None = None) -> float:
+    """Return the wall-clock budget for one non-streaming upstream call.
+
+    Non-streaming routes get no per-chunk reset, so their ``total`` timeout is
+    the whole-completion deadline and MUST come from the route's configured
+    attempt budget. A flat value is the same trap the idle timers avoid: it
+    pre-empts a larger configured budget, so the operator-visible attempt
+    timeout never applies. Production evidence (2026-10-21): non-stream
+    ``local-llm/qwen3-vl:8b`` died at 120.4s despite the 240s budget in
+    ``TUSKER_PROVIDER_ATTEMPT_TIMEOUT_OVERRIDES_JSON``.
+    """
+    seconds = _UPSTREAM_STREAM_SOCK_READ_SECS
+    attempt = _attempt_idle_secs(provider, model)
+    if attempt is not None:
+        seconds = max(seconds, attempt)
+    return seconds
 
 
 # Build per-provider endpoints dict from the normalized registry in config.py
@@ -1909,27 +1950,97 @@ async def _stream_with_model_alias(
         if buffer:
             yield buffer
     finally:
-        await wrapped.aclose()
+        await _close_wrapped_stream(wrapped)
 
 
-async def _lease_released_stream(
+async def _close_wrapped_stream(wrapped: AsyncIterator[bytes]) -> None:
+    """Close a wrapped stream, tolerating objects without ``aclose``."""
+    close = getattr(wrapped, "aclose", None)
+    if close is not None:
+        try:
+            await close()
+        except Exception:
+            logger.debug("failed to close wrapped provider stream", exc_info=True)
+
+
+class _LeaseGuardedStream:
+    """Async iterator that releases a capacity lease on every close path."""
+
+    def __init__(
+        self,
+        wrapped: AsyncIterator[bytes],
+        lease: "CapacityLease | None",
+    ) -> None:
+        self._wrapped = wrapped
+        self._lease = lease
+        self._finalizer = _arm_lease_finalizer(lease, self)
+
+    def __aiter__(self) -> "_LeaseGuardedStream":
+        return self
+
+    async def __anext__(self) -> bytes:
+        try:
+            return await self._wrapped.__anext__()
+        except StopAsyncIteration:
+            self._release()
+            raise
+        except BaseException:
+            self._release()
+            raise
+
+    async def aclose(self) -> None:
+        self._release()
+        await _close_wrapped_stream(self._wrapped)
+
+    def _release(self) -> None:
+        self._finalizer.detach()
+        if self._lease is not None:
+            self._lease.release()
+
+
+def _lease_released_stream(
     wrapped: AsyncIterator[bytes],
     lease: "CapacityLease | None",
 ) -> AsyncIterator[bytes]:
-    """Yield a provider stream and release its capacity lease when it ends.
+    """Return a provider stream that releases its capacity lease when it ends.
 
     Process-backed providers hold a CLI child process for the whole stream, so
     the in-flight slot must survive until the last frame is delivered or the
-    consumer closes the stream - releasing it when the generator is merely
-    created would leave the memory bound unenforced.
+    consumer closes the stream. The guard also releases immediately when an
+    unstarted stream is explicitly closed; its finalizer covers a stream that
+    is simply discarded.
     """
+    return _LeaseGuardedStream(wrapped, lease)
+
+
+def _arm_lease_finalizer(
+    lease: "CapacityLease | None",
+    generator: AsyncIterator[bytes],
+) -> "weakref.finalize | _NullFinalizer":
+    """Arm a GC fallback that releases ``lease`` if ``generator`` is dropped."""
+    if lease is None:
+        return _NullFinalizer()
     try:
-        async for chunk in wrapped:
-            yield chunk
-    finally:
-        if lease is not None:
-            lease.release()
-        await wrapped.aclose()
+        return weakref.finalize(generator, lease.release)
+    except TypeError:
+        # Not weak-referenceable; the iterator's explicit close is the only
+        # path available beyond its own provider cleanup.
+        return _NullFinalizer()
+
+
+class _NullFinalizer:
+    """No-op stand-in used when there is no lease to guard."""
+
+    def detach(self) -> bool:
+        return False
+
+
+def _guard_stream_lease(
+    stream: AsyncIterator[bytes],
+    lease: "CapacityLease | None",
+) -> AsyncIterator[bytes]:
+    """Wrap a stream so explicit close releases its capacity lease eagerly."""
+    return _LeaseGuardedStream(stream, lease)
 
 
 class PassthroughClient:
@@ -2465,6 +2576,7 @@ class PassthroughClient:
                 started=start,
                 chunk_budget_secs=_stream_total_budget(provider=provider),
             )
+            stream_iter = _guard_stream_lease(stream_iter, capacity_lease)
             if upstream_model != model:
                 return _stream_with_model_alias(upstream_model, model, stream_iter)
             return stream_iter
@@ -2474,7 +2586,15 @@ class PassthroughClient:
                 url,
                 headers=headers,
                 json=body,
-                timeout=aiohttp.ClientTimeout(total=120),
+                # Non-streaming routes wait for the whole completion, so the
+                # wall-clock total is the only upstream timeout. It must come
+                # from the route's configured attempt budget: a flat 120s
+                # pre-empted the 240s budget local-llm/mlx-mac carry for cold
+                # model loads (2026-10-21, local-llm/qwen3-vl:8b died at
+                # 120.4s while the same request took ~1s warm upstream).
+                timeout=aiohttp.ClientTimeout(
+                    total=_non_stream_total_secs(provider, model)
+                ),
             ) as resp:
                 await self._check_response(
                     resp,
@@ -2962,7 +3082,16 @@ class PassthroughClient:
                 headers["Copilot-Vision-Request"] = "true"
             start = time.monotonic()
             resp = await self._http.request(
-                "POST", url, headers=headers, json=body, timeout=aiohttp.ClientTimeout(total=120)
+                "POST",
+                url,
+                headers=headers,
+                json=body,
+                # Same rule as the non-stream chat path: the wall-clock total
+                # derives from the configured attempt budget rather than a
+                # flat 120s that pre-empts local cold loads.
+                timeout=aiohttp.ClientTimeout(
+                    total=_non_stream_total_secs(provider, model)
+                ),
             )
             try:
                 await self._check_response(

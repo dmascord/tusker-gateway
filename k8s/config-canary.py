@@ -83,6 +83,7 @@ SPEND_GUARD_ENV = (
     # Input-modality probes: one upstream round trip per candidate model,
     # rotating through the code/premium/swarm pools.
     ("TUSKER_MODALITY_QUALIFICATION_ENABLED", "false"),
+    ("TUSKER_COMPOSITE_QUALIFICATION_ENABLED", "false"),
     # Generates media against image/video providers.
     ("TUSKER_MEDIA_QUALIFICATION_ENABLED", "false"),
 )

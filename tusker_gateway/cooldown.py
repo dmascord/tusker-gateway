@@ -59,6 +59,24 @@ _QUOTA_HINTS = (
 # Error codes whose presence signals a quota/session-limit even without body evidence.
 # Matches as a substring so adding new quota-ish codes (e.g. X_quota) works automatically.
 _QUOTA_CODE_MARKERS = ("quota", "rate_limited")
+# Hint phrases that mark a 429 body as "short stated cooldown is wrong;
+# the real window is much longer". A per-minute TPM/RPM ledger that
+# replies "Try again in 8 seconds." looks like a transient blip but the
+# actual reset happens at the next minute boundary (or further). When
+# the body matches any of these, the per-second floor in
+# ``_cooldown_seconds_for_429`` is raised to 60s so the breaker at
+# least waits until the next whole-minute boundary.
+_SHORT_COOLDOWN_FLOOR_HINTS = (
+    "token limit",
+    "tokens per minute",
+    "tokens_per_minute",
+    "tpm",
+    "rpm",
+    "requests per minute",
+    "requests_per_minute",
+    "rate limit",
+    "too many requests",
+)
 
 
 def is_account_quota_exhausted(body: str | None) -> bool:
@@ -493,12 +511,30 @@ def _cooldown_seconds_for_429(exc: dict[str, Any]) -> float:
         body_for_hints,
     )
     if m:
-        n, unit = float(m.group(1)), m.group(2)
-        if unit.startswith("second"): return n
-        if unit.startswith("minute"): return n * 60.0
-        if unit.startswith("hour"): return n * 3600.0
-        if unit.startswith("day"): return n * 86400.0
-        if unit.startswith("week"): return n * 7 * 86400.0
+        n = float(m.group(1))
+        unit = m.group(2)
+        if unit.startswith("second"): n *= 1.0
+        elif unit.startswith("minute"): n *= 60.0
+        elif unit.startswith("hour"): n *= 3600.0
+        elif unit.startswith("day"): n *= 86400.0
+        elif unit.startswith("week"): n *= 7 * 86400.0
+        else: n = 0.0
+        # Quota / TPM-flavoured phrasing ("Token limit is exceeded. Try
+        # again in 8 seconds.") is a near-term hint with a longer actual
+        # reset window. Backing off for the stated N seconds hammers the
+        # upstream on the next request inside the same minute. Floor at
+        # 60s for in-minute windows so the breaker at least waits until
+        # the next whole-minute boundary; the floor also applies to
+        # token/RPM/requests-per phrasing for the same reason.
+        if n < 60.0 and any(
+            _hint_in_body(hint, body_for_hints) for hint in _SHORT_COOLDOWN_FLOOR_HINTS
+        ):
+            logger.info(
+                "429 cooldown: floor 60.0s for hinted short cooldown body=%r",
+                body_for_hints[:120],
+            )
+            return 60.0
+        return max(0.0, n)
     # Quota / usage-limit exhaustion is a long-lived state (the window won't
     # reset for hours or days), not a transient rate-limit blip. Backing off
     # for only 60s would hammer the upstream with pointless probes until the

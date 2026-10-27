@@ -279,6 +279,52 @@ async def test_responses_streaming_does_not_return_non_stream_json(client):
 
 
 @pytest.mark.asyncio
+async def test_responses_stream_restores_sealed_model_output(app, client):
+    """Responses SSE must not expose gateway redaction tokens to OMP."""
+    from tusker_gateway.redaction import RedactionRuleSet, Tokenizer
+
+    tokenizer = Tokenizer(
+        key=bytes.fromhex("ab" * 32),
+        rules=RedactionRuleSet(),
+    )
+    email = "model-generated" + chr(64) + "example.test"
+    token = tokenizer.tokenize_text(email)
+    app["redaction_tokenizer"] = tokenizer
+
+    async def upstream():
+        yield (
+            "data: "
+            + json.dumps(
+                {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": "Contact " + token},
+                            "finish_reason": None,
+                        }
+                    ]
+                }
+            )
+            + "\n\n"
+        ).encode()
+        yield b"data: [DONE]\n\n"
+
+    with patch("tusker_gateway.endpoints.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
+        mock_chat.return_value = upstream()
+        resp = await client.post(
+            "/v1/responses",
+            json={"model": "openai::gpt-4o", "input": "hello", "stream": True},
+            headers=HEADERS_AUTH,
+        )
+        body = await resp.read()
+
+    assert resp.status == 200
+    assert email.encode() in body
+    assert token.encode() not in body
+
+
+
+@pytest.mark.asyncio
 async def test_responses_stream_starts_before_provider_dispatch_finishes(client):
     started = asyncio.Event()
     release = asyncio.Event()

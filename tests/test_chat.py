@@ -12,8 +12,11 @@ import pytest
 from tusker_gateway.budget import BudgetDecision
 import tusker_gateway.sse
 from tusker_gateway.errors import (
+    BadRequestError,
     HighImpactApprovalRequiredError,
     InvalidToolCallArgumentsError,
+    NoHealthyModelsError,
+    ProviderCapacityError,
     ProviderEmptyStreamError,
     ProviderError,
     ProviderRouteDisabledError,
@@ -119,6 +122,46 @@ def test_public_stream_error_suppresses_raw_provider_json_body():
     assert code == "provider_error"
 
 
+def test_public_stream_error_explains_empty_pool_as_availability_not_provider_failure():
+    """An empty pool is a gateway availability answer, not an upstream error.
+
+    Regression for 2026-10-27: ``NoHealthyModelsError`` was raised after the
+    SSE 200 was committed, the handler wrote an OpenAI ``error`` object, and
+    OMP replaced the message with
+    ``Provider returned an in-band OpenAI completions stream error``
+    (rid req_b673132700f2562e).
+    """
+    exc = NoHealthyModelsError(pool="privacy")
+
+    message, code = _public_stream_error(
+        exc,
+        request_id="req_b673132700f2562e",
+        provider="",
+        model="hermes-privacy",
+    )
+
+    assert code == "no_healthy_models"
+    assert "'privacy'" in message
+    assert "no eligible model" in message
+    assert "req_b673132700f2562e" in message
+    assert "Upstream provider error" not in message
+
+
+def test_public_stream_error_keeps_gateway_rejection_wording():
+    """A post-commit gateway 400 must not be relabelled as upstream failure."""
+    message, code = _public_stream_error(
+        BadRequestError("Unsupported parameter combination", code="invalid_request"),
+        request_id="req-gateway-400",
+        provider="openrouter",
+        model="model-a",
+    )
+
+    assert code == "invalid_request"
+    assert message.startswith("Unsupported parameter combination")
+    assert "req-gateway-400" in message
+    assert "Upstream provider error" not in message
+
+
 def test_public_stream_error_explains_empty_provider_response():
     exc = ProviderEmptyStreamError(provider="provider-a", model="model-a")
     message, code = _public_stream_error(
@@ -133,6 +176,80 @@ def test_public_stream_error_explains_empty_provider_response():
     assert "req-empty-1" in message
     assert "Retry" in message
 
+
+def test_public_stream_error_suppresses_xai_grok_json_envelope_on_message():
+    """Non-OpenAI JSON envelopes on the message path must not reach clients.
+
+    Incident req_50a994b481aa7fe3 (2026-10-21): the client received
+    ``Upstream provider error: {"statusCode":429,"message":"Token limit
+    is exceeded. Try again in 8 seconds."}`` from a Grok response carried
+    on ``exc.message``. The existing ``"error" in text`` guard did not
+    match (no ``error`` key in the Grok envelope), so the JSON leaked.
+    """
+    body = (
+        '{ "statusCode": 429, "message": '
+        '"Token limit is exceeded. Try again in 8 seconds.", '
+        '"error": "Too Many Requests", "code": "token_limit_exceeded" }'
+    )
+    exc = ProviderError(message=body)
+
+    message, code = _public_stream_error(
+        exc,
+        request_id="req_50a994b481aa7fe3",
+        provider="xai-grok",
+        model="grok-3-mini",
+    )
+
+    assert "statusCode" not in message
+    assert "Token limit" not in message
+    assert body not in message
+    assert "req_50a994b481aa7fe3" in message
+    assert code == "provider_error"
+
+
+def test_public_stream_error_suppresses_non_openai_envelope_on_upstream_body():
+    """The same envelope shape on upstream_body must also be suppressed.
+
+    Some adapters place the provider JSON on ``upstream_body`` instead of
+    ``exc.message``. The hardened suppression needs to cover both paths.
+    """
+    body = (
+        '{ "statusCode": 429, "message": "Token limit is exceeded." }'
+    )
+    exc = ProviderError(message="upstream returned 429")
+    exc.upstream_body = body
+
+    message, code = _public_stream_error(
+        exc,
+        request_id="req_xai_body",
+        provider="xai-grok",
+        model="grok-3-mini",
+    )
+
+    assert body not in message
+    assert "statusCode" not in message
+    assert "Token limit" not in message
+    assert "req_xai_body" in message
+
+
+def test_public_stream_error_keeps_plain_text_messages():
+    """A plain upstream message (no JSON shape) is still relayed safely.
+
+    Guards against the new envelope detector mistaking normal provider
+    prose for a JSON envelope and swallowing operator-actionable
+    diagnostics.
+    """
+    exc = ProviderError(message="model overloaded, please retry")
+
+    message, _ = _public_stream_error(
+        exc,
+        request_id="req_plain",
+        provider="synthetic",
+        model="syn:large",
+    )
+
+    assert "model overloaded" in message
+    assert "req_plain" in message
 
 def test_approval_stream_message_is_actionable_for_omp_clients():
     exc = HighImpactApprovalRequiredError(
@@ -432,6 +549,86 @@ async def test_pool_fallback_recovery_probe_without_http_server():
             allow_cooldown_probe=True,
         ),
     ]
+
+@pytest.mark.asyncio
+async def test_pool_fallback_recovery_probe_after_capacity_failure():
+    """Capacity quarantine must not suppress the next configured candidate."""
+    pool_manager = MagicMock()
+    pool_manager.fallback_pools.return_value = ()
+    pool_manager.select.side_effect = [
+        ("mlx-mac", "busy-model"),
+        None,
+        ("ollama-cloud", "fallback-model"),
+    ]
+    upstream = MagicMock()
+    upstream.chat = AsyncMock(side_effect=[
+        ProviderCapacityError(group="mlx-mac"),
+        {"choices": [{"message": {"role": "assistant", "content": "ok"}}]},
+    ])
+
+    provider, model, result = await _call_with_pool_fallback(
+        {"pools": {}},
+        {
+            "model": "hermes-privacy",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+        upstream,
+        request=SimpleNamespace(app={"pool_manager": pool_manager}),
+    )
+
+    assert (provider, model) == ("ollama-cloud", "fallback-model")
+    assert result["choices"][0]["message"]["content"] == "ok"
+    assert pool_manager.select.call_args_list[2] == call(
+        "privacy",
+        excluded={("mlx-mac", "busy-model")},
+        required_input_modalities=None,
+        context_tokens=ANY,
+        allow_cooldown_probe=True,
+    )
+
+@pytest.mark.asyncio
+async def test_image_tools_capacity_failure_rotates_to_fallback(app):
+    """A capacity failure keeps image-plus-tools constraints during failover."""
+    pool_manager = MagicMock()
+    pool_manager.fallback_pools.return_value = ()
+    pool_manager.select.side_effect = [
+        ("apim", "gpt-5.6-luna"),
+        ("ollama-cloud", "glm-5.3-flash"),
+    ]
+    upstream = MagicMock()
+    upstream.chat = AsyncMock(side_effect=[
+        ProviderCapacityError(group="apim"),
+        {"choices": [{"message": {"role": "assistant", "content": "recovered"}}]},
+    ])
+    tools = [{"type": "function", "function": {"name": "read"}}]
+
+    provider, model, result = await _call_with_pool_fallback(
+        {"pools": {}},
+        {
+            "model": "hermes-privacy",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "inspect this"},
+                    {"type": "image_url", "image_url": {"url": "https://example.test/image.png"}},
+                ],
+            }],
+        },
+        upstream,
+        tools=tools,
+        request=SimpleNamespace(app={"pool_manager": pool_manager}),
+    )
+
+    assert (provider, model) == ("ollama-cloud", "glm-5.3-flash")
+    assert result["choices"][0]["message"]["content"] == "recovered"
+    assert pool_manager.select.call_args_list[1] == call(
+        "privacy",
+        excluded={("apim", "gpt-5.6-luna")},
+        required_input_modalities=frozenset({"image"}),
+        context_tokens=ANY,
+        requires_image_tools=True,
+        requires_tools=True,
+    )
 
 
 @pytest.mark.asyncio
@@ -1389,6 +1586,9 @@ async def test_terminal_provider_capacity_error_is_not_returned_to_client(app, c
     pool_manager = MagicMock()
     pool_manager.select.side_effect = [
         ("openrouter", "nvidia/saturated-model"),
+        # A capacity rejection still triggers one recovery probe pass
+        # (1056402), so the empty chain is consulted twice.
+        None,
         None,
     ]
     app["pool_manager"] = pool_manager
@@ -2206,6 +2406,76 @@ async def test_chat_preserves_provider_429_with_retry_after(client):
     assert "custom-upstream-quota-token" not in payload["error"]["message"]
 
 @pytest.mark.asyncio
+async def test_pool_internalizes_github_enterprise_429_before_client_response(app, client):
+    """Enterprise Copilot 429s must select another privacy candidate."""
+    pool_manager = MagicMock()
+    pool_manager.fallback_pools.return_value = ()
+    pool_manager.select.side_effect = [
+        ("github-copilot-enterprise", "gpt-5.6-luna"),
+        ("apim", "gpt-5.6-luna"),
+    ]
+    app["pool_manager"] = pool_manager
+    enterprise_429 = RateLimitError(
+        body='{"statusCode":429,"message":"enterprise quota exhausted"}',
+        headers={"Retry-After": "60"},
+    )
+    fallback_result = {
+        "choices": [{"message": {"role": "assistant", "content": "fallback"}}],
+    }
+
+    with patch(
+        "tusker_gateway.endpoints.PassthroughClient.chat",
+        new_callable=AsyncMock,
+        side_effect=[enterprise_429, fallback_result],
+    ) as mock_chat:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-privacy",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            headers=HEADERS_AUTH,
+        )
+
+    assert response.status == 200
+    payload = await response.json()
+    assert payload["choices"][0]["message"]["content"] == "fallback"
+    assert mock_chat.await_count == 2
+    assert pool_manager.select.call_args_list[1].kwargs["excluded"] == {
+        ("github-copilot-enterprise", "gpt-5.6-luna")
+    }
+
+@pytest.mark.asyncio
+async def test_exhausted_github_enterprise_429_returns_gateway_503(app, client):
+    """An exhausted Enterprise Copilot pool must not expose provider 429."""
+    pool_manager = MagicMock()
+    pool_manager.fallback_pools.return_value = ()
+    pool_manager.select.return_value = ("github-copilot-enterprise", "gpt-5.6-luna")
+    app["pool_manager"] = pool_manager
+
+    with patch(
+        "tusker_gateway.endpoints.PassthroughClient.chat",
+        new_callable=AsyncMock,
+        side_effect=RateLimitError(
+            body='{"statusCode":429,"message":"enterprise quota exhausted"}',
+            headers={"Retry-After": "60"},
+        ),
+    ):
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-privacy",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            headers=HEADERS_AUTH,
+        )
+
+    assert response.status == 503
+    payload = await response.json()
+    assert payload["error"]["code"] == "service_unavailable"
+    assert "rate_limit_exceeded" not in payload["error"]["message"]
+
+@pytest.mark.asyncio
 async def test_chat_completions_streaming(client):
     # Mock streaming response. The endpoint sends [DONE] itself on EOF, so
     # the upstream mock only yields content chunks here.
@@ -2341,6 +2611,60 @@ async def test_chat_stream_provider_setup_error_is_actionable_text_not_in_band_e
     assert b"Upstream provider error" in body
     assert b'"error"' not in body
     assert b"data: [DONE]" in body
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_no_healthy_models_is_assistant_text_not_in_band_error(
+    app, client,
+):
+    """An empty pool after SSE commit must reach OMP as text, not a banner.
+
+    Regression for 2026-10-27: the composite image+tools gate excluded every
+    curated route, ``NoHealthyModelsError`` was raised after the 200 was
+    committed, and the handler wrote an OpenAI ``error`` object. OMP renders
+    that as ``Provider returned an in-band OpenAI completions stream error``
+    and discards the message (rid req_b673132700f2562e,
+    req_b0c6dd248a83c24c, req_4e8e6044dfc1d4af).
+    """
+    pool_manager = MagicMock()
+    pool_manager.fallback_pools.return_value = ()
+    pool_manager.select.return_value = None
+    app["pool_manager"] = pool_manager
+
+    response = await client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "hermes-privacy",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": True,
+        },
+        headers=HEADERS_AUTH,
+    )
+    body = await response.read()
+
+    assert response.status == 200
+    events = [
+        json.loads(line[len(b"data: "):])
+        for line in body.splitlines()
+        if line.startswith(b"data: {")
+    ]
+    assert events
+    # No top-level error object: that is the frame OMP turns into a banner.
+    assert all("error" not in event for event in events)
+    text = "".join(
+        choice.get("delta", {}).get("content") or ""
+        for event in events
+        for choice in event.get("choices", [])
+    )
+    assert "'privacy'" in text
+    assert "no eligible model" in text
+    assert "Request ID:" in text
+    assert any(
+        choice.get("finish_reason") == "stop"
+        for event in events
+        for choice in event.get("choices", [])
+    )
+    assert body.rstrip().endswith(b"data: [DONE]")
 
 
 @pytest.mark.asyncio

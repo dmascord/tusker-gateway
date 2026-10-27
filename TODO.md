@@ -1,5 +1,11 @@
 # Project TODOs
 
+## Privacy image-plus-tools fallback hardening (2026-10-27)
+
+- Pool-selection exhaustion diagnostics now identify maintenance qualification scans separately from live request routing.
+- Added regression coverage proving an image-plus-tools capacity failure preserves both constraints while rotating to the next candidate.
+- Remaining operational review: confirm ZDR eligibility for excluded Ollama Cloud/Codex routes before changing privacy policy.
+
 ## Engineering review remediation (2026-10-16)
 
 ### Priority 0: restore a clean deterministic suite
@@ -962,6 +968,36 @@ legacy-database column upgrade). Full suite:
 → 1482 passed, 8 skipped. Throwaway proof of the rebuild path: an unchanged
 provider fingerprint preserves the handler instances, an endpoint edit rebuilds
 both, and the rebuilt embed handler reads the new provider config.
+
+## Codex refresh rotation + Grok/xAI 429 envelope leak (2026-10-21, closed)
+
+- **Defect.** `_public_stream_error` rendered the xAI/Grok body
+  ``{"statusCode": 429, "message": "Token limit is exceeded. Try again
+  in 8 seconds."}`` to the client verbatim because
+  `_client_safe_failure_detail` only suppressed JSON envelopes carrying
+  an ``"error"`` substring; xAI's shape has no such key. The 8-second
+  stated cooldown then re-probed inside the same TPM window.
+- **Operational.** `~/.hermes/auth.json` on visor was stale (only
+  damien.01, three duplicate rows) while the state DB held three
+  distinct accounts whose refresh tokens had all been revoked by
+  OpenAI. Operator action: re-enroll the three accounts via
+  `enroll_codex_credential.py`, then `migrate_config_to_db --update`.
+  Full checklist: `docs/incidents/2026-10-21-codex-rotation-and-grok-429-leak.md`.
+
+Source changes (`tusker_gateway/endpoints.py`,
+`tusker_gateway/cooldown.py`):
+
+- New helper `_looks_like_provider_json_envelope` runs on both
+  `upstream_body` and the message path inside `_client_safe_failure_detail`,
+  dropping any `{...}` envelope that contains at least one key-shaped
+  field.
+- `_cooldown_seconds_for_429` recognises TPM/RPM/`token limit` phrasing
+  via the new `_SHORT_COOLDOWN_FLOOR_HINTS` list and floors the
+  per-second cooldown at 60s; longer stated windows still win.
+- Two pre-existing tests in `test_reliability_hardening.py` that
+  pinned the buggy 8s cooldown are re-pinned to 60s; three new
+  tests cover the hardened behaviour in `test_chat.py` and
+  `test_cooldown.py`.
 
 Historical note: Gap C and Gap D are implemented. Capability enforcement
 remains disabled unless `TUSKER_MEDIA_CAPABILITY_GATE_ENABLED=true`.

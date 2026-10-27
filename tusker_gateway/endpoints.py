@@ -2081,6 +2081,18 @@ class _PreparedStream:
     def __aiter__(self) -> AsyncIterator[bytes]:
         return self.iterator
 
+    async def aclose(self) -> None:
+        """Propagate close to the wrapped iterator.
+
+        Candidate rejection paths (``_close_async_iterator``) look for
+        ``aclose``. Without this the wrapper silently swallows the close, so
+        a stream that was created but never iterated leaves its source
+        generator's ``finally`` block unrun — which leaks the provider
+        capacity lease and can strand a single-slot backend (mlx-mac) as
+        permanently busy for the life of the process.
+        """
+        await _close_async_iterator(self.iterator)
+
 
 async def _prepend_stream(
     prefix: list[bytes],
@@ -3990,6 +4002,10 @@ def _select_cache_route_target(
     pool_name = route.pool_name or "code"
     pool_manager = request.app.get("pool_manager") or PoolManager(config)
     required_modalities = _required_input_modalities(body.get("messages"))
+    requires_tools = bool(body.get("tools"))
+    requires_image_tools = bool(
+        required_modalities and "image" in required_modalities and requires_tools
+    )
     requires_structured_output = _requires_structured_output(body, pool_name)
     excluded: set[tuple[str, str]] = set()
     while True:
@@ -4001,6 +4017,10 @@ def _select_cache_route_target(
                 estimate_prompt_tokens(body.get("messages"), body.get("tools"))
             ),
         }
+        if requires_tools:
+            select_kwargs["requires_tools"] = True
+        if requires_image_tools:
+            select_kwargs["requires_image_tools"] = True
         if requires_structured_output:
             select_kwargs["requires_structured_output"] = True
         allowed_providers = provider_patterns_for_request(request)
@@ -4352,6 +4372,29 @@ def _pool_failure_summary(exc: BaseException) -> str:
 
 
 _RAW_JSON_BODY_RE = re.compile(r'^\s*[\{\[]')
+_RAW_JSON_OBJECT_RE = re.compile(r'^\s*\{[^{}]*"[^"]+"\s*:')
+_JSON_KEY_VALUE_LINE_RE = re.compile(r'\\?"[a-zA-Z0-9_]+\\?"\s*:')
+
+
+def _looks_like_provider_json_envelope(text: str) -> bool:
+    """Detect any provider-shaped JSON envelope, regardless of field names.
+
+    The existing suppression guarded only the OpenAI ``{"error": {...}}``
+    shape via ``"error" in text``. xAI/Grok and others emit
+    ``{"statusCode": ..., "message": ...}`` envelopes with no ``error`` key,
+    and those slipped through to the client as the rendered error string.
+    """
+    if not text:
+        return False
+    stripped = text.strip()
+    if not (stripped.startswith("{") and stripped.endswith("}")):
+        return False
+    if not _RAW_JSON_OBJECT_RE.match(stripped):
+        return False
+    # ``"key": `` shape check: any key-like quoted token followed by a
+    # colon is evidence of a JSON object. Guards against an upstream that
+    # accidentally returns a bare ``{...}`` substring without a real key.
+    return bool(_JSON_KEY_VALUE_LINE_RE.search(stripped))
 
 
 def _client_safe_failure_detail(exc: BaseException) -> str:
@@ -4368,17 +4411,30 @@ def _client_safe_failure_detail(exc: BaseException) -> str:
     upstream_body = getattr(exc, "upstream_body", None)
     if upstream_body:
         text = str(upstream_body).strip()
-        if _RAW_JSON_BODY_RE.match(text) or '"error"' in text:
+        if (
+            _RAW_JSON_BODY_RE.match(text)
+            or '"error"' in text
+            or _looks_like_provider_json_envelope(text)
+        ):
             return ""
     own_message = getattr(exc, "message", None) or str(exc)
     own_message = str(own_message).strip()
     if not own_message or _RAW_JSON_BODY_RE.match(own_message):
+        return ""
+    # Non-OpenAI envelopes such as ``{"statusCode": 429, "message": ...}``
+    # from xAI/Grok attach the entire JSON to ``exc.message`` (not
+    # ``upstream_body``), so the suppression needs to run on the message
+    # path too. Without this, a mid-stream 429 dumps the upstream envelope
+    # into the SSE ``data: {"error": {"message": "..."}}`` text the client
+    # reads verbatim (see incident req_50a994b481aa7fe3, 2026-10-21).
+    if _looks_like_provider_json_envelope(own_message):
         return ""
     # A provider message frequently embeds the body verbatim
     # (``Provider returned 400: {json}``). Drop just that tail.
     if '"error"' in own_message:
         own_message = own_message.split('{"error"')[0].rstrip(" :")
     return _safe_upstream_body(own_message, limit=200)
+
 
 
 def _is_capacity_failure(exc: BaseException | None) -> bool:
@@ -4403,6 +4459,33 @@ def _is_capacity_failure(exc: BaseException | None) -> bool:
         if value
     )
     return is_capacity_error(detail)
+
+
+_PROVIDER_WIDE_RATE_LIMIT_PROVIDERS = frozenset({
+    # Enterprise Copilot answers pooled requests with a provider-wide
+    # quota/rate-limit 429 that the calling tenant does not own. Surfacing it
+    # as a client 429 tells the caller that *its* quota is gone, so the
+    # gateway instead reports retryable upstream unavailability once failover
+    # has no candidates left.
+    "github-copilot-enterprise",
+})
+def _internalize_github_copilot_rate_limit(
+    provider: str,
+    exc: RateLimitError,
+) -> ProviderCapacityError | None:
+    """Convert Enterprise Copilot 429s into pool-internal unavailability."""
+    if str(provider or "").strip().lower() not in _PROVIDER_WIDE_RATE_LIMIT_PROVIDERS:
+        return None
+    return ProviderCapacityError(
+        group="github-copilot-enterprise",
+        detail=exc.body or "GitHub Copilot Enterprise returned HTTP 429",
+    )
+
+
+def _provider_rate_limit_is_external(exc: BaseException) -> bool:
+    """Whether a provider 429 may be reported to the client as a 429."""
+    provider = str(getattr(exc, "provider", "") or "").strip().lower()
+    return provider not in _PROVIDER_WIDE_RATE_LIMIT_PROVIDERS
 
 
 def _provider_rate_limit_response(exc: RateLimitError) -> web.Response:
@@ -4466,6 +4549,23 @@ def _public_provider_failure_response(
     error code the caller can switch on.
     """
     if isinstance(exc, RateLimitError):
+        if not _provider_rate_limit_is_external(exc):
+            try:
+                retry_after = max(
+                    1,
+                    int(float(os.environ.get("TUSKER_PROVIDER_RETRY_AFTER_SECS", "5"))),
+                )
+            except (TypeError, ValueError):
+                retry_after = 5
+            return web.json_response(
+                openai_error(
+                    "Upstream provider capacity is unavailable; retry shortly.",
+                    code="service_unavailable",
+                    error_type="server_error",
+                ),
+                status=503,
+                headers={"Retry-After": str(retry_after)},
+            )
         return _provider_rate_limit_response(exc)
 
     if not _is_capacity_failure(exc):
@@ -4597,11 +4697,16 @@ def _public_stream_error(
 ) -> tuple[str, str]:
     """Return safe, actionable details for a prepared SSE error frame."""
     if isinstance(exc, RateLimitError):
-        # RateLimitError carries the upstream Retry-After hint. Surface it as
-        # a generic 429 signal so clients back off, without echoing the raw
-        # upstream body.
-        message = "Upstream provider rate limit exceeded; retry shortly."
-        code = "rate_limit_exceeded"
+        # Enterprise Copilot 429s are provider-wide pool failures, not a
+        # caller quota signal. The stream fallback path normally consumes
+        # them before this function; this keeps the terminal frame safe when
+        # no alternative candidate remains.
+        if _provider_rate_limit_is_external(exc):
+            message = "Upstream provider rate limit exceeded; retry shortly."
+            code = "rate_limit_exceeded"
+        else:
+            message = "Upstream provider capacity is unavailable; retry shortly."
+            code = "service_unavailable"
     elif _is_capacity_failure(exc):
         message = "Upstream provider capacity is unavailable; retry shortly."
         code = "service_unavailable"
@@ -4611,6 +4716,26 @@ def _public_stream_error(
             f"Retry the request or choose another model. Request ID: {request_id}."
         )
         code = "provider_empty_stream"
+    elif isinstance(exc, NoHealthyModelsError):
+        # A pool that cannot satisfy the request's own requirements (tools,
+        # input modality, capability evidence) is a retryable availability
+        # condition, not an upstream failure. Say so: the client otherwise
+        # only sees a generic provider error.
+        pool_label = str(getattr(exc, "pool", "") or "requested pool")
+        message = (
+            f"The gateway has no eligible model in pool '{pool_label}' for this "
+            "request right now (the pool's tool, modality or capability "
+            f"requirements filtered every route). Retry shortly or choose "
+            f"another model. Request ID: {request_id}."
+        )
+        code = "no_healthy_models"
+    elif isinstance(exc, BadRequestError):
+        # Gateway-authored rejection (validation, routing, payload size). The
+        # wording is the gateway's own, so keep it verbatim and only add
+        # correlation: it must not be prefixed as an upstream failure.
+        detail = str(exc.message or "").strip() or "The request was rejected."
+        message = f"{detail} Request ID: {request_id}."
+        code = str(exc.code or "bad_request")
     elif isinstance(
         exc,
         (
@@ -4870,6 +4995,11 @@ async def _call_with_pool_fallback(
     prompt_estimate = estimate_prompt_tokens(body.get("messages"), tools)
     required_input_modalities = _required_input_modalities(body.get("messages"))
     requires_tools = bool(tools)
+    requires_image_tools = bool(
+        required_input_modalities
+        and "image" in required_input_modalities
+        and requires_tools
+    )
     high_impact_tools = tools_include_high_impact(tools)
     pool_name = _pool_name(body)
     requires_structured_output = _requires_structured_output(body, pool_name)
@@ -4998,6 +5128,7 @@ async def _call_with_pool_fallback(
                 await asyncio.to_thread(breaker.release_probe, provider, model)
             raise
         except RateLimitError as exc:
+            exc.provider = provider
             if breaker is not None:
                 await asyncio.to_thread(
                     breaker.record_failure,
@@ -5123,6 +5254,8 @@ async def _call_with_pool_fallback(
                 "required_input_modalities": required_input_modalities,
                 "context_tokens": required_context_tokens(prompt_estimate),
             }
+            if requires_image_tools:
+                select_kwargs["requires_image_tools"] = True
             if payload_ceiling_of is not None and payload_bytes > 0:
                 # Only meaningful with a breaker to consult; without one the
                 # filter has no evidence source and the args stay inert.
@@ -5164,13 +5297,12 @@ async def _call_with_pool_fallback(
             if (
                 not recovery_probe
                 and attempts < max_attempts
-                and not _is_capacity_failure(last_error)
             ):
                 # A prior request can quarantine every currently ranked
-                # candidate. Probe the same configured fallback chain once,
-                # ignoring only individual transient cooldowns. Shared/global
-                # capacity quarantines, policy, modalities, and known lack of
-                # tool support remain enforced by PoolManager.select().
+                # candidate, including after a capacity rejection. Probe the
+                # same configured fallback chain once; PoolManager still
+                # enforces policy, modalities, and known tool support during
+                # this pass.
                 recovery_probe = True
                 pool_index = 0
                 active_pool = pool_names[pool_index]
@@ -5447,6 +5579,9 @@ async def _call_with_pool_fallback(
                 await asyncio.to_thread(breaker.release_probe, provider, model)
             raise
         except RateLimitError as exc:
+            # Preserve the concrete provider for terminal-response policy.
+            # Pool selection already handles the failover itself.
+            exc.provider = provider
             if breaker is not None:
                 await asyncio.to_thread(
                     breaker.record_failure,
@@ -5454,13 +5589,18 @@ async def _call_with_pool_fallback(
                     model,
                     cooldown_secs=_cooldown_for_exc(exc),
                 )
-            last_error = exc
+            internal_failure = _internalize_github_copilot_rate_limit(provider, exc)
+            last_error = internal_failure or exc
             excluded.add(selected)
             if request is not None:
                 set_access_log_context(
                     request,
-                    failure_class=exc.code or type(exc).__name__,
-                    error_detail=_pool_failure_summary(exc),
+                    failure_class=(
+                        internal_failure.code
+                        if internal_failure is not None
+                        else exc.code or type(exc).__name__
+                    ),
+                    error_detail=_pool_failure_summary(last_error),
                     candidate_attempts=attempts,
                 )
             logger.warning(
@@ -6180,6 +6320,7 @@ def _responses_stream_from_chat(
     complete_result: dict[str, Any] | None = None,
     response_id: str | None = None,
     emit_created: bool = True,
+    redaction_tokenizer: Any | None = None,
 ) -> AsyncIterator[bytes]:
     """Adapt canonical Chat Completions SSE to Responses SSE.
 
@@ -6188,6 +6329,7 @@ def _responses_stream_from_chat(
     event lifecycle; returning a Chat JSON object for ``stream=true`` causes
     clients to lose text/tool deltas and is especially harmful to agent loops.
     """
+
 
     async def generate() -> AsyncIterator[bytes]:
         stream_response_id = response_id or f"resp_{uuid.uuid4().hex}"
@@ -6210,6 +6352,8 @@ def _responses_stream_from_chat(
         usage: dict[str, Any] = {}
         stream_buffer = bytearray()
         done_seen = False
+        field_restorers: dict[tuple[int, str], _BufferedRestorer] = {}
+        argument_restorers: dict[tuple[int, int], _BufferedRestorer] = {}
 
         def _tool_index(raw_call: dict[str, Any], position: int) -> int:
             value = raw_call.get("index", position)
@@ -6272,6 +6416,15 @@ def _responses_stream_from_chat(
                             },
                         )
                     output_index, item = message_state or message_items[choice_index]
+                    if redaction_tokenizer is not None:
+                        key = (choice_index, "content")
+                        buf = field_restorers.get(key)
+                        if buf is None:
+                            buf = _BufferedRestorer(tokenizer=redaction_tokenizer)
+                            field_restorers[key] = buf
+                        text = buf.feed(text)
+                    if not text:
+                        continue
                     content = item.setdefault("_text", "")
                     item["_text"] = content + text
                     yield _responses_sse_frame(
@@ -6329,6 +6482,17 @@ def _responses_stream_from_chat(
                         arguments = function.get("arguments")
                         if arguments not in (None, ""):
                             fragment = _arguments_text(arguments)
+                            if redaction_tokenizer is not None:
+                                buf = argument_restorers.get(call_key)
+                                if buf is None:
+                                    buf = _BufferedRestorer(
+                                        tokenizer=redaction_tokenizer,
+                                        json_escape=True,
+                                    )
+                                    argument_restorers[call_key] = buf
+                                fragment = buf.feed(fragment)
+                            if not fragment:
+                                continue
                             item["arguments"] += fragment
                             yield _responses_sse_frame(
                                 "response.function_call_arguments.delta",
@@ -6413,6 +6577,42 @@ def _responses_stream_from_chat(
                 {"output_index": 0, "item": dict(item)},
             )
 
+        for (choice_index, _field), buf in field_restorers.items():
+            tail = buf.flush()
+            if not tail:
+                continue
+            message_state = message_items.get(choice_index)
+            if message_state is None:
+                continue
+            output_index, item = message_state
+            item["_text"] = item.setdefault("_text", "") + tail
+            yield _responses_sse_frame(
+                "response.output_text.delta",
+                {
+                    "item_id": item["id"],
+                    "output_index": output_index,
+                    "content_index": 0,
+                    "delta": tail,
+                },
+            )
+        for call_key, buf in argument_restorers.items():
+            tail = buf.flush()
+            if not tail:
+                continue
+            tool_state = tool_items.get(call_key)
+            if tool_state is None:
+                continue
+            output_index, item = tool_state
+            item["arguments"] += tail
+            yield _responses_sse_frame(
+                "response.function_call_arguments.delta",
+                {
+                    "item_id": item["id"],
+                    "output_index": output_index,
+                    "call_id": item["call_id"],
+                    "delta": tail,
+                },
+            )
         for output_index, item in enumerate(output_items):
             if item.get("type") == "message":
                 text_value = str(item.pop("_text", ""))
@@ -6631,12 +6831,18 @@ def _route_target(config: dict[str, Any], body: dict[str, Any]) -> tuple[str, st
             pool_name = "swarm"
         else:
             pool_name = route.pool_name or "code"
-        selected = PoolManager(config).select(
-            pool_name,
-            required_input_modalities=_required_input_modalities(body.get("messages")),
-            requires_structured_output=_requires_structured_output(body, pool_name),
-            high_impact_tools=tools_include_high_impact(body.get("tools")),
-        )
+        required_modalities = _required_input_modalities(body.get("messages"))
+        requires_tools = bool(body.get("tools"))
+        select_kwargs: dict[str, Any] = {
+            "required_input_modalities": required_modalities,
+            "requires_structured_output": _requires_structured_output(body, pool_name),
+            "high_impact_tools": tools_include_high_impact(body.get("tools")),
+        }
+        if requires_tools:
+            select_kwargs["requires_tools"] = True
+        if required_modalities and "image" in required_modalities and requires_tools:
+            select_kwargs["requires_image_tools"] = True
+        selected = PoolManager(config).select(pool_name, **select_kwargs)
         if not selected:
             raise NoHealthyModelsError(pool=pool_name)
         return selected
@@ -7498,6 +7704,8 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                             asyncio.TimeoutError,
                             asyncio.IncompleteReadError,
                         ) as stream_recovery_exc:
+                            if isinstance(stream_recovery_exc, RateLimitError):
+                                stream_recovery_exc.provider = provider
                             # The role event and SSE headers are already sent,
                             # but a model can still be changed safely until an
                             # assistant data frame has reached the client.
@@ -7810,12 +8018,36 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                 except asyncio.TimeoutError:
                     stream_hb_task.cancel()
                 try:
+                    # The 200/SSE response is already committed, so this is
+                    # not a client-facing 400 any more. An OpenAI ``error``
+                    # event is rendered by OMP as the opaque banner
+                    # ``Provider returned an in-band ... stream error`` and
+                    # the message is discarded (2026-10-27
+                    # rid req_b673132700f2562e: the banner hid a plain
+                    # "no eligible candidate"). Emit the sanitized detail as
+                    # ordinary assistant text, matching every other
+                    # post-commit failure.
+                    message, stream_error_code = _public_stream_error(
+                        exc,
+                        request_id=request_id,
+                        provider=provider,
+                        model=target_model,
+                    )
+                    # Keep the failure visible to the audit log and the access
+                    # log: the 2026-10-27 incident was only diagnosable from
+                    # ``error_detail`` because this path recorded nothing.
+                    request["_stream_error"] = status
+                    request["_stream_error_code"] = stream_error_code or status
                     await stream_resp.write(
-                        sse_frame({
-                            "error": openai_error(
-                                exc.message, code=exc.code, error_type=exc.error_type
+                        sse_frame(format_openai_chunk(message, model="tusker-gateway"))
+                    )
+                    await stream_resp.write(
+                        sse_frame(
+                            format_openai_chunk(
+                                finish_reason="stop",
+                                model="tusker-gateway",
                             )
-                        })
+                        )
                     )
                     await stream_resp.write(sse_done())
                 except (ConnectionResetError, ConnectionError, BrokenPipeError):
@@ -8227,6 +8459,7 @@ async def _responses_handler_impl(request: web.Request) -> web.Response | web.St
                     complete_result=result,
                     response_id=response_id,
                     emit_created=False,
+                    redaction_tokenizer=request.app.get("redaction_tokenizer"),
                 )
             else:
                 raw_stream = result.iterator if isinstance(result, _PreparedStream) else result
@@ -8240,6 +8473,7 @@ async def _responses_handler_impl(request: web.Request) -> web.Response | web.St
                     model=body.get("model") or config["model_name"],
                     response_id=response_id,
                     emit_created=False,
+                    redaction_tokenizer=request.app.get("redaction_tokenizer"),
                 )
 
             try:
@@ -8780,7 +9014,6 @@ async def rerank_handler(request: web.Request) -> web.Response:
             body,
             session=request.app.get("http_session"),
             breaker=request.app.get("breaker"),
-            payload_bytes=int(request.get("_tusker_payload_bytes") or 0),
         )
         set_access_log_context(
             request,

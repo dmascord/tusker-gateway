@@ -198,3 +198,50 @@ def test_malformed_escalation_ladder_falls_back_to_defaults():
     finally:
         __import__("os").environ.clear()
         __import__("os").environ.update(original)
+
+def test_429_short_stated_cooldown_floored_under_tpm_phrasing():
+    """Stated short cooldowns on TPM/quota-flavoured 429s are bumped to 60s.
+
+    Incident req_50a994b481aa7fe3 (2026-10-21): a Grok/xAI response
+    ``"Token limit is exceeded. Try again in 8 seconds."`` was parsed by
+    ``_cooldown_seconds_for_429`` and applied as an 8s breaker window.
+    The next chat request was sent inside the same minute, hit the same
+    TPM window, and surfaced the verbatim upstream envelope to the
+    client. The intent of "Try again in 8 seconds" on a TPM ledger is
+    "this minute's window is full", so the floor must hold the breaker
+    off until the next whole-minute boundary.
+    """
+    from tusker_gateway.cooldown import _cooldown_seconds_for_429
+
+    body = (
+        '{ "statusCode": 429, "message": '
+        '"Token limit is exceeded. Try again in 8 seconds.", '
+        '"error": "Too Many Requests" }'
+    )
+    assert _cooldown_seconds_for_429({"body": body, "headers": {}}) == 60.0
+
+
+def test_429_short_stated_cooldown_floored_for_rate_limit_phrasing():
+    """Non-token rate-limit phrasing also gets the 60s floor.
+
+    RPM-flavoured ledgers may reply with the same short-second phrasing.
+    A 429 body that says "Rate limit reached. Try again in 5 seconds."
+    is a near-term hint with a longer actual reset, so the floor applies.
+    """
+    from tusker_gateway.cooldown import _cooldown_seconds_for_429
+
+    body = "Rate limit reached. Try again in 5 seconds."
+    assert _cooldown_seconds_for_429({"body": body, "headers": {}}) == 60.0
+
+
+def test_429_short_cooldown_preserved_when_body_lacks_quota_phrasing():
+    """Without a quota/TPM hint the stated seconds remain honoured.
+
+    A transient 429 with a truthful "Try again in 3 seconds" hint
+    should not be inflated — the floor is quota-aware, not universal.
+    """
+    from tusker_gateway.cooldown import _cooldown_seconds_for_429
+
+    assert _cooldown_seconds_for_429(
+        {"body": "Service warming up. Try again in 3 seconds.", "headers": {}}
+    ) == 3.0

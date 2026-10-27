@@ -193,11 +193,85 @@ async def test_midstream_statuscode_429_envelope_raises_rate_limit_error():
     assert exc_info.value.upstream_status == 429
     assert "Token limit is exceeded" in (exc_info.value.body or "")
     # The stated retry interval must feed the cooldown parser, not the
-    # status-less permanent-failure classification.
+    # status-less permanent-failure classification. TPM/quota-flavoured
+    # bodies are floored to 60s so the breaker holds off until the next
+    # whole-minute boundary (incident req_50a994b481aa7fe3, 2026-10-21):
+    # honouring the stated 8s would re-probe the same minute-window
+    # immediately and surface the upstream envelope verbatim.
     from tusker_gateway.cooldown import _cooldown_seconds_for_429
     assert _cooldown_seconds_for_429(
         {"body": exc_info.value.body or "", "headers": {}}
-    ) == 8.0
+    ) == 60.0
+    client._record_stream_failure.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_midstream_toplevel_statuscode_429_raises_rate_limit_error():
+    """A FastAPI-style proxy can put the error envelope at the TOP level
+    instead of nesting it under ``error``:
+
+        {"statusCode": 429, "message": "Token limit is exceeded. ..."}
+
+    That shape matches no ``_STREAM_ERROR_HINTS`` word, so the frame was
+    treated as ordinary content: the route never failed over, no cooldown was
+    recorded, and the raw body reached the client (2026-10-21,
+    req_50a994b481aa7fe3). It must classify as a 429 and feed the stated retry
+    interval into the cooldown parser.
+    """
+    client = object.__new__(PassthroughClient)
+    client._record_stream_failure = AsyncMock()
+    client._record_quality = AsyncMock()
+    client._release_capacity = MagicMock()
+
+    async def rate_limited():
+        yield (
+            b'data: {"statusCode": 429,'
+            b'"message":"Token limit is exceeded. Try again in 8 seconds."}\n\n'
+        )
+
+    stream = client._stream_events(
+        _Response(),
+        provider="test",
+        model="model",
+        stream_iterator=rate_limited(),
+    )
+    with pytest.raises(RateLimitError) as exc_info:
+        _ = [chunk async for chunk in stream]
+    assert exc_info.value.upstream_status == 429
+    assert "Token limit is exceeded" in (exc_info.value.body or "")
+    from tusker_gateway.cooldown import _cooldown_seconds_for_429
+    # TPM-flavoured 429 bodies are floored to 60s — the per-minute ledger
+    # is full and 8s would re-probe the same window immediately. See
+    # incident req_50a994b481aa7fe3.
+    assert _cooldown_seconds_for_429(
+        {"body": exc_info.value.body or "", "headers": {}}
+    ) == 60.0
+    client._record_stream_failure.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_midstream_toplevel_5xx_statuscode_raises_provider_error():
+    """A top-level 5xx status envelope must classify as an error carrying the
+    upstream status, so the breaker uses its transient ladder instead of
+    treating the frame as assistant content.
+    """
+    client = object.__new__(PassthroughClient)
+    client._record_stream_failure = AsyncMock()
+    client._record_quality = AsyncMock()
+    client._release_capacity = MagicMock()
+
+    async def server_error():
+        yield b'data: {"statusCode": 503, "message": "Service unavailable"}\n\n'
+
+    stream = client._stream_events(
+        _Response(),
+        provider="test",
+        model="model",
+        stream_iterator=server_error(),
+    )
+    with pytest.raises(ProviderError) as exc_info:
+        _ = [chunk async for chunk in stream]
+    assert exc_info.value.upstream_status == 503
     client._record_stream_failure.assert_awaited_once()
 
 

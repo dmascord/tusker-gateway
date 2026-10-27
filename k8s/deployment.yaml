@@ -6,9 +6,9 @@ metadata:
   labels:
     app: tusker-gateway
   annotations:
-    tusker.net.au/commit: 5785d7cc825f0732ee592833e6a14715d3e07d17
-    tusker.net.au/image-tag: swarm-alpine-20261021164721
-    tusker.net.au/image-digest: sha256:1468c4578c5a7ecd8bdaadbc8ec52cfec628a87aa12755d3eef52e0b5e8b884f
+    tusker.net.au/commit: 041fa107a9a01d3a1c01c2eb9bc757cf6a717ea3
+    tusker.net.au/image-tag: swarm-alpine-041fa107a9a01d3a1c01c2eb9bc757cf6a717ea3
+    tusker.net.au/image-digest: sha256:2d756cdc3f8c445c5d099b7648d82c3a59463ec53984200528508b43eb840c90
 spec:
   replicas: 1
   selector:
@@ -34,7 +34,7 @@ spec:
       terminationGracePeriodSeconds: 90
       containers:
       - name: tusker-gateway
-        image: registry.tusker.net.au:5000/tusker-gateway@sha256:d70884948f694d4d6ec9b3f8944eabf89cda5eb56b2a597d95770a22c9fa96c9
+        image: registry.tusker.net.au:5000/tusker-gateway@sha256:2d756cdc3f8c445c5d099b7648d82c3a59463ec53984200528508b43eb840c90
         imagePullPolicy: Always
         envFrom:
         - secretRef:
@@ -264,6 +264,10 @@ spec:
           value: 'true'
         - name: TUSKER_REDACTION_API_KEYS
           value: 'true'
+        # Preserve email/key syntax for OMP while retaining authenticated ciphertext.
+        # Keep disabled unless clients require syntax-shaped redaction aliases.
+        - name: TUSKER_REDACTION_FORMAT_PRESERVING
+          value: 'false'
         # Entropy-gated fallback for unprefixed secrets: opt-in, because the
         # rule can false-positive on long identifiers in code.
         - name: TUSKER_REDACTION_ENTROPY_FALLBACK
@@ -540,6 +544,18 @@ spec:
         - name: TUSKER_MODALITY_QUALIFICATION_INITIAL_DELAY_SECS
           value: '600'
         - name: TUSKER_MODALITY_QUALIFICATION_INTERVAL_SECS
+          value: '43200'
+        # Composite image-plus-tool evidence is refreshed separately from ordinary
+        # tool and modality probes; routes are admitted only after both pass.
+        - name: TUSKER_COMPOSITE_QUALIFICATION_ENABLED
+          value: 'true'
+        - name: TUSKER_COMPOSITE_QUALIFICATION_LIMIT
+          value: '8'
+        - name: TUSKER_COMPOSITE_QUALIFICATION_TIMEOUT_SECS
+          value: '45'
+        - name: TUSKER_COMPOSITE_QUALIFICATION_MAX_AGE_SECS
+          value: '86400'
+        - name: TUSKER_COMPOSITE_QUALIFICATION_INTERVAL_SECS
           value: '43200'
         # Media routes are qualified out of band; no cold probe is added to requests.
         - name: TUSKER_MEDIA_QUALIFICATION_ENABLED

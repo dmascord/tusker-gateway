@@ -62,10 +62,10 @@ A model is **heavyweight** when *either*:
 
 | Family | Heavy slugs |
 |---|---|
-| Codex (paid) | `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.5`, `gpt-5.4` |
-| Anthropic (paid) | `claude-sonnet-4.6`, `claude-opus-4.6`, `claude-sonnet-4.5`, `claude-opus-4.5` |
-| Google (paid) | `gemini-2.5-pro`, `gemini-3-pro` |
-| Cohere (paid) | `command-a-plus-05-2026`, `command-a-03-2025` |
+| OpenAI Codex | `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.5`, `gpt-5.4`, `gpt-6-astra` |
+| Anthropic Claude | `claude-sonnet-4.6`, `claude-opus-4.6`, `claude-sonnet-4.5`, `claude-opus-4.5` |
+| Google Gemini | `gemini-2.5-pro`, `gemini-3-pro` |
+| Cohere | `command-a-plus-05-2026`, `command-a-03-2025` |
 | Other | `mistral-large-3:675b`, `deepseek-v4-pro` |
 | Synthetic.new (usage-heavy) | `Kimi-K3`, `syn:large:vision` |
 | Ollama Cloud (usage-heavy) | `kimi-k2.6`, `kimi-k2.7-code`, `kimi-k3` |
@@ -110,8 +110,17 @@ For each request to `hermes-code`/`hermes-privacy`/etc:
    - Required input modalities (for example, image requests skip known text-only models)
    - Behavioral tool qualification for the privacy pool (a passing current
      streaming tool contract is required even for ordinary chat)
+   - Composite image-plus-tool qualification when an image-bearing request
+     also supplies tools (see below)
    - ZDR + EXCLUDED_PROVIDERS env var (privacy pool only)
    - Operator model blacklist (`TUSKER_BLACKLISTED_MODELS`)
+
+For an image-bearing request that also supplies tools, selection requires the
+model's latest `input_image_tools` capability record to be `passed` with probe
+version `image-tool-contract-v1`. Image-only and text-tool qualification are
+not combined implicitly: a route that passes only one half is excluded before
+the upstream call. The same requirement is applied on ordinary selection,
+fallback attempts, recovery probes, and session-sticky re-selection.
 3. **Rank by quality score** (descending) from `model_quality.db`. New models
    use an adaptive floor (median - 20.0 clamped to 20.0). Models with an LLM
    Stats rank receive an additional score bonus (see
@@ -427,6 +436,15 @@ them only for explicitly selected providers/models because generation requests
 can incur cost or create asynchronous jobs. A passing probe is evidence for
 the tested contract only, not a blanket multimodal capability claim.
 
+When `TUSKER_COMPOSITE_QUALIFICATION_ENABLED=true`, the background maintenance
+loop refreshes a bounded batch of lightweight chat routes every
+`TUSKER_COMPOSITE_QUALIFICATION_INTERVAL_SECS` (default 12 hours). It only
+persists route-level evidence and never admits a route from image support or
+ordinary tool support alone. The batch size, timeout, and evidence age are
+controlled by `TUSKER_COMPOSITE_QUALIFICATION_LIMIT`,
+`TUSKER_COMPOSITE_QUALIFICATION_TIMEOUT_SECS`, and
+`TUSKER_COMPOSITE_QUALIFICATION_MAX_AGE_SECS`.
+
 
 The privacy pool applies the provider policy before catalog pricing. The
 default registry currently allows local `local-llm`, Ollama Cloud, OpenCode
@@ -510,6 +528,17 @@ override, then raised again by any
 actually reachable. Production evidence for the fix is
 `req_e1d8a9fe5ade8736` (2026-10-21), where a cold 240K-token `mlx-mac` prompt
 died at 90s under a 240s attempt budget.
+
+Non-streaming requests wait for the whole completion, so they have no idle
+timer to reset and aiohttp's `total` is the only upstream deadline. It must
+derive from the same attempt budget: both non-stream call sites use
+`passthrough._non_stream_total_secs()`, which returns
+`TUSKER_UPSTREAM_SOCK_READ_SECS` raised to the route's attempt override.
+A flat `120s` here is the same trap as a flat `sock_read` — before
+2026-10-21 the non-stream path passed a literal `120`, so a configured-240s
+`local-llm` request failed at 120.4s and again at 121.0s (reproducible)
+while the identical request took ~1s warm and ~6s cold directly against
+Ollama. Non-stream `local-llm`/`mlx-mac` now get the full `240s`.
 
 #### Process-backed CLI capacity gate
 
