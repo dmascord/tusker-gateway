@@ -1163,6 +1163,7 @@ class PoolManager:
         allow_tool_compatibility_fallback: bool = False,
         allowed_providers: tuple[str, ...] | None = None,
         allowed_models: tuple[str, ...] | None = None,
+        selection_context: str | None = None,
         payload_bytes: int = 0,
         payload_ceiling_of: Callable[[str, str], int | None] | None = None,
     ) -> tuple[str, str] | None:
@@ -1677,12 +1678,13 @@ class PoolManager:
                 if count
             ) or "none"
             logger.warning(
-                "pool '%s' has no eligible candidates configured=%d requires_tools=%s "
-                "input_modalities=%s context_tokens=%d filters=%s cooldown_models=%s "
-                "cooldown_probe=%s unqualified_static_tools=%s "
+                "pool '%s' has no eligible candidates context=%s configured=%d "
+                "requires_tools=%s input_modalities=%s context_tokens=%d filters=%s "
+                "cooldown_models=%s cooldown_probe=%s unqualified_static_tools=%s "
                 "structured_tool_fallback=%s tool_compatibility_fallback=%s "
                 "structured_output=%s unkeyed=%d",
                 pool_name,
+                selection_context or "request",
                 len(specs),
                 requires_tools,
                 "+".join(sorted(required_modalities)) or "none",

@@ -1,5 +1,11 @@
 # Project TODOs
 
+## Privacy image-plus-tools fallback hardening (2026-10-27)
+
+- Pool-selection exhaustion diagnostics now identify maintenance qualification scans separately from live request routing.
+- Added regression coverage proving an image-plus-tools capacity failure preserves both constraints while rotating to the next candidate.
+- Remaining operational review: confirm ZDR eligibility for excluded Ollama Cloud/Codex routes before changing privacy policy.
+
 ## Engineering review remediation (2026-10-16)
 
 ### Priority 0: restore a clean deterministic suite

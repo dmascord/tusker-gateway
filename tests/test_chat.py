@@ -586,6 +586,50 @@ async def test_pool_fallback_recovery_probe_after_capacity_failure():
         allow_cooldown_probe=True,
     )
 
+@pytest.mark.asyncio
+async def test_image_tools_capacity_failure_rotates_to_fallback(app):
+    """A capacity failure keeps image-plus-tools constraints during failover."""
+    pool_manager = MagicMock()
+    pool_manager.fallback_pools.return_value = ()
+    pool_manager.select.side_effect = [
+        ("apim", "gpt-5.6-luna"),
+        ("ollama-cloud", "glm-5.3-flash"),
+    ]
+    upstream = MagicMock()
+    upstream.chat = AsyncMock(side_effect=[
+        ProviderCapacityError(group="apim"),
+        {"choices": [{"message": {"role": "assistant", "content": "recovered"}}]},
+    ])
+    tools = [{"type": "function", "function": {"name": "read"}}]
+
+    provider, model, result = await _call_with_pool_fallback(
+        {"pools": {}},
+        {
+            "model": "hermes-privacy",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "inspect this"},
+                    {"type": "image_url", "image_url": {"url": "https://example.test/image.png"}},
+                ],
+            }],
+        },
+        upstream,
+        tools=tools,
+        request=SimpleNamespace(app={"pool_manager": pool_manager}),
+    )
+
+    assert (provider, model) == ("ollama-cloud", "glm-5.3-flash")
+    assert result["choices"][0]["message"]["content"] == "recovered"
+    assert pool_manager.select.call_args_list[1] == call(
+        "privacy",
+        excluded={("apim", "gpt-5.6-luna")},
+        required_input_modalities=frozenset({"image"}),
+        context_tokens=ANY,
+        requires_image_tools=True,
+        requires_tools=True,
+    )
+
 
 @pytest.mark.asyncio
 async def test_tool_pool_compatibility_probe_without_http_server():

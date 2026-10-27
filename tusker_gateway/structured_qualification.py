@@ -337,7 +337,11 @@ def _qualified_pairs(
     }
     qualified = []
     while pair := selector.select(
-        pool_name, requires_structured_output=True, excluded=excluded, session_id=None
+        pool_name,
+        requires_structured_output=True,
+        excluded=excluded,
+        session_id=None,
+        selection_context="maintenance:structured-qualification",
     ):
         qualified.append(pair)
         excluded.add(pair)
