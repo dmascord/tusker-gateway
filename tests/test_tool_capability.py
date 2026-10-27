@@ -362,6 +362,162 @@ def test_composite_runner_refreshes_stale_or_unavailable_records(monkeypatch, tm
     assert [item["model"] for item in results] == ["unavailable"]
 
 
+def _composite_runner(monkeypatch, tmp_path):
+    from tusker_gateway.model_capability import ModelCapabilityDB
+    from tusker_gateway.tool_qualification import run_image_tool_qualification
+
+    db = ModelCapabilityDB(str(tmp_path / "model-capability.db"))
+    config = {
+        "quality_db_path": str(tmp_path / "quality.db"),
+        "model_capability_db_path": str(tmp_path / "model-capability.db"),
+        "pools": {},
+    }
+    monkeypatch.setattr("tusker_gateway.tool_qualification.load_config", lambda: config)
+    monkeypatch.setenv("API_KEYS", "test-key")
+    return db, run_image_tool_qualification
+
+
+def test_composite_runner_keeps_passing_evidence_after_transient_failure(
+    monkeypatch, tmp_path
+):
+    """A 5xx probe result says nothing about the image-plus-tool contract.
+
+    Regression for 2026-10-27: a rate-limited probe burst overwrote every
+    passing composite record with ``unavailable``, so the pool filter
+    excluded routes that had already proved the contract and live requests
+    failed with ``no eligible candidate``.
+    """
+    db, run = _composite_runner(monkeypatch, tmp_path)
+    db.record(
+        provider="ollama-cloud",
+        model="proven",
+        capability=COMPOSITE_CAPABILITY,
+        status="passed",
+        source="composite_probe",
+        probe_version=COMPOSITE_CAPABILITY_PROBE_VERSION,
+        checked_at=0.0,
+    )
+
+    async def fake_probe(*args, **kwargs):
+        return {
+            "provider": kwargs["provider"],
+            "model": kwargs["model"],
+            "status": "unavailable",
+            "http_status": 502,
+            "failure_class": "upstream_error",
+        }
+
+    monkeypatch.setattr(
+        "tusker_gateway.tool_qualification.probe_image_tool_model", fake_probe
+    )
+
+    results = asyncio.run(
+        run(
+            base_url="http://gateway.test",
+            model_pairs={("ollama-cloud", "proven")},
+            max_age_secs=1.0,
+        )
+    )
+
+    assert results[0]["status"] == "unavailable"
+    record = db.get("ollama-cloud", "proven", COMPOSITE_CAPABILITY)
+    assert record is not None
+    assert record.status == "passed"
+    # The original evidence is untouched, not merely re-stamped as passing.
+    assert record.checked_at == 0.0
+
+
+def test_composite_runner_records_definitive_failure_over_passing_evidence(
+    monkeypatch, tmp_path
+):
+    """A definitive verdict must still replace older passing evidence."""
+    db, run = _composite_runner(monkeypatch, tmp_path)
+    db.record(
+        provider="ollama-cloud",
+        model="regressed",
+        capability=COMPOSITE_CAPABILITY,
+        status="passed",
+        source="composite_probe",
+        probe_version=COMPOSITE_CAPABILITY_PROBE_VERSION,
+        checked_at=0.0,
+    )
+
+    async def fake_probe(*args, **kwargs):
+        return {
+            "provider": kwargs["provider"],
+            "model": kwargs["model"],
+            "status": "unsupported",
+            "http_status": 400,
+            "failure_class": "tool_call_missing",
+        }
+
+    monkeypatch.setattr(
+        "tusker_gateway.tool_qualification.probe_image_tool_model", fake_probe
+    )
+
+    asyncio.run(
+        run(
+            base_url="http://gateway.test",
+            model_pairs={("ollama-cloud", "regressed")},
+            max_age_secs=1.0,
+        )
+    )
+
+    record = db.get("ollama-cloud", "regressed", COMPOSITE_CAPABILITY)
+    assert record is not None
+    assert record.status == "unsupported"
+    assert record.checked_at > 0.0
+
+
+def test_composite_runner_retries_its_own_rate_limit(monkeypatch, tmp_path):
+    """The probe reaches the gateway through the public boundary.
+
+    A burst can be answered by the gateway's own rate limiter; one paced
+    retry turns that self-inflicted 429 into a real verdict instead of a
+    false capability denial.
+    """
+    db, run = _composite_runner(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        "tusker_gateway.tool_qualification._COMPOSITE_PROBE_RETRY_DELAY_SECS", 0.0
+    )
+    calls: list[tuple[str, str]] = []
+
+    async def fake_probe(*args, **kwargs):
+        calls.append((kwargs["provider"], kwargs["model"]))
+        if len(calls) == 1:
+            return {
+                "provider": kwargs["provider"],
+                "model": kwargs["model"],
+                "status": "unavailable",
+                "http_status": 429,
+                "failure_class": "rate_limited",
+            }
+        return {
+            "provider": kwargs["provider"],
+            "model": kwargs["model"],
+            "status": "passed",
+            "http_status": 200,
+        }
+
+    monkeypatch.setattr(
+        "tusker_gateway.tool_qualification.probe_image_tool_model", fake_probe
+    )
+
+    results = asyncio.run(
+        run(
+            base_url="http://gateway.test",
+            model_pairs={("ollama-cloud", "busy")},
+            max_age_secs=1.0,
+        )
+    )
+
+    assert len(calls) == 2
+    assert results[0]["status"] == "passed"
+    record = db.get("ollama-cloud", "busy", COMPOSITE_CAPABILITY)
+    assert record is not None
+    assert record.status == "passed"
+
+
 def test_non_opencode_probe_omits_session_header():
     session = _ProbeSession()
 

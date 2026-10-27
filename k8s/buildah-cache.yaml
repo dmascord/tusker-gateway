@@ -1,0 +1,62 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: tusker-gateway-buildah-cache
+  namespace: hermes
+  labels:
+    app: tusker-gateway-buildah
+spec:
+  accessModes:
+  - ReadWriteOnce
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 50Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tusker-gateway-buildah
+  namespace: hermes
+  labels:
+    app: tusker-gateway-buildah
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: tusker-gateway-buildah
+  template:
+    metadata:
+      labels:
+        app: tusker-gateway-buildah
+    spec:
+      nodeSelector:
+        feature.node.kubernetes.io/cpu-cpuid.AVX2: "true"
+      containers:
+      - name: buildah
+        image: quay.io/buildah/stable@sha256:4f47edc1eace7a3fcbafb2c4bb784d13225986c1253e321f68c7229a33d628a0
+        command:
+        - sleep
+        - infinity
+        securityContext:
+          privileged: true
+        resources:
+          requests:
+            cpu: "2"
+            memory: 2Gi
+            ephemeral-storage: 512Mi
+          limits:
+            cpu: "4"
+            memory: 8Gi
+            ephemeral-storage: 4Gi
+        volumeMounts:
+        - name: buildah-cache
+          mountPath: /var/lib/containers
+        - name: buildah-cache
+          mountPath: /workspace
+      volumes:
+      - name: buildah-cache
+        persistentVolumeClaim:
+          claimName: tusker-gateway-buildah-cache

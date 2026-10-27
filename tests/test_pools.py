@@ -9,6 +9,7 @@ import pytest
 
 from tusker_gateway.config import PoolConfig, _load_pools, load_config
 from tusker_gateway.cooldown import CooldownTracker, _cooldown_seconds_for_429
+from tusker_gateway.model_capability import STRUCTURED_OUTPUT_PROBE_VERSION
 from tusker_gateway.pools import ModelSpec, PoolManager, is_general_chat_model
 from tusker_gateway.quality import QualityDB
 from tusker_gateway.tool_capability import ToolCapabilityLevel
@@ -446,6 +447,120 @@ def test_image_tools_selection_requires_composite_probe(tmp_path):
         requires_tools=True,
         requires_image_tools=True,
     ) == ("synthetic", "vision-tools-good")
+
+
+def _composite_evidence_manager(tmp_path, *, auto_discovered: bool) -> PoolManager:
+    manager = PoolManager(
+        {
+            "pools": {
+                "code": PoolConfig(
+                    name="code",
+                    require_tool_qualification=True,
+                    models=[
+                        {
+                            "provider": "synthetic",
+                            "model": "vision-tools",
+                            "input_modalities": ["text", "image"],
+                            "auto_discovered": auto_discovered,
+                        },
+                    ],
+                ),
+            },
+            "quality_db_path": str(tmp_path / "quality.db"),
+            "tool_capability_db_path": str(tmp_path / "capability.db"),
+            "model_capability_db_path": str(tmp_path / "model-capability.db"),
+            "excluded_providers": [],
+            "provider_api_keys": {"synthetic": "test"},
+        }
+    )
+    # Behavioural tool qualification passes, so only the composite gate can
+    # exclude the route.
+    manager._tool_capabilities.record(
+        provider="synthetic",
+        model="vision-tools",
+        level=ToolCapabilityLevel.STRICT_STRUCTURED_STREAM,
+        status="passed",
+        http_status=200,
+        tool_call_count=1,
+        structured_stream=True,
+        arguments_valid=True,
+        arguments_match=True,
+        finish_reason="tool_calls",
+    )
+    return manager
+
+
+@pytest.mark.parametrize(
+    "status,auto_discovered,expected",
+    [
+        # A passed composite probe admits the route.
+        ("passed", False, True),
+        ("passed", True, True),
+        # A definitive verdict about the image-plus-tool contract excludes it,
+        # curated or not.
+        ("unsupported", False, False),
+        ("unsupported", True, False),
+        # ``unavailable`` is a transient probe failure (429/5xx/timeout), not
+        # evidence about the contract: it must not empty a curated pool.
+        ("unavailable", False, True),
+        # An auto-discovered route that never proved the contract stays out.
+        ("unavailable", True, False),
+        # No evidence at all: operator-declared routes remain eligible, and
+        # the per-request provider failover handles a route that turns out to
+        # be unable to combine image input with tools.
+        (None, False, True),
+        (None, True, False),
+    ],
+)
+def test_composite_image_tools_evidence_policy(
+    tmp_path, status, auto_discovered, expected
+):
+    """Transient composite probe failures must not deny curated routes.
+
+    Regression for 2026-10-27: a self-rate-limited composite probe cycle
+    overwrote passing evidence with ``unavailable`` and every image+tools
+    request was answered ``no eligible candidate`` (rid
+    req_b673132700f2562e, req_b0c6dd248a83c24c, req_4e8e6044dfc1d4af).
+    """
+    manager = _composite_evidence_manager(tmp_path, auto_discovered=auto_discovered)
+    if status is not None:
+        manager._model_capability_db.record(
+            provider="synthetic",
+            model="vision-tools",
+            capability="input_image_tools",
+            status=status,
+            source="composite_probe",
+            probe_version="image-tool-contract-v1",
+        )
+
+    selected = manager.select(
+        "code",
+        required_input_modalities={"image"},
+        requires_tools=True,
+        requires_image_tools=True,
+    )
+
+    assert selected == (("synthetic", "vision-tools") if expected else None)
+
+
+def test_composite_evidence_from_older_probe_version_is_not_authoritative(tmp_path):
+    """A stale probe version is no evidence at all, not a denial."""
+    manager = _composite_evidence_manager(tmp_path, auto_discovered=False)
+    manager._model_capability_db.record(
+        provider="synthetic",
+        model="vision-tools",
+        capability="input_image_tools",
+        status="unsupported",
+        source="composite_probe",
+        probe_version="image-tool-contract-v0",
+    )
+
+    assert manager.select(
+        "code",
+        required_input_modalities={"image"},
+        requires_tools=True,
+        requires_image_tools=True,
+    ) == ("synthetic", "vision-tools")
 
 
 def test_text_tools_selection_does_not_require_composite_probe(tmp_path):

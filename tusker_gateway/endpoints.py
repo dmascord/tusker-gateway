@@ -4716,6 +4716,26 @@ def _public_stream_error(
             f"Retry the request or choose another model. Request ID: {request_id}."
         )
         code = "provider_empty_stream"
+    elif isinstance(exc, NoHealthyModelsError):
+        # A pool that cannot satisfy the request's own requirements (tools,
+        # input modality, capability evidence) is a retryable availability
+        # condition, not an upstream failure. Say so: the client otherwise
+        # only sees a generic provider error.
+        pool_label = str(getattr(exc, "pool", "") or "requested pool")
+        message = (
+            f"The gateway has no eligible model in pool '{pool_label}' for this "
+            "request right now (the pool's tool, modality or capability "
+            f"requirements filtered every route). Retry shortly or choose "
+            f"another model. Request ID: {request_id}."
+        )
+        code = "no_healthy_models"
+    elif isinstance(exc, BadRequestError):
+        # Gateway-authored rejection (validation, routing, payload size). The
+        # wording is the gateway's own, so keep it verbatim and only add
+        # correlation: it must not be prefixed as an upstream failure.
+        detail = str(exc.message or "").strip() or "The request was rejected."
+        message = f"{detail} Request ID: {request_id}."
+        code = str(exc.code or "bad_request")
     elif isinstance(
         exc,
         (
@@ -7998,12 +8018,36 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                 except asyncio.TimeoutError:
                     stream_hb_task.cancel()
                 try:
+                    # The 200/SSE response is already committed, so this is
+                    # not a client-facing 400 any more. An OpenAI ``error``
+                    # event is rendered by OMP as the opaque banner
+                    # ``Provider returned an in-band ... stream error`` and
+                    # the message is discarded (2026-10-27
+                    # rid req_b673132700f2562e: the banner hid a plain
+                    # "no eligible candidate"). Emit the sanitized detail as
+                    # ordinary assistant text, matching every other
+                    # post-commit failure.
+                    message, stream_error_code = _public_stream_error(
+                        exc,
+                        request_id=request_id,
+                        provider=provider,
+                        model=target_model,
+                    )
+                    # Keep the failure visible to the audit log and the access
+                    # log: the 2026-10-27 incident was only diagnosable from
+                    # ``error_detail`` because this path recorded nothing.
+                    request["_stream_error"] = status
+                    request["_stream_error_code"] = stream_error_code or status
                     await stream_resp.write(
-                        sse_frame({
-                            "error": openai_error(
-                                exc.message, code=exc.code, error_type=exc.error_type
+                        sse_frame(format_openai_chunk(message, model="tusker-gateway"))
+                    )
+                    await stream_resp.write(
+                        sse_frame(
+                            format_openai_chunk(
+                                finish_reason="stop",
+                                model="tusker-gateway",
                             )
-                        })
+                        )
                     )
                     await stream_resp.write(sse_done())
                 except (ConnectionResetError, ConnectionError, BrokenPipeError):

@@ -47,6 +47,10 @@ logger = logging.getLogger(__name__)
 
 COMPOSITE_IMAGE_TOOLS_CAPABILITY = "input_image_tools"
 COMPOSITE_IMAGE_TOOLS_PROBE_VERSION = "image-tool-contract-v1"
+# Probe verdicts that are evidence *about* the image-plus-tool contract. Any
+# other status (notably ``unavailable``: 429, 5xx, timeout) says nothing about
+# the contract, so it must not be read as a capability denial.
+COMPOSITE_IMAGE_TOOLS_DEFINITIVE_FAILURES = frozenset({"unsupported", "failed"})
 
 
 def _normalise_input_modality(value: Any) -> str:
@@ -886,6 +890,44 @@ class PoolManager:
         capability_cache[key] = (modalities, tool_support)
         return modalities, tool_support
 
+    def _image_tools_evidence_allows(
+        self,
+        spec: ModelSpec,
+        record: Any | None,
+    ) -> bool:
+        """Return whether composite image-plus-tool evidence admits this route.
+
+        Image input and tool calling are separate contracts, so a combined
+        request needs its own probe. Only a *definitive* verdict is evidence
+        about that contract:
+
+        * ``passed`` for the current probe version admits the route;
+        * ``unsupported``/``failed`` excludes it, for curated and
+          auto-discovered routes alike;
+        * ``unavailable`` (429, 5xx, timeout — including the gateway's own
+          rate limiter answering a probe burst) and missing/stale evidence
+          say nothing about the contract, so they only hold back
+          auto-discovered routes that have never proved it. A curated route
+          stays eligible, exactly like the behavioural tool gate
+          (``_tool_capability_allowed``) treats a transient probe failure.
+
+        Reading a transient probe failure as a capability denial empties a
+        pool: on 2026-10-27 a self-rate-limited composite probe cycle
+        overwrote passing evidence with ``unavailable`` and every image+tools
+        request failed with ``no eligible candidate``
+        (rid req_b673132700f2562e, req_b0c6dd248a83c24c,
+        req_4e8e6044dfc1d4af).
+        """
+        if record is not None and (
+            record.probe_version == COMPOSITE_IMAGE_TOOLS_PROBE_VERSION
+        ):
+            status = str(record.status or "").strip().lower()
+            if status == "passed":
+                return True
+            if status in COMPOSITE_IMAGE_TOOLS_DEFINITIVE_FAILURES:
+                return False
+        return not spec.auto_discovered
+
     def _input_modalities_allowed(
         self,
         spec: ModelSpec,
@@ -1346,11 +1388,11 @@ class PoolManager:
                             self._drop_stickiness(key)
                             break
                         if requires_image_tools and "image" in required_modalities:
-                            composite_record = composite_records.get((s.provider, s.model))
-                            if (
-                                composite_record is None
-                                or composite_record.status != "passed"
-                                or composite_record.probe_version != COMPOSITE_IMAGE_TOOLS_PROBE_VERSION
+                            composite_record = composite_records.get(
+                                (s.provider, s.model)
+                            )
+                            if not self._image_tools_evidence_allows(
+                                s, composite_record
                             ):
                                 self._drop_stickiness(key)
                                 break
@@ -1488,11 +1530,7 @@ class PoolManager:
                 continue
             if requires_image_tools and "image" in required_modalities:
                 composite_record = composite_records.get((s.provider, s.model))
-                if (
-                    composite_record is None
-                    or composite_record.status != "passed"
-                    or composite_record.probe_version != COMPOSITE_IMAGE_TOOLS_PROBE_VERSION
-                ):
+                if not self._image_tools_evidence_allows(s, composite_record):
                     filter_counts["image_tools"] += 1
                     filtered_composite_models.append(f"{s.provider}/{s.model}")
                     continue

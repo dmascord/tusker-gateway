@@ -56,6 +56,16 @@ always fine.
 `./k8s/deploy.sh` on visor (buildah build → push → apply manifests → rollout
 → smoke-test `/health` and `/ready`). See `docs/deployment-k8s.md`.
 
+### Buildah fallback and retained cache
+
+The normal gateway build host remains `visor`; its SSH path is documented in `docs/deployment-k8s.md`. If `visor` is unavailable, builds MAY run from the retained privileged Buildah Deployment in the `hermes` namespace. Its manifest is `k8s/buildah-cache.yaml`.
+
+The cache workload is `tusker-gateway-buildah`, using image `quay.io/buildah/stable@sha256:4f47edc1eace7a3fcbafb2c4bb784d13225986c1253e321f68c7229a33d628a0`, PVC `tusker-gateway-buildah-cache` (50 GiB, Longhorn), and a Recreate strategy because the PVC is ReadWriteOnce. The PVC is mounted at `/var/lib/containers` and `/workspace`; Buildah's graphroot is therefore retained across pod restarts and future builds.
+
+The fallback MUST use an exact `git archive` of the intended committed source, an explicit full `TUSKER_COMMIT`, `buildah bud --layers`, and a digest-pinned deployment. Namespace container ephemeral storage is capped at 4 GiB, so Buildah storage MUST stay on the PVC. Delete only revision-specific temporary source/PVC resources; do not delete the retained cache PVC after a normal build.
+
+The registry remains the durable artifact store. The retained PVC is a performance cache, not the source of truth: it MAY be cleared and rebuilt from the registry/source archive. Do not place registry credentials, API keys, or source archives containing secrets in this repository. Verify the pushed digest, running pod imageID, embedded `/health` commit, and live route before cleanup.
+
 ## Testing
 
 `pytest tests/ -p no:cacheprovider` — skip

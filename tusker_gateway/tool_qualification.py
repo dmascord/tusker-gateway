@@ -41,6 +41,45 @@ logger = logging.getLogger(__name__)
 
 COMPOSITE_CAPABILITY = "input_image_tools"
 COMPOSITE_CAPABILITY_PROBE_VERSION = "image-tool-contract-v1"
+_COMPOSITE_PROBE_RETRY_DELAY_SECS = 2.0
+_COMPOSITE_PROBE_LOCK: asyncio.Lock | None = None
+_COMPOSITE_PROBE_LOCK_LOOP: asyncio.AbstractEventLoop | None = None
+
+
+def _composite_probe_lock() -> asyncio.Lock:
+    """Return the process-wide single-flight lock for composite probing.
+
+    Created lazily, and recreated when the running loop changes, so the lock
+    is never left bound to a closed loop (the maintenance loop and a CLI
+    invocation can otherwise share this module across ``asyncio.run`` calls).
+    """
+    global _COMPOSITE_PROBE_LOCK, _COMPOSITE_PROBE_LOCK_LOOP
+    loop = asyncio.get_running_loop()
+    if _COMPOSITE_PROBE_LOCK is None or _COMPOSITE_PROBE_LOCK_LOOP is not loop:
+        _COMPOSITE_PROBE_LOCK = asyncio.Lock()
+        _COMPOSITE_PROBE_LOCK_LOOP = loop
+    return _COMPOSITE_PROBE_LOCK
+
+
+def _composite_probe_was_rate_limited(result: dict[str, Any]) -> bool:
+    """Return whether the gateway itself answered the probe with a 429."""
+    return int(result.get("http_status") or 0) == 429 or str(
+        result.get("failure_class") or ""
+    ).strip().lower() == "rate_limited"
+
+
+def _composite_probe_keeps_passing_evidence(
+    existing: Any,
+    result: dict[str, Any],
+) -> bool:
+    """Return whether a transient probe result must not replace passing evidence."""
+    if existing is None:
+        return False
+    if str(getattr(existing, "status", "") or "").strip().lower() != "passed":
+        return False
+    if getattr(existing, "probe_version", None) != COMPOSITE_CAPABILITY_PROBE_VERSION:
+        return False
+    return str(result.get("status") or "").strip().lower() == "unavailable"
 
 PROBE_TOOL_NAME = "tusker_capability_probe"
 PROBE_PATH = "/tmp/tusker-tool-capability-probe"
@@ -822,6 +861,32 @@ async def run_image_tool_qualification(
                     session, base_url=base_url, api_key=api_key,
                     provider=pair[0], model=pair[1], timeout_secs=timeout_secs,
                 )
+                if _composite_probe_was_rate_limited(result):
+                    # The probe reaches the gateway through its public
+                    # boundary, so a burst can be answered by the gateway's
+                    # own limiter. One paced retry turns that self-inflicted
+                    # 429 into a real verdict instead of a false denial.
+                    await asyncio.sleep(_COMPOSITE_PROBE_RETRY_DELAY_SECS)
+                    result = await probe_image_tool_model(
+                        session, base_url=base_url, api_key=api_key,
+                        provider=pair[0], model=pair[1],
+                        timeout_secs=timeout_secs,
+                    )
+                existing = capability_db.get(*pair, COMPOSITE_CAPABILITY)
+                if _composite_probe_keeps_passing_evidence(existing, result):
+                    # A transient failure (429/5xx/timeout) is not evidence
+                    # about the image-plus-tool contract. Never let a probe
+                    # cycle overwrite passing evidence with ``unavailable``:
+                    # the pool filter would then exclude a route that was
+                    # already proved to work.
+                    logger.info(
+                        "composite probe transient failure kept passing evidence "
+                        "provider=%s model=%s failure_class=%s",
+                        pair[0],
+                        pair[1],
+                        result.get("failure_class"),
+                    )
+                    return result
                 capability_db.record(
                     provider=pair[0], model=pair[1], capability=COMPOSITE_CAPABILITY,
                     status=result["status"], source="composite_probe",
@@ -830,7 +895,11 @@ async def run_image_tool_qualification(
                     failure_class=result.get("failure_class"),
                 )
                 return result
-        return await asyncio.gather(*(one(pair) for pair in pairs))
+        # Single-flight: overlapping cycles used to multiply one bounded
+        # batch into a burst (43 probes in one second on 2026-10-27) that the
+        # gateway's own rate limiter answered with 429 for every route.
+        async with _composite_probe_lock():
+            return await asyncio.gather(*(one(pair) for pair in pairs))
 
 
 def composite_main(argv: list[str] | None = None) -> int:
