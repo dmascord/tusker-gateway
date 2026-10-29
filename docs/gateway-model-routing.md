@@ -52,6 +52,16 @@ is re-established:
 - `xiaomi/mimo-v2.5-pro`
 
 
+### Ollama Cloud retirement policy
+
+Ollama Cloud announced retirement of `minimax-m2.7`, `mistral-large-3:675b`,
+and `nemotron-3-nano:30b` on 2026-11-09. Production blacklists those exact
+`ollama-cloud/*` routes so stale DB pool rows and explicit provider routes fail
+before dispatch. Current catalog replacements observed on 2026-10-30 are
+`minimax-m3`, `mistral-large-4`, and `nemotron-3-super`; catalog discovery may
+also add other supported models. Historical migration files and dated test
+fixtures are intentionally left unchanged.
+
 ## Heavyweight classification
 
 A model is **heavyweight** when *either*:

@@ -50,6 +50,17 @@ def test_configured_blacklist_supports_provider_model_globs(monkeypatch):
     assert model_is_blacklisted(config, "zai", "glm-5.3-flash")
 
 
+def test_ollama_cloud_retirements_are_blacklisted(monkeypatch):
+    monkeypatch.setenv(
+        "TUSKER_BLACKLISTED_MODELS",
+        "ollama-cloud/minimax-m2.7,ollama-cloud/mistral-large-3:675b,"
+        "ollama-cloud/nemotron-3-nano:30b",
+    )
+    config = load_config()
+    for model in ("minimax-m2.7", "mistral-large-3:675b", "nemotron-3-nano:30b"):
+        assert model_is_blacklisted(config, "ollama-cloud", model)
+    assert not model_is_blacklisted(config, "ollama-cloud", "minimax-m3")
+
 def test_blacklisted_model_is_not_selected(tmp_path):
     manager = PoolManager(
         {

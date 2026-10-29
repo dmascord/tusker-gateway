@@ -188,7 +188,11 @@ spec:
         # repeatedly reached the 60s candidate-timeout ceiling with no
         # repeatable hour-of-day relief (2026-10-14 analysis).
         - name: TUSKER_BLACKLISTED_MODELS
-          value: ''
+          # Ollama Cloud retires these models on 2026-11-09. Keep stale DB
+          # pool rows and explicit client routes from reaching the provider;
+          # current catalog replacements are minimax-m3, mistral-large-4,
+          # and nemotron-3-super.
+          value: ollama-cloud/minimax-m2.7,ollama-cloud/mistral-large-3:675b,ollama-cloud/nemotron-3-nano:30b
         - name: TUSKER_GREYLISTED_MODELS
           value: ''
         # Comma-separated provider/model globs allowed to emit direct
