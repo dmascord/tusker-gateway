@@ -2201,6 +2201,42 @@ async def test_semantic_cache_uses_concrete_route_and_does_not_cross_hit(app, cl
     assert mock_chat.call_args.args[:2] == ("openai", "gpt-4o-mini")
 
 
+
+@pytest.mark.asyncio
+async def test_semantic_cache_hit_restores_redaction_tokens_before_delivery(app, client):
+    from tusker_gateway.redaction import RedactionRuleSet, Tokenizer
+
+    tokenizer = Tokenizer(
+        key=bytes.fromhex("ab" * 32),
+        rules=RedactionRuleSet(),
+    )
+    email = "semantic-cache" + chr(64) + "example.test"
+    token = tokenizer.tokenize_text(email)
+    app["redaction_tokenizer"] = tokenizer
+    app["semantic_cache"] = _FakeSemanticCache([
+        {"id": "semantic-hit", "choices": [{"message": {"content": "mail " + token}}]},
+    ])
+    pool_manager = MagicMock()
+    pool_manager.select.return_value = ("openai", "gpt-4o-mini")
+    app["pool_manager"] = pool_manager
+
+    with patch("tusker_gateway.endpoints.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-code",
+                "messages": [{"role": "user", "content": "find the cached answer"}],
+                "temperature": 0,
+            },
+            headers=HEADERS_AUTH,
+        )
+
+    body = await response.json()
+    assert response.status == 200
+    assert body["choices"][0]["message"]["content"] == "mail " + email
+    assert token not in json.dumps(body)
+    mock_chat.assert_not_awaited()
+
 @pytest.mark.asyncio
 async def test_semantic_cache_requires_explicit_deterministic_request(app, client):
     semantic = _FakeSemanticCache()

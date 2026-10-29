@@ -7419,6 +7419,10 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                         pool=pool_name,
                         cache_status="hit",
                     )
+                    _tok = request.app.get("redaction_tokenizer")
+                    if _tok is not None and isinstance(sem_hit, dict):
+                        from tusker_gateway.redaction import restore_response
+                        sem_hit = restore_response(sem_hit, _tok)
                     return web.json_response(sem_hit)
                 set_access_log_context(request, cache_status="miss")
 
@@ -8363,6 +8367,10 @@ async def _responses_handler_impl(request: web.Request) -> web.Response | web.St
                         model=str(chat_body.get("model") or ""),
                         cache_status="hit",
                     )
+                    _tok = request.app.get("redaction_tokenizer")
+                    if _tok is not None and isinstance(sem_hit, dict):
+                        from tusker_gateway.redaction import restore_response
+                        sem_hit = restore_response(sem_hit, _tok)
                     return web.json_response(
                         _chat_result_to_responses(
                             sem_hit, body.get("model") or config["model_name"]
