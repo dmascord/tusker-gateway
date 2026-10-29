@@ -6824,6 +6824,26 @@ def _validate_chat_body(body: Any) -> dict[str, Any]:
     return body
 
 
+_DIRECT_TEXT_ONLY_IMAGE_MODELS = frozenset({
+    ("ollama-cloud", "gpt-oss:20b"),
+    ("ollama-cloud", "gpt-oss:120b"),
+    ("ollama-cloud", "glm-5.2"),
+    ("ollama-cloud", "glm-5.3"),
+})
+
+
+def _direct_route_supports_modalities(
+    provider: str, model: str, body: dict[str, Any]
+) -> bool:
+    required = _required_input_modalities(body.get("messages"))
+    if not required or "image" not in required:
+        return True
+    key = (provider.strip().lower(), model.strip().lower())
+    if key in _DIRECT_TEXT_ONLY_IMAGE_MODELS:
+        return False
+    return True
+
+
 def _route_target(config: dict[str, Any], body: dict[str, Any]) -> tuple[str, str]:
     route = resolve_route(body.get("model"), body)
     if route.kind in {"pool", "code", "swarm"}:
@@ -6860,6 +6880,11 @@ def _route_target(config: dict[str, Any], body: dict[str, Any]) -> tuple[str, st
             raise BadRequestError(
                 f"model is not trusted for high-impact tools: {route.provider}/{route.model}",
                 code="high_impact_model_not_trusted",
+            )
+        if not _direct_route_supports_modalities(route.provider, route.model, body):
+            raise BadRequestError(
+                f"model route does not support image input: {route.provider}/{route.model}",
+                code="unsupported_input_modality",
             )
         return route.provider, route.model
     raise BadRequestError("Unsupported model route", code="unsupported_route")

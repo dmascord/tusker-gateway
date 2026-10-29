@@ -31,6 +31,7 @@ from tusker_gateway.endpoints import (
     _validation_stream_message,
     _request_conversation_id,
     _required_input_modalities,
+    _route_target,
     _validate_tool_call_arguments,
     _validate_chat_body,
     _validate_complete_tool_response,
@@ -502,6 +503,20 @@ def test_required_input_modalities_collects_multiple_media_types():
             ],
         }
     ]) == frozenset({"audio", "image", "video"})
+
+def test_direct_text_only_ollama_route_rejects_image_input():
+    body = {
+        "model": "ollama-cloud::gpt-oss:20b",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "describe this"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+            ],
+        }],
+    }
+    with pytest.raises(BadRequestError, match="does not support image input"):
+        _route_target({}, body)
 
 
 def test_request_conversation_id_prefers_explicit_client_header():
