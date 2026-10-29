@@ -640,7 +640,7 @@ class PoolManager:
                 tuple(providers())
                 if callable(providers)
                 else tuple(getattr(self.catalog_registry, "_clients", {}))
-                or ("openrouter", "opencode-zen", "opencode-go", "xiaomi")
+                or ("openrouter", "opencode-zen", "opencode-go", "xiaomi", "kilo-cli")
             )
             for provider in catalog_providers:
                 if provider == "models.dev":

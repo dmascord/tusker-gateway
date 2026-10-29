@@ -8,16 +8,32 @@ same tool-contract, high-impact audit, and stream validation path as HTTP
 providers. Adapters are code-registered; request data and provider config
 cannot choose an executable or import arbitrary code.
 
-### CLI version coupling and model catalog
+### CLI version coupling, model refresh, and retirement
+
+The CLI binaries remain pinned in the image; catalog refresh never upgrades a
+binary. The gateway's 5-minute catalog loop runs the following commands:
+
+- OpenCode: `opencode models`; only the `opencode/` free namespace is exposed.
+- Kilo: `kilo models --refresh --pure`; only `:free` routes and Kilo's
+  `kilo/kilo-auto/*` routes enter the cheap code pool.
+- Claude Code: no model-list API exists. Its stable `sonnet`, `opus`, and
+  `haiku` aliases remain the supported contract; aliases rejected by Claude's
+  CLI with deterministic retirement wording are marked permanently failed.
+
+OpenCode and Kilo catalog snapshots replace their previously auto-discovered
+entries on a successful refresh, so removed upstream models leave rotation.
+Failed or empty CLI listings retain the last-good snapshot. Static operator
+routes are not removed by catalog disappearance. A request-time deterministic
+retirement response is also persisted as a permanent failure and excluded
+from selection until the route is explicitly recovered.
 
 The CLI adapters classify some provider rejections from the executable's
 stdout, so their parsing contract is coupled to the installed CLI version.
 After any CLI bump, re-verify the adapters with
 `tests/test_opencode_cli_adapter.py` and a live tool-qualification probe;
 the adapter's rejection parsing must still match the CLI's output. Only
-`opencode-cli` feeds the automatic model catalog: its pinned `opencode
-models` output supplies the `opencode/` entries. The Claude Code and Kilo CLI
-adapters do not add models to that catalog.
+OpenCode and Kilo feed the automatic model catalog; Claude Code remains
+alias-based because it exposes no reliable machine-readable model list.
 
 ## Claude Code CLI
 
@@ -156,6 +172,11 @@ rejects the gateway's direct HTTP provider path (`opencode-zen`) with
 `FreeTierError` regardless of client headers, so the free models are served
 exclusively through this CLI route; tool qualification for them runs through
 the CLI via the normal `tool_qualification --provider opencode-cli` path.
+
+OpenCode CLI models are text-only in the gateway contract: image, audio, and
+video message parts are rejected before dispatch. The catalog marks every
+auto-discovered entry as text-only, and explicit routes use the same
+request-time modality guard.
 
 Set `TUSKER_OPENCODE_CLI_PATH` when an operator-managed installation should
 be used instead. OpenCode Zen may still reject CLI/API use based on account or
@@ -310,6 +331,11 @@ adapter reads JSON events as they arrive and forwards assistant text deltas
 as OpenAI SSE; lifecycle and diagnostic events are filtered out. Tool calls
 continue to be returned as normal OpenAI tool-call deltas. The gateway
 heartbeat stays active while waiting for the first CLI text event.
+
+Kilo CLI models are text-only in the gateway contract. Image, audio, and
+video message parts are rejected before dispatch for both direct routes and
+pool selection; the worker preserves the same 400 modality error for any
+request that reaches it.
 
 ### Warm worker servers
 

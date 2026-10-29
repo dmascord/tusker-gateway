@@ -33,6 +33,7 @@ from tusker_gateway.errors import (
     BadRequestError,
     ClaudeAuthRequiredError,
     ProviderError,
+    ProviderModelRetiredError,
     ProviderRouteDisabledError,
 )
 from tusker_gateway.sse import format_openai_chunk, sse_done, sse_frame
@@ -122,6 +123,24 @@ def _quota_error_indicated(*parts: bytes | str) -> bool:
         "too many requests",
     ))
 
+
+def _model_retired_indicated(*parts: bytes | str) -> bool:
+    """Detect deterministic Claude model retirement/rejection wording."""
+    text = " ".join(
+        part.decode("utf-8", errors="ignore") if isinstance(part, bytes) else part
+        for part in parts
+    ).lower()
+    return any(
+        phrase in text
+        for phrase in (
+            "model is not available",
+            "model is unavailable",
+            "model has been deprecated",
+            "model is deprecated",
+            "unknown model",
+            "invalid model",
+        )
+    )
 
 _RESET_AT_RE = re.compile(
     r"\breset(?:s|ting)?(?:\s+at)?\s+"
@@ -654,6 +673,10 @@ class ClaudeCodeCLIAdapter:
                 if event.get("type") != "result" or not event.get("is_error"):
                     return None
                 message = event.get("result") if isinstance(event.get("result"), str) else ""
+                if _model_retired_indicated(message):
+                    return ProviderModelRetiredError(
+                        "Claude Code CLI rejected the model as deprecated or unavailable"
+                    )
                 if event.get("api_error_status") == 401 or _auth_error_indicated(message):
                     return ClaudeAuthRequiredError()
                 if _quota_error_indicated(message):
@@ -798,6 +821,10 @@ class ClaudeCodeCLIAdapter:
                 len(stderr),
                 stderr_preview,
             )
+            if _model_retired_indicated(stdout, stderr):
+                raise ProviderModelRetiredError(
+                    "Claude Code CLI rejected the model as deprecated or unavailable"
+                )
             if _auth_error_indicated(stdout, stderr):
                 raise ClaudeAuthRequiredError()
             quota_message = _cli_result_message(stdout)
@@ -826,9 +853,13 @@ class ClaudeCodeCLIAdapter:
                 result.get("subtype"),
                 api_status,
             )
-            if api_status == 401 or _auth_error_indicated(result.get("result", "")):
-                raise ClaudeAuthRequiredError()
             message = result.get("result") if isinstance(result.get("result"), str) else ""
+            if _model_retired_indicated(message):
+                raise ProviderModelRetiredError(
+                    "Claude Code CLI rejected the model as deprecated or unavailable"
+                )
+            if api_status == 401 or _auth_error_indicated(message):
+                raise ClaudeAuthRequiredError()
             if _quota_error_indicated(message):
                 raise _quota_limit_error(message)
             auth_status = await claude_auth_status(executable=resolved)

@@ -6831,17 +6831,25 @@ _DIRECT_TEXT_ONLY_IMAGE_MODELS = frozenset({
     ("ollama-cloud", "glm-5.3"),
 })
 
+_DIRECT_CLI_INPUT_MODALITIES = {
+    "claude-code-cli": frozenset({"text", "image"}),
+    "opencode-cli": frozenset({"text"}),
+    "kilo-cli": frozenset({"text"}),
+}
+
 
 def _direct_route_supports_modalities(
     provider: str, model: str, body: dict[str, Any]
 ) -> bool:
     required = _required_input_modalities(body.get("messages"))
-    if not required or "image" not in required:
+    if not required:
         return True
-    key = (provider.strip().lower(), model.strip().lower())
+    normalized_provider = provider.strip().lower()
+    key = (normalized_provider, model.strip().lower())
     if key in _DIRECT_TEXT_ONLY_IMAGE_MODELS:
         return False
-    return True
+    supported = _DIRECT_CLI_INPUT_MODALITIES.get(normalized_provider)
+    return supported is None or required <= supported
 
 
 def _route_target(config: dict[str, Any], body: dict[str, Any]) -> tuple[str, str]:
@@ -6883,7 +6891,7 @@ def _route_target(config: dict[str, Any], body: dict[str, Any]) -> tuple[str, st
             )
         if not _direct_route_supports_modalities(route.provider, route.model, body):
             raise BadRequestError(
-                f"model route does not support image input: {route.provider}/{route.model}",
+                f"model route does not support requested input modalities: {route.provider}/{route.model}",
                 code="unsupported_input_modality",
             )
         return route.provider, route.model

@@ -530,7 +530,10 @@ class OpenCodeCLIAdapter:
                 return warm
 
         if stream:
-            from tusker_gateway.provider_adapters.cli_streaming import stream_cli_jsonl, text_from_event
+            from tusker_gateway.provider_adapters.cli_streaming import (
+                stream_cli_jsonl,
+                text_from_event,
+            )
 
             temp_dir = Path(tempfile.mkdtemp(prefix="tusker-opencode-stream-"))
             call_file: Path | None = None
@@ -551,13 +554,26 @@ class OpenCodeCLIAdapter:
                     },
                 }
                 env["OPENCODE_CONFIG_CONTENT"] = json.dumps(config, separators=(",", ":"))
+
+            def stream_error(event: dict[str, Any]) -> Exception | None:
+                if event.get("type") not in {"error", "result"}:
+                    return None
+                if event.get("type") == "result" and not event.get("is_error"):
+                    return None
+                return _cli_failure_error(json.dumps(event, separators=(",", ":")).encode())
+
+            def diagnostic_error(data: bytes) -> Exception | None:
+                return _cli_failure_error(data) if data else None
+
             command = [resolved, "run", "--standalone", "--format", "json", "--model", cli_model]
             timeout = max(10.0, float(os.environ.get("TUSKER_OPENCODE_CLI_TIMEOUT_SECS", "600")))
             return stream_cli_jsonl(
                 command, env=env, prompt=prompt.encode(), model=model, timeout=timeout,
-                text_extractor=text_from_event, call_file=call_file, cleanup_dir=temp_dir,
-                cwd=temp_dir,
-                error_code="opencode_cli_failed", timeout_message="OpenCode CLI request timed out",
+                text_extractor=text_from_event, event_error_extractor=stream_error,
+                diagnostic_error_extractor=diagnostic_error,
+                call_file=call_file, cleanup_dir=temp_dir, cwd=temp_dir,
+                error_code="opencode_cli_failed",
+                timeout_message="OpenCode CLI request timed out",
             )
 
         with tempfile.TemporaryDirectory(prefix="tusker-opencode-") as temp_name:

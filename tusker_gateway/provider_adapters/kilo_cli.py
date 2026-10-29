@@ -11,9 +11,13 @@ import sys
 import tempfile
 from urllib.parse import urljoin
 from pathlib import Path
-from typing import Any
-
-from tusker_gateway.errors import BadRequestError, GatewayError, ProviderError, ProviderRouteDisabledError
+from tusker_gateway.errors import (
+    BadRequestError,
+    GatewayError,
+    ProviderError,
+    ProviderModelRetiredError,
+    ProviderRouteDisabledError,
+)
 from tusker_gateway.provider_adapters.claude_code import (
     _normalise_tools,
     _prompt,
@@ -24,6 +28,24 @@ from tusker_gateway.provider_adapters.claude_code import ClaudeCodeCLIAdapter
 
 logger = logging.getLogger(__name__)
 
+
+
+def _model_retired_indicated(*parts: bytes | str) -> bool:
+    text = " ".join(
+        part.decode("utf-8", errors="ignore") if isinstance(part, bytes) else part
+        for part in parts
+    ).lower()
+    return any(
+        phrase in text
+        for phrase in (
+            "model is not available",
+            "model is unavailable",
+            "model has been deprecated",
+            "model is deprecated",
+            "unknown model",
+            "invalid model",
+        )
+    )
 
 def _enabled() -> bool:
     return os.environ.get("TUSKER_KILO_CLI_ENABLED", "").strip().lower() in {
@@ -72,7 +94,7 @@ def _model_for_cli(model: str) -> str:
         len(parts) < 2
         or any(not part for part in parts)
         or any(part in {".", ".."} or part.startswith("-") for part in parts)
-        or any(not (ch.isalnum() or ch in "._-~") for part in parts for ch in part)
+        or any(not (ch.isalnum() or ch in "._-~:") for part in parts for ch in part)
     ):
         raise BadRequestError(
             "kilo-cli model must be a provider/model identifier",
@@ -267,7 +289,10 @@ class KiloCLIAdapter:
                 env[name] = value
 
         if stream:
-            from tusker_gateway.provider_adapters.cli_streaming import stream_cli_jsonl, text_from_event
+            from tusker_gateway.provider_adapters.cli_streaming import (
+                stream_cli_jsonl,
+                text_from_event,
+            )
 
             temp_dir = Path(tempfile.mkdtemp(prefix="tusker-kilo-stream-"))
             call_file: Path | None = None
@@ -290,13 +315,35 @@ class KiloCLIAdapter:
                 for item in tool_manifest:
                     config["permission"][f"gateway_{item['mcp_name']}"] = "allow"
             env["KILO_CONFIG_CONTENT"] = json.dumps(config, separators=(",", ":"))
+
+            def stream_error(event: dict[str, Any]) -> Exception | None:
+                if event.get("type") not in {"error", "result"}:
+                    return None
+                message = json.dumps(event, separators=(",", ":"))
+                if event.get("type") == "result" and not event.get("is_error"):
+                    return None
+                if _model_retired_indicated(message):
+                    return ProviderModelRetiredError(
+                        "Kilo CLI rejected the model as deprecated or unavailable"
+                    )
+                return None
+
+            def diagnostic_error(data: bytes) -> Exception | None:
+                if _model_retired_indicated(data):
+                    return ProviderModelRetiredError(
+                        "Kilo CLI rejected the model as deprecated or unavailable"
+                    )
+                return None
+
             command = [resolved, "run", "--pure", "--format", "json", "--model", cli_model]
             timeout = max(10.0, float(os.environ.get("TUSKER_KILO_CLI_TIMEOUT_SECS", "600")))
             return stream_cli_jsonl(
                 command, env=env, prompt=prompt.encode(), model=model, timeout=timeout,
-                text_extractor=text_from_event, call_file=call_file, cleanup_dir=temp_dir,
-                cwd=temp_dir,
-                error_code="kilo_cli_failed", timeout_message="Kilo CLI request timed out",
+                text_extractor=text_from_event, event_error_extractor=stream_error,
+                diagnostic_error_extractor=diagnostic_error,
+                call_file=call_file, cleanup_dir=temp_dir,
+                cwd=temp_dir, error_code="kilo_cli_failed",
+                timeout_message="Kilo CLI request timed out",
             )
 
         with tempfile.TemporaryDirectory(prefix="tusker-kilo-") as temp_name:
@@ -396,6 +443,10 @@ class KiloCLIAdapter:
                 "kilo-cli exited rc=%s stderr_bytes=%d stderr=%r",
                 proc.returncode, len(stderr), stderr_preview,
             )
+            if _model_retired_indicated(stdout, stderr):
+                raise ProviderModelRetiredError(
+                    "Kilo CLI rejected the model as deprecated or unavailable"
+                )
             raise ProviderError("Kilo CLI request failed", code="kilo_cli_failed")
         text = self._extract_text(stdout)
         if text is None:
@@ -457,7 +508,12 @@ class KiloCLIAdapter:
                 raise ProviderError("Kilo warm request timed out", code="upstream_timeout") from exc
         logger.info("kilo warm request model=%s elapsed_s=%.3f rc=%s", cli_model, asyncio.get_running_loop().time() - started, proc.returncode)
         if proc.returncode != 0:
-            logger.warning("kilo warm client failed rc=%s stderr=%r", proc.returncode, stderr.decode(errors="replace")[:512])
+            stderr_preview = stderr.decode(errors="replace")[:512]
+            logger.warning("kilo warm client failed rc=%s stderr=%r", proc.returncode, stderr_preview)
+            if _model_retired_indicated(stdout, stderr):
+                raise ProviderModelRetiredError(
+                    "Kilo CLI rejected the model as deprecated or unavailable"
+                )
             raise ProviderError("Kilo warm request failed", code="kilo_cli_failed")
         text = self._extract_text(stdout)
         if text is None:

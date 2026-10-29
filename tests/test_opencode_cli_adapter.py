@@ -39,6 +39,29 @@ class _FakeProcess:
     async def wait(self):
         return self.returncode
 
+class _FakeStreamingProcess(_FakeProcess):
+    def __init__(self, stdout: bytes, stderr: bytes = b"", returncode: int = 0):
+        super().__init__(stdout, stderr, returncode)
+        self.stdin = self
+        self.stdout = self
+        self.stderr = self
+        self._lines = list(stdout.splitlines(keepends=True)) + [b""]
+
+    def write(self, _data: bytes) -> None:
+        pass
+
+    async def drain(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+    async def readline(self) -> bytes:
+        return self._lines.pop(0) if self._lines else b""
+
+    async def read(self) -> bytes:
+        return b""
+
 
 def _tool(name: str = "report_value"):
     return {"type": "function", "function": {
@@ -131,6 +154,19 @@ async def test_opencode_stream_uses_incremental_json_event_reader(monkeypatch):
         "--model", "opencode/big-pickle",
     ]
     assert captured["text_extractor"].__name__ == "text_from_event"
+
+@pytest.mark.asyncio
+async def test_opencode_stream_surfaces_model_retirement(monkeypatch):
+    monkeypatch.setenv("TUSKER_OPENCODE_CLI_ENABLED", "true")
+    event = {"type": "error", "error": {"message": "Invalid model reference: old-free"}}
+    process = _FakeStreamingProcess(json.dumps(event).encode() + b"\n")
+    with patch("tusker_gateway.provider_adapters.opencode_cli.shutil.which", return_value="opencode"), \
+         patch("tusker_gateway.provider_adapters.opencode_cli.asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)):
+        result = await OpenCodeCLIAdapter().chat(
+            provider="opencode-cli", model="old-free", messages=[], stream=True,
+        )
+        with pytest.raises(ProviderModelRetiredError):
+            _ = [frame async for frame in result]
 
 
 @pytest.mark.asyncio

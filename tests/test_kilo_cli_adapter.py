@@ -5,11 +5,16 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
-
 from tusker_gateway.config import DEFAULT_PROVIDER_REGISTRY
-from tusker_gateway.errors import BadRequestError, ProviderError, ProviderRouteDisabledError
+from tusker_gateway.errors import (
+    BadRequestError,
+    ProviderError,
+    ProviderModelRetiredError,
+    ProviderRouteDisabledError,
+)
 from tusker_gateway.provider_adapters import provider_adapters
 from tusker_gateway.provider_adapters.kilo_cli import KiloCLIAdapter, _model_for_cli
+
 
 
 class _FakeProcess:
@@ -24,6 +29,31 @@ class _FakeProcess:
 
     async def wait(self):
         return self.returncode
+
+class _FakeStreamingProcess(_FakeProcess):
+    def __init__(self, stdout: bytes, stderr: bytes = b"", returncode: int = 0):
+        super().__init__(stdout, stderr, returncode)
+        self.stdin = self
+        self.stdout = self
+        self.stderr = self
+        self._lines = list(stdout.splitlines(keepends=True)) + [b""]
+
+    def write(self, _data: bytes) -> None:
+        pass
+
+    async def drain(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+    async def readline(self) -> bytes:
+        return self._lines.pop(0) if self._lines else b""
+
+    async def read(self) -> bytes:
+        return b""
+
+
 
 
 def _tool():
@@ -118,6 +148,19 @@ async def test_kilo_stream_uses_incremental_json_event_reader(monkeypatch):
     assert result is marker
     assert captured["command"][:5] == ["/opt/kilo", "run", "--pure", "--format", "json"]
     assert captured["text_extractor"].__name__ == "text_from_event"
+
+@pytest.mark.asyncio
+async def test_kilo_stream_surfaces_model_retirement(monkeypatch):
+    monkeypatch.setenv("TUSKER_KILO_CLI_ENABLED", "true")
+    event = {"type": "error", "error": {"message": "Model is unavailable"}}
+    process = _FakeStreamingProcess(json.dumps(event).encode() + b"\n")
+    with patch("tusker_gateway.provider_adapters.kilo_cli.shutil.which", return_value="kilo"), \
+         patch("tusker_gateway.provider_adapters.kilo_cli.asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)):
+        result = await KiloCLIAdapter().chat(
+            provider="kilo-cli", model="kilo/kilo-auto/free", messages=[], stream=True,
+        )
+        with pytest.raises(ProviderModelRetiredError):
+            _ = [frame async for frame in result]
 
 
 @pytest.mark.asyncio

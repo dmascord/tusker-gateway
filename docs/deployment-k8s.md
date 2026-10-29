@@ -103,12 +103,15 @@ git HEAD) in agreement.
 
 The image pins three npm CLIs (`ARG CLAUDE_CODE_CLI_VERSION`,
 `ARG OPENCODE_CLI_VERSION`, `ARG KILO_CLI_VERSION` in the `Dockerfile`).
-The OpenCode free models are served *through* the CLI because the HTTP zen
-route is free-tier-gated, so a stale pin means a stale model catalog:
-newer CLIs list new free models (the `opencode-cli` auto-catalog adopts
-them into the code pool without a manifest change) and drop deprecated
-entries. Models a CLI still lists but refuses to serve are pruned at
-request time by the adapter's 410 retired-model mapping.
+The gateway catalog loop runs `opencode models` and, when Kilo is enabled,
+`kilo models --refresh --pure` every five minutes. OpenCode's `opencode/`
+free namespace and Kilo's `:free` plus `kilo/kilo-auto/*` routes are merged into
+the code pool as auto-discovered entries; a successful refresh prunes entries
+removed by the CLI. Empty or failed listings retain the last-good snapshot.
+Claude Code has no reliable model-list command, so its `sonnet`, `opus`, and
+`haiku` aliases remain a deliberate static contract; deterministic retirement
+errors are marked as permanently failed at request time.
+
 
 `k8s/check_cli_version_drift.py` compares the pins against npm `latest`
 and exits 1 on drift. `k8s/cli-drift-cronjob.yaml` runs it weekly in the
