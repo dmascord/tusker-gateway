@@ -127,7 +127,7 @@ For each request to `hermes-code`/`hermes-privacy`/etc:
 
 For an image-bearing request that also supplies tools, selection requires the
 model's latest `input_image_tools` capability record to be `passed` with probe
-version `image-tool-contract-v1`. Image-only and text-tool qualification are
+version `image-tool-contract-v2`. Image-only and text-tool qualification are
 not combined implicitly: a route that passes only one half is excluded before
 the upstream call. The same requirement is applied on ordinary selection,
 fallback attempts, recovery probes, and session-sticky re-selection.
@@ -439,12 +439,13 @@ The composite image-plus-tool probe is intentionally explicit and bounded:
 tusker-gateway-qualify-image-tools --model PROVIDER/MODEL
 ```
 
-It sends one tiny image and one harmless required tool call, then validates the
-tool arguments and result completion. It never changes pool membership or
-enables a route automatically. Generation probes are likewise opt-in: run
-them only for explicitly selected providers/models because generation requests
-can incur cost or create asynchronous jobs. A passing probe is evidence for
-the tested contract only, not a blanket multimodal capability claim.
+It sends one tiny image and one harmless required tool call. The required tool
+argument includes the observed middle-stripe color, and the gateway compares it
+with the known probe image as well as validating the path, tool name, and stream
+completion. This prevents a text-only route from passing merely because
+`tool_choice=required` forced a syntactically valid call. It never changes pool
+membership or enables a route automatically. Generation probes are likewise
+opt-in: run them only for explicitly selected providers/models because
 
 When `TUSKER_COMPOSITE_QUALIFICATION_ENABLED=true`, the background maintenance
 loop refreshes a bounded batch of lightweight chat routes every

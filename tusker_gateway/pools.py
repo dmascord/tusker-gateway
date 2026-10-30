@@ -46,8 +46,7 @@ logger = logging.getLogger(__name__)
 
 
 COMPOSITE_IMAGE_TOOLS_CAPABILITY = "input_image_tools"
-COMPOSITE_IMAGE_TOOLS_PROBE_VERSION = "image-tool-contract-v1"
-# Probe verdicts that are evidence *about* the image-plus-tool contract. Any
+COMPOSITE_IMAGE_TOOLS_PROBE_VERSION = "image-tool-contract-v2"
 # other status (notably ``unavailable``: 429, 5xx, timeout) says nothing about
 # the contract, so it must not be read as a capability denial.
 COMPOSITE_IMAGE_TOOLS_DEFINITIVE_FAILURES = frozenset({"unsupported", "failed"})
