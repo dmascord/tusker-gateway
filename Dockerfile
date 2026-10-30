@@ -35,7 +35,7 @@ ENV PYTHONDONTWRITEBYTECODE=1
 WORKDIR /opt/tusker-gateway
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential libffi-dev libssl-dev curl \
+    build-essential libffi-dev libssl-dev curl libbrotli1 \
     && rm -rf /var/lib/apt/lists/*
 
 
