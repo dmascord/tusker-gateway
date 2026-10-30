@@ -126,7 +126,6 @@ async def test_text_result_parses_opencode_json_event_stream(monkeypatch):
     assert env["OPENCODE_DISABLE_DEFAULT_PLUGINS"] == "true"
     assert "OPENCODE_API_KEY" not in env
     assert "OPENCODE_ZEN_API_KEY" not in env
-    assert "OPENCODE_CONFIG_CONTENT" not in env
     assert spawn.await_args.kwargs["cwd"]
 
 
@@ -208,11 +207,12 @@ async def test_deployment_scoped_zen_key_is_forwarded_only_when_explicitly_enabl
 @pytest.mark.asyncio
 async def test_mcp_tool_invocation_becomes_openai_tool_call(monkeypatch):
     monkeypatch.setenv("TUSKER_OPENCODE_CLI_ENABLED", "1")
-
+    captured_config: dict[str, Any] = {}
     class ToolCallProcess(_FakeProcess):
         async def communicate(self, _input: bytes):
-            env = json.loads(spawn.await_args.kwargs["env"]["OPENCODE_CONFIG_CONTENT"])
-            bridge = env["mcp"]["gateway"]["environment"]
+            config = json.loads((Path(spawn.await_args.kwargs["cwd"]) / "opencode.json").read_text())
+            captured_config.update(config)
+            bridge = config["mcp"]["servers"]["gateway"]["environment"]
             Path(bridge["TUSKER_MCP_CALL_FILE"]).write_text(json.dumps({
                 "id": "call_opencode_1", "name": "report_value", "arguments": {"value": "ok"},
             }))
@@ -231,10 +231,10 @@ async def test_mcp_tool_invocation_becomes_openai_tool_call(monkeypatch):
     assert call["function"]["name"] == "report_value"
     assert json.loads(call["function"]["arguments"]) == {"value": "ok"}
     assert result["choices"][0]["finish_reason"] == "tool_calls"
-    config = json.loads(spawn.await_args.kwargs["env"]["OPENCODE_CONFIG_CONTENT"])
+    config = captured_config
     assert "permission" not in config
-    assert config["mcp"]["gateway"]["type"] == "local"
-
+    assert config["mcp"]["servers"]["gateway"]["type"] == "local"
+    assert config["mcp"]["servers"]["gateway"]["enabled"] is True
 
 @pytest.mark.asyncio
 async def test_cli_error_and_missing_binary_are_actionable(monkeypatch):
@@ -479,7 +479,7 @@ async def test_warm_service_serves_text_request_without_standalone(warm_state):
     assert "OPENCODE_CONFIG_CONTENT" not in spawn.await_args.kwargs["env"]
     assert fake.stdin.written.decode() != ""
     started = next(env for args, env in calls if args[:2] == ["service", "start"])
-    bridge = json.loads(started["OPENCODE_CONFIG_CONTENT"])["mcp"]["gateway"]
+    bridge = json.loads((_broker_path() / "opencode.json").read_text())["mcp"]["servers"]["gateway"]
     assert bridge["environment"]["TUSKER_MCP_BROKER_DIR"] == str(_broker_path())
     assert ["api", "DELETE", "/api/session/ses_warm_text"] in [args for args, _ in calls]
     assert (_broker_path() / "active.json").read_text(encoding="utf-8") == "{}"
@@ -598,7 +598,7 @@ async def test_foreign_service_is_replaced_to_keep_the_broker_contract(warm_stat
         ["service", "status"], ["service", "stop"], ["service", "start"],
     ]
     assert warm_state._WARM_SERVICE_URL == "http://127.0.0.1:5000"
-    assert calls[-1][1]["OPENCODE_CONFIG_CONTENT"]
+    assert json.loads((_broker_path() / "opencode.json").read_text())["mcp"]["servers"]["gateway"]
 
 
 @pytest.mark.asyncio

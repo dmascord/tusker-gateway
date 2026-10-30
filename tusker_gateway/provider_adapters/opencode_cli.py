@@ -107,12 +107,20 @@ def _service_url(output: bytes) -> str | None:
 
 def _warm_bridge_config(broker_dir: Path) -> dict[str, Any]:
     """MCP config for the shared warm server: one bridge, request-scoped tools."""
-    return {"mcp": {"gateway": {
+    return {"mcp": {"servers": {"gateway": {
         "type": "local",
         "command": [sys.executable, "-m", "tusker_gateway.provider_adapters.mcp_stdio"],
         "environment": {"TUSKER_MCP_BROKER_DIR": str(broker_dir)},
+        "enabled": True,
         "timeout": 120000,
-    }}}
+    }}}}
+
+
+def _write_project_config(directory: Path, config: dict[str, Any]) -> None:
+    """Write the request or warm-server MCP config where OpenCode reads it."""
+    (directory / "opencode.json").write_text(
+        json.dumps(config, separators=(",", ":")), encoding="utf-8",
+    )
 
 
 async def _run_cli_tool(
@@ -242,9 +250,7 @@ async def _ensure_warm_service(binary: str, env: dict[str, str]) -> str | None:
             logger.warning("opencode warm broker unavailable (%s)", type(exc).__name__)
             return None
         service_env = dict(env)
-        service_env["OPENCODE_CONFIG_CONTENT"] = json.dumps(
-            _warm_bridge_config(broker_dir), separators=(",", ":"),
-        )
+        _write_project_config(broker_dir, _warm_bridge_config(broker_dir))
         await _run_cli_tool(binary, ["service", "stop"], env, timeout=60)
         code, stdout, stderr = await _run_cli_tool(
             binary, ["service", "start"], service_env, timeout=180, cwd=broker_dir,
@@ -484,6 +490,20 @@ def _child_env() -> dict[str, str]:
         part for part in (package_root, os.environ.get("PYTHONPATH", "")) if part
     )
     return env
+def _opencode_tool_prompt(prompt: str, tool_manifest: list[dict[str, Any]]) -> str:
+    """Tell OpenCode the MCP names exposed for the request's gateway tools."""
+    if not tool_manifest:
+        return prompt
+    mappings = ", ".join(
+        f"{item['name']} -> gateway_{item['mcp_name']}"
+        for item in tool_manifest
+    )
+    return (
+        f"{prompt}\n\n<gateway_mcp_tool_names>"
+        f"The supplied gateway functions are exposed as MCP tools with these exact names: "
+        f"{mappings}. Call the MCP tool name on the right, not the function name on the left."
+        "</gateway_mcp_tool_names>"
+    )
 
 
 class OpenCodeCLIAdapter:
@@ -491,7 +511,6 @@ class OpenCodeCLIAdapter:
 
     def __init__(self, *, executable: str | None = None) -> None:
         self._executable = executable
-
     async def chat(
         self,
         *,
@@ -514,9 +533,12 @@ class OpenCodeCLIAdapter:
 
         tool_manifest = _normalise_tools(tools, tool_choice)
         has_images = _has_image_parts(messages)
-        prompt = _prompt(
-            messages, has_tools=bool(tool_manifest), tool_choice=tool_choice,
-            allow_images=has_images, provider_label="opencode-cli",
+        prompt = _opencode_tool_prompt(
+            _prompt(
+                messages, has_tools=bool(tool_manifest), tool_choice=tool_choice,
+                allow_images=has_images, provider_label="opencode-cli",
+            ),
+            tool_manifest,
         )
         env = _child_env()
 
@@ -549,17 +571,21 @@ class OpenCodeCLIAdapter:
                 call_file = temp_dir / "tool-call.json"
                 manifest_file.write_text(json.dumps(tool_manifest), encoding="utf-8")
                 config["mcp"] = {
-                    "gateway": {
-                        "type": "local",
-                        "command": [sys.executable, "-m", "tusker_gateway.provider_adapters.mcp_stdio"],
-                        "environment": {
-                            "TUSKER_MCP_MANIFEST": str(manifest_file),
-                            "TUSKER_MCP_CALL_FILE": str(call_file),
+                    "servers": {
+                        "gateway": {
+                            "type": "local",
+                            "command": [sys.executable, "-m", "tusker_gateway.provider_adapters.mcp_stdio"],
+                            "environment": {
+                                "TUSKER_MCP_MANIFEST": str(manifest_file),
+                                "TUSKER_MCP_CALL_FILE": str(call_file),
+                            },
+                            "enabled": True,
+                            "timeout": 120000,
                         },
-                        "timeout": 120000,
                     },
                 }
-                env["OPENCODE_CONFIG_CONTENT"] = json.dumps(config, separators=(",", ":"))
+                _write_project_config(temp_dir, config)
+                env.pop("OPENCODE_CONFIG_CONTENT", None)
 
             def stream_error(event: dict[str, Any]) -> Exception | None:
                 if event.get("type") not in {"error", "result"}:
@@ -596,24 +622,28 @@ class OpenCodeCLIAdapter:
                 call_file = temp_dir / "tool-call.json"
                 manifest_file.write_text(json.dumps(tool_manifest), encoding="utf-8")
                 config["mcp"] = {
-                    "gateway": {
-                        "type": "local",
-                        "command": [
-                            sys.executable,
-                            "-m", "tusker_gateway.provider_adapters.mcp_stdio",
-                        ],
-                        "environment": {
-                            "TUSKER_MCP_MANIFEST": str(manifest_file),
-                            "TUSKER_MCP_CALL_FILE": str(call_file),
+                    "servers": {
+                        "gateway": {
+                            "type": "local",
+                            "command": [
+                                sys.executable,
+                                "-m", "tusker_gateway.provider_adapters.mcp_stdio",
+                            ],
+                            "environment": {
+                                "TUSKER_MCP_MANIFEST": str(manifest_file),
+                                "TUSKER_MCP_CALL_FILE": str(call_file),
+                            },
+                            "enabled": True,
+                            "timeout": 120000,
                         },
-                        "timeout": 120000,
                     },
                 }
                 # Do not set OpenCode's `permission` config here. OpenCode Zen
                 # free-tier auth rejects CLI requests with custom permission
                 # rules (403), while MCP-only config works and its run command
                 # auto-rejects permission prompts in non-interactive mode.
-                env["OPENCODE_CONFIG_CONTENT"] = json.dumps(config, separators=(",", ":"))
+                _write_project_config(temp_dir, config)
+                env.pop("OPENCODE_CONFIG_CONTENT", None)
             # The model must not inherit the gateway's working tree as its
             # project. Keep its workspace request-scoped and empty.
 

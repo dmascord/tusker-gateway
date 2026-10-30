@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 
 
 def _model_retired_indicated(*parts: bytes | str) -> bool:
+    """Detect deterministic Kilo model retirement/rejection wording."""
     text = " ".join(
         part.decode("utf-8", errors="ignore") if isinstance(part, bytes) else part
         for part in parts
@@ -48,6 +49,7 @@ def _model_retired_indicated(*parts: bytes | str) -> bool:
             "invalid model",
         )
     )
+
 
 def _enabled() -> bool:
     return os.environ.get("TUSKER_KILO_CLI_ENABLED", "").strip().lower() in {

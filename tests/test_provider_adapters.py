@@ -662,8 +662,11 @@ async def test_non_anthropic_cli_adapters_return_declared_tool_call(
     class ToolCallProcess(_FakeProcess):
         async def communicate(self, _input: bytes):
             env = spawn.await_args.kwargs["env"]
-            config = json.loads(env[config_var])
-            bridge = config["mcp"]["gateway"]
+            if provider == "opencode-cli":
+                config = json.loads((Path(spawn.await_args.kwargs["cwd"]) / "opencode.json").read_text())
+            else:
+                config = json.loads(env[config_var])
+            bridge = config["mcp"]["servers"]["gateway"] if provider == "opencode-cli" else config["mcp"]["gateway"]
             bridge_env = bridge.get("environment", {})
             call_file = Path(bridge_env["TUSKER_MCP_CALL_FILE"])
             call_file.write_text(json.dumps(tool_call), encoding="utf-8")
