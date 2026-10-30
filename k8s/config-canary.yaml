@@ -12,9 +12,9 @@ items:
       tusker.gateway.io/canary: 'true'
       tusker.gateway.io/source-deployment: tusker-gateway
     annotations:
-      tusker.gateway.io/rendered-at: '2026-09-10T09:59:59Z'
-      tusker.gateway.io/image-digest: sha256:408aad0c47026e4b47ac24f39b732ef12afc9fb9797f79243104298b817ba9ce
-      tusker.gateway.io/source-image: registry.tusker.net.au:5000/tusker-gateway:swarm-alpine-23237dc14a74fe1614dfa123d16cba92df4596e0
+      tusker.gateway.io/rendered-at: '2026-10-30T03:29:22Z'
+      tusker.gateway.io/image-digest: sha256:76c0c71b675c95649f1323f294bc868a2bf3433e92db905a94ba40f2d9f932b0
+      tusker.gateway.io/source-image: registry.tusker.net.au:5000/tusker-gateway@sha256:76c0c71b675c95649f1323f294bc868a2bf3433e92db905a94ba40f2d9f932b0
   spec:
     replicas: 1
     selector:
@@ -34,7 +34,7 @@ items:
         terminationGracePeriodSeconds: 90
         containers:
         - name: tusker-gateway-config-canary
-          image: registry.tusker.net.au:5000/tusker-gateway@sha256:408aad0c47026e4b47ac24f39b732ef12afc9fb9797f79243104298b817ba9ce
+          image: registry.tusker.net.au:5000/tusker-gateway@sha256:76c0c71b675c95649f1323f294bc868a2bf3433e92db905a94ba40f2d9f932b0
           imagePullPolicy: Always
           envFrom:
           - secretRef:
