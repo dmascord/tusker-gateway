@@ -6,9 +6,9 @@ metadata:
   labels:
     app: tusker-gateway
   annotations:
-    tusker.net.au/commit: 0584233839085dcbbca14ddfa286fc40f472e381
-    tusker.net.au/image-tag: swarm-alpine-0584233839085dcbbca14ddfa286fc40f472e381
-    tusker.net.au/image-digest: sha256:0e9c0d9ba970ffa571f834f8b05677bec6cf31ccf0a7765caec38c53d48fda76
+    tusker.net.au/commit: 4490acdc4d4a86e18e51563b8dfd6a35f261cf6c
+    tusker.net.au/image-tag: swarm-alpine-4490acdc4d4a86e18e51563b8dfd6a35f261cf6c
+    tusker.net.au/image-digest: sha256:77613692144ff4ff3b8b4d9ab7e59eff9ef7d19df759bd73fa02c0b5e838887a
 spec:
   replicas: 1
   selector:
@@ -34,7 +34,7 @@ spec:
       terminationGracePeriodSeconds: 90
       containers:
       - name: tusker-gateway
-        image: registry.tusker.net.au:5000/tusker-gateway@sha256:0e9c0d9ba970ffa571f834f8b05677bec6cf31ccf0a7765caec38c53d48fda76
+        image: registry.tusker.net.au:5000/tusker-gateway@sha256:77613692144ff4ff3b8b4d9ab7e59eff9ef7d19df759bd73fa02c0b5e838887a
         imagePullPolicy: Always
         envFrom:
         - secretRef:
@@ -188,7 +188,11 @@ spec:
         # repeatedly reached the 60s candidate-timeout ceiling with no
         # repeatable hour-of-day relief (2026-10-14 analysis).
         - name: TUSKER_BLACKLISTED_MODELS
-          value: ''
+          # Ollama Cloud retires these models on 2026-11-09. Keep stale DB
+          # pool rows and explicit client routes from reaching the provider;
+          # current catalog replacements are minimax-m3, mistral-large-4,
+          # and nemotron-3-super.
+          value: ollama-cloud/minimax-m2.7,ollama-cloud/mistral-large-3:675b,ollama-cloud/nemotron-3-nano:30b
         - name: TUSKER_GREYLISTED_MODELS
           value: ''
         # Comma-separated provider/model globs allowed to emit direct
@@ -306,7 +310,7 @@ spec:
         - name: TUSKER_EMBED_LOCAL_LLM_DIMENSIONS
           value: '768'
         - name: TUSKER_POOL_CODE
-          value: '{"models":[{"provider":"minimax","model":"MiniMax-M3","input_modalities":["text","image"]},{"provider":"minimax","model":"MiniMax-M2.7","input_modalities":["text"]},{"provider":"minimax","model":"MiniMax-M2.7-highspeed","input_modalities":["text"]},{"provider":"minimax","model":"MiniMax-M2.5","input_modalities":["text"]},{"provider":"minimax","model":"MiniMax-M2.5-highspeed","input_modalities":["text"]},{"provider":"minimax","model":"MiniMax-M2.1","input_modalities":["text"]},{"provider":"minimax","model":"MiniMax-M2.1-highspeed","input_modalities":["text"]},{"provider":"minimax","model":"MiniMax-M2","input_modalities":["text"]},{"provider":"synthetic","model":"syn:large:text","input_modalities":["text"]},{"provider":"synthetic","model":"syn:small:text","input_modalities":["text"]},{"provider":"synthetic","model":"syn:small:vision","input_modalities":["text","image"]},{"provider":"groq","model":"openai/gpt-oss-20b","input_modalities":["text"]},{"provider":"groq","model":"qwen/qwen3.6-27b","input_modalities":["text"]},{"provider":"zai","model":"glm-4.7"},{"provider":"openai-codex","model":"gpt-5.6-luna"},{"provider":"openai-codex","model":"gpt-5.4-mini"},{"provider":"github-copilot","model":"gpt-5.6-luna"},{"provider":"github-copilot-enterprise","model":"gpt-5.6-luna"},{"provider":"google","model":"gemini-3.5-flash","input_modalities":["text","image"]},{"provider":"google","model":"gemini-3.1-flash-lite","input_modalities":["text","image"]},{"provider":"google","model":"gemini-3.1-flash-lite-preview","input_modalities":["text","image"]},{"provider":"alibaba","model":"deepseek-v4-flash-0731","input_modalities":["text","image"]},{"provider":"opencode-go","model":"qwen3.6-plus"},{"provider":"zai","model":"glm-5.3-flash"},{"provider":"alibaba","model":"deepseek-v4-pro","input_modalities":["text","image"]},{"provider":"alibaba","model":"deepseek-v4.1-flash","input_modalities":["text","image"]},{"provider":"alibaba","model":"qwen3.6-flash","input_modalities":["text","image"]},{"provider":"alibaba","model":"qwen3.7-plus","input_modalities":["text","image"]},{"provider":"alibaba","model":"qwen3.8-flash","input_modalities":["text","image"]},{"provider":"claude-code-cli","model":"sonnet"},{"provider":"opencode-cli","model":"big-pickle"},{"provider":"opencode-cli","model":"cat-jam-free"},{"provider":"opencode-cli","model":"longcat-2.5-preview-free"},{"provider":"opencode-cli","model":"mimo-v2.6-flash-free"},{"provider":"opencode-cli","model":"muse-spark-1.3-contributor-free"},{"provider":"opencode-cli","model":"nemotron-3.5-lightning-free"},{"provider":"opencode-cli","model":"space-bunny-free"},{"provider":"opencode-cli","model":"step-5-preview-free"},{"provider":"kilo-cli","model":"kilo/kilo-auto/free"}],"fallback_pools":["premium","swarm"],"auto_catalog":true,"auto_catalog_providers":["minimax","synthetic","zai","openai-codex","github-copilot","github-copilot-enterprise","alibaba","opencode-go","workers-ai","ollama-cloud","groq","google","cerebras","opencode-cli"]}'
+          value: '{"models":[{"provider":"minimax","model":"MiniMax-M3","input_modalities":["text","image"]},{"provider":"minimax","model":"MiniMax-M2.7","input_modalities":["text"]},{"provider":"minimax","model":"MiniMax-M2.7-highspeed","input_modalities":["text"]},{"provider":"minimax","model":"MiniMax-M2.5","input_modalities":["text"]},{"provider":"minimax","model":"MiniMax-M2.5-highspeed","input_modalities":["text"]},{"provider":"minimax","model":"MiniMax-M2.1","input_modalities":["text"]},{"provider":"minimax","model":"MiniMax-M2.1-highspeed","input_modalities":["text"]},{"provider":"minimax","model":"MiniMax-M2","input_modalities":["text"]},{"provider":"synthetic","model":"syn:large:text","input_modalities":["text"]},{"provider":"synthetic","model":"syn:small:text","input_modalities":["text"]},{"provider":"synthetic","model":"syn:small:vision","input_modalities":["text","image"]},{"provider":"groq","model":"openai/gpt-oss-20b","input_modalities":["text"]},{"provider":"groq","model":"qwen/qwen3.6-27b","input_modalities":["text"]},{"provider":"zai","model":"glm-4.7"},{"provider":"openai-codex","model":"gpt-5.6-luna"},{"provider":"openai-codex","model":"gpt-5.4-mini"},{"provider":"github-copilot","model":"gpt-5.6-luna"},{"provider":"github-copilot-enterprise","model":"gpt-5.6-luna"},{"provider":"google","model":"gemini-3.5-flash","input_modalities":["text","image"]},{"provider":"google","model":"gemini-3.1-flash-lite","input_modalities":["text","image"]},{"provider":"google","model":"gemini-3.1-flash-lite-preview","input_modalities":["text","image"]},{"provider":"alibaba","model":"deepseek-v4-flash-0731","input_modalities":["text","image"]},{"provider":"opencode-go","model":"qwen3.6-plus"},{"provider":"zai","model":"glm-5.3-flash"},{"provider":"alibaba","model":"deepseek-v4-pro","input_modalities":["text","image"]},{"provider":"alibaba","model":"deepseek-v4.1-flash","input_modalities":["text","image"]},{"provider":"alibaba","model":"qwen3.6-flash","input_modalities":["text","image"]},{"provider":"alibaba","model":"qwen3.7-plus","input_modalities":["text","image"]},{"provider":"alibaba","model":"qwen3.8-flash","input_modalities":["text","image"]},{"provider":"claude-code-cli","model":"sonnet","input_modalities":["text","image"]},{"provider":"opencode-cli","model":"big-pickle","input_modalities":["text"]},{"provider":"opencode-cli","model":"cat-jam-free","input_modalities":["text"]},{"provider":"opencode-cli","model":"longcat-2.5-preview-free","input_modalities":["text"]},{"provider":"opencode-cli","model":"mimo-v2.6-flash-free","input_modalities":["text"]},{"provider":"opencode-cli","model":"muse-spark-1.3-contributor-free","input_modalities":["text"]},{"provider":"opencode-cli","model":"nemotron-3.5-lightning-free","input_modalities":["text"]},{"provider":"opencode-cli","model":"space-bunny-free","input_modalities":["text"]},{"provider":"opencode-cli","model":"step-5-preview-free","input_modalities":["text"]},{"provider":"kilo-cli","model":"kilo/kilo-auto/free","input_modalities":["text"]}],"fallback_pools":["premium","swarm"],"auto_catalog":true,"auto_catalog_providers":["minimax","synthetic","zai","openai-codex","github-copilot","github-copilot-enterprise","alibaba","opencode-go","workers-ai","ollama-cloud","groq","google","cerebras","opencode-cli","kilo-cli"]}'
         - name: TUSKER_POOL_PRIVACY
           value: '{"models":[{"provider":"mlx-mac","model":"qwen3.8-27b","input_modalities":["text","image"]},{"provider":"apim","model":"gpt-5.6-luna","input_modalities":["text","image"]}],"context_window":128000,"zdr":true,"auto_catalog":true,"require_tool_qualification":true,"auto_catalog_providers":["mlx-mac","openai-codex","github-copilot-enterprise","ollama-cloud"]}'
         - name: TUSKER_POOL_PREMIUM

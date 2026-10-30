@@ -8,16 +8,32 @@ same tool-contract, high-impact audit, and stream validation path as HTTP
 providers. Adapters are code-registered; request data and provider config
 cannot choose an executable or import arbitrary code.
 
-### CLI version coupling and model catalog
+### CLI version coupling, model refresh, and retirement
+
+The CLI binaries remain pinned in the image; catalog refresh never upgrades a
+binary. The gateway's 5-minute catalog loop runs the following commands:
+
+- OpenCode: `opencode models`; only the `opencode/` free namespace is exposed.
+- Kilo: `kilo models --refresh --pure`; only `:free` routes and Kilo's
+  `kilo/kilo-auto/*` routes enter the cheap code pool.
+- Claude Code: no model-list API exists. Its stable `sonnet`, `opus`, and
+  `haiku` aliases remain the supported contract; aliases rejected by Claude's
+  CLI with deterministic retirement wording are marked permanently failed.
+
+OpenCode and Kilo catalog snapshots replace their previously auto-discovered
+entries on a successful refresh, so removed upstream models leave rotation.
+Failed or empty CLI listings retain the last-good snapshot. Static operator
+routes are not removed by catalog disappearance. A request-time deterministic
+retirement response is also persisted as a permanent failure and excluded
+from selection until the route is explicitly recovered.
 
 The CLI adapters classify some provider rejections from the executable's
 stdout, so their parsing contract is coupled to the installed CLI version.
 After any CLI bump, re-verify the adapters with
 `tests/test_opencode_cli_adapter.py` and a live tool-qualification probe;
 the adapter's rejection parsing must still match the CLI's output. Only
-`opencode-cli` feeds the automatic model catalog: its pinned `opencode
-models` output supplies the `opencode/` entries. The Claude Code and Kilo CLI
-adapters do not add models to that catalog.
+OpenCode and Kilo feed the automatic model catalog; Claude Code remains
+alias-based because it exposes no reliable machine-readable model list.
 
 ## Claude Code CLI
 
@@ -156,6 +172,12 @@ rejects the gateway's direct HTTP provider path (`opencode-zen`) with
 `FreeTierError` regardless of client headers, so the free models are served
 exclusively through this CLI route; tool qualification for them runs through
 the CLI via the normal `tool_qualification --provider opencode-cli` path.
+
+OpenCode CLI models accept text and base64 image data URLs in the gateway
+contract. The adapter materializes each image into a request-scoped file and
+passes it with `opencode run --file`; remote image URLs, audio, and video remain
+rejected. Warm-server mode is bypassed for image requests because its persistent
+request shape cannot carry the per-request file attachments.
 
 Set `TUSKER_OPENCODE_CLI_PATH` when an operator-managed installation should
 be used instead. OpenCode Zen may still reject CLI/API use based on account or
@@ -311,6 +333,12 @@ as OpenAI SSE; lifecycle and diagnostic events are filtered out. Tool calls
 continue to be returned as normal OpenAI tool-call deltas. The gateway
 heartbeat stays active while waiting for the first CLI text event.
 
+Kilo CLI models accept text and base64 image data URLs in the gateway contract.
+The adapter materializes each image into a request-scoped file and passes it
+with `kilo run --file`; remote image URLs, audio, and video remain rejected.
+Worker and warm-server paths are bypassed for image requests so the isolated
+CLI invocation owns the request-scoped attachments.
+
 ### Warm worker servers
 
 The worker keeps two long-lived `kilo serve` processes so request handling does
@@ -349,9 +377,8 @@ code, so the modality probe records an authoritative `unsupported` verdict and
 clients see a clean 400 rather than a misleading 502. Worker-side outages and
 unparseable bodies still surface as 502 `kilo_worker_failed`. Streaming
 requests that reject before the first SSE byte get the same code/message via
-the SSE error frame. Kilo has no catalog advertisement for image input, so
-re-probing it requires `python -m tusker_gateway.modality_qualification
---include-unadvertised`. Other environments can run the adapter
+the SSE error frame. Kilo catalog entries advertise image input, and image
+requests use the isolated CLI path. Other environments can run the adapter
 locally by leaving `TUSKER_KILO_WORKER_URL` unset. The gateway image includes
 the pinned Kilo CLI (currently 7.8.12); set `TUSKER_KILO_CLI_PATH` to use an
 operator-managed installation instead.

@@ -24,11 +24,19 @@ _WARM_TOOL_SERVER: asyncio.subprocess.Process | None = None
 _WARM_TOOL_SERVER_URL = "http://127.0.0.1:4097"
 _WARM_SERVER_LOCK = asyncio.Lock()
 _BROKER_DIR = "/tmp/tusker-kilo-broker"
-_ALLOWED_MODELS = frozenset({
+_STATIC_ALLOWED_MODELS = frozenset({
     "groq/openai/gpt-oss-20b",
     "groq/qwen/qwen3.8-27b",
     "kilo/kilo-auto/free",
 })
+
+
+def _model_allowed(model: Any) -> bool:
+    """Accept static routes plus the refreshed free Kilo catalog surface."""
+    if not isinstance(model, str) or not model.strip():
+        return False
+    value = model.strip()
+    return value in _STATIC_ALLOWED_MODELS or value.endswith(":free") or value.startswith("kilo/kilo-auto/")
 _CONCURRENCY = asyncio.Semaphore(2)
 
 
@@ -176,7 +184,7 @@ async def chat(request: web.Request) -> web.Response:
         raise web.HTTPBadRequest(text="request body must be an object")
     model = body.get("model")
     messages = body.get("messages")
-    if model not in _ALLOWED_MODELS:
+    if not _model_allowed(model):
         return web.json_response(
             {"error": {"code": "unsupported_model", "message": "Kilo model is not enabled on this worker"}},
             status=400,

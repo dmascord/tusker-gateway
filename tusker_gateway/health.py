@@ -125,6 +125,118 @@ def _runtime_pool_candidates(
     return candidates
 
 
+def _provider_health_breakdown(
+    request: web.Request,
+    cfg: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Return credential-safe provider and route health for ``/health``.
+
+    Readiness answers whether a pool can serve; this view explains why a
+    provider is or is not being selected without exposing credentials or
+    upstream response bodies.
+    """
+    providers = cfg.get("providers")
+    if not isinstance(providers, dict):
+        providers = {}
+    manager = request.app.get("pool_manager")
+    model_map = getattr(manager, "models", {}) if manager is not None else {}
+    configured: dict[str, list[tuple[str, str]]] = {}
+    for pool_name, specs in model_map.items() if isinstance(model_map, dict) else ():
+        for spec in specs:
+            provider = _normalise_provider_name(getattr(spec, "provider", ""))
+            model = str(getattr(spec, "model", ""))
+            if provider and model:
+                configured.setdefault(provider, []).append((str(pool_name), model))
+
+    selectable: dict[str, int] = {}
+    if manager is not None and isinstance(model_map, dict):
+        from tusker_gateway.cooldown import global_tracker
+        from tusker_gateway.cooldown import is_permanently_failed
+        from tusker_gateway.pools import is_general_chat_model
+
+        credentials = _credential_pool_sizes(request, cfg)
+        tracker = global_tracker()
+        for pool_name, specs in model_map.items():
+            pool = getattr(manager, "pools", {}).get(pool_name)
+            catalog_unavailable = (
+                manager._catalog_unavailable_routes(specs)
+                if callable(getattr(manager, "_catalog_unavailable_routes", None))
+                else set()
+            )
+            for spec in specs:
+                provider = _normalise_provider_name(getattr(spec, "provider", ""))
+                model = str(getattr(spec, "model", ""))
+                endpoint = providers.get(provider) or providers.get(provider.replace("-", "_"))
+                if endpoint is None or (provider, model) in catalog_unavailable:
+                    continue
+                if is_permanently_failed(provider, model) or tracker.is_cooldown(provider, model):
+                    continue
+                if not is_general_chat_model(provider, model):
+                    continue
+                if pool is not None and getattr(pool, "zdr", False) and not getattr(spec, "zdr_ok", False):
+                    continue
+                if _provider_kind(endpoint) in {"oauth", "codex"} and not credentials.get(provider, 0):
+                    continue
+                selectable[provider] = selectable.get(provider, 0) + 1
+
+    from tusker_gateway.cooldown import global_tracker
+
+    cooldowns = global_tracker().snapshot()
+    cooldown_models: dict[str, list[str]] = {}
+    cooldown_providers: set[str] = set()
+    for entry in cooldowns.get("models", ()):
+        provider = _normalise_provider_name(entry.get("provider"))
+        cooldown_models.setdefault(provider, []).append(str(entry.get("model", "")))
+    for entry in cooldowns.get("providers", ()):
+        cooldown_providers.add(_normalise_provider_name(entry.get("provider")))
+    breaker = request.app.get("breaker")
+    breaker_open: dict[str, list[str]] = {}
+    try:
+        breaker_rows = breaker.snapshot() if breaker is not None else {}
+        for row in breaker_rows.values():
+            if str(row.get("state", "")).upper() == "OPEN":
+                provider = _normalise_provider_name(row.get("provider"))
+                breaker_open.setdefault(provider, []).append(str(row.get("model", "")))
+    except Exception:
+        logger.debug("provider health breaker breakdown unavailable", exc_info=True)
+    catalog_registry = request.app.get("catalog_registry")
+    try:
+        catalog = catalog_registry.diagnostics() if catalog_registry is not None else {}
+    except Exception:
+        catalog = {}
+    keys = cfg.get("provider_api_keys")
+    keys = keys if isinstance(keys, dict) else {}
+
+    names = set(_normalise_provider_name(name) for name in providers)
+    names.update(configured)
+    names.update(catalog)
+    result: dict[str, dict[str, Any]] = {}
+    for provider in sorted(name for name in names if name):
+        endpoint = providers.get(provider)
+        if endpoint is None:
+            endpoint = providers.get(provider.replace("-", "_"))
+        auth_type = _provider_kind(endpoint) if endpoint is not None else "unknown"
+        routes = configured.get(provider, [])
+        route_pools: dict[str, list[str]] = {}
+        for pool_name, model in routes:
+            route_pools.setdefault(pool_name, []).append(model)
+        result[provider] = {
+            "auth_type": auth_type,
+            "key_configured": bool(keys.get(provider)),
+            "configured_candidates": len(routes),
+            "selectable_candidates": selectable.get(provider, 0),
+            "route_pools": {
+                pool_name: models[:12]
+                for pool_name, models in sorted(route_pools.items())
+            },
+            "cooldown_provider": provider in cooldown_providers,
+            "cooldown_models": sorted(set(cooldown_models.get(provider, ())))[:24],
+            "breaker_open_models": sorted(set(breaker_open.get(provider, ())))[:24],
+            "catalog": catalog.get(provider),
+        }
+    return result
+
+
 def health_handler(request: web.Request) -> web.Response:
     """GET /health — liveness probe."""
     logger.debug('health check')
@@ -140,6 +252,7 @@ def health_handler(request: web.Request) -> web.Response:
             semantic_cache is not None and semantic_cache.enabled
         ),
         "state_store": storage_status(),
+        "provider_health": _provider_health_breakdown(request, request.app.get("config", {})),
         "config_runtime_status": request.app.get("config_runtime_status"),
     })
 

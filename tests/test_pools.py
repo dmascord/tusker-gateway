@@ -430,7 +430,7 @@ def test_image_tools_selection_requires_composite_probe(tmp_path):
         capability="input_image_tools",
         status="unsupported",
         source="composite_probe",
-        probe_version="image-tool-contract-v1",
+        probe_version="image-tool-contract-v2",
     )
     manager._model_capability_db.record(
         provider="synthetic",
@@ -438,7 +438,7 @@ def test_image_tools_selection_requires_composite_probe(tmp_path):
         capability="input_image_tools",
         status="passed",
         source="composite_probe",
-        probe_version="image-tool-contract-v1",
+        probe_version="image-tool-contract-v2",
     )
 
     assert manager.select(
@@ -530,7 +530,7 @@ def test_composite_image_tools_evidence_policy(
             capability="input_image_tools",
             status=status,
             source="composite_probe",
-            probe_version="image-tool-contract-v1",
+            probe_version="image-tool-contract-v2",
         )
 
     selected = manager.select(

@@ -16,6 +16,8 @@ rejected because the CLI's fetcher honours robots.txt).
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import json
 import logging
 import os
@@ -33,6 +35,7 @@ from tusker_gateway.errors import (
     BadRequestError,
     ClaudeAuthRequiredError,
     ProviderError,
+    ProviderModelRetiredError,
     ProviderRouteDisabledError,
 )
 from tusker_gateway.sse import format_openai_chunk, sse_done, sse_frame
@@ -122,6 +125,24 @@ def _quota_error_indicated(*parts: bytes | str) -> bool:
         "too many requests",
     ))
 
+
+def _model_retired_indicated(*parts: bytes | str) -> bool:
+    """Detect deterministic Claude model retirement/rejection wording."""
+    text = " ".join(
+        part.decode("utf-8", errors="ignore") if isinstance(part, bytes) else part
+        for part in parts
+    ).lower()
+    return any(
+        phrase in text
+        for phrase in (
+            "model is not available",
+            "model is unavailable",
+            "model has been deprecated",
+            "model is deprecated",
+            "unknown model",
+            "invalid model",
+        )
+    )
 
 _RESET_AT_RE = re.compile(
     r"\breset(?:s|ting)?(?:\s+at)?\s+"
@@ -311,6 +332,52 @@ def _as_text(
     raise BadRequestError("Message content must be text", code="invalid_message_content")
 
 
+def _image_attachments(messages: list[dict[str, Any]], temp_dir: Path, *, provider_label: str) -> list[str]:
+    """Materialize base64 image parts for CLIs that expose ``run --file``."""
+    from tusker_gateway.tool_formats import _ANTHROPIC_IMAGE_DATA_URL_RE
+
+    paths: list[str] = []
+    image_index = 0
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            kind = str(part.get("type") or "").strip().lower()
+            if kind not in {"image_url", "input_image"}:
+                continue
+            url = part.get("image_url")
+            if isinstance(url, dict):
+                url = url.get("url")
+            if not isinstance(url, str) or not url:
+                raise BadRequestError(
+                    "Message image block must contain a non-empty image_url",
+                    code="invalid_image_url",
+                )
+            match = _ANTHROPIC_IMAGE_DATA_URL_RE.fullmatch(url)
+            if match is None:
+                raise BadRequestError(
+                    f"{provider_label} accepts base64 image data URLs only; "
+                    "convert remote images before sending",
+                    code="invalid_image_url",
+                )
+            try:
+                data = base64.b64decode(match.group(2), validate=True)
+            except (ValueError, binascii.Error) as exc:
+                raise BadRequestError(
+                    "Message image block contains invalid base64 data",
+                    code="invalid_image_url",
+                ) from exc
+            suffix = match.group(1).split("/", 1)[1].lower().replace("+", "_")
+            path = temp_dir / f"gateway-image-{image_index}.{suffix}"
+            path.write_bytes(data)
+            paths.append(str(path))
+            image_index += 1
+    return paths
+
+
 def _image_blocks(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Collect base64 image blocks from every message for Claude stream-json input.
 
@@ -356,12 +423,22 @@ def _image_blocks(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return blocks
 
 
+def _has_image_parts(messages: list[dict[str, Any]]) -> bool:
+    return any(
+        isinstance(part, dict)
+        and str(part.get("type") or "").strip().lower() in {"image_url", "input_image"}
+        for message in messages
+        for part in (message.get("content") if isinstance(message.get("content"), list) else ())
+    )
+
+
 def _stream_json_input(prompt: str, images: list[dict[str, Any]]) -> bytes:
     """Encode transcript plus image blocks as Claude stream-json input."""
     content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
     content.extend(images)
     message = {"type": "user", "message": {"role": "user", "content": content}}
     return (json.dumps(message, ensure_ascii=False) + "\n").encode("utf-8")
+
 
 
 def _stream_json_result(stdout: bytes) -> dict[str, Any]:
@@ -654,6 +731,10 @@ class ClaudeCodeCLIAdapter:
                 if event.get("type") != "result" or not event.get("is_error"):
                     return None
                 message = event.get("result") if isinstance(event.get("result"), str) else ""
+                if _model_retired_indicated(message):
+                    return ProviderModelRetiredError(
+                        "Claude Code CLI rejected the model as deprecated or unavailable"
+                    )
                 if event.get("api_error_status") == 401 or _auth_error_indicated(message):
                     return ClaudeAuthRequiredError()
                 if _quota_error_indicated(message):
@@ -798,6 +879,10 @@ class ClaudeCodeCLIAdapter:
                 len(stderr),
                 stderr_preview,
             )
+            if _model_retired_indicated(stdout, stderr):
+                raise ProviderModelRetiredError(
+                    "Claude Code CLI rejected the model as deprecated or unavailable"
+                )
             if _auth_error_indicated(stdout, stderr):
                 raise ClaudeAuthRequiredError()
             quota_message = _cli_result_message(stdout)
@@ -826,9 +911,13 @@ class ClaudeCodeCLIAdapter:
                 result.get("subtype"),
                 api_status,
             )
-            if api_status == 401 or _auth_error_indicated(result.get("result", "")):
-                raise ClaudeAuthRequiredError()
             message = result.get("result") if isinstance(result.get("result"), str) else ""
+            if _model_retired_indicated(message):
+                raise ProviderModelRetiredError(
+                    "Claude Code CLI rejected the model as deprecated or unavailable"
+                )
+            if api_status == 401 or _auth_error_indicated(message):
+                raise ClaudeAuthRequiredError()
             if _quota_error_indicated(message):
                 raise _quota_limit_error(message)
             auth_status = await claude_auth_status(executable=resolved)

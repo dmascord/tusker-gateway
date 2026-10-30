@@ -5,6 +5,7 @@ import asyncio
 import aiohttp
 import json
 import os
+import tempfile
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 
@@ -31,11 +32,14 @@ from tusker_gateway.endpoints import (
     _validation_stream_message,
     _request_conversation_id,
     _required_input_modalities,
+    _route_target,
     _validate_tool_call_arguments,
     _validate_chat_body,
     _validate_complete_tool_response,
     _validate_tool_call_contract,
 )
+from tusker_gateway.config import PoolConfig
+from tusker_gateway.pools import PoolManager
 from tusker_gateway.quality import QualityDB
 from .conftest import HEADERS_AUTH, HEADERS_NO_AUTH
 
@@ -502,6 +506,64 @@ def test_required_input_modalities_collects_multiple_media_types():
             ],
         }
     ]) == frozenset({"audio", "image", "video"})
+
+def test_direct_text_only_ollama_route_rejects_image_input():
+    body = {
+        "model": "ollama-cloud::gpt-oss:20b",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "describe this"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+            ],
+        }],
+    }
+    with pytest.raises(BadRequestError, match="does not support requested input modalities"):
+        _route_target({}, body)
+
+
+@pytest.mark.parametrize(
+    ("model", "content_type"),
+    [
+        ("claude-code-cli/sonnet", "input_audio"),
+        ("claude-code-cli/sonnet", "input_video"),
+    ],
+)
+def test_direct_cli_routes_reject_unsupported_input_modalities(model, content_type):
+    body = {
+        "model": model,
+        "messages": [{
+            "role": "user",
+            "content": [{
+                "type": content_type,
+                content_type: {"url": "data:application/octet-stream;base64,AA=="},
+            }],
+        }],
+    }
+    with pytest.raises(BadRequestError, match="does not support requested input modalities"):
+        _route_target({}, body)
+
+
+def test_static_claude_route_advertises_image_input():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = PoolManager({
+            "pools": {
+                "code": PoolConfig(
+                    name="code",
+                    models=[{
+                        "provider": "claude-code-cli",
+                        "model": "sonnet",
+                        "input_modalities": ["text", "image"],
+                    }],
+                ),
+            },
+            "quality_db_path": os.path.join(tmpdir, "quality.db"),
+            "excluded_providers": [],
+        })
+        assert manager.select("code", required_input_modalities={"image"}) == (
+            "claude-code-cli",
+            "sonnet",
+        )
 
 
 def test_request_conversation_id_prefers_explicit_client_header():

@@ -39,6 +39,29 @@ class _FakeProcess:
     async def wait(self):
         return self.returncode
 
+class _FakeStreamingProcess(_FakeProcess):
+    def __init__(self, stdout: bytes, stderr: bytes = b"", returncode: int = 0):
+        super().__init__(stdout, stderr, returncode)
+        self.stdin = self
+        self.stdout = self
+        self.stderr = self
+        self._lines = list(stdout.splitlines(keepends=True)) + [b""]
+
+    def write(self, _data: bytes) -> None:
+        pass
+
+    async def drain(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+    async def readline(self) -> bytes:
+        return self._lines.pop(0) if self._lines else b""
+
+    async def read(self) -> bytes:
+        return b""
+
 
 def _tool(name: str = "report_value"):
     return {"type": "function", "function": {
@@ -103,7 +126,6 @@ async def test_text_result_parses_opencode_json_event_stream(monkeypatch):
     assert env["OPENCODE_DISABLE_DEFAULT_PLUGINS"] == "true"
     assert "OPENCODE_API_KEY" not in env
     assert "OPENCODE_ZEN_API_KEY" not in env
-    assert "OPENCODE_CONFIG_CONTENT" not in env
     assert spawn.await_args.kwargs["cwd"]
 
 
@@ -131,6 +153,19 @@ async def test_opencode_stream_uses_incremental_json_event_reader(monkeypatch):
         "--model", "opencode/big-pickle",
     ]
     assert captured["text_extractor"].__name__ == "text_from_event"
+
+@pytest.mark.asyncio
+async def test_opencode_stream_surfaces_model_retirement(monkeypatch):
+    monkeypatch.setenv("TUSKER_OPENCODE_CLI_ENABLED", "true")
+    event = {"type": "error", "error": {"message": "Invalid model reference: old-free"}}
+    process = _FakeStreamingProcess(json.dumps(event).encode() + b"\n")
+    with patch("tusker_gateway.provider_adapters.opencode_cli.shutil.which", return_value="opencode"), \
+         patch("tusker_gateway.provider_adapters.opencode_cli.asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)):
+        result = await OpenCodeCLIAdapter().chat(
+            provider="opencode-cli", model="old-free", messages=[], stream=True,
+        )
+        with pytest.raises(ProviderModelRetiredError):
+            _ = [frame async for frame in result]
 
 
 @pytest.mark.asyncio
@@ -172,11 +207,12 @@ async def test_deployment_scoped_zen_key_is_forwarded_only_when_explicitly_enabl
 @pytest.mark.asyncio
 async def test_mcp_tool_invocation_becomes_openai_tool_call(monkeypatch):
     monkeypatch.setenv("TUSKER_OPENCODE_CLI_ENABLED", "1")
-
+    captured_config: dict[str, Any] = {}
     class ToolCallProcess(_FakeProcess):
         async def communicate(self, _input: bytes):
-            env = json.loads(spawn.await_args.kwargs["env"]["OPENCODE_CONFIG_CONTENT"])
-            bridge = env["mcp"]["gateway"]["environment"]
+            config = json.loads((Path(spawn.await_args.kwargs["cwd"]) / "opencode.json").read_text())
+            captured_config.update(config)
+            bridge = config["mcp"]["servers"]["gateway"]["environment"]
             Path(bridge["TUSKER_MCP_CALL_FILE"]).write_text(json.dumps({
                 "id": "call_opencode_1", "name": "report_value", "arguments": {"value": "ok"},
             }))
@@ -195,10 +231,10 @@ async def test_mcp_tool_invocation_becomes_openai_tool_call(monkeypatch):
     assert call["function"]["name"] == "report_value"
     assert json.loads(call["function"]["arguments"]) == {"value": "ok"}
     assert result["choices"][0]["finish_reason"] == "tool_calls"
-    config = json.loads(spawn.await_args.kwargs["env"]["OPENCODE_CONFIG_CONTENT"])
+    config = captured_config
     assert "permission" not in config
-    assert config["mcp"]["gateway"]["type"] == "local"
-
+    assert config["mcp"]["servers"]["gateway"]["type"] == "local"
+    assert config["mcp"]["servers"]["gateway"]["enabled"] is True
 
 @pytest.mark.asyncio
 async def test_cli_error_and_missing_binary_are_actionable(monkeypatch):
@@ -277,19 +313,27 @@ async def test_deprecated_model_exit_marks_route_retired(monkeypatch):
             assert getattr(exc.value, "upstream_status", None) is None
 
 
+
 @pytest.mark.asyncio
-async def test_opencode_rejects_image_content_naming_opencode(monkeypatch):
+async def test_opencode_forwards_base64_image_as_file(monkeypatch):
     monkeypatch.setenv("TUSKER_OPENCODE_CLI_ENABLED", "true")
-    with patch("tusker_gateway.provider_adapters.opencode_cli.shutil.which", return_value="opencode"):
-        with pytest.raises(BadRequestError) as exc:
-            await OpenCodeCLIAdapter().chat(
-                provider="opencode-cli", model="big-pickle",
-                messages=[{"role": "user", "content": [
-                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}},
-                ]}], stream=False,
-            )
-    assert exc.value.code == "unsupported_message_content"
-    assert "opencode-cli currently accepts text-only" in exc.value.message
+    stdout = json.dumps({"type": "text", "part": {"text": "seen"}}).encode()
+    captured: dict[str, bytes] = {}
+    async def _spawn(*args, **kwargs):
+        image_path = args[args.index("--file") + 1]
+        captured["image"] = Path(image_path).read_bytes()
+        return _FakeProcess(stdout)
+    with patch("tusker_gateway.provider_adapters.opencode_cli.shutil.which", return_value="opencode"), \
+         patch("tusker_gateway.provider_adapters.opencode_cli.asyncio.create_subprocess_exec", new=_spawn):
+        result = await OpenCodeCLIAdapter().chat(
+            provider="opencode-cli", model="big-pickle",
+            messages=[{"role": "user", "content": [
+                {"type": "text", "text": "describe"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}},
+            ]}], stream=False,
+        )
+    assert result["choices"][0]["message"]["content"] == "seen"
+    assert captured["image"] == b"hi"
 
 
 class _FakeStdin:
@@ -435,7 +479,7 @@ async def test_warm_service_serves_text_request_without_standalone(warm_state):
     assert "OPENCODE_CONFIG_CONTENT" not in spawn.await_args.kwargs["env"]
     assert fake.stdin.written.decode() != ""
     started = next(env for args, env in calls if args[:2] == ["service", "start"])
-    bridge = json.loads(started["OPENCODE_CONFIG_CONTENT"])["mcp"]["gateway"]
+    bridge = json.loads((_broker_path() / "opencode.json").read_text())["mcp"]["servers"]["gateway"]
     assert bridge["environment"]["TUSKER_MCP_BROKER_DIR"] == str(_broker_path())
     assert ["api", "DELETE", "/api/session/ses_warm_text"] in [args for args, _ in calls]
     assert (_broker_path() / "active.json").read_text(encoding="utf-8") == "{}"
@@ -554,7 +598,7 @@ async def test_foreign_service_is_replaced_to_keep_the_broker_contract(warm_stat
         ["service", "status"], ["service", "stop"], ["service", "start"],
     ]
     assert warm_state._WARM_SERVICE_URL == "http://127.0.0.1:5000"
-    assert calls[-1][1]["OPENCODE_CONFIG_CONTENT"]
+    assert json.loads((_broker_path() / "opencode.json").read_text())["mcp"]["servers"]["gateway"]
 
 
 @pytest.mark.asyncio

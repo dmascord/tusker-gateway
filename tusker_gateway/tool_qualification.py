@@ -39,8 +39,8 @@ from tusker_gateway.tool_capability import (
 )
 logger = logging.getLogger(__name__)
 
+COMPOSITE_CAPABILITY_PROBE_VERSION = "image-tool-contract-v2"
 COMPOSITE_CAPABILITY = "input_image_tools"
-COMPOSITE_CAPABILITY_PROBE_VERSION = "image-tool-contract-v1"
 _COMPOSITE_PROBE_RETRY_DELAY_SECS = 2.0
 _COMPOSITE_PROBE_LOCK: asyncio.Lock | None = None
 _COMPOSITE_PROBE_LOCK_LOOP: asyncio.AbstractEventLoop | None = None
@@ -83,6 +83,7 @@ def _composite_probe_keeps_passing_evidence(
 
 PROBE_TOOL_NAME = "tusker_capability_probe"
 PROBE_PATH = "/tmp/tusker-tool-capability-probe"
+IMAGE_PROBE_COLOR = "green"
 
 PROBE_TOOL: dict[str, Any] = {
     "type": "function",
@@ -93,6 +94,26 @@ PROBE_TOOL: dict[str, Any] = {
             "type": "object",
             "properties": {"path": {"type": "string"}},
             "required": ["path"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+IMAGE_PROBE_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": PROBE_TOOL_NAME,
+        "description": "Return the harmless probe result and the color observed in the image.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "middle_stripe_color": {
+                    "type": "string",
+                    "enum": ["red", "green", "blue"],
+                },
+            },
+            "required": ["path", "middle_stripe_color"],
             "additionalProperties": False,
         },
     },
@@ -372,6 +393,7 @@ def _result_from_stream(
     calls: dict[int, dict[str, str]],
     text_parts: list[str],
     finish_reason: str | None,
+    expected_arguments: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Convert a parsed response into a safe DB/report record."""
     call_count = len(calls)
@@ -386,9 +408,10 @@ def _result_from_stream(
         except (TypeError, json.JSONDecodeError):
             arguments = None
         arguments_valid = isinstance(arguments, dict)
+        expected = expected_arguments or {"path": PROBE_PATH}
         arguments_match = (
             function_name == PROBE_TOOL_NAME
-            and arguments == {"path": PROBE_PATH}
+            and arguments == expected
         )
 
     structured = call_count > 0
@@ -466,8 +489,11 @@ async def probe_image_tool_model(
     model: str,
     timeout_secs: float = 45.0,
 ) -> dict[str, Any]:
-    """Probe a model with the canonical image payload and required tool."""
+    """Probe a model with an image-derived required tool call."""
     # Keep the decodable PNG and image message shape in the modality probe.
+    # The tool argument must contain the color of the middle stripe. This
+    # prevents a text-only model from passing merely because tool_choice forces
+    # it to emit a syntactically valid call.
     from tusker_gateway.modality_qualification import _messages_for_modality
 
     payload = {
@@ -477,12 +503,14 @@ async def probe_image_tool_model(
                 "role": "system",
                 "content": (
                     "Call tusker_capability_probe exactly once with path "
-                    f"{PROBE_PATH}. Do not emit prose or call any other function."
+                    f"{PROBE_PATH} and middle_stripe_color set to the color "
+                    "you observe in the middle stripe of the image. "
+                    "Do not emit prose or call any other function."
                 ),
             },
             {"role": "user", "content": _messages_for_modality("image")[0]["content"]},
         ],
-        "tools": [PROBE_TOOL],
+        "tools": [IMAGE_PROBE_TOOL],
         "tool_choice": "required",
         "stream": True,
         "temperature": 0,
@@ -554,6 +582,10 @@ async def probe_image_tool_model(
         calls=calls,
         text_parts=text_parts,
         finish_reason=finish_reason,
+        expected_arguments={
+            "path": PROBE_PATH,
+            "middle_stripe_color": IMAGE_PROBE_COLOR,
+        },
     )
     result.update(
         status="passed" if parsed["status"] == "passed" else "unsupported",

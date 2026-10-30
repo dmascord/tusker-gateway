@@ -16,6 +16,7 @@ from tusker_gateway.errors import (
     BadRequestError,
     ClaudeAuthRequiredError,
     ProviderError,
+    ProviderModelRetiredError,
     ProviderRouteDisabledError,
 )
 from tusker_gateway.provider_adapters import ProviderAdapterRegistry, provider_adapters
@@ -444,6 +445,23 @@ async def test_cli_stream_surfaces_auth_expiry_as_specific_error(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_cli_stream_surfaces_model_retirement(monkeypatch):
+    monkeypatch.setenv("TUSKER_CLAUDE_CODE_ENABLED", "true")
+    error_event = {
+        "type": "result", "is_error": True,
+        "result": "The model has been deprecated and is unavailable",
+    }
+    process = _FakeStreamingProcess(json.dumps(error_event).encode() + b"\n")
+    with patch("tusker_gateway.provider_adapters.claude_code.shutil.which", return_value="claude"), \
+         patch("tusker_gateway.provider_adapters.claude_code.asyncio.create_subprocess_exec",
+               new=AsyncMock(return_value=process)):
+        result = await ClaudeCodeCLIAdapter().chat(
+            provider="claude-code-cli", model="sonnet", messages=[], stream=True,
+        )
+        with pytest.raises(ProviderModelRetiredError):
+            _ = [frame async for frame in result]
+
+@pytest.mark.asyncio
 async def test_cli_stream_tool_call_preserves_openai_tool_delta(monkeypatch):
     monkeypatch.setenv("TUSKER_CLAUDE_CODE_ENABLED", "true")
 
@@ -644,8 +662,11 @@ async def test_non_anthropic_cli_adapters_return_declared_tool_call(
     class ToolCallProcess(_FakeProcess):
         async def communicate(self, _input: bytes):
             env = spawn.await_args.kwargs["env"]
-            config = json.loads(env[config_var])
-            bridge = config["mcp"]["gateway"]
+            if provider == "opencode-cli":
+                config = json.loads((Path(spawn.await_args.kwargs["cwd"]) / "opencode.json").read_text())
+            else:
+                config = json.loads(env[config_var])
+            bridge = config["mcp"]["servers"]["gateway"] if provider == "opencode-cli" else config["mcp"]["gateway"]
             bridge_env = bridge.get("environment", {})
             call_file = Path(bridge_env["TUSKER_MCP_CALL_FILE"])
             call_file.write_text(json.dumps(tool_call), encoding="utf-8")

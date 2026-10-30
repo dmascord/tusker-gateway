@@ -41,6 +41,7 @@ registers:
 
 - `GET /health`: liveness response.
 - `GET /ready`: readiness response; currently requires at least one credential.
+- `GET /health` includes credential-safe `provider_health` entries with API-key presence, configured/selectable route counts, active cooldowns, breaker state, and catalog refresh diagnostics.
 - `GET /status`: pool and quality status.
 - `GET /metrics`: Prometheus text exposition (Release 1; optional auth via
   `TUSKER_METRICS_TOKEN`).
