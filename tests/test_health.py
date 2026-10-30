@@ -7,7 +7,8 @@ from types import SimpleNamespace
 import pytest
 from .conftest import HEADERS_AUTH, HEADERS_NO_AUTH
 from tusker_gateway.config import DEFAULT_PROVIDER_REGISTRY, PoolConfig
-from tusker_gateway.health import ready_handler
+from tusker_gateway.cooldown import global_tracker
+from tusker_gateway.health import health_handler, ready_handler
 
 
 @pytest.mark.asyncio
@@ -16,7 +17,9 @@ async def test_health(client):
     assert resp.status == 200
     data = await resp.json()
     assert data["status"] == "ok"
+    assert "provider_health" in data
 
+    assert isinstance(data["provider_health"], dict)
 
 @pytest.mark.asyncio
 async def test_ready(client):
@@ -122,6 +125,29 @@ def test_ready_does_not_count_oauth_candidate_without_credentials():
     assert response.status == 503
     data = json.loads(response.text)
     assert data["pools"]["code"]["usable"] == 0
+
+def test_health_provider_breakdown_exposes_cooldown_without_key_material():
+    cfg = {
+        "providers": {"opencode-go": DEFAULT_PROVIDER_REGISTRY["opencode-go"]},
+        "provider_api_keys": {"opencode-go": "secret-value"},
+        "pools": {"code": PoolConfig("code", [{"provider": "opencode-go", "model": "m"}])},
+    }
+    manager = SimpleNamespace(
+        models={"code": [SimpleNamespace(provider="opencode-go", model="m", zdr_ok=True)]},
+        pools=cfg["pools"],
+    )
+    tracker = global_tracker()
+    tracker.cooldown("opencode-go", "m", 3600)
+
+    response = health_handler(SimpleNamespace(app={"config": cfg, "pool_manager": manager}))
+    data = json.loads(response.text)
+    provider = data["provider_health"]["opencode-go"]
+
+    assert provider["key_configured"] is True
+    assert provider["configured_candidates"] == 1
+    assert provider["selectable_candidates"] == 0
+    assert provider["cooldown_models"] == ["m"]
+    assert "secret-value" not in response.text
 
 
 @pytest.mark.asyncio

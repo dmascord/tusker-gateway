@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from unittest.mock import AsyncMock
+import os
 
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
@@ -10,6 +11,22 @@ from aiohttp import web
 from tusker_gateway import kilo_worker
 from tusker_gateway.errors import BadRequestError, ProviderError
 from tusker_gateway.provider_adapters.kilo_cli import KiloCLIAdapter
+
+
+@pytest.fixture(autouse=True)
+def restore_worker_environment():
+    names = (
+        "TUSKER_KILO_WARM_SERVER_URL",
+        "TUSKER_KILO_WARM_TOOL_SERVER_URL",
+        "TUSKER_MCP_BROKER_DIR",
+    )
+    saved = {name: os.environ.get(name) for name in names}
+    yield
+    for name, value in saved.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
 
 
 
@@ -42,9 +59,25 @@ async def test_worker_rejects_models_outside_qualified_allowlist(monkeypatch):
     finally:
         await client.close()
 
+@pytest.mark.asyncio
+async def test_worker_accepts_refreshed_free_model(monkeypatch):
+    run = AsyncMock(return_value={"choices": [{"message": {"role": "assistant", "content": "ok"}}]})
+    monkeypatch.setattr(kilo_worker.KiloCLIAdapter, "chat", run)
+    client = TestClient(TestServer(kilo_worker.create_app()))
+    await client.start_server()
+    try:
+        response = await client.post("/v1/chat/completions", json={
+            "model": "openrouter/google/gemma-4-31b-it:free",
+            "messages": [{"role": "user", "content": "test"}],
+        })
+        assert response.status == 200
+        run.assert_awaited_once()
+    finally:
+        await client.close()
+
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("model", sorted(kilo_worker._ALLOWED_MODELS))
+@pytest.mark.parametrize("model", sorted(kilo_worker._STATIC_ALLOWED_MODELS))
 async def test_worker_forwards_allowed_tool_requests_without_execution(monkeypatch, model):
     completion = {"choices": [{"message": {"role": "assistant", "tool_calls": [
         {"id": "call_test", "type": "function", "function": {

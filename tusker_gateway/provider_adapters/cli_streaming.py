@@ -43,6 +43,7 @@ def stream_cli_jsonl(
     command: list[str], *, env: dict[str, str], prompt: bytes, model: str,
     timeout: float, text_extractor: Callable[[dict[str, Any]], str | None],
     event_error_extractor: Callable[[dict[str, Any]], Exception | None] | None = None,
+    diagnostic_error_extractor: Callable[[bytes], Exception | None] | None = None,
     call_file: Path | None = None, cleanup_dir: Path | None = None,
     cwd: Path | None = None,
     error_code: str = "cli_failed", timeout_message: str = "CLI request timed out",
@@ -145,6 +146,10 @@ def stream_cli_jsonl(
                     "CLI stream exited rc=%s stderr_bytes=%d stderr=%r",
                     proc.returncode, len(stderr), stderr_preview,
                 )
+                if diagnostic_error_extractor is not None:
+                    error = diagnostic_error_extractor(stderr)
+                    if error is not None:
+                        raise error
                 raise ProviderError("CLI request failed", code=error_code)
             if not emitted:
                 raise ProviderError("CLI returned no assistant output", code="invalid_upstream_response")

@@ -12,6 +12,7 @@ from tusker_gateway.tool_capability import (
     ToolCapabilityDB,
     ToolCapabilityLevel,
 )
+from tusker_gateway.tool_qualification import IMAGE_PROBE_COLOR, IMAGE_PROBE_TOOL
 from tusker_gateway.tool_qualification import (
     COMPOSITE_CAPABILITY,
     COMPOSITE_CAPABILITY_PROBE_VERSION,
@@ -120,19 +121,33 @@ def _sse(event):
 @pytest.mark.asyncio
 async def test_composite_probe_passes_image_and_exact_tool_call():
     response = _CompositeResponse([
-        _sse({"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"name": PROBE_TOOL_NAME, "arguments": '{"path":"/tmp/tusker-tool-capability-probe"}'}}]}, "finish_reason": "tool_calls"}]}),
+        _sse({"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"name": PROBE_TOOL_NAME, "arguments": '{"path":"/tmp/tusker-tool-capability-probe","middle_stripe_color":"green"}'}}]}, "finish_reason": "tool_calls"}]}),
     ])
     session = _CompositeSession(response)
     result = await probe_image_tool_model(session, base_url="http://gateway.test", api_key="key", provider="openrouter", model="vision")
     assert result["status"] == "passed"
     assert result["capability"] == COMPOSITE_CAPABILITY
     assert session.payload["messages"][1]["content"][1]["type"] == "image_url"
-    assert session.payload["tools"]
+    assert session.payload["tools"] == [IMAGE_PROBE_TOOL]
+    assert IMAGE_PROBE_COLOR not in session.payload["messages"][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_composite_probe_rejects_forced_call_without_image_evidence():
+    response = _CompositeResponse([
+        _sse({"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"name": PROBE_TOOL_NAME, "arguments": '{"path":"/tmp/tusker-tool-capability-probe","middle_stripe_color":"red"}'}}]}, "finish_reason": "tool_calls"}]}),
+    ])
+    result = await probe_image_tool_model(
+        _CompositeSession(response), base_url="http://gateway.test", api_key="key",
+        provider="openrouter", model="text-only",
+    )
+    assert result["status"] == "unsupported"
+    assert result["failure_class"] == "non_strict_tool_contract"
 
 @pytest.mark.asyncio
 async def test_composite_probe_allows_reasoning_budget_for_multimodal_models():
     response = _CompositeResponse([
-        _sse({"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"name": PROBE_TOOL_NAME, "arguments": '{"path":"/tmp/tusker-tool-capability-probe"}'}}]}, "finish_reason": "tool_calls"}]}),
+        _sse({"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"name": PROBE_TOOL_NAME, "arguments": '{"path":"/tmp/tusker-tool-capability-probe","middle_stripe_color":"green"}'}}]}, "finish_reason": "tool_calls"}]}),
     ])
     session = _CompositeSession(response)
     result = await probe_image_tool_model(

@@ -5,6 +5,7 @@ import asyncio
 import aiohttp
 import json
 import os
+import tempfile
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 
@@ -31,11 +32,14 @@ from tusker_gateway.endpoints import (
     _validation_stream_message,
     _request_conversation_id,
     _required_input_modalities,
+    _route_target,
     _validate_tool_call_arguments,
     _validate_chat_body,
     _validate_complete_tool_response,
     _validate_tool_call_contract,
 )
+from tusker_gateway.config import PoolConfig
+from tusker_gateway.pools import PoolManager
 from tusker_gateway.quality import QualityDB
 from .conftest import HEADERS_AUTH, HEADERS_NO_AUTH
 
@@ -502,6 +506,64 @@ def test_required_input_modalities_collects_multiple_media_types():
             ],
         }
     ]) == frozenset({"audio", "image", "video"})
+
+def test_direct_text_only_ollama_route_rejects_image_input():
+    body = {
+        "model": "ollama-cloud::gpt-oss:20b",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "describe this"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+            ],
+        }],
+    }
+    with pytest.raises(BadRequestError, match="does not support requested input modalities"):
+        _route_target({}, body)
+
+
+@pytest.mark.parametrize(
+    ("model", "content_type"),
+    [
+        ("claude-code-cli/sonnet", "input_audio"),
+        ("claude-code-cli/sonnet", "input_video"),
+    ],
+)
+def test_direct_cli_routes_reject_unsupported_input_modalities(model, content_type):
+    body = {
+        "model": model,
+        "messages": [{
+            "role": "user",
+            "content": [{
+                "type": content_type,
+                content_type: {"url": "data:application/octet-stream;base64,AA=="},
+            }],
+        }],
+    }
+    with pytest.raises(BadRequestError, match="does not support requested input modalities"):
+        _route_target({}, body)
+
+
+def test_static_claude_route_advertises_image_input():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = PoolManager({
+            "pools": {
+                "code": PoolConfig(
+                    name="code",
+                    models=[{
+                        "provider": "claude-code-cli",
+                        "model": "sonnet",
+                        "input_modalities": ["text", "image"],
+                    }],
+                ),
+            },
+            "quality_db_path": os.path.join(tmpdir, "quality.db"),
+            "excluded_providers": [],
+        })
+        assert manager.select("code", required_input_modalities={"image"}) == (
+            "claude-code-cli",
+            "sonnet",
+        )
 
 
 def test_request_conversation_id_prefers_explicit_client_header():
@@ -2200,6 +2262,42 @@ async def test_semantic_cache_uses_concrete_route_and_does_not_cross_hit(app, cl
     assert semantic.store.call_args.kwargs["scope"] == semantic.query.call_args_list[0].kwargs["scope"]
     assert mock_chat.call_args.args[:2] == ("openai", "gpt-4o-mini")
 
+
+
+@pytest.mark.asyncio
+async def test_semantic_cache_hit_restores_redaction_tokens_before_delivery(app, client):
+    from tusker_gateway.redaction import RedactionRuleSet, Tokenizer
+
+    tokenizer = Tokenizer(
+        key=bytes.fromhex("ab" * 32),
+        rules=RedactionRuleSet(),
+    )
+    email = "semantic-cache" + chr(64) + "example.test"
+    token = tokenizer.tokenize_text(email)
+    app["redaction_tokenizer"] = tokenizer
+    app["semantic_cache"] = _FakeSemanticCache([
+        {"id": "semantic-hit", "choices": [{"message": {"content": "mail " + token}}]},
+    ])
+    pool_manager = MagicMock()
+    pool_manager.select.return_value = ("openai", "gpt-4o-mini")
+    app["pool_manager"] = pool_manager
+
+    with patch("tusker_gateway.endpoints.PassthroughClient.chat", new_callable=AsyncMock) as mock_chat:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-code",
+                "messages": [{"role": "user", "content": "find the cached answer"}],
+                "temperature": 0,
+            },
+            headers=HEADERS_AUTH,
+        )
+
+    body = await response.json()
+    assert response.status == 200
+    assert body["choices"][0]["message"]["content"] == "mail " + email
+    assert token not in json.dumps(body)
+    mock_chat.assert_not_awaited()
 
 @pytest.mark.asyncio
 async def test_semantic_cache_requires_explicit_deterministic_request(app, client):
