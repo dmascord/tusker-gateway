@@ -254,17 +254,25 @@ async def test_nonzero_exit_logs_bounded_stderr_preview(monkeypatch):
 
 
 
+
 @pytest.mark.asyncio
-async def test_kilo_rejects_image_content_naming_kilo(monkeypatch):
+async def test_kilo_forwards_base64_image_as_file(monkeypatch):
     monkeypatch.setenv("TUSKER_KILO_CLI_ENABLED", "true")
     monkeypatch.delenv("TUSKER_KILO_WORKER_URL", raising=False)
-    with patch("tusker_gateway.provider_adapters.kilo_cli.shutil.which", return_value="kilo"):
-        with pytest.raises(BadRequestError) as exc:
-            await KiloCLIAdapter().chat(
-                provider="kilo-cli", model="kilo/kilo-auto/free",
-                messages=[{"role": "user", "content": [
-                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}},
-                ]}], stream=False,
-            )
-    assert exc.value.code == "unsupported_message_content"
-    assert "kilo-cli currently accepts text-only" in exc.value.message
+    stdout = json.dumps({"type": "text", "part": {"text": "seen"}}).encode()
+    captured: dict[str, bytes] = {}
+    async def _spawn(*args, **kwargs):
+        image_path = args[args.index("--file") + 1]
+        captured["image"] = Path(image_path).read_bytes()
+        return _FakeProcess(stdout)
+    with patch("tusker_gateway.provider_adapters.kilo_cli.shutil.which", return_value="kilo"), \
+         patch("tusker_gateway.provider_adapters.kilo_cli.asyncio.create_subprocess_exec", new=_spawn):
+        result = await KiloCLIAdapter().chat(
+            provider="kilo-cli", model="kilo/kilo-auto/free",
+            messages=[{"role": "user", "content": [
+                {"type": "text", "text": "describe"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}},
+            ]}], stream=False,
+        )
+    assert result["choices"][0]["message"]["content"] == "seen"
+    assert captured["image"] == b"hi"

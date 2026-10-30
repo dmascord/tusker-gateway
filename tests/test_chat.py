@@ -525,8 +525,6 @@ def test_direct_text_only_ollama_route_rejects_image_input():
 @pytest.mark.parametrize(
     ("model", "content_type"),
     [
-        ("opencode-cli/big-pickle", "image_url"),
-        ("kilo-cli/kilo/kilo-auto/free", "image_url"),
         ("claude-code-cli/sonnet", "input_audio"),
         ("claude-code-cli/sonnet", "input_video"),
     ],

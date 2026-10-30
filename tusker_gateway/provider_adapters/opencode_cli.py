@@ -30,6 +30,8 @@ from tusker_gateway.errors import (
     RateLimitError,
 )
 from tusker_gateway.provider_adapters.claude_code import (
+    _has_image_parts,
+    _image_attachments,
     _normalise_tools,
     _prompt,
     _read_tool_call,
@@ -511,13 +513,14 @@ class OpenCodeCLIAdapter:
             raise ProviderError("OpenCode CLI is not installed in the runtime", code="opencode_cli_unavailable")
 
         tool_manifest = _normalise_tools(tools, tool_choice)
+        has_images = _has_image_parts(messages)
         prompt = _prompt(
             messages, has_tools=bool(tool_manifest), tool_choice=tool_choice,
-            provider_label="opencode-cli",
+            allow_images=has_images, provider_label="opencode-cli",
         )
         env = _child_env()
 
-        if _warm_enabled():
+        if _warm_enabled() and not has_images:
             warm = await self._warm_request(
                 binary=resolved,
                 cli_model=cli_model,
@@ -536,6 +539,9 @@ class OpenCodeCLIAdapter:
             )
 
             temp_dir = Path(tempfile.mkdtemp(prefix="tusker-opencode-stream-"))
+            image_paths = _image_attachments(
+                messages, temp_dir, provider_label="opencode-cli",
+            )
             call_file: Path | None = None
             config: dict[str, Any] = {}
             if tool_manifest:
@@ -566,6 +572,8 @@ class OpenCodeCLIAdapter:
                 return _cli_failure_error(data) if data else None
 
             command = [resolved, "run", "--standalone", "--format", "json", "--model", cli_model]
+            for image_path in image_paths:
+                command.extend(["--file", image_path])
             timeout = max(10.0, float(os.environ.get("TUSKER_OPENCODE_CLI_TIMEOUT_SECS", "600")))
             return stream_cli_jsonl(
                 command, env=env, prompt=prompt.encode(), model=model, timeout=timeout,
@@ -578,6 +586,9 @@ class OpenCodeCLIAdapter:
 
         with tempfile.TemporaryDirectory(prefix="tusker-opencode-") as temp_name:
             temp_dir = Path(temp_name)
+            image_paths = _image_attachments(
+                messages, temp_dir, provider_label="opencode-cli",
+            )
             call_file: Path | None = None
             config: dict[str, Any] = {}
             if tool_manifest:
@@ -610,6 +621,8 @@ class OpenCodeCLIAdapter:
                 resolved, "run", "--standalone", "--format", "json",
                 "--model", cli_model,
             ]
+            for image_path in image_paths:
+                command.extend(["--file", image_path])
             try:
                 proc = await asyncio.create_subprocess_exec(
                     *command,

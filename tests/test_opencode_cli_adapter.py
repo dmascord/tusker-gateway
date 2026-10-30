@@ -313,19 +313,27 @@ async def test_deprecated_model_exit_marks_route_retired(monkeypatch):
             assert getattr(exc.value, "upstream_status", None) is None
 
 
+
 @pytest.mark.asyncio
-async def test_opencode_rejects_image_content_naming_opencode(monkeypatch):
+async def test_opencode_forwards_base64_image_as_file(monkeypatch):
     monkeypatch.setenv("TUSKER_OPENCODE_CLI_ENABLED", "true")
-    with patch("tusker_gateway.provider_adapters.opencode_cli.shutil.which", return_value="opencode"):
-        with pytest.raises(BadRequestError) as exc:
-            await OpenCodeCLIAdapter().chat(
-                provider="opencode-cli", model="big-pickle",
-                messages=[{"role": "user", "content": [
-                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}},
-                ]}], stream=False,
-            )
-    assert exc.value.code == "unsupported_message_content"
-    assert "opencode-cli currently accepts text-only" in exc.value.message
+    stdout = json.dumps({"type": "text", "part": {"text": "seen"}}).encode()
+    captured: dict[str, bytes] = {}
+    async def _spawn(*args, **kwargs):
+        image_path = args[args.index("--file") + 1]
+        captured["image"] = Path(image_path).read_bytes()
+        return _FakeProcess(stdout)
+    with patch("tusker_gateway.provider_adapters.opencode_cli.shutil.which", return_value="opencode"), \
+         patch("tusker_gateway.provider_adapters.opencode_cli.asyncio.create_subprocess_exec", new=_spawn):
+        result = await OpenCodeCLIAdapter().chat(
+            provider="opencode-cli", model="big-pickle",
+            messages=[{"role": "user", "content": [
+                {"type": "text", "text": "describe"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}},
+            ]}], stream=False,
+        )
+    assert result["choices"][0]["message"]["content"] == "seen"
+    assert captured["image"] == b"hi"
 
 
 class _FakeStdin:

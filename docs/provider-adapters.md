@@ -173,10 +173,11 @@ rejects the gateway's direct HTTP provider path (`opencode-zen`) with
 exclusively through this CLI route; tool qualification for them runs through
 the CLI via the normal `tool_qualification --provider opencode-cli` path.
 
-OpenCode CLI models are text-only in the gateway contract: image, audio, and
-video message parts are rejected before dispatch. The catalog marks every
-auto-discovered entry as text-only, and explicit routes use the same
-request-time modality guard.
+OpenCode CLI models accept text and base64 image data URLs in the gateway
+contract. The adapter materializes each image into a request-scoped file and
+passes it with `opencode run --file`; remote image URLs, audio, and video remain
+rejected. Warm-server mode is bypassed for image requests because its persistent
+request shape cannot carry the per-request file attachments.
 
 Set `TUSKER_OPENCODE_CLI_PATH` when an operator-managed installation should
 be used instead. OpenCode Zen may still reject CLI/API use based on account or
@@ -332,10 +333,11 @@ as OpenAI SSE; lifecycle and diagnostic events are filtered out. Tool calls
 continue to be returned as normal OpenAI tool-call deltas. The gateway
 heartbeat stays active while waiting for the first CLI text event.
 
-Kilo CLI models are text-only in the gateway contract. Image, audio, and
-video message parts are rejected before dispatch for both direct routes and
-pool selection; the worker preserves the same 400 modality error for any
-request that reaches it.
+Kilo CLI models accept text and base64 image data URLs in the gateway contract.
+The adapter materializes each image into a request-scoped file and passes it
+with `kilo run --file`; remote image URLs, audio, and video remain rejected.
+Worker and warm-server paths are bypassed for image requests so the isolated
+CLI invocation owns the request-scoped attachments.
 
 ### Warm worker servers
 
@@ -375,9 +377,8 @@ code, so the modality probe records an authoritative `unsupported` verdict and
 clients see a clean 400 rather than a misleading 502. Worker-side outages and
 unparseable bodies still surface as 502 `kilo_worker_failed`. Streaming
 requests that reject before the first SSE byte get the same code/message via
-the SSE error frame. Kilo has no catalog advertisement for image input, so
-re-probing it requires `python -m tusker_gateway.modality_qualification
---include-unadvertised`. Other environments can run the adapter
+the SSE error frame. Kilo catalog entries advertise image input, and image
+requests use the isolated CLI path. Other environments can run the adapter
 locally by leaving `TUSKER_KILO_WORKER_URL` unset. The gateway image includes
 the pinned Kilo CLI (currently 7.8.12); set `TUSKER_KILO_CLI_PATH` to use an
 operator-managed installation instead.

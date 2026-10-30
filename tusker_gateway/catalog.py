@@ -867,10 +867,9 @@ class OpenCodeCLICatalog(CatalogClient):
     the key-filtered HTTP catalog omits CLI-only free models, so it
     cannot act as an intersection filter.
 
-    The adapter is text-only, so entries advertise text modalities
-    explicitly. Any failure raises so the base class keeps the
-    last-good snapshot; an empty list is treated as a glitch, not as
-    every free model being retired at once.
+    The CLI supports text and base64 image input; entries advertise both
+    modalities explicitly. Any failure raises so the base class keeps the
+    last-good snapshot; an empty list is treated as a glitch, not as every free model being retired at once.
     """
 
     provider = "opencode-cli"
@@ -922,7 +921,7 @@ class OpenCodeCLICatalog(CatalogClient):
                     provider=self.provider,
                     model=model,
                     raw={"source": "opencode models"},
-                    input_modalities=frozenset({"text"}),
+                    input_modalities=frozenset({"text", "image"}),
                     output_modalities=frozenset({"text"}),
                 )
             )
@@ -1016,8 +1015,7 @@ class KiloCLICatalog(CatalogClient):
                 CatalogEntry(
                     provider=self.provider,
                     model=model,
-                    raw={"source": "kilo models --refresh"},
-                    input_modalities=frozenset({"text"}),
+                    input_modalities=frozenset({"text", "image"}),
                     output_modalities=frozenset({"text"}),
                 )
             )

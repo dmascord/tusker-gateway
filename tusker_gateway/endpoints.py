@@ -6833,8 +6833,8 @@ _DIRECT_TEXT_ONLY_IMAGE_MODELS = frozenset({
 
 _DIRECT_CLI_INPUT_MODALITIES = {
     "claude-code-cli": frozenset({"text", "image"}),
-    "opencode-cli": frozenset({"text"}),
-    "kilo-cli": frozenset({"text"}),
+    "opencode-cli": frozenset({"text", "image"}),
+    "kilo-cli": frozenset({"text", "image"}),
 }
 
 

@@ -644,8 +644,8 @@ async def test_opencode_cli_catalog_parses_free_namespace(monkeypatch):
     assert calls == [("/usr/bin/opencode", "models")]
     assert [e.model for e in entries] == ["big-pickle", "cat-jam-free", "exo-free"]
     assert all(e.provider == "opencode-cli" for e in entries)
-    # The CLI adapter is text-only; entries must not advertise images.
-    assert all(e.input_modalities == frozenset({"text"}) for e in entries)
+    # CLI attachments support base64 image input via ``run --file``.
+    assert all(e.input_modalities == frozenset({"text", "image"}) for e in entries)
     assert all(e.output_modalities == frozenset({"text"}) for e in entries)
 
 
@@ -695,14 +695,14 @@ async def test_kilo_cli_catalog_refreshes_and_parses_provider_models(monkeypatch
     assert all(entry.provider == "kilo-cli" for entry in entries)
 
 
-def test_kilo_cli_catalog_is_text_only():
+def test_kilo_cli_catalog_advertises_images():
     entry = CatalogEntry(
         provider="kilo-cli",
         model="kilo/kilo-auto/free",
-        input_modalities=frozenset({"text"}),
+        input_modalities=frozenset({"text", "image"}),
         output_modalities=frozenset({"text"}),
     )
-    assert advertised_input_modalities(entry) == frozenset({"text"})
+    assert advertised_input_modalities(entry) == frozenset({"text", "image"})
     assert advertised_output_modalities(entry) == frozenset({"text"})
 
 

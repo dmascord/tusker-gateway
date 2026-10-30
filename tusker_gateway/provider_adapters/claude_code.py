@@ -16,6 +16,8 @@ rejected because the CLI's fetcher honours robots.txt).
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import json
 import logging
 import os
@@ -330,6 +332,52 @@ def _as_text(
     raise BadRequestError("Message content must be text", code="invalid_message_content")
 
 
+def _image_attachments(messages: list[dict[str, Any]], temp_dir: Path, *, provider_label: str) -> list[str]:
+    """Materialize base64 image parts for CLIs that expose ``run --file``."""
+    from tusker_gateway.tool_formats import _ANTHROPIC_IMAGE_DATA_URL_RE
+
+    paths: list[str] = []
+    image_index = 0
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            kind = str(part.get("type") or "").strip().lower()
+            if kind not in {"image_url", "input_image"}:
+                continue
+            url = part.get("image_url")
+            if isinstance(url, dict):
+                url = url.get("url")
+            if not isinstance(url, str) or not url:
+                raise BadRequestError(
+                    "Message image block must contain a non-empty image_url",
+                    code="invalid_image_url",
+                )
+            match = _ANTHROPIC_IMAGE_DATA_URL_RE.fullmatch(url)
+            if match is None:
+                raise BadRequestError(
+                    f"{provider_label} accepts base64 image data URLs only; "
+                    "convert remote images before sending",
+                    code="invalid_image_url",
+                )
+            try:
+                data = base64.b64decode(match.group(2), validate=True)
+            except (ValueError, binascii.Error) as exc:
+                raise BadRequestError(
+                    "Message image block contains invalid base64 data",
+                    code="invalid_image_url",
+                ) from exc
+            suffix = match.group(1).split("/", 1)[1].lower().replace("+", "_")
+            path = temp_dir / f"gateway-image-{image_index}.{suffix}"
+            path.write_bytes(data)
+            paths.append(str(path))
+            image_index += 1
+    return paths
+
+
 def _image_blocks(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Collect base64 image blocks from every message for Claude stream-json input.
 
@@ -375,12 +423,22 @@ def _image_blocks(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return blocks
 
 
+def _has_image_parts(messages: list[dict[str, Any]]) -> bool:
+    return any(
+        isinstance(part, dict)
+        and str(part.get("type") or "").strip().lower() in {"image_url", "input_image"}
+        for message in messages
+        for part in (message.get("content") if isinstance(message.get("content"), list) else ())
+    )
+
+
 def _stream_json_input(prompt: str, images: list[dict[str, Any]]) -> bytes:
     """Encode transcript plus image blocks as Claude stream-json input."""
     content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
     content.extend(images)
     message = {"type": "user", "message": {"role": "user", "content": content}}
     return (json.dumps(message, ensure_ascii=False) + "\n").encode("utf-8")
+
 
 
 def _stream_json_result(stdout: bytes) -> dict[str, Any]:
