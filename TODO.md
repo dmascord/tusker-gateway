@@ -20,6 +20,13 @@ The catalog defect that hid these routes entirely is fixed (see
 `docs/gateway-model-routing.md`, "Copilot capability shape"): the live GHE
 catalog now yields 21 image+tool models where it yielded none.
 
+The same class of defect hid the Ollama routes (see
+`docs/gateway-model-routing.md`, "Ollama capability shape"): 14 of the 24
+served Ollama Cloud models now resolve image input, and the local
+`mlx-mac` rows resolve from `/api/tags`. Both fixes are deployed, so the
+privacy pool has Ollama and MLX routes available while the GHE credential
+is in cooldown.
+
 ## Privacy image-plus-tools fallback hardening (2026-10-27)
 
 - Pool-selection exhaustion diagnostics now identify maintenance qualification scans separately from live request routing.
