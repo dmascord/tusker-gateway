@@ -1400,6 +1400,60 @@ def test_selection_filters_catalog_models_without_tools_or_images():
         ) == ("openrouter", "tool-image")
 
 
+def test_selection_reads_copilot_supports_shape_for_image_and_tools():
+    """Copilot/GHE advertises vision + tools inside capabilities.supports.
+
+    Missing that shape made every Claude route look image-unknown, so an
+    image+tools privacy request found no eligible candidate (2026-10-31).
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = PoolManager(
+            {
+                "pools": {
+                    "privacy": PoolConfig(
+                        name="privacy",
+                        models=[
+                            {
+                                "provider": "github-copilot-enterprise",
+                                "model": "claude-haiku-4-5",
+                            },
+                        ],
+                    ),
+                },
+                "quality_db_path": os.path.join(tmpdir, "quality.db"),
+                "model_capability_db_path": os.path.join(
+                    tmpdir, "model-capability.db"
+                ),
+                "excluded_providers": [],
+                "provider_api_keys": {"github-copilot-enterprise": "k-ghe"},
+            }
+        )
+        manager.catalog_registry = _CatalogRegistry(
+            {
+                "github-copilot-enterprise": [
+                    _CatalogEntry(
+                        "github-copilot-enterprise",
+                        "claude-haiku-4-5",
+                        raw={
+                            "capabilities": {
+                                "supports": {
+                                    "vision": True,
+                                    "tool_calls": True,
+                                }
+                            }
+                        },
+                    ),
+                ],
+            }
+        )
+
+        assert manager.select(
+            "privacy",
+            required_input_modalities={"image"},
+            requires_tools=True,
+        ) == ("github-copilot-enterprise", "claude-haiku-4-5")
+
+
 def test_persistent_positive_modality_evidence_survives_sparse_catalog():
     """A later text-only catalog refresh must not erase known image support."""
     with tempfile.TemporaryDirectory() as tmpdir:

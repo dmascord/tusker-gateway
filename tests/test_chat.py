@@ -5,6 +5,9 @@ import asyncio
 import aiohttp
 import json
 import os
+import logging
+import re
+
 import tempfile
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
@@ -2502,6 +2505,54 @@ async def test_chat_preserves_provider_429_with_retry_after(client):
     assert payload["error"]["type"] == "rate_limit_error"
     # The upstream body must never be echoed back verbatim.
     assert "custom-upstream-quota-token" not in payload["error"]["message"]
+
+@pytest.mark.asyncio
+async def test_chat_rate_limit_429_includes_request_id(client, caplog):
+    """The sanitized 429 envelope must carry the request ID so the client can
+    correlate the generic message with the gateway's structured logs, the
+    same way every other sanitized failure branch does (2026-10-31: the
+    rate-limit branch was the only one omitting it).
+    """
+    upstream = RateLimitError(
+        body='{"statusCode":429,"message":"Token limit will exceed based on estimated request tokens."}',
+        headers={"Retry-After": "5"},
+    )
+    with caplog.at_level(logging.WARNING, logger="tusker_gateway.endpoints"):
+        with patch(
+            "tusker_gateway.endpoints.PassthroughClient.chat",
+            new_callable=AsyncMock,
+            side_effect=upstream,
+        ):
+            resp = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "openai::gpt-4o-mini",
+                    "messages": [{"role": "user", "content": "hello"}],
+                },
+                headers=HEADERS_AUTH,
+            )
+
+    assert resp.status == 429
+    payload = await resp.json()
+    message = payload["error"]["message"]
+    assert "Upstream provider rate limit exceeded" in message
+    # Raw upstream token-estimate detail still suppressed.
+    assert "Token limit" not in message
+    assert "statusCode" not in message
+    # The envelope exposes exactly the request ID the failure was logged
+    # under, so the client can correlate it with the operator logs.
+    logged_rid = next(
+        (
+            match.group(1)
+            for record in caplog.records
+            if "chat request failed" in record.getMessage()
+            for match in [re.search(r"rid=([0-9a-zA-Z_-]+)", record.getMessage())]
+            if match
+        ),
+        None,
+    )
+    assert logged_rid is not None, caplog.text
+    assert f"Request ID: {logged_rid}." in message
 
 @pytest.mark.asyncio
 async def test_pool_internalizes_github_enterprise_429_before_client_response(app, client):

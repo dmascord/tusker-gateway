@@ -90,6 +90,29 @@ def test_catalog_capability_helpers_read_openrouter_shape():
     assert advertised_tool_support(CatalogEntry(provider="x", model="unknown")) is None
 
 
+def test_catalog_capability_helpers_read_copilot_supports_shape():
+    """GitHub Copilot (GHE) nests vision/tool booleans in capabilities.supports.
+
+    Without parsing it every Claude model looked image-unknown and was
+    filtered out of image+tools privacy-pool requests (2026-10-31).
+    """
+    entry = CatalogEntry(
+        provider="github-copilot-enterprise",
+        model="claude-sonnet-5",
+        raw={"capabilities": {"supports": {"vision": True, "tool_calls": True}}},
+    )
+    assert advertised_input_modalities(entry) == frozenset({"text", "image"})
+    assert advertised_tool_support(entry) is True
+
+    text_only = CatalogEntry(
+        provider="github-copilot-enterprise",
+        model="gpt-4",
+        raw={"capabilities": {"supports": {"tool_calls": True}}},
+    )
+    assert advertised_input_modalities(text_only) is None
+    assert advertised_tool_support(text_only) is True
+
+
 # ---------------------------------------------------------------------------
 # CodexCatalog.fetch
 # ---------------------------------------------------------------------------
