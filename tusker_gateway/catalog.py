@@ -209,6 +209,77 @@ def _capability_values(value: Any) -> frozenset[str] | None:
     return frozenset(values)
 
 
+# Ollama publishes a flat capability vocabulary (``completion``, ``tools``,
+# ``vision``, ``thinking``, ``embedding``) instead of modality arrays. Only
+# ``vision`` maps to a non-text input modality; Ollama chat models emit text.
+_OLLAMA_CAPABILITY_INPUTS = {"vision": "image"}
+
+# Capability names Ollama gives its chat-capable models. A row outside this
+# set (an embedding or decision model) carries no chat contract.
+_OLLAMA_CHAT_CAPABILITIES = frozenset({"completion", "vision", "tools", "thinking"})
+
+# Row keys that carry capability metadata. Used to pick the richer of two
+# model lists a provider publishes for the same model set.
+_CAPABILITY_ROW_KEYS = (
+    "architecture",
+    "capabilities",
+    "supports",
+    "input_modalities",
+    "inputModalities",
+    "output_modalities",
+    "outputModalities",
+    "modality",
+    "supported_parameters",
+    "supportedParameters",
+)
+
+
+def _flat_capability_list(raw: Any) -> frozenset[str] | None:
+    """Return a flat ``capabilities: [...]`` list from a catalog row.
+
+    Ollama lists capabilities as flat strings (``completion``, ``tools``,
+    ``vision``) rather than the modality arrays other catalogs use. ``None``
+    means the row carries no list, so it stays unknown instead of turning a
+    sparse payload into an explicit text-only claim.
+    """
+    if not isinstance(raw, dict):
+        return None
+    capabilities = raw.get("capabilities")
+    if not isinstance(capabilities, (list, tuple, set, frozenset)):
+        return None
+    return _capability_values(capabilities) or None
+
+
+def advertises_capability_metadata(collection: Any) -> bool:
+    """Return whether any row of a model collection advertises capabilities."""
+    rows = collection.values() if isinstance(collection, dict) else collection
+    if isinstance(rows, (str, bytes)) or not hasattr(rows, "__iter__"):
+        return False
+    return any(
+        isinstance(row, dict) and any(key in row for key in _CAPABILITY_ROW_KEYS)
+        for row in rows
+    )
+
+
+def _row_is_served(raw: Any) -> bool:
+    """Return whether a provider marks this row reachable over its API.
+
+    Rich catalogs list discovery-only models alongside servable ones. Ollama
+    Cloud's ``models`` block marks them ``visibility: "hide"`` and
+    ``supported_in_api: false``; both are the provider's own statement that
+    the route cannot serve a request, so it must not become a pool candidate.
+    Absent fields leave the row eligible.
+    """
+    if not isinstance(raw, dict):
+        return True
+    if raw.get("supported_in_api") is False:
+        return False
+    visibility = raw.get("visibility")
+    return not (
+        isinstance(visibility, str)
+        and visibility.strip().lower() in {"hide", "hidden"}
+    )
+
 def _advertised_modalities(
     entry: Any,
     direction: str,
@@ -243,6 +314,9 @@ def _advertised_modalities(
     field_name = f"{direction}_modalities"
     camel_field_name = f"{direction}Modalities"
     for source in sources:
+        # An explicit modality array is the most precise claim available,
+        # so it wins over the coarser shapes below even when a payload
+        # publishes several of them for the same model.
         for key in (field_name, camel_field_name):
             values = _capability_values(source.get(key))
             if values is not None:
@@ -259,6 +333,27 @@ def _advertised_modalities(
             )
             if values:
                 return values
+
+        # Ollama advertises a flat capability vocabulary instead of modality
+        # arrays. ``vision`` is the only non-text input modality it publishes;
+        # its chat models all emit text, so the output direction stays unknown
+        # rather than becoming an explicit text-only claim.
+        #
+        # Only a row that actually declares a chat modality is read this way.
+        # A capability list carrying none of ``completion``/``vision``/
+        # ``tools``/``thinking`` (Ollama's ``["embedding"]`` and ``["decision"]``
+        # rows) says nothing about input acceptance, so it stays unknown.
+        if direction == "input":
+            capabilities = _flat_capability_list(source)
+            if capabilities and capabilities & _OLLAMA_CHAT_CAPABILITIES:
+                return frozenset(
+                    {"text"}
+                    | {
+                        modality_name
+                        for capability, modality_name in _OLLAMA_CAPABILITY_INPUTS.items()
+                        if capability in capabilities
+                    }
+                )
 
         # Copilot/GHE advertises vision as a boolean in
         # capabilities.supports.vision rather than a modality list. Only
@@ -335,6 +430,15 @@ def advertised_tool_support(entry: Any) -> bool | None:
             values = _capability_values(source.get(key))
             if values is not None:
                 return bool(values & tool_values)
+
+    # Ollama's flat capability vocabulary names the tool contract directly:
+    # ``tools`` present means the model accepts function calls. Its absence is
+    # not a denial — the local Ollama runtime omits ``tools`` from rows for
+    # models that still return real tool calls (mlx-mac/qwen3.8-27b), so an
+    # absent entry stays unknown rather than excluding the route.
+    capabilities = _flat_capability_list(raw)
+    if capabilities is not None and "tools" in capabilities:
+        return True
     return None
 
 
@@ -748,11 +852,25 @@ class ProviderModelsCatalog(CatalogClient):
         if isinstance(data, list):
             rows = [(None, row) for row in data]
         elif isinstance(data, dict):
-            collection: Any = None
-            for key in ("data", "models", "items"):
-                if key in data:
-                    collection = data[key]
-                    break
+            # Providers may publish several model lists in one payload. Ollama
+            # Cloud returns a sparse OpenAI-style ``data`` list plus a
+            # ``models`` list carrying the same slugs alongside capability
+            # metadata (``input_modalities``, ``visibility``). Reading only the
+            # first key present would discard every capability claim, so pick
+            # the first collection that actually advertises capabilities.
+            collections = [
+                data[key]
+                for key in ("data", "models", "items")
+                if isinstance(data.get(key), (list, dict))
+            ]
+            collection: Any = next(
+                (
+                    candidate
+                    for candidate in collections
+                    if advertises_capability_metadata(candidate)
+                ),
+                collections[0] if collections else None,
+            )
             if isinstance(collection, list):
                 rows = [(None, row) for row in collection]
             elif isinstance(collection, dict):
@@ -777,6 +895,12 @@ class ProviderModelsCatalog(CatalogClient):
             else:
                 continue
             if not slug:
+                continue
+            if not _row_is_served(raw):
+                # The richer collection also lists models the provider itself
+                # marks hidden or excluded from the API (Ollama Cloud's
+                # ``visibility: "hide"`` / ``supported_in_api: false``). They
+                # are discovery metadata, not usable routes.
                 continue
             if self.model_allowlist and slug not in self.model_allowlist:
                 continue

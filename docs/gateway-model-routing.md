@@ -683,6 +683,52 @@ filter dropped all of its routes on image requests and the pool fell back to
 support where none did before, and the privacy request that had been failing
 served a real vision answer.
 
+### Ollama capability shape
+
+Ollama publishes a flat capability vocabulary instead of modality arrays:
+`capabilities: ["completion", "thinking", "tools", "vision"]`. Neither
+`_advertised_modalities` nor `advertised_tool_support` read that list, so
+every Ollama row parsed as image-unknown and the privacy pool dropped all of
+its routes on image requests. The visible symptom was the same as the
+Copilot case above — the pool fell back to a single candidate, and a 429 on
+that candidate emptied the pool and surfaced "Upstream provider rate limit
+exceeded; retry shortly.".
+
+Two payload shapes carry the list, and both are now read:
+
+- `mlx-mac` and `local-llm` publish it in `/api/tags`.
+- Ollama Cloud's `/v1/models` returns two model lists for the same slugs: a
+  sparse OpenAI-style `data` list (`{"id": ...}` only) and a richer `models`
+  list carrying `input_modalities`, `visibility` and `supported_in_api`. The
+  catalog took the first key present, so the sparse list won and every
+  capability claim was discarded. `ProviderModelsCatalog` now picks the first
+  collection that actually advertises capabilities; a payload with no such
+  collection still falls back to the first one.
+
+Three rules follow from the shape:
+
+- `vision` is the only non-text input modality Ollama publishes, so a chat
+  row resolves to `text` or `text+image`. The output direction stays
+  unknown rather than becoming an explicit text-only claim.
+- A capability list outside the chat vocabulary (`["embedding"]`,
+  `["decision"]`) says nothing about input acceptance, so it stays unknown
+  instead of being read as text-only.
+- An absent `tools` entry is not a denial. The local Ollama runtime omits
+  `tools` for `mlx-mac/qwen3.8-27b`, which nevertheless returns a real
+  function call, so the tool claim is positive-only: `tools` present means
+  supported, absent means unknown.
+
+Rows the provider itself marks unreachable (`visibility: "hide"`,
+`supported_in_api: false`) are skipped — they are discovery metadata, not
+routes. Verified against the live Ollama Cloud payload: 14 of the 24 served
+models resolve image input where none did before, and the hidden
+`clef:27b` row is excluded.
+
+Covered by `tests/test_catalog.py::test_catalog_capability_helpers_read_ollama_capability_list`,
+`tests/test_catalog.py::test_provider_models_catalog_prefers_collection_carrying_capabilities`
+and `tests/test_pools.py::test_ollama_capability_shape_admits_image_tool_privacy_candidates`
+(which fails without the parser change).
+
 
 A tool turn that ends `finish_reason=length` with no answer or tool call is
 classified as `output_budget_exhausted`. That depends on the request, not the

@@ -1038,6 +1038,9 @@ class _CatalogRegistry:
     def entries_for(self, provider: str) -> list[_CatalogEntry] | None:
         return self._entries.get(provider)
 
+    def providers(self) -> tuple[str, ...]:
+        return tuple(self._entries)
+
 
 def _xiaomi_pool_manager(tmpdir: str, pools: dict[str, PoolConfig]) -> PoolManager:
     return PoolManager(
@@ -1049,6 +1052,90 @@ def _xiaomi_pool_manager(tmpdir: str, pools: dict[str, PoolConfig]) -> PoolManag
         }
     )
 
+
+def test_ollama_capability_shape_admits_image_tool_privacy_candidates():
+    """Auto-discovered Ollama rows survive the privacy modality filter.
+
+    Ollama reports capabilities as a flat list (``/api/tags`` and the
+    ``models`` block of Ollama Cloud's ``/v1/models``) rather than a modality
+    array. Both were read as image-unknown, so the privacy pool dropped every
+    Ollama route from image requests and fell back to the single apim route.
+    A 429 on that route then emptied the pool and surfaced
+    "Upstream provider rate limit exceeded; retry shortly." (2026-10-31).
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = PoolManager(
+            {
+                "pools": {
+                    "privacy": PoolConfig(
+                        name="privacy",
+                        models=[],
+                        zdr=True,
+                        auto_catalog=True,
+                        auto_catalog_providers=("ollama-cloud", "mlx-mac"),
+                    ),
+                },
+                "quality_db_path": os.path.join(tmpdir, "quality.db"),
+                "excluded_providers": [],
+                "provider_api_keys": {"ollama-cloud": "k-ollama"},
+                # mlx-mac is a local route injected by the deployment
+                # manifest rather than a registry default, so it is declared
+                # here the way production declares it.
+                "providers": {
+                    "ollama-cloud": {"kind": "bearer", "zdr_ok": True},
+                    "mlx-mac": {"kind": "local", "zdr_ok": True},
+                },
+            }
+        )
+        manager.catalog_registry = _CatalogRegistry({
+            "ollama-cloud": [
+                _CatalogEntry(
+                    "ollama-cloud",
+                    "kimi-k3",
+                    raw={"capabilities": ["completion", "thinking", "tools", "vision"]},
+                ),
+                _CatalogEntry(
+                    "ollama-cloud",
+                    "glm-5.2",
+                    raw={"capabilities": ["completion", "thinking", "tools"]},
+                ),
+            ],
+            "mlx-mac": [
+                _CatalogEntry(
+                    "mlx-mac",
+                    "qwen3.8-27b:latest",
+                    raw={"capabilities": ["completion", "vision"]},
+                ),
+            ],
+        })
+
+        manager.extend_pools_with_auto_catalog()
+
+        admitted = {(spec.provider, spec.model) for spec in manager.models["privacy"]}
+        assert ("ollama-cloud", "kimi-k3") in admitted
+        assert ("mlx-mac", "qwen3.8-27b:latest") in admitted
+        # Text-only routes are still discovered, just not image-eligible.
+        assert ("ollama-cloud", "glm-5.2") in admitted
+
+        selected = manager.select(
+            "privacy",
+            required_input_modalities={"image"},
+        )
+        assert selected in {
+            ("ollama-cloud", "kimi-k3"),
+            ("mlx-mac", "qwen3.8-27b:latest"),
+        }
+
+        # A row whose capability list says nothing about chat input stays
+        # held back rather than being treated as text-only or as vision.
+        assert manager.select(
+            "privacy",
+            required_input_modalities={"image"},
+            excluded={
+                ("ollama-cloud", "kimi-k3"),
+                ("mlx-mac", "qwen3.8-27b:latest"),
+            },
+        ) is None
 
 def test_selection_filters_known_modalities_and_invalidates_stickiness():
     with tempfile.TemporaryDirectory() as tmpdir:
