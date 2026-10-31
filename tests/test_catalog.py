@@ -113,6 +113,72 @@ def test_catalog_capability_helpers_read_copilot_supports_shape():
     assert advertised_tool_support(text_only) is True
 
 
+
+def test_catalog_capability_helpers_read_ollama_capability_list():
+    """Ollama advertises a flat capability list, not modality arrays.
+
+    Neither ``/api/tags`` (local Ollama) nor the richer ``models`` block of
+    Ollama Cloud's ``/v1/models`` publishes ``input_modalities``; they publish
+    ``capabilities: ["completion", "vision", ...]``. Without reading that list
+    every Ollama row parsed as image-unknown and the privacy pool's
+    auto-catalog routes were dropped by the input-modality filter, which left
+    a single candidate behind (2026-10-31).
+    """
+    vision = CatalogEntry(
+        provider="ollama-cloud",
+        model="kimi-k3",
+        raw={"model": "kimi-k3", "capabilities": ["vision", "thinking", "completion", "tools"]},
+    )
+    assert advertised_input_modalities(vision) == frozenset({"text", "image"})
+    assert advertised_tool_support(vision) is True
+
+    text_only = CatalogEntry(
+        provider="ollama-cloud",
+        model="glm-5.2",
+        raw={"model": "glm-5.2", "capabilities": ["thinking", "completion", "tools"]},
+    )
+    assert advertised_input_modalities(text_only) == frozenset({"text"})
+    assert advertised_tool_support(text_only) is True
+
+    # Ollama's chat models emit text; an unknown output direction must not
+    # become an explicit "text only" claim that excludes a model elsewhere.
+    assert advertised_output_modalities(text_only) is None
+
+
+def test_catalog_capability_helpers_do_not_read_non_chat_capability_lists():
+    """An embedding/decision row says nothing about chat input acceptance."""
+    embedding = CatalogEntry(
+        provider="mlx-mac",
+        model="nomic-embed-text:latest",
+        raw={"model": "nomic-embed-text:latest", "capabilities": ["embedding"]},
+    )
+    assert advertised_input_modalities(embedding) is None
+    assert advertised_tool_support(embedding) is None
+
+    decision = CatalogEntry(
+        provider="ollama-cloud",
+        model="clef:27b",
+        raw={"model": "clef:27b", "capabilities": ["decision", "vision"]},
+    )
+    assert advertised_input_modalities(decision) == frozenset({"text", "image"})
+    assert advertised_tool_support(decision) is None
+
+
+def test_catalog_tool_support_absence_is_not_a_denial():
+    """A missing ``tools`` entry stays unknown, not "unsupported".
+
+    The local Ollama runtime omitted ``tools`` for mlx-mac/qwen3.8-27b even
+    though that model returned a real function call, so an absent entry must
+    not exclude the route from tool-bearing requests.
+    """
+    entry = CatalogEntry(
+        provider="mlx-mac",
+        model="qwen3.8-27b:latest",
+        raw={"model": "qwen3.8-27b:latest", "capabilities": ["completion", "vision"]},
+    )
+    assert advertised_tool_support(entry) is None
+    assert advertised_input_modalities(entry) == frozenset({"text", "image"})
+
 # ---------------------------------------------------------------------------
 # CodexCatalog.fetch
 # ---------------------------------------------------------------------------
@@ -303,6 +369,85 @@ async def test_provider_models_catalog_applies_pricing_overrides():
     # Payload-provided pricing wins; unknown slugs stay unpriced.
     assert entries["priced-in-payload"].cost_input == 0.0
     assert entries["priced-in-payload"].cost_output == 0.0
+
+
+@pytest.mark.asyncio
+async def test_provider_models_catalog_prefers_collection_carrying_capabilities():
+    """Ollama Cloud publishes two model lists; the sparse one wins by accident.
+
+    Its ``/v1/models`` payload is
+    ``{"object": "list", "data": [{"id": ...}], "models": [{"slug": ...,
+    "input_modalities": [...], "visibility": ...}]}``. Taking the first key
+    present (``data``) discarded every capability claim, so all 25 rows parsed
+    as image-unknown and the privacy pool's auto-catalog routes were filtered
+    out of image requests (2026-10-31).
+    """
+    session = _CapturingSession(FakeResponse(200, {
+        "object": "list",
+        "data": [
+            {"id": "kimi-k3", "object": "model"},
+            {"id": "glm-5.2", "object": "model"},
+            {"id": "clef:27b", "object": "model"},
+        ],
+        "models": [
+            {"slug": "kimi-k3", "input_modalities": ["text", "image"], "visibility": "list"},
+            {"slug": "glm-5.2", "input_modalities": ["text"], "visibility": "list"},
+            {"slug": "clef:27b", "input_modalities": ["text", "image"], "visibility": "hide"},
+        ],
+    }))
+    catalog = ProviderModelsCatalog(
+        provider="ollama-cloud",
+        endpoint="https://api.example.test/v1/models",
+    )
+
+    entries = {entry.model: entry for entry in await catalog.fetch(session)}
+
+    # ``clef:27b`` is marked visibility=hide/supported_in_api=false by the
+    # provider itself, so it is discovery metadata rather than a route.
+    assert set(entries) == {"kimi-k3", "glm-5.2"}
+    assert advertised_input_modalities(entries["kimi-k3"]) == frozenset({"text", "image"})
+    assert advertised_input_modalities(entries["glm-5.2"]) == frozenset({"text"})
+
+
+@pytest.mark.asyncio
+async def test_provider_models_catalog_falls_back_to_first_collection():
+    """A payload with no capability metadata still parses its first list."""
+    session = _CapturingSession(FakeResponse(200, {
+        "data": [{"id": "plain-model"}],
+        "models": [{"slug": "ignored-model"}],
+    }))
+    catalog = ProviderModelsCatalog(
+        provider="cerebras",
+        endpoint="https://api.example.test/v1/models",
+    )
+
+    entries = await catalog.fetch(session)
+
+    assert [entry.model for entry in entries] == ["plain-model"]
+
+
+@pytest.mark.asyncio
+async def test_provider_models_catalog_reads_ollama_tags_capabilities():
+    """Local Ollama ``/api/tags`` rows list capabilities as flat strings."""
+    session = _CapturingSession(FakeResponse(200, {
+        "models": [
+            {"model": "qwen3.8-27b:latest", "capabilities": ["completion", "vision"]},
+            {"model": "shirdel-coder-9b-claude-fable-5:latest", "capabilities": ["completion"]},
+            {"model": "nomic-embed-text:latest", "capabilities": ["embedding"]},
+        ],
+    }))
+    catalog = ProviderModelsCatalog(
+        provider="mlx-mac",
+        endpoint="http://10.0.0.141:11434/api/tags",
+    )
+
+    entries = {entry.model: entry for entry in await catalog.fetch(session)}
+
+    assert advertised_input_modalities(entries["qwen3.8-27b:latest"]) == frozenset({"text", "image"})
+    assert advertised_input_modalities(
+        entries["shirdel-coder-9b-claude-fable-5:latest"]
+    ) == frozenset({"text"})
+    assert advertised_input_modalities(entries["nomic-embed-text:latest"]) is None
 
 
 @pytest.mark.asyncio
