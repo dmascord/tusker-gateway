@@ -1,5 +1,25 @@
 # Project TODOs
 
+
+## GitHub Copilot Enterprise credential quota (2026-10-31)
+
+The GHE credential behind `github-copilot-enterprise` returns `429 quota
+exceeded` for every model, so those routes sit in a 3600s cooldown and their
+composite image-plus-tools probe records `unavailable`. That is an
+account/quota condition, not a gateway defect: `unavailable` is not in
+`COMPOSITE_IMAGE_TOOLS_DEFINITIVE_FAILURES`, so the routes re-qualify on the
+next cycle once quota returns (composite maintenance: interval 43200s,
+limit 8, max_age 86400s).
+
+Until quota resets, privacy image+tools requests are served by
+`apim/gpt-5.6-luna` alone. Check `GET /admin/cooldowns` for
+`github-copilot-enterprise` entries and the provider's usage page before
+treating it as a routing regression.
+
+The catalog defect that hid these routes entirely is fixed (see
+`docs/gateway-model-routing.md`, "Copilot capability shape"): the live GHE
+catalog now yields 21 image+tool models where it yielded none.
+
 ## Privacy image-plus-tools fallback hardening (2026-10-27)
 
 - Pool-selection exhaustion diagnostics now identify maintenance qualification scans separately from live request routing.
