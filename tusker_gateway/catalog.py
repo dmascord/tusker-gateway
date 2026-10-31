@@ -232,10 +232,14 @@ def _advertised_modalities(
     if not isinstance(raw, dict):
         return None
     sources = [raw]
-    for key in ("architecture", "capabilities"):
+    for key in ("architecture", "capabilities", "supports"):
         nested = raw.get(key)
-        if isinstance(nested, dict):
+        if isinstance(nested, dict) and nested not in sources:
             sources.append(nested)
+        # Copilot/GHE nests a second level: capabilities.supports.vision.
+        inner = nested.get("supports") if isinstance(nested, dict) else None
+        if isinstance(inner, dict) and inner not in sources:
+            sources.append(inner)
     field_name = f"{direction}_modalities"
     camel_field_name = f"{direction}Modalities"
     for source in sources:
@@ -255,6 +259,20 @@ def _advertised_modalities(
             )
             if values:
                 return values
+
+        # Copilot/GHE advertises vision as a boolean in
+        # capabilities.supports.vision rather than a modality list. Only
+        # image input is currently represented this way; there is no
+        # equivalent output-side boolean, so this is input-direction only.
+        if direction == "input" and source is not raw:
+            key_map = (
+                ("vision", "image"),
+                ("audio", "audio"),
+                ("video", "video"),
+            )
+            for bool_key, modality_name in key_map:
+                if source.get(bool_key) is True:
+                    return frozenset({"text", modality_name})
     return None
 
 
@@ -285,13 +303,18 @@ def advertised_tool_support(entry: Any) -> bool | None:
         nested = raw.get(key)
         if isinstance(nested, dict):
             sources.append(nested)
-
+            # Copilot/GHE: capabilities.supports.tool_calls carries the
+            # tool-support boolean one level deeper than other catalogs.
+            inner = nested.get("supports")
+            if isinstance(inner, dict):
+                sources.append(inner)
     boolean_keys = (
         "supports_tools",
         "supports_tool_use",
         "tool_support",
         "tool_use",
         "function_calling",
+        "tool_calls",
     )
     parameter_keys = ("supported_parameters", "supportedParameters")
     tool_values = frozenset({

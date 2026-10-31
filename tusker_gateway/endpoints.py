@@ -4488,16 +4488,23 @@ def _provider_rate_limit_is_external(exc: BaseException) -> bool:
     return provider not in _PROVIDER_WIDE_RATE_LIMIT_PROVIDERS
 
 
-def _provider_rate_limit_response(exc: RateLimitError) -> web.Response:
+def _provider_rate_limit_response(
+    exc: RateLimitError,
+    *,
+    request_id: str | None = None,
+) -> web.Response:
     """Surface a provider 429 instead of collapsing it into a 502.
 
     Preserving the status and Retry-After lets the client back off on the
     provider's own schedule. The upstream body stays hidden; only a generic
     message plus the quota signal (when the body indicates quota exhaustion)
-    are exposed.
+    are exposed. The request ID is appended so the caller correlates the
+    sanitized answer with the gateway's structured logs, like every other
+    sanitized failure branch.
     """
-    quota_exhausted = is_account_quota_exhausted(str(getattr(exc, "body", None) or ""))
+    suffix = f" Request ID: {request_id}." if request_id else ""
     headers: dict[str, str] = {}
+    quota_exhausted = is_account_quota_exhausted(str(getattr(exc, "body", None) or ""))
     if quota_exhausted:
         # Machine-readable signal for the maintenance qualification path;
         # mirrors the existing capacity-failure handler.
@@ -4515,7 +4522,7 @@ def _provider_rate_limit_response(exc: RateLimitError) -> web.Response:
         "Upstream provider quota exhausted; retry after the upstream quota window resets."
         if quota_exhausted
         else "Upstream provider rate limit exceeded; retry shortly."
-    )
+    ) + suffix
     return web.json_response(
         openai_error(message, code="rate_limit_exceeded", error_type="rate_limit_error"),
         status=429,
@@ -4539,6 +4546,7 @@ def _public_provider_failure_response(
     exc: BaseException,
     *,
     route_kind: str | None = None,
+    request_id: str | None = None,
 ) -> web.Response:
     """Hide provider error details without changing other error semantics.
 
@@ -4557,16 +4565,17 @@ def _public_provider_failure_response(
                 )
             except (TypeError, ValueError):
                 retry_after = 5
+            suffix = f" Request ID: {request_id}." if request_id else ""
             return web.json_response(
                 openai_error(
-                    "Upstream provider capacity is unavailable; retry shortly.",
+                    "Upstream provider capacity is unavailable; retry shortly." + suffix,
                     code="service_unavailable",
                     error_type="server_error",
                 ),
                 status=503,
                 headers={"Retry-After": str(retry_after)},
             )
-        return _provider_rate_limit_response(exc)
+        return _provider_rate_limit_response(exc, request_id=request_id)
 
     if not _is_capacity_failure(exc):
         upstream_body = (
@@ -4702,10 +4711,16 @@ def _public_stream_error(
         # them before this function; this keeps the terminal frame safe when
         # no alternative candidate remains.
         if _provider_rate_limit_is_external(exc):
-            message = "Upstream provider rate limit exceeded; retry shortly."
+            message = (
+                "Upstream provider rate limit exceeded; retry shortly. "
+                f"Request ID: {request_id}."
+            )
             code = "rate_limit_exceeded"
         else:
-            message = "Upstream provider capacity is unavailable; retry shortly."
+            message = (
+                "Upstream provider capacity is unavailable; retry shortly. "
+                f"Request ID: {request_id}."
+            )
             code = "service_unavailable"
     elif _is_capacity_failure(exc):
         message = "Upstream provider capacity is unavailable; retry shortly."
@@ -8186,6 +8201,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
             return _public_provider_failure_response(
                 exc,
                 route_kind="direct" if pool_name == "passthrough" else "pool",
+                request_id=request_id,
             )
 
 
@@ -8617,7 +8633,10 @@ async def _responses_handler_impl(request: web.Request) -> web.Response | web.St
         if stream_resp is not None:
             await _write_stream_failure(str(exc), "provider_error")
             return stream_resp
-        return _public_provider_failure_response(exc)
+        return _public_provider_failure_response(
+            exc,
+            request_id=str(request.get("_request_id") or ""),
+        )
 
 
 class _NoOpCM:
