@@ -657,6 +657,32 @@ The message still reaches the client when every eligible candidate is
 throttled, and the visible-output guard still refuses to splice providers after
 assistant bytes have been written.
 
+Every client-visible terminal failure appends `Request ID: <rid>.` so a
+truncated turn is traceable in the access log. Rate-limit and provider-capacity
+failures were the last branches missing it: the 2026-10-31 privacy-pool report
+was a bare "Upstream provider rate limit exceeded; retry shortly." with nothing
+to quote. `_provider_rate_limit_response`, the capacity 503, the 502
+`provider_error` branch, and the SSE frame from `_public_stream_error` now all
+carry the ID; the `provider_error` message told callers to quote a request_id
+while omitting it. Covered by
+`tests/test_chat.py::test_chat_rate_limit_429_includes_request_id` (the envelope
+carries exactly the rid the failure was logged under) and
+`tests/test_chat.py::test_public_provider_non_capacity_failure_does_not_leak_upstream_body`.
+
+### Copilot capability shape
+
+GitHub Copilot and GHE publish input modalities and tool support as booleans
+under `capabilities.supports` (`vision`, `tool_calls`) rather than the
+`architecture.input_modalities` list the other catalogs use. Both
+`_advertised_modalities` and `advertised_tool_support` stopped one level short
+of that shape, so every GHE row parsed as image-unknown. Because `privacy`
+lists `github-copilot-enterprise` in `auto_catalog_providers`, the input-modality
+filter dropped all of its routes on image requests and the pool fell back to
+`apim/gpt-5.6-luna` alone. Verified against the live
+`copilot-api.sita.ghe.com/models` payload: 21 of 31 models resolve image+tool
+support where none did before, and the privacy request that had been failing
+served a real vision answer.
+
 
 A tool turn that ends `finish_reason=length` with no answer or tool call is
 classified as `output_budget_exhausted`. That depends on the request, not the

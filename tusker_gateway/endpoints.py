@@ -4577,6 +4577,7 @@ def _public_provider_failure_response(
             )
         return _provider_rate_limit_response(exc, request_id=request_id)
 
+    suffix = f" Request ID: {request_id}." if request_id else ""
     if not _is_capacity_failure(exc):
         upstream_body = (
             getattr(exc, "body", None)
@@ -4607,15 +4608,18 @@ def _public_provider_failure_response(
             if route_kind == "direct":
                 public_message = (
                     "The requested upstream provider route failed; retry shortly "
-                    "or choose another provider. Contact the gateway operator "
-                    "with the request_id for triage."
+                    "or choose another provider."
                 )
             else:
                 public_message = (
                     "Upstream provider request failed; the gateway could not find a "
-                    "healthy candidate. Retry shortly or contact the gateway "
-                    "operator with the request_id for triage."
+                    "healthy candidate. Retry shortly."
                 )
+            # The message points operators at the request ID, so it must carry
+            # one; without it the triage hint was unactionable.
+            public_message += suffix or (
+                " Contact the gateway operator with the request ID."
+            )
         return web.json_response(
             openai_error(
                 public_message,
@@ -4634,7 +4638,8 @@ def _public_provider_failure_response(
         retry_after = 5
     return web.json_response(
         openai_error(
-            "No healthy upstream model is currently available; retry shortly.",
+            "No healthy upstream model is currently available; retry shortly."
+            + suffix,
             code="service_unavailable",
             error_type="server_error",
         ),
