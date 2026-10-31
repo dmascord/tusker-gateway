@@ -369,7 +369,7 @@ def test_public_provider_non_capacity_failure_does_not_leak_upstream_body():
     )
     exc = ProviderError(message="upstream chat failed")
     exc.upstream_body = secret_upstream_body
-    response = _public_provider_failure_response(exc)
+    response = _public_provider_failure_response(exc, request_id="req_abc123")
     assert response.status == 502
     body = response.body.decode("utf-8")
     assert "neurons" not in body
@@ -378,8 +378,16 @@ def test_public_provider_non_capacity_failure_does_not_leak_upstream_body():
     assert secret_upstream_body[:20] not in body
     payload = json.loads(body)
     assert payload["error"]["code"] == "provider_error"
-    assert "request_id" in payload["error"]["message"]
+    # The message tells the caller to quote a request ID, so it must carry
+    # the real one rather than only naming the concept.
+    assert "Request ID: req_abc123." in payload["error"]["message"]
     assert "X-Tusker-Provider-Failure" not in response.headers
+
+    # Without a request ID the hint stays, but it must not invent one.
+    anonymous = json.loads(
+        _public_provider_failure_response(exc).body.decode("utf-8")
+    )
+    assert "Request ID:" not in anonymous["error"]["message"]
 
 
 def test_public_provider_auth_failure_has_safe_machine_signal():
