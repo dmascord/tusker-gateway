@@ -554,7 +554,7 @@ spec:
         - name: TUSKER_COMPOSITE_QUALIFICATION_ENABLED
           value: 'true'
         - name: TUSKER_COMPOSITE_QUALIFICATION_LIMIT
-          value: '8'
+          value: '16'
         - name: TUSKER_COMPOSITE_QUALIFICATION_TIMEOUT_SECS
           value: '45'
         - name: TUSKER_COMPOSITE_QUALIFICATION_MAX_AGE_SECS
