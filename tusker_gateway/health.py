@@ -155,6 +155,7 @@ def _provider_health_breakdown(
         from tusker_gateway.pools import is_general_chat_model
 
         credentials = _credential_pool_sizes(request, cfg)
+        breaker = request.app.get("breaker")
         tracker = global_tracker()
         for pool_name, specs in model_map.items():
             pool = getattr(manager, "pools", {}).get(pool_name)
@@ -169,7 +170,15 @@ def _provider_health_breakdown(
                 endpoint = providers.get(provider) or providers.get(provider.replace("-", "_"))
                 if endpoint is None or (provider, model) in catalog_unavailable:
                     continue
-                if is_permanently_failed(provider, model) or tracker.is_cooldown(provider, model):
+                if (
+                    is_permanently_failed(provider, model)
+                    or tracker.is_cooldown(provider, model)
+                    or (
+                        breaker is not None
+                        and hasattr(breaker, "is_active")
+                        and breaker.is_active(provider, model)
+                    )
+                ):
                     continue
                 if not is_general_chat_model(provider, model):
                     continue
@@ -194,9 +203,19 @@ def _provider_health_breakdown(
     try:
         breaker_rows = breaker.snapshot() if breaker is not None else {}
         for row in breaker_rows.values():
-            if str(row.get("state", "")).upper() == "OPEN":
-                provider = _normalise_provider_name(row.get("provider"))
-                breaker_open.setdefault(provider, []).append(str(row.get("model", "")))
+            provider = _normalise_provider_name(row.get("provider"))
+            model = str(row.get("model", ""))
+            if (
+                str(row.get("state", "")).upper() == "OPEN"
+                and provider
+                and model
+                and (
+                    breaker.is_active(provider, model)
+                    if breaker is not None and hasattr(breaker, "is_active")
+                    else True
+                )
+            ):
+                breaker_open.setdefault(provider, []).append(model)
     except Exception:
         logger.debug("provider health breaker breakdown unavailable", exc_info=True)
     catalog_registry = request.app.get("catalog_registry")

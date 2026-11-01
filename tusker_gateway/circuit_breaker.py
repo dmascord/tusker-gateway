@@ -344,6 +344,7 @@ class CircuitBreaker:
                 window_total=0,
                 window_started_at=time.time(),
                 opened_at=None,
+                cooldown_secs=None,
                 half_open_probe_inflight=0,
                 half_open_probes=0,
             )
@@ -357,6 +358,7 @@ class CircuitBreaker:
             window_failures=new_window["window_failures"],
             window_total=new_window["window_total"],
             window_started_at=new_window["window_started_at"],
+            cooldown_secs=None,
         )
 
     def record_failure(
@@ -447,6 +449,25 @@ class CircuitBreaker:
         if not self._config.enabled:
             return
         self._update(provider, model, half_open_probe_inflight=0)
+
+    def is_active(self, provider: str, model: str, *, now: float | None = None) -> bool:
+        """Return whether the route is still inside an OPEN quarantine window.
+
+        Expired OPEN rows remain persisted until the next request probes them;
+        callers such as health diagnostics must not report those historical rows
+        as active or exclude the route before the probe is due.
+        """
+        if not self._config.enabled:
+            return False
+        row = self._read(provider, model)
+        if row is None or row.get("state") != BreakerState.OPEN.value:
+            return False
+        opened_at = row.get("opened_at")
+        if opened_at is None:
+            return False
+        policy = self._policy_for(provider)
+        cooldown = row.get("cooldown_secs") or policy.cooldown_secs
+        return (now if now is not None else time.time()) - float(opened_at) < float(cooldown)
 
     def snapshot(self) -> dict[str, dict[str, Any]]:
         """Return current breaker state for the dashboard."""
