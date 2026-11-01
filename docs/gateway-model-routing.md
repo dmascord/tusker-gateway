@@ -813,6 +813,15 @@ kept the privacy pool from ever growing past its curated routes:
 Verified against the live 2026-11-01 privacy pool (31 routes, 29 due): the old
 ordering selected 8 `github-copilot-enterprise` routes and no `ollama-cloud`
 route; the new ordering selects 4 providers including 3 `ollama-cloud` routes.
+
+The deployed privacy seed explicitly qualifies every currently advertised
+route. The scheduled batch is now `16` routes every `12h`: two cycles cover
+the 31-route privacy pool within the 24-hour evidence window, while the
+provider-interleaved ordering prevents a quota-cooled provider from consuming
+the entire batch. A route can still remain `unavailable` or `unsupported`; the
+record is current in those cases and selection continues to enforce the
+capability verdict.
+
 Covered by
 `tests/test_maintenance.py::test_composite_probe_runs_on_initial_delay_not_full_interval`,
 `tests/test_tool_capability.py::test_composite_probe_batch_does_not_starve_a_provider`
