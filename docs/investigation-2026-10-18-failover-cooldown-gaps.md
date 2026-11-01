@@ -75,7 +75,9 @@ walk the full six-candidate budget, stalls consume it in one or two.
 
 Evidence: `endpoints.py:4036-4068` (`_provider_attempt_timeout_secs`),
 `endpoints.py:5063-5075` (attempt/max_attempts logging),
-`_max_pool_provider_attempts` (`TUSKER_MAX_PROVIDER_ATTEMPTS`, default 6),
+`_max_pool_provider_attempts` (`TUSKER_MAX_PROVIDER_ATTEMPTS`, default 12
+since 2026-11-01; it was 6, which was below the eligible-route count of the
+`code` pool),
 `test_chat.py::test_pool_fallback_bounded_per_attempt_timeout` (asserts the
 per-attempt bound, not a total bound).
 
@@ -120,7 +122,8 @@ From the live deployment (`kubectl -n hermes get deployment tusker-gateway`):
 - `TUSKER_CIRCUIT_ENABLED=true` — the breaker is live, so all of this applies.
 - `TUSKER_CIRCUIT_COOLDOWN` unset → 60s policy cooldown.
 - `TUSKER_CIRCUIT_CONSECUTIVE` unset → trips at 5 consecutive failures.
-- `TUSKER_MAX_PROVIDER_ATTEMPTS` unset → 6.
+- `TUSKER_MAX_PROVIDER_ATTEMPTS` unset → 6 at the time of this analysis; the
+  default is now 12.
 - `TUSKER_PROVIDER_ATTEMPT_TIMEOUT_SECS` unset → 45s.
 - `TUSKER_RETRY_PERMANENT_COOLDOWN` unset → 3600s.
 - `TUSKER_PROVIDER_CAPACITY_COOLDOWN_SECS=300` — capacity group cooldowns are

@@ -1021,6 +1021,112 @@ def test_probe_transport_classification_is_bounded():
     assert _classify_http_failure(502, "provider down")[0] == ToolCapabilityLevel.UNAVAILABLE
 
 
+def test_strict_pool_keeps_route_with_transient_tool_evidence(tmp_path):
+    """A rate-limited probe records availability, not a capability denial.
+
+    On 2026-11-01 ``apim/gpt-5.6-luna`` held an ``unavailable`` record with
+    ``failure_class='rate_limited'``. The strict qualification branch read
+    that as a definitive denial, so the ZDR privacy pool collapsed to its
+    one remaining route and image+tools requests failed once that route was
+    busy (rid req_ba316b8d545bbbe8).
+    """
+    manager = PoolManager(
+        {
+            "pools": {
+                "privacy": PoolConfig(
+                    name="privacy",
+                    models=[
+                        {"provider": "synthetic", "model": "rate-limited"},
+                        {"provider": "synthetic", "model": "passed"},
+                    ],
+                    zdr=True,
+                    require_tool_qualification=True,
+                ),
+            },
+            "quality_db_path": str(tmp_path / "quality.db"),
+            "tool_capability_db_path": str(tmp_path / "capability.db"),
+            "excluded_providers": [],
+            "provider_api_keys": {"synthetic": "test-key"},
+        }
+    )
+    manager._tool_capabilities.record(
+        provider="synthetic",
+        model="rate-limited",
+        level=ToolCapabilityLevel.UNAVAILABLE,
+        status="unavailable",
+        http_status=200,
+        failure_class="rate_limited",
+    )
+    manager._tool_capabilities.record(
+        provider="synthetic",
+        model="passed",
+        level=ToolCapabilityLevel.STRICT_STRUCTURED_STREAM,
+        status="passed",
+        http_status=200,
+        tool_call_count=1,
+        structured_stream=True,
+        arguments_valid=True,
+        arguments_match=True,
+        finish_reason="tool_calls",
+    )
+
+    first = manager.select("privacy", requires_tools=True)
+    assert first is not None
+    second = manager.select("privacy", requires_tools=True, excluded={first})
+    assert second is not None
+    assert {first, second} == {
+        ("synthetic", "rate-limited"),
+        ("synthetic", "passed"),
+    }
+
+
+def test_strict_pool_rejects_definitive_tool_denial(tmp_path):
+    """Behavioural failures stay excluded even though availability does not."""
+    manager = PoolManager(
+        {
+            "pools": {
+                "privacy": PoolConfig(
+                    name="privacy",
+                    models=[
+                        {"provider": "synthetic", "model": "no-call"},
+                        {"provider": "synthetic", "model": "passed"},
+                    ],
+                    zdr=True,
+                    require_tool_qualification=True,
+                ),
+            },
+            "quality_db_path": str(tmp_path / "quality.db"),
+            "tool_capability_db_path": str(tmp_path / "capability.db"),
+            "excluded_providers": [],
+            "provider_api_keys": {"synthetic": "test-key"},
+        }
+    )
+    manager._tool_capabilities.record(
+        provider="synthetic",
+        model="no-call",
+        level=ToolCapabilityLevel.UNSUPPORTED,
+        status="unsupported",
+        http_status=200,
+        tool_call_count=0,
+    )
+    manager._tool_capabilities.record(
+        provider="synthetic",
+        model="passed",
+        level=ToolCapabilityLevel.STRICT_STRUCTURED_STREAM,
+        status="passed",
+        http_status=200,
+        tool_call_count=1,
+        structured_stream=True,
+        arguments_valid=True,
+        arguments_match=True,
+        finish_reason="tool_calls",
+    )
+
+    assert manager.select("privacy", requires_tools=True) == (
+        "synthetic",
+        "passed",
+    )
+
 def test_catalog_registry_prefers_injected_live_rotators():
     """When the gateway's live rotators are supplied, the codex catalog
     client must use them as its token source instead of building a new

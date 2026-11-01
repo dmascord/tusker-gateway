@@ -727,6 +727,27 @@ async def test_image_tools_capacity_failure_rotates_to_fallback(app):
 
 
 @pytest.mark.asyncio
+async def test_pool_fallback_default_attempt_budget_clears_eligible_routes(monkeypatch):
+    """The default attempt cap must outlast a run of dead routes.
+
+    On 2026-11-01 ``req_661692d57974d957`` exhausted six attempts on rate
+    limited ``opencode-cli`` free models while ten eligible ``code`` routes
+    were still untried. Six attempts is below the eligible-route count of a
+    large pool, so the default must leave room for the healthy remainder.
+    """
+    from tusker_gateway.endpoints import _max_pool_provider_attempts
+
+    monkeypatch.delenv("TUSKER_MAX_PROVIDER_ATTEMPTS", raising=False)
+    assert _max_pool_provider_attempts() >= 12
+
+    monkeypatch.setenv("TUSKER_MAX_PROVIDER_ATTEMPTS", "3")
+    assert _max_pool_provider_attempts() == 3
+
+    monkeypatch.setenv("TUSKER_MAX_PROVIDER_ATTEMPTS", "not-a-number")
+    assert _max_pool_provider_attempts() == 12
+
+
+@pytest.mark.asyncio
 async def test_tool_pool_compatibility_probe_without_http_server():
     """The final tool fallback is bounded and keeps the normal validator."""
     pool_manager = MagicMock()

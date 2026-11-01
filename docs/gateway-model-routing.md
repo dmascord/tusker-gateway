@@ -620,10 +620,19 @@ turn is eligible for failover in the pre-visible recovery gate: the gateway may
 re-dispatch it to alternative candidates while only role/SSE metadata has
 reached the client, bounded by `TUSKER_MAX_PREVISIBLE_FAILOVERS` (default 3).
 Each retry also spends the shared per-request candidate budget
-(`TUSKER_MAX_PROVIDER_ATTEMPTS`), so a pool full of unusable routes cannot
-multiply its own retries. The gate refuses to re-route once visible assistant
-output has reached the client. Each failed route is quarantined for
-`TUSKER_TOOL_FAILURE_COOLDOWN_SECS` (default 300s).
+(`TUSKER_MAX_PROVIDER_ATTEMPTS`, default 12), so a pool full of unusable
+routes cannot multiply its own retries. The default must exceed the number of
+routes a single request shape can offer, otherwise a run of structurally dead
+candidates (rate-limited free tiers, stale credentials) can exhaust the budget
+while healthy candidates are still eligible: on 2026-11-01 the `code` pool had
+19 eligible image-plus-tools routes but the cap was six, so
+`req_661692d57974d957` failed after four exhausted `opencode-cli` free models
+with ten untried routes remaining. Wall-clock cost stays bounded by the
+request deadline and the optional
+`TUSKER_PROVIDER_TOTAL_ATTEMPT_BUDGET_SECS`, not by this count. The gate
+refuses to re-route once visible assistant output has reached the client. Each
+failed route is quarantined for `TUSKER_TOOL_FAILURE_COOLDOWN_SECS`
+(default 300s).
 
 Only if every alternative also fails does the client receive the gateway error
 message. Incident: `req_639b33b3904d2d0c` (2026-10-15) on

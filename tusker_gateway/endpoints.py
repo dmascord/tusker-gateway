@@ -4094,11 +4094,24 @@ def _sanitize_cross_provider_messages(messages: Any) -> list[dict[str, Any]]:
 
 
 def _max_pool_provider_attempts() -> int:
-    """Bound per-request fallback work so one outage cannot stall OMP."""
+    """Bound per-request fallback work so one outage cannot stall OMP.
+
+    The bound must clear the number of routes a large pool can offer for one
+    request shape, otherwise a request that walks a run of structurally dead
+    candidates (rate-limited free tiers, stale credentials) can exhaust its
+    budget while healthy candidates are still eligible. On 2026-11-01 the
+    ``code`` pool had 19 eligible image+tools routes but six attempts, so
+    ``req_661692d57974d957`` failed after four exhausted ``opencode-cli``
+    free models with ten untried routes remaining.
+
+    The request deadline and the optional
+    ``TUSKER_PROVIDER_TOTAL_ATTEMPT_BUDGET_SECS`` still bound wall-clock
+    cost; this cap only bounds how many distinct candidates are tried.
+    """
     try:
-        return max(1, int(os.environ.get("TUSKER_MAX_PROVIDER_ATTEMPTS", "6")))
+        return max(1, int(os.environ.get("TUSKER_MAX_PROVIDER_ATTEMPTS", "12")))
     except ValueError:
-        return 6
+        return 12
 
 
 def _max_previsible_failovers() -> int:
