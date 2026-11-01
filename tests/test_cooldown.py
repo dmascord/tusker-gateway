@@ -10,6 +10,18 @@ def test_model_scoped_provider_does_not_block_sibling_models():
     assert not tracker.is_cooldown("openrouter", "openai/gpt-oss-20b:free")
 
 
+
+def test_codex_json_reset_seconds_override_generic_quota_default():
+    from tusker_gateway.cooldown import _cooldown_seconds_for_429
+
+    body = (
+        '{"error":{"type":"usage_limit_reached",'
+        '"resets_in_seconds":252782}}'
+    )
+
+    assert _cooldown_seconds_for_429({"body": body, "headers": {}}) == 252782
+
+
 def test_gemini_and_groq_are_model_scoped():
     for provider in ("google", "groq"):
         tracker = CooldownTracker()

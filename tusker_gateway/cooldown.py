@@ -397,6 +397,12 @@ def _header_to_seconds(value: str | None) -> float | None:
         return None
 
 
+_RESET_SECONDS_FIELD_RE = re.compile(
+    r"[\"'](?:resets_in_seconds|reset_after_seconds|retry_after_seconds)[\"']\s*:\s*"
+    r"[\"']?([0-9]+(?:\.[0-9]+)?)[\"']?",
+    re.IGNORECASE,
+)
+
 _COMPOUND_DURATION_RE = re.compile(
     r"\b("
     r"\d+(?:\.\d+)?ms"
@@ -477,6 +483,13 @@ def _cooldown_seconds_for_429(exc: dict[str, Any]) -> float:
     reset_secs = _seconds_until_absolute_reset(body_for_hints)
     if reset_secs is not None:
         return max(60.0, reset_secs)
+
+    reset_match = _RESET_SECONDS_FIELD_RE.search(body)
+    if reset_match:
+        try:
+            return max(30.0, float(reset_match.group(1)))
+        except (TypeError, ValueError):
+            pass
 
     ra_seconds = _header_to_seconds(headers.get("Retry-After"))
     if ra_seconds is None:

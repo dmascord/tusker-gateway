@@ -731,6 +731,40 @@ async def test_codex_has_available_credential_tracks_get_token():
     assert pooled.has_available_credential("gpt-5.6-luna") is False
     assert await pooled.get_token(model="gpt-5.6-luna") is None
 
+@pytest.mark.asyncio
+async def test_codex_quota_cooldown_keeps_other_accounts_available():
+    """A quota window belongs to one account, never the Codex route."""
+    from tusker_gateway.passthrough import CodexTokenRotator
+
+    rotator = CodexTokenRotator([
+        {"access_token": "account-a", "account_user_id": "seat-a"},
+        {"access_token": "account-b", "account_user_id": "seat-b"},
+    ])
+    rotator.cooldown_credential(rotator.fingerprint("account-a"), 60.0)
+
+    assert await rotator.get_token(model="gpt-5.6-luna") == "account-b"
+    assert rotator.has_available_credential("gpt-5.6-luna")
+    assert not rotator.credential_available(rotator.fingerprint("account-a"))
+
+@pytest.mark.asyncio
+async def test_codex_cooldown_follows_account_identity_after_token_rotation():
+    from tusker_gateway.passthrough import CodexTokenRotator
+    rotator = CodexTokenRotator([
+        {"access_token": "old-token", "account_user_id": "seat-a"},
+        {"access_token": "other-token", "account_user_id": "seat-b"},
+    ])
+    identity = rotator._credential_identity(rotator._creds[0], "old-token")
+    rotator.cooldown_credential(
+        rotator.fingerprint("old-token"), 60.0, identity=identity
+    )
+    rotator.reload([
+        {"access_token": "new-token", "account_user_id": "seat-a"},
+        {"access_token": "other-token", "account_user_id": "seat-b"},
+    ])
+
+    assert await rotator.get_token(model="gpt-5.6-luna") == "other-token"
+
+
 
 @pytest.mark.asyncio
 async def test_codex_without_credential_fails_before_sending_request(
@@ -957,11 +991,10 @@ async def test_stream_prefetch_preserves_successful_upstream_bytes(
 
 
 @pytest.mark.asyncio
-async def test_chat_codex_uses_next_rotator_credential_after_rate_limit():
-    """A 429 must leave the next round-robin credential ready for use."""
+async def test_chat_codex_uses_next_account_after_quota_rate_limit():
+    """One account's quota 429 must fail over to a healthy pool entry."""
     from unittest.mock import AsyncMock, MagicMock
 
-    from tusker_gateway.errors import RateLimitError
     from tusker_gateway.passthrough import CodexTokenRotator, PassthroughClient
 
     rotator = CodexTokenRotator([
@@ -973,26 +1006,67 @@ async def test_chat_codex_uses_next_rotator_credential_after_rate_limit():
     client._config = {"quality_db_path": "/tmp/q.db"}
     client._http = MagicMock()
 
-    fake_resp = MagicMock()
-    fake_resp.status = 429
-    fake_resp.headers = {"Retry-After": "60"}
-    fake_resp.text = AsyncMock(return_value="rate limited")
+    limited = MagicMock()
+    limited.status = 429
+    limited.headers = {"Retry-After": "60"}
+    limited.text = AsyncMock(return_value='{"error":"usage_limit_reached"}')
+    success = MagicMock()
+    success.status = 200
+    success.content = _AsyncChunks([
+        b'data: {"type":"response.completed","response":{"output":[{"type":"message",'
+        b'"content":[{"type":"output_text","text":"ok"}]}]}}\n\n'
+    ])
+    client._http.request = AsyncMock(side_effect=[limited, success])
 
-    class FakeHTTPRequest:
-        async def __call__(self, *_a, **_kw):
-            return fake_resp
+    result = await client._chat_codex(
+        provider="openai-codex",
+        model="gpt-5.4",
+        messages=[{"role": "user", "content": "ok"}],
+        stream=False,
+        api_key=None,
+    )
 
-    client._http.request = FakeHTTPRequest()
+    assert result["choices"][0]["message"]["content"] == "ok"
+    assert client._http.request.await_count == 2
+    assert [
+        call.kwargs["headers"]["Authorization"]
+        for call in client._http.request.await_args_list
+    ] == ["Bearer tok-a", "Bearer tok-b"]
+    assert not rotator.credential_available(rotator.fingerprint("tok-a"))
+    assert rotator.has_available_credential("gpt-5.4")
+
+@pytest.mark.asyncio
+async def test_chat_codex_account_quota_does_not_cool_model_route():
+    """Exhausting one account must not quarantine the shared Codex route."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from tusker_gateway.cooldown import global_tracker
+    from tusker_gateway.errors import RateLimitError
+    from tusker_gateway.passthrough import CodexTokenRotator, PassthroughClient
+
+    rotator = CodexTokenRotator([
+        {"access_token": "only-account", "expires_at_ms": 9999999999999},
+    ])
+    client = PassthroughClient.__new__(PassthroughClient)
+    client._codex_rotator = rotator
+    client._config = {"quality_db_path": "/tmp/q.db"}
+    client._http = MagicMock()
+    response = MagicMock()
+    response.status = 429
+    response.headers = {"Retry-After": "60"}
+    response.text = AsyncMock(return_value='{"error":"usage_limit_reached"}')
+    client._http.request = AsyncMock(return_value=response)
 
     with pytest.raises(RateLimitError):
         await client._chat_codex(
             provider="openai-codex",
-            model="gpt-5.4",
+            model="gpt-5.6-luna",
             messages=[{"role": "user", "content": "ok"}],
             stream=False,
             api_key=None,
         )
-    assert await rotator.get_token() == "tok-b"
+
+    assert not global_tracker().is_cooldown("openai-codex", "gpt-5.6-luna")
 
 
 @pytest.mark.asyncio

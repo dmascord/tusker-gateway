@@ -60,3 +60,15 @@ def test_code_pool_opts_into_opencode_cli_auto_catalog():
     assert "opencode-cli" in code["auto_catalog_providers"]
     assert "opencode-cli" not in privacy["auto_catalog_providers"]
     assert "opencode-cli" not in premium["auto_catalog_providers"]
+
+def test_privacy_pool_prefers_local_route_but_keeps_apim_fallback():
+    """APIM remains ZDR-eligible without competing equally with local MLX."""
+    privacy = json.loads(_deployment_env()["TUSKER_POOL_PRIVACY"]["value"])
+    routes = {
+        (item["provider"], item["model"]): item
+        for item in privacy["models"]
+    }
+
+    assert routes[("mlx-mac", "qwen3.8-27b")]["weight"] == 1.0
+    assert routes[("apim", "gpt-5.6-luna")]["weight"] == 0.05
+    assert privacy["zdr"] is True
