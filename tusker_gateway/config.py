@@ -781,8 +781,8 @@ DEFAULT_PROVIDER_REGISTRY: dict[str, ProviderConfig] = {
     "opencode-go": ProviderConfig(
         "opencode-go",
         "bearer",
-        "https://opencode.ai/zen/go/v1",
-        "/chat/completions",
+        "https://opencode.ai/inference/go",
+        "/openai/v1/chat/completions",
         auth_env="OPENCODE_GO_API_KEY",
         zdr_ok=True,
     ),

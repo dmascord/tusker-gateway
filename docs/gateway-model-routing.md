@@ -380,8 +380,7 @@ free into the pool's allowlist. Discovery differs per upstream:
 |---|---|
 | `openrouter` | `pricing.prompt == "0" AND pricing.completion == "0"` |
 | `arcee` | Provider-native model catalog; static code route uses `trinity-mini` |
-| `opencode-zen` | All entries returned by `/zen/v1/models` (the upstream key-filters paid models) |
-| `opencode-go` | All entries returned by `/zen/go/v1/models` (same key-filter) |
+| `opencode-go` | All entries returned by `/inference/go/v1/models` (same key-filter) |
 | `xiaomi` | Authenticated Token Plan catalog; proven chat models only, cheap non-ZDR pools only, heavyweight entries excluded |
 | provider-native catalogs | Both catalog/model.dev prices must resolve to exactly zero; unpriced or paid models stay out of free pools |
 | `opencode-cli` | Every model in the `opencode/` namespace of the pinned CLI's `opencode models` output — the CLI's own eligibility list. The key-filtered HTTP `/zen/v1/models` catalog omits CLI-exclusive free models, so it is not used as a filter |

@@ -987,13 +987,12 @@ class OpenCodeCatalog(CatalogClient):
 
 
 class OpenCodeGoCatalog(OpenCodeCatalog):
-    """OpenCode Go (zen/go) backend — same auth/response shape as Zen
-    but a different model list and endpoint."""
+    """OpenCode Go inference catalog under the Console Go base URL."""
 
     provider = "opencode-go"
     ttl_secs = DEFAULT_TTLS["opencode-go"]
 
-    ENDPOINT = "https://opencode.ai/zen/go/v1/models"
+    ENDPOINT = "https://opencode.ai/inference/go/v1/models"
 
 
 # ---------------------------------------------------------------------------
