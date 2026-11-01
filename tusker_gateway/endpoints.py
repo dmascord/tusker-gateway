@@ -21,7 +21,7 @@ from tusker_gateway.redaction import _BufferedRestorer
 from tusker_gateway.cache import ResponseCache, make_cache_key, make_caller_scope
 from tusker_gateway.budget import BudgetTracker
 from tusker_gateway.circuit_breaker import BreakerDecision, BreakerState, CircuitBreaker
-from tusker_gateway.cooldown import is_account_quota_exhausted
+from tusker_gateway.cooldown import _cooldown_seconds_for_429, is_account_quota_exhausted
 from tusker_gateway.config import (
     build_high_impact_argument_regex,
     build_high_impact_content_regex,
@@ -4054,10 +4054,7 @@ def _cooldown_for_exc(
     earns the cooldown its status implies; gating on the type silently
     downgraded a 4xx whose 3600s window had already been computed.
     """
-    from tusker_gateway.cooldown import (
-        _cooldown_seconds_for_429,
-        _cooldown_seconds_for_provider_error,
-    )
+    from tusker_gateway.cooldown import _cooldown_seconds_for_provider_error
 
     try:
         if isinstance(exc, RateLimitError):
@@ -4501,6 +4498,39 @@ def _provider_rate_limit_is_external(exc: BaseException) -> bool:
     return provider not in _PROVIDER_WIDE_RATE_LIMIT_PROVIDERS
 
 
+def _retry_after_seconds_for_exc(exc: BaseException) -> int:
+    """Return the backoff a client is told to use for a provider 429.
+
+    One derivation for every client-facing 429 surface (JSON envelope and
+    in-band stream frame) so neither can drift from the window the gateway
+    itself enforces: a provider header wins, otherwise the body is parsed by
+    the same helper the cooldown tracker uses.
+
+    A fixed fallback here told clients to retry in 5s while the route stayed
+    quarantined for minutes, so retries walked back into the same 429. On
+    2026-11-01 the privacy pool repeated that cycle for the whole cooldown
+    window.
+    """
+    header_value = _provider_retry_after_header(
+        getattr(exc, "headers", None) or None
+    )
+    if header_value is not None:
+        try:
+            return max(1, int(float(header_value)))
+        except (TypeError, ValueError):
+            pass
+    try:
+        seconds = _cooldown_seconds_for_429(
+            {
+                "body": str(getattr(exc, "body", None) or ""),
+                "headers": dict(getattr(exc, "headers", None) or {}),
+            }
+        )
+    except Exception:
+        seconds = float(os.environ.get("TUSKER_PROVIDER_RETRY_AFTER_SECS", "5"))
+    return max(1, int(round(seconds)))
+
+
 def _provider_rate_limit_response(
     exc: RateLimitError,
     *,
@@ -4522,19 +4552,15 @@ def _provider_rate_limit_response(
         # Machine-readable signal for the maintenance qualification path;
         # mirrors the existing capacity-failure handler.
         headers["X-Tusker-Provider-Failure"] = "provider_quota"
-    retry_after = _provider_retry_after_header(exc.headers)
-    if retry_after is None:
-        try:
-            retry_after = str(
-                max(1, int(float(os.environ.get("TUSKER_PROVIDER_RETRY_AFTER_SECS", "5"))))
-            )
-        except (TypeError, ValueError):
-            retry_after = "5"
-    headers["Retry-After"] = retry_after
+    retry_after_secs = _retry_after_seconds_for_exc(exc)
+    headers["Retry-After"] = str(retry_after_secs)
     message = (
         "Upstream provider quota exhausted; retry after the upstream quota window resets."
         if quota_exhausted
-        else "Upstream provider rate limit exceeded; retry shortly."
+        else (
+            "Upstream provider rate limit exceeded; retry in about "
+            f"{retry_after_secs}s."
+        )
     ) + suffix
     return web.json_response(
         openai_error(message, code="rate_limit_exceeded", error_type="rate_limit_error"),
@@ -4729,8 +4755,13 @@ def _public_stream_error(
         # them before this function; this keeps the terminal frame safe when
         # no alternative candidate remains.
         if _provider_rate_limit_is_external(exc):
+            # Name the window the gateway itself honours. "Retry shortly"
+            # invited an immediate retry into a route still quarantined for
+            # minutes (2026-11-01 privacy pool), which is the same defect the
+            # JSON envelope's Retry-After had.
             message = (
-                "Upstream provider rate limit exceeded; retry shortly. "
+                "Upstream provider rate limit exceeded; retry in about "
+                f"{_retry_after_seconds_for_exc(exc)}s. "
                 f"Request ID: {request_id}."
             )
             code = "rate_limit_exceeded"

@@ -683,6 +683,23 @@ carries exactly the rid the failure was logged under),
 `tests/test_chat.py::test_public_provider_non_capacity_failure_does_not_leak_upstream_body`,
 and `tests/test_chat.py::test_public_stream_error_correlates_capacity_failure`.
 
+The backoff a client is told now matches the window the gateway enforces. A
+provider 429 that carried no `Retry-After` header used to fall back to a fixed
+5s (`TUSKER_PROVIDER_RETRY_AFTER_SECS`) while the cooldown tracker quarantined
+the route for the body-derived window — 60s for a per-minute token limit, 3600s
+for quota exhaustion. Retries therefore walked straight back into the same 429
+for the whole quarantine, which read as "the privacy pool is timing out again".
+On 2026-11-01 the upstream said "Try again in 23 seconds." and the client was
+told 5. Both 429 surfaces — the JSON envelope from `_provider_rate_limit_response`
+and the in-band SSE frame from `_public_stream_error` — now derive their value
+from `_retry_after_seconds_for_exc`, which prefers a provider header and
+otherwise calls the same `_cooldown_seconds_for_429` parser the cooldown uses,
+so the two cannot drift. Covered by
+`tests/test_chat.py::test_client_retry_after_matches_gateway_cooldown` (asserts
+equality with the parser rather than a literal),
+`tests/test_chat.py::test_client_retry_after_prefers_provider_header`, and
+`tests/test_chat.py::test_stream_rate_limit_frame_names_the_real_backoff`.
+
 ### Codex seat identity
 
 A ChatGPT *team* workspace gives every member the same `account_id`; only
