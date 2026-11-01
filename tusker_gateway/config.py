@@ -1043,6 +1043,7 @@ def _load_pools() -> dict[str, PoolConfig]:
                 "openai-codex",
                 "github-copilot-enterprise",
                 "ollama-cloud",
+                "opencode-go",
             ),
             require_tool_qualification=True,
         )

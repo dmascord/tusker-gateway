@@ -461,8 +461,10 @@ The privacy pool applies the provider policy before catalog pricing. The
 default registry currently allows local `local-llm`, Ollama Cloud, OpenCode
 Go, OpenAI Codex, GitHub Copilot Enterprise, Xiaomi MiMo, and the public
 Copilot route (via the `TUSKER_COPILOT_BUSINESS` opt-in below). The strict
-privacy pool discovers Ollama Cloud as a ZDR-eligible provider; models such as
-`glm-5.3-flash` still require a passing behavioral qualification before use.
+privacy pool discovers Ollama Cloud and OpenCode Go as ZDR-eligible providers;
+their account-filtered catalogs are admitted only after the provider's
+behavioral tool qualification passes. Models such as `glm-5.3-flash` still
+require a passing behavioral qualification before use.
 Deployment
 overrides register the local hardware routes explicitly; runtime provider
 configuration takes precedence over built-in endpoint defaults.
