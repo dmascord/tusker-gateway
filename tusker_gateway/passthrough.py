@@ -1284,6 +1284,21 @@ class CodexTokenRotator:
             return True
         return False
 
+    def clear_credential_cooldown(self, label: str) -> bool:
+        """Clear cooldown entries for one non-secret credential label."""
+        target = str(label or "").strip()
+        for index, cred in enumerate(self._creds):
+            if self._credential_label(cred, index) != target:
+                continue
+            token = _creds_access_token(cred)
+            identity = self._credential_identity(cred, token)
+            keys = {self.fingerprint(token), f"identity:{identity}" if identity else None}
+            for key in keys:
+                if key:
+                    self._credential_cooldowns.pop(key, None)
+            return True
+        return False
+
     def has_available_credential(self, model: str | None = None) -> bool:
         """Return whether some credential could serve ``model`` right now.
 
