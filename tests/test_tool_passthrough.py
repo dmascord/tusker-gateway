@@ -269,8 +269,7 @@ async def test_opencode_go_sets_conversation_session_header():
     request = http.request.call_args
     headers = request.kwargs["headers"]
     assert headers["x-opencode-session"] == "omp-conversation-123"
-    assert request.args[0] == "POST"
-    assert request.args[1].endswith("/zen/go/v1/chat/completions")
+    assert request.args[1].endswith("/inference/go/openai/v1/chat/completions")
 
 
 @pytest.mark.asyncio

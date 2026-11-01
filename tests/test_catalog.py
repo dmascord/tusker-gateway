@@ -750,8 +750,8 @@ async def test_opencode_go_catalog_parses_models():
     entries = await OpenCodeGoCatalog().fetch(session)
     assert {e.model for e in entries} == {"minimax-m3", "kimi-k2.6"}
     assert all(e.provider == "opencode-go" for e in entries)
-    # Go subclass should hit /go/v1/models, not /v1/models.
-    assert OpenCodeGoCatalog.ENDPOINT.endswith("/go/v1/models")
+    # Go uses the Console inference catalog under the Go base URL.
+    assert OpenCodeGoCatalog.ENDPOINT == "https://opencode.ai/inference/go/v1/models"
     assert session.captured["headers"]["x-opencode-session"] == (
         OpenCodeGoCatalog.OPENCODE_GO_CATALOG_SESSION
     )
