@@ -6,9 +6,9 @@ metadata:
   labels:
     app: tusker-gateway
   annotations:
-    tusker.net.au/commit: 67e2d219286216620169214c99dd03a3b782945a
-    tusker.net.au/image-tag: swarm-alpine-67e2d219286216620169214c99dd03a3b782945a
-    tusker.net.au/image-digest: sha256:8e6bd4718e333ba1615eec14cc623302f38904a9fa621e09de44a728cad6ae40
+    tusker.net.au/commit: 4d41477e69b7905f818f8b9a34b0e33651a8c4a6
+    tusker.net.au/image-tag: swarm-alpine-4d41477e69b7905f818f8b9a34b0e33651a8c4a6
+    tusker.net.au/image-digest: sha256:95fcaeab2a7843450f88911f758f318a2365ceaa450dc4d5a56e456285ed8a29
 spec:
   replicas: 1
   selector:
@@ -34,7 +34,7 @@ spec:
       terminationGracePeriodSeconds: 90
       containers:
       - name: tusker-gateway
-        image: registry.tusker.net.au:5000/tusker-gateway@sha256:8e6bd4718e333ba1615eec14cc623302f38904a9fa621e09de44a728cad6ae40
+        image: registry.tusker.net.au:5000/tusker-gateway@sha256:95fcaeab2a7843450f88911f758f318a2365ceaa450dc4d5a56e456285ed8a29
         imagePullPolicy: Always
         envFrom:
         - secretRef:
