@@ -1091,7 +1091,23 @@ class PoolManager:
                 result = self._tool_capabilities.get(spec.provider, spec.model)
             else:
                 result = capability_cache.get((spec.provider, spec.model))
-            return bool(result is not None and result.qualified_for_tools)
+            if result is None:
+                return False
+            if result.qualified_for_tools:
+                return True
+            # A transient probe result (provider 429, 5xx, or transport
+            # failure) reports availability, not the tool contract, so it
+            # must not be read as a capability denial — the same rule
+            # ``_image_tools_evidence_allows`` applies to composite evidence.
+            # Reading it as a denial empties a strict pool whose only route
+            # was rate-limited at probe time: on 2026-11-01 the privacy pool's
+            # ``apim/gpt-5.6-luna`` record held ``rate_limited``, leaving
+            # ``mlx-mac/qwen3.8-27b`` as the sole candidate and every
+            # image+tools request failed once that route was busy
+            # (rid req_ba316b8d545bbbe8). Definitive outcomes (unsupported
+            # contract, no tool call, 401/403) still deny, and the runtime
+            # stream boundary remains the hard gate on the response.
+            return result.transient_for_tools and not spec.auto_discovered
 
         mode = os.environ.get("TUSKER_TOOL_CAPABILITY_GATE", "auto").strip().lower()
         if mode in {"0", "false", "no", "off", "disabled"}:
