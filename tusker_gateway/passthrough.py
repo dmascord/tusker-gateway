@@ -912,6 +912,14 @@ def _creds_expires_at(cred: dict[str, Any]) -> float:
         return 0.0
 
 
+def _normalized_identity_value(value: Any) -> str:
+    """Return a comparable credential-identity value, or "" when absent."""
+    if value is None:
+        return ""
+    text = " ".join(str(value).split()).casefold()
+    return text
+
+
 # An OAuth-backed route with no usable credential must fail before the request
 # is sent: a credential-less call can only come back 401, which the request path
 # records and logs as an upstream auth failure - it reads as a broken credential
@@ -1056,18 +1064,43 @@ class CodexTokenRotator:
         except Exception:
             return "unknown"
 
-    @staticmethod
-    def _matches_identity(a: dict[str, Any], b: dict[str, Any]) -> bool:
-        """Return whether two credential dicts describe the same account.
+    # Seat-level claims first. A ChatGPT *team* account gives every member
+    # the same ``account_id``, so that field identifies the organization and
+    # cannot on its own say "these two credentials are the same login".
+    _SEAT_IDENTITY_FIELDS: tuple[str, ...] = (
+        "account_user_id",
+        "user_id",
+        "email",
+        "label",
+    )
 
-        Stable identity fields first; fall back to refresh-token equality
-        when no shared account metadata is present.
+    @classmethod
+    def _matches_identity(cls, a: dict[str, Any], b: dict[str, Any]) -> bool:
+        """Return whether two credential dicts describe the same OAuth seat.
+
+        Matching on ``account_id`` alone collapsed the three Codex seats of
+        one team account into a single credential: the adoption path treated
+        every seat as "the same account", copied the one unexpired seat's
+        tokens over the other two, and left the pool holding three copies of
+        one access token. One quota 429 then quarantined all three by token
+        fingerprint and the pool reported ``pool_empty_or_all_cooling``
+        (2026-10-31, ``openai-codex/gpt-5.6-luna``).
+
+        The most specific field both records carry decides. ``account_id`` is
+        consulted only when no seat-level field is comparable on both sides -
+        the shape of a pool enrolled before seat claims were recorded - so
+        those pools keep adopting as before.
         """
-        for key in ("account_id", "email", "label"):
-            av = a.get(key)
-            bv = b.get(key)
-            if av and bv:
-                return str(av) == str(bv)
+        for key in cls._SEAT_IDENTITY_FIELDS:
+            av = _normalized_identity_value(a.get(key))
+            bv = _normalized_identity_value(b.get(key))
+            if not av or not bv:
+                continue
+            return av == bv
+        account_a = _normalized_identity_value(a.get("account_id"))
+        account_b = _normalized_identity_value(b.get("account_id"))
+        if account_a and account_b:
+            return account_a == account_b
         return str(a.get("refresh_token") or "") == str(b.get("refresh_token") or "")
 
     def _log_pool_initialized(self) -> None:
@@ -1262,13 +1295,19 @@ class CodexTokenRotator:
             return True
         return False
 
-    @staticmethod
-    def _credential_identity(cred: dict[str, Any], token: str | None = None) -> str:
-        """Stable, non-secret identity for per-account model exclusions."""
-        for key in ("account_id", "user_id", "email", "label", "id"):
+    @classmethod
+    def _credential_identity(cls, cred: dict[str, Any], token: str | None = None) -> str:
+        """Stable, non-secret identity for per-account model exclusions.
+
+        Seat-level claims lead for the same reason they lead the adoption
+        match: ``account_id`` is the *team* and every seat in it shares that
+        value, so an entitlement failure recorded against it would exclude
+        the model for every seat rather than the one that failed.
+        """
+        for key in (*cls._SEAT_IDENTITY_FIELDS, "account_id", "id"):
             value = cred.get(key)
             if value:
-                raw = f"{key}:{' '.join(str(value).split()).casefold()}"
+                raw = f"{key}:{_normalized_identity_value(value)}"
                 return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
         # Refresh tokens are more stable than short-lived access tokens.
         raw = str(cred.get("refresh_token") or token or _creds_access_token(cred) or "")

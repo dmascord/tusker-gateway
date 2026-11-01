@@ -154,6 +154,28 @@ def test_public_stream_error_explains_empty_pool_as_availability_not_provider_fa
     assert "Upstream provider error" not in message
 
 
+def test_public_stream_error_correlates_capacity_failure():
+    """A post-commit capacity failure must name the gateway request.
+
+    The rate-limit arm of ``_public_stream_error`` appended the request ID
+    while the sibling capacity arm did not, so the 2026-10-31 privacy-pool
+    report ("Upstream provider capacity is unavailable; retry shortly.")
+    carried nothing an operator could search for.
+    """
+    exc = ProviderCapacityError(group="mlx-mac", detail="provider capacity unavailable")
+
+    message, code = _public_stream_error(
+        exc,
+        request_id="req_ef7626de7c191781",
+        provider="mlx-mac",
+        model="qwen3.8-27b",
+    )
+
+    assert code == "service_unavailable"
+    assert "capacity is unavailable" in message
+    assert "Request ID: req_ef7626de7c191781." in message
+
+
 def test_public_stream_error_keeps_gateway_rejection_wording():
     """A post-commit gateway 400 must not be relabelled as upstream failure."""
     message, code = _public_stream_error(
