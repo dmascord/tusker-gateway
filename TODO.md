@@ -1,6 +1,21 @@
 # Project TODOs
 
 
+## Codex seat enrollment after identity fix (2026-11-01)
+
+`CodexTokenRotator` no longer identifies a seat by `account_id` (the ChatGPT
+team workspace); adoption and per-seat model exclusions now key on
+`account_user_id`/`user_id`/`email`/`label`. See
+`docs/incidents/2026-11-01-privacy-pool-codex-seat-collapse.md`.
+
+Operator follow-up: verify the three `openai-codex` rows still hold *distinct*
+refresh tokens. The pre-fix adoption path overwrote seats 2 and 3 with seat
+1's rotated tokens, so a seat whose stored refresh token now equals another
+seat's must be re-enrolled with
+`python3 -m tusker_gateway.tools.enroll_codex_credential --replace-email` from
+inside the pod. A revoked refresh token still fails that seat alone.
+
+
 ## GitHub Copilot Enterprise credential quota (2026-10-31)
 
 The GHE credential behind `github-copilot-enterprise` returns `429 quota

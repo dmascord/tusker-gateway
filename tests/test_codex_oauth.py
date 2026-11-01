@@ -845,6 +845,107 @@ async def test_rotator_adopts_fresher_credential_from_store_before_refresh(
 
 
 @pytest.mark.asyncio
+async def test_rotator_keeps_team_seats_distinct_during_store_adoption(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Seats of one team account must not collapse into a single credential.
+
+    A ChatGPT *team* gives every member the same ``account_id``. Matching
+    adoption candidates on that field made the pool adopt seat 1's rotated
+    tokens into seats 2 and 3, leaving three copies of one access token in
+    the rotator. One quota 429 then cooled all three by token fingerprint
+    and the pool reported ``pool_empty_or_all_cooling`` (2026-10-31,
+    ``openai-codex/gpt-5.6-luna``).
+    """
+    import tusker_gateway.codex_oauth as codex_oauth
+    from tusker_gateway.passthrough import CodexTokenRotator
+
+    refresh = AsyncMock(
+        side_effect=AssertionError(
+            "refresh must not run: every seat already holds a fresh token"
+        )
+    )
+    monkeypatch.setattr(codex_oauth, "refresh_codex_token", refresh)
+
+    team_account_id = "80b149a8-0bfa-430f-aa41-7e6818308e81"
+    expired_at_ms = int((time.time() - 60) * 1000)
+    expires_at_ms = int((time.time() + 3600) * 1000)
+    in_memory = [
+        {
+            "label": f"codex-{index}",
+            "account_id": team_account_id,
+            "account_user_id": f"user-{index}",
+            "email": f"seat-{index}@example.test",
+            "access_token": f"access-{index}",
+            "refresh_token": f"refresh-{index}",
+            "expires_at_ms": expired_at_ms,
+        }
+        for index in (1, 2, 3)
+    ]
+    stored = [
+        {
+            **credential,
+            "access_token": f"rotated-access-{index}",
+            "refresh_token": f"rotated-refresh-{index}",
+            "expires_at_ms": expires_at_ms,
+        }
+        for index, credential in enumerate(in_memory, start=1)
+    ]
+
+    rotator = CodexTokenRotator(
+        in_memory,
+        http_client=object(),
+        provider="openai-codex",
+        load_credentials=lambda _provider: [dict(entry) for entry in stored],
+    )
+
+    selected = [await rotator.get_token() for _ in range(3)]
+
+    assert selected == ["rotated-access-1", "rotated-access-2", "rotated-access-3"]
+    assert len({rotator.fingerprint(token) for token in selected}) == 3
+    # Each seat keeps its own label, so operator logs stay unambiguous.
+    assert [rotator._credential_label(cred, index) for index, cred in enumerate(rotator._creds)] == [
+        "codex-1",
+        "codex-2",
+        "codex-3",
+    ]
+    refresh.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_rotator_model_exclusion_is_scoped_to_one_team_seat() -> None:
+    """An entitlement failure must not exclude the model for the whole team.
+
+    ``account_id`` identifies the team, not the seat. Recording a per-seat
+    entitlement failure against it excluded the model for every member of
+    the team.
+    """
+    from tusker_gateway.passthrough import CodexTokenRotator
+
+    team_account_id = "80b149a8-0bfa-430f-aa41-7e6818308e81"
+    rotator = CodexTokenRotator([
+        {
+            "label": "codex-1",
+            "account_id": team_account_id,
+            "account_user_id": "user-1",
+            "email": "seat-1@example.test",
+            "access_token": "access-1",
+        },
+        {
+            "label": "codex-2",
+            "account_id": team_account_id,
+            "account_user_id": "user-2",
+            "email": "seat-2@example.test",
+            "access_token": "access-2",
+        },
+    ])
+
+    assert rotator.exclude_model_for_token("access-1", "gpt-5.4-mini")
+    assert not rotator.model_excluded_for_all_credentials("gpt-5.4-mini")
+    assert await rotator.get_token(model="gpt-5.4-mini") == "access-2"
+
+
+@pytest.mark.asyncio
 async def test_rotator_initialised_log_redacts_tokens(caplog: pytest.LogCaptureFixture) -> None:
     """Initial rotator state must show fingerprints, never raw tokens."""
     import logging

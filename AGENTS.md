@@ -21,6 +21,7 @@ Read in order when picking up the repo:
 | `docs/incidents/2026-08-26-usb-ssd-flap.md` | USB-SSD flap postmortem, storage migration, and Longhorn v1.12.1 upgrade notes. |
 | `docs/migrations/2026-09-09-config-db/` | DB-backed config store — shipped. Plan, schema, rollout. |
 | `docs/incidents/2026-10-21-codex-rotation-and-grok-429-leak.md` | Codex refresh-token rotation + xAI/Grok `{"statusCode":429,...}` envelope leak (req_50a994b481aa7fe3). Operator runbook + hardened cooldown suppression. |
+| `docs/incidents/2026-11-01-privacy-pool-codex-seat-collapse.md` | Codex team-seat collapse (`account_id` vs `account_user_id`) + uncorrelated capacity SSE frame (req_ef7626de7c191781). |
 | `TODO.md` | Active cross-session work items. |
 
 

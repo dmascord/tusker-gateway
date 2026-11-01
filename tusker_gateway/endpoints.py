@@ -4728,7 +4728,10 @@ def _public_stream_error(
             )
             code = "service_unavailable"
     elif _is_capacity_failure(exc):
-        message = "Upstream provider capacity is unavailable; retry shortly."
+        message = (
+            "Upstream provider capacity is unavailable; retry shortly. "
+            f"Request ID: {request_id}."
+        )
         code = "service_unavailable"
     elif isinstance(exc, ProviderEmptyStreamError):
         message = (

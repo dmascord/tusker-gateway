@@ -662,12 +662,46 @@ truncated turn is traceable in the access log. Rate-limit and provider-capacity
 failures were the last branches missing it: the 2026-10-31 privacy-pool report
 was a bare "Upstream provider rate limit exceeded; retry shortly." with nothing
 to quote. `_provider_rate_limit_response`, the capacity 503, the 502
-`provider_error` branch, and the SSE frame from `_public_stream_error` now all
-carry the ID; the `provider_error` message told callers to quote a request_id
-while omitting it. Covered by
+`provider_error` branch, and the rate-limit SSE frame from
+`_public_stream_error` now all carry the ID; the `provider_error` message told
+callers to quote a request_id while omitting it. The capacity arm of
+`_public_stream_error` had the same gap and was fixed with it: request
+`req_ef7626de7c191781` (2026-10-31T22:59:12Z) reached the client as a bare
+"Upstream provider capacity is unavailable; retry shortly." on a committed
+HTTP 200 stream. Covered by
 `tests/test_chat.py::test_chat_rate_limit_429_includes_request_id` (the envelope
-carries exactly the rid the failure was logged under) and
-`tests/test_chat.py::test_public_provider_non_capacity_failure_does_not_leak_upstream_body`.
+carries exactly the rid the failure was logged under),
+`tests/test_chat.py::test_public_provider_non_capacity_failure_does_not_leak_upstream_body`,
+and `tests/test_chat.py::test_public_stream_error_correlates_capacity_failure`.
+
+### Codex seat identity
+
+A ChatGPT *team* workspace gives every member the same `account_id`; only
+`account_user_id` (or `user_id`, `email`, `label`) identifies the individual
+seat. Two credential-pool paths keyed on `account_id` and so treated the whole
+team as one login:
+
+- `_maybe_adopt_from_store` adopted the first *matching* stored credential into
+  every in-memory seat. Because seat 1 held the only unexpired token, seats 2
+  and 3 were overwritten with seat 1's rotated tokens and the pool held three
+  copies of one access token. One quota 429 then cooled all three by token
+  fingerprint and the pool reported `pool_empty_or_all_cooling`
+  (2026-10-31, `openai-codex/gpt-5.6-luna`).
+- `_credential_identity` recorded a per-seat model entitlement failure against
+  the team, excluding the model for every member instead of the seat that
+  failed.
+
+Both paths now compare the most specific seat-level field both records carry
+and fall back to `account_id` only when no seat-level field is comparable on
+both sides - the shape of a pool enrolled before seat claims were recorded.
+Covered by `tests/test_codex_oauth.py::test_rotator_keeps_team_seats_distinct_during_store_adoption`
+and `tests/test_codex_oauth.py::test_rotator_model_exclusion_is_scoped_to_one_team_seat`.
+
+Per-seat exclusions are persisted in `credential_model_exclusions`, keyed by
+the hashed seat identity. The hash changed with the identity rule, so rows
+written under the old team-wide key never match again. The table has no
+pruning, so those rows stay: one inert row per (provider, model) previously
+excluded, which no lookup reads.
 
 ### Copilot capability shape
 
