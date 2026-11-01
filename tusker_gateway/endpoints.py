@@ -5027,6 +5027,20 @@ def _protocol_attempt_diagnostics(
 
 
 
+def _allows_qualification_breaker_probe(request: web.Request | None) -> bool:
+    """Allow maintenance probes to test an OPEN route once.
+
+    Qualification runs inside the gateway pod and marks its requests with a
+    private header. Restricting the override to loopback prevents an
+    authenticated external client from using that header to bypass a route's
+    circuit breaker.
+    """
+    headers = getattr(request, "headers", None) if request is not None else None
+    if not headers or not headers.get("X-Tusker-Tool-Qualification"):
+        return False
+    return getattr(request, "remote", None) in {"127.0.0.1", "::1"}
+
+
 async def _call_with_pool_fallback(
     config: dict[str, Any],
     body: dict[str, Any],
@@ -5088,7 +5102,12 @@ async def _call_with_pool_fallback(
                 **_protocol_attempt_diagnostics(config, provider, model),
             )
         decision = (
-            await asyncio.to_thread(breaker.check, provider, model)
+            await asyncio.to_thread(
+                breaker.check,
+                provider,
+                model,
+                allow_open_probe=_allows_qualification_breaker_probe(request),
+            )
             if breaker
             else BreakerDecision(allowed=True, state=None)
         )
@@ -5433,7 +5452,12 @@ async def _call_with_pool_fallback(
             raise NoHealthyModelsError(pool=pool_name)
         decision = BreakerDecision(allowed=True, state=None)
         if breaker is not None:
-            decision = await asyncio.to_thread(breaker.check, selected[0], selected[1])
+            decision = await asyncio.to_thread(
+                breaker.check,
+                selected[0],
+                selected[1],
+                allow_open_probe=_allows_qualification_breaker_probe(request),
+            )
             if not decision.allowed:
                 excluded.add(selected)
                 continue

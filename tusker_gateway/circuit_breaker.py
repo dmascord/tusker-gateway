@@ -210,8 +210,21 @@ class CircuitBreaker:
 
     # -- public API ------------------------------------------------------
 
-    def check(self, provider: str, model: str) -> BreakerDecision:
-        """Decide whether a request to (provider, model) should proceed."""
+    def check(
+        self,
+        provider: str,
+        model: str,
+        *,
+        allow_open_probe: bool = False,
+    ) -> BreakerDecision:
+        """Decide whether a request to (provider, model) should proceed.
+
+        ``allow_open_probe`` is reserved for an explicit operator or
+        maintenance qualification request. It admits one half-open probe
+        before the normal cooldown expires, while retaining the same atomic
+        lease and success/failure accounting as an ordinary recovery probe.
+        Normal traffic leaves this disabled.
+        """
         if not self._config.enabled:
             return BreakerDecision(allowed=True, state=BreakerState.CLOSED)
         now = time.time()
@@ -231,15 +244,22 @@ class CircuitBreaker:
                 if row and row.get("cooldown_secs")
                 else policy.cooldown_secs
             )
-            if opened_at is None or (now - opened_at) >= cooldown:
+            cooldown_expired = opened_at is None or (now - opened_at) >= cooldown
+            if allow_open_probe or cooldown_expired:
                 # Transition to HALF_OPEN and atomically reserve a probe slot.
                 if self._reserve_probe(provider, model, max_probes, from_open=True):
                     self.stats.half_open_probes += 1
-                    logger.info("breaker %s/%s -> HALF_OPEN (probe)", provider, model)
+                    reason = "forced_probe" if not cooldown_expired else "half_open_probe"
+                    logger.info(
+                        "breaker %s/%s -> HALF_OPEN (%s)",
+                        provider,
+                        model,
+                        reason,
+                    )
                     return BreakerDecision(
                         allowed=True,
                         state=BreakerState.HALF_OPEN,
-                        reason="half_open_probe",
+                        reason=reason,
                     )
                 self.stats.short_circuits += 1
                 return BreakerDecision(

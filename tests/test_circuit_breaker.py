@@ -88,6 +88,18 @@ def test_half_open_probe_success_closes(tmp_breaker_path):
     # State should be CLOSED again.
     assert cb.check("p", "m").allowed
     assert cb.stats_snapshot()["half_open_successes"] == 1
+def test_forced_open_probe_reserves_half_open_slot(tmp_breaker_path):
+    cb = CircuitBreaker(_cfg(tmp_breaker_path, consecutive_failures=1, cooldown_secs=3600))
+    cb.record_failure("openai-codex", "gpt-5.6-luna", cooldown_secs=3600)
+
+    decision = cb.check("openai-codex", "gpt-5.6-luna", allow_open_probe=True)
+
+    assert decision.allowed
+    assert decision.state == BreakerState.HALF_OPEN
+    assert decision.reason == "forced_probe"
+    assert cb._read("openai-codex", "gpt-5.6-luna")["half_open_probe_inflight"] == 1
+    assert not cb.check("openai-codex", "gpt-5.6-luna").allowed
+
 def test_success_clears_quota_cooldown_override(tmp_breaker_path):
     cb = CircuitBreaker(_cfg(tmp_breaker_path, consecutive_failures=1, cooldown_secs=0.01))
     cb.record_failure("p", "m", cooldown_secs=0.01)
