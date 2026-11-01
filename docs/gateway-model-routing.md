@@ -789,6 +789,37 @@ Covered by `tests/test_catalog.py::test_catalog_capability_helpers_read_ollama_c
 and `tests/test_pools.py::test_ollama_capability_shape_admits_image_tool_privacy_candidates`
 (which fails without the parser change).
 
+### Composite probe scheduling and batch composition
+
+Image-plus-tool evidence is refreshed by its own bounded cycle. Two defects
+kept the privacy pool from ever growing past its curated routes:
+
+1. **The first run was scheduled one full interval out.** `composite_next_due_at`
+   was set to `interval_secs` (12h) instead of an initial delay, so a pod that
+   lived less than 12 hours produced no composite evidence at all. Every
+   image-plus-tools request was therefore filtered down to the two curated
+   routes the static pool listed. The cycle now honours
+   `TUSKER_COMPOSITE_QUALIFICATION_INITIAL_DELAY_SECS` (default 600s), the same
+   shape the modality probe already used.
+2. **A bounded batch spent all its slots on one blocked provider.** The batch
+   was `sorted(pairs)[:limit]`, so the eight `github-copilot-enterprise`
+   privacy routes — all carrying `unavailable` evidence from a 3600s account
+   quota cooldown — took every slot on every cycle. Because `unavailable` is
+   always retried, that set never drained, and the twelve `ollama-cloud`
+   privacy routes (no composite evidence at all) were never probed. Routes
+   with no evidence now sort first and the rest are interleaved provider by
+   provider, so a bounded batch still spans the pool.
+
+Verified against the live 2026-11-01 privacy pool (31 routes, 29 due): the old
+ordering selected 8 `github-copilot-enterprise` routes and no `ollama-cloud`
+route; the new ordering selects 4 providers including 3 `ollama-cloud` routes.
+Covered by
+`tests/test_maintenance.py::test_composite_probe_runs_on_initial_delay_not_full_interval`,
+`tests/test_tool_capability.py::test_composite_probe_batch_does_not_starve_a_provider`
+and
+`tests/test_tool_capability.py::test_composite_probe_batch_spans_providers_when_all_are_unproven`.
+
+
 
 A tool turn that ends `finish_reason=length` with no answer or tool call is
 classified as `output_budget_exhausted`. That depends on the request, not the

@@ -561,6 +561,11 @@ spec:
           value: '86400'
         - name: TUSKER_COMPOSITE_QUALIFICATION_INTERVAL_SECS
           value: '43200'
+        # The first composite run fires shortly after startup, not one full
+        # interval later: a pod that lives less than the interval otherwise
+        # produces no image-plus-tool evidence at all.
+        - name: TUSKER_COMPOSITE_QUALIFICATION_INITIAL_DELAY_SECS
+          value: '600'
         # Media routes are qualified out of band; no cold probe is added to requests.
         - name: TUSKER_MEDIA_QUALIFICATION_ENABLED
           value: 'true'
