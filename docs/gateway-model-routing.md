@@ -32,6 +32,11 @@ routes, so APIM is not an automatic privacy-pool catalog provider. The privacy
 pool keeps the explicitly configured `apim/gpt-5.6-luna` route; the provider's
 `gpt-6-luna` route remains available through explicit passthrough.
 
+The explicit privacy routes use relative weights to keep the local MLX route as
+the normal first choice while retaining APIM as a ZDR-compliant fallback. A
+weight changes selection probability only within the highest quality tier; it
+does not bypass cooldowns, capability qualification, or fallback rotation.
+
 The tier is the source of truth — `PoolManager.pool_keeps_heavyweight()` returns
 `True` for `premium`/`swarm` and `False` for `code`/`privacy`. Callers can override
 per-request by passing `heavyweight_ok=True/False` to `PoolManager.select()`.
@@ -701,6 +706,16 @@ equality with the parser rather than a literal),
 `tests/test_chat.py::test_client_retry_after_prefers_provider_header`, and
 `tests/test_chat.py::test_stream_rate_limit_frame_names_the_real_backoff`.
 
+
+Codex quota cooldowns are scoped to the individual pool entry, not the model
+or provider. A 429 from one team seat skips only that seat; other seats can
+serve the same model immediately. The cooldown is keyed by the stable seat
+identity as well as the current access-token fingerprint, so an OAuth refresh
+does not make the exhausted seat eligible early. The route is not written to
+the shared cooldown store for this case. Covered by
+`tests/test_passthrough_providers.py::test_chat_codex_uses_next_account_after_quota_rate_limit`
+and
+`tests/test_passthrough_providers.py::test_codex_cooldown_follows_account_identity_after_token_rotation`.
 ### Codex seat identity
 
 A ChatGPT *team* workspace gives every member the same `account_id`; only

@@ -1196,11 +1196,15 @@ class CodexTokenRotator:
         return len(self._creds)
 
     def reload(self, credentials: list[dict[str, Any]]) -> None:
-        """Reload the pool from external source (e.g. file)."""
+        """Reload credentials without losing stable account cooldowns."""
         self._creds = list(credentials)
         self._index = min(self._index, max(len(self._creds) - 1, 0))
         self._refresh_failed_until.clear()
-        self._credential_cooldowns.clear()
+        self._credential_cooldowns = {
+            key: expiry
+            for key, expiry in self._credential_cooldowns.items()
+            if key.startswith("identity:") and expiry > time.time()
+        }
         # Keep exclusions across credential refresh/reload. Their identity is
         # derived from stable account metadata, not the short-lived access token.
         self._initial_refresh_tokens = frozenset(
@@ -1224,17 +1228,20 @@ class CodexTokenRotator:
         return hashlib.sha256(token.encode("utf-8")).hexdigest()[:12]
 
     def cooldown_credential(
-        self, fingerprint: str | None, seconds: float, *, label: str = ""
+        self,
+        fingerprint: str | None,
+        seconds: float,
+        *,
+        label: str = "",
+        identity: str | None = None,
     ) -> None:
-        """Quarantine a single credential so ``get_token`` skips it.
-
-        Used for per-user quota exhaustion (e.g. a codex team user hitting
-        their own quota) so a single bad credential does not lock the model
-        out for the other credentials in the same pool.
-        """
+        """Quarantine one pool entry, including across access-token rotation."""
         if not fingerprint or seconds <= 0:
             return
-        self._credential_cooldowns[fingerprint] = time.time() + float(seconds)
+        expiry = time.time() + float(seconds)
+        self._credential_cooldowns[fingerprint] = expiry
+        if identity:
+            self._credential_cooldowns[f"identity:{identity}"] = expiry
         logger.info(
             "credential cooldown set provider=%s fingerprint=%s label=%s seconds=%.0f",
             self._provider,
@@ -1243,15 +1250,36 @@ class CodexTokenRotator:
             float(seconds),
         )
 
+    def _credential_cooldown_active(
+        self, cred: dict[str, Any], token: str | None
+    ) -> bool:
+        """Return whether this pool entry is cooling down."""
+        keys = [self.fingerprint(token)]
+        identity = self._credential_identity(cred, token)
+        if identity:
+            keys.insert(0, f"identity:{identity}")
+        now = time.time()
+        active = False
+        for key in keys:
+            if not key:
+                continue
+            expiry = self._credential_cooldowns.get(key)
+            if expiry is None:
+                continue
+            if expiry <= now:
+                self._credential_cooldowns.pop(key, None)
+                continue
+            active = True
+        return active
+
     def credential_available(self, fingerprint: str | None) -> bool:
-        """Return True when the fingerprint has no active cooldown."""
+        """Return True when the token fingerprint has no active cooldown."""
         if not fingerprint:
             return True
         expiry = self._credential_cooldowns.get(fingerprint)
         if expiry is None:
             return True
         if expiry <= time.time():
-            # Expired; drop it so the dict does not grow forever.
             self._credential_cooldowns.pop(fingerprint, None)
             return True
         return False
@@ -1280,8 +1308,7 @@ class CodexTokenRotator:
                 identity = self._credential_identity(cred, token)
                 if (identity, str(model).casefold()) in self._unsupported_models:
                     continue
-            cooldown_until = self._credential_cooldowns.get(self.fingerprint(token))
-            if cooldown_until is not None and cooldown_until > now:
+            if self._credential_cooldown_active(cred, token):
                 continue
             if self._is_expired(cred):
                 # A dead access token is usable only while this process can
@@ -1392,7 +1419,7 @@ class CodexTokenRotator:
                         fp,
                     )
                     continue
-                if not self.credential_available(fp):
+                if self._credential_cooldown_active(cred, token):
                     logger.debug(
                         "oauth rotator skip provider=%s credential_index=%d/%d "
                         "label=%s fingerprint=%s reason=credential_cooldown",
@@ -3147,44 +3174,32 @@ class PassthroughClient:
 
                 tracker = global_tracker()
                 body_text = exc.body or "429"
-                seconds = _cooldown_seconds_for_429({"body": body_text, "headers": {}})
-                # Per-credential quarantine: when a codex user hits their own
-                # quota (plan_type: team, usage_limit_reached, etc.), only the
-                # credential that returned 429 should be skipped. The other
-                # credentials in the same pool keep serving the same model so
-                # healthy accounts are not collateral damage. Generic 429s
-                # (provider-wide throttling) still trigger model-level cooldown.
+                seconds = _cooldown_seconds_for_429(
+                    {"body": body_text, "headers": getattr(exc, "headers", {})}
+                )
+                # Codex pool entries are independent team seats/accounts. Any
+                # 429 returned while using one bearer belongs to that entry;
+                # never quarantine the shared provider/model route.
                 auth_value = str(headers.get("Authorization") or "")
                 used_token = auth_value[7:] if auth_value.lower().startswith("bearer ") else ""
                 used_fp = CodexTokenRotator.fingerprint(used_token)
-                quota_429 = bool(used_fp) and any(
-                    hint in body_text.lower() for hint in _QUOTA_HINTS
+                account_scoped_429 = (
+                    provider.lower() == "openai-codex"
+                    and rotator is not None
+                    and bool(used_fp)
                 )
-                if quota_429 and rotator is not None and used_fp:
+                if account_scoped_429:
                     used_label = ""
+                    identity = ""
                     for c in rotator._creds:
                         if CodexTokenRotator.fingerprint(_creds_access_token(c)) == used_fp:
                             used_label = rotator._credential_label(c, 0)
+                            identity = rotator._credential_identity(c, used_token)
                             break
-                    rotator.cooldown_credential(used_fp, seconds, label=used_label)
+                    rotator.cooldown_credential(
+                        used_fp, seconds, label=used_label, identity=identity
+                    )
                     last_exc = exc
-                    # Only escalate to a model-level cooldown once EVERY
-                    # credential is individually quarantined; otherwise the
-                    # next pool selection still tries a healthy account.
-                    if len(rotator._credential_cooldowns) >= rotator.size:
-                        tracker.cooldown(provider, model, seconds)
-                        try:
-                            from tusker_gateway.persistent_cooldown import PersistentCooldownStore
-
-                            db_path = (
-                                Path(self._config.get("quality_db_path", "data/quality.db")).parent
-                                / "cooldowns.db"
-                            )
-                            PersistentCooldownStore(db_path=db_path).record(
-                                provider, model, seconds
-                            )
-                        except Exception:
-                            pass
                     logger.warning(
                         "codex quota 429 provider=%s model=%s credential=%s "
                         "attempt=%d/%d cooldown=%.0fs",
