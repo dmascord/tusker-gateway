@@ -1187,3 +1187,102 @@ def test_catalog_registry_builds_read_only_rotator_without_live_rotators(monkeyp
     assert client is not None
     assert len(constructed) == 1
     assert constructed[0].get("refresh_enabled") is False
+
+
+def test_composite_probe_batch_does_not_starve_a_provider(monkeypatch, tmp_path):
+    """A bounded batch must not spend every slot on one blocked provider.
+
+    Regression for 2026-11-01: the batch was ``sorted(pairs)[:limit]``, so
+    the eight ``github-copilot-enterprise`` privacy routes (all carrying
+    ``unavailable`` evidence from a 3600s account quota cooldown) took all
+    eight slots on every cycle. The twelve ``ollama-cloud`` privacy routes
+    had no composite evidence at all and were never probed, so every
+    image-plus-tools request filtered them out and the pool fell back to a
+    single curated route.
+    """
+    db, run = _composite_runner(monkeypatch, tmp_path)
+    blocked = [
+        ("github-copilot-enterprise", f"blocked-{index}") for index in range(8)
+    ]
+    unproven = [("ollama-cloud", f"unproven-{index}") for index in range(12)]
+    for provider, model in blocked:
+        db.record(
+            provider=provider,
+            model=model,
+            capability=COMPOSITE_CAPABILITY,
+            status="unavailable",
+            source="composite_probe",
+            probe_version=COMPOSITE_CAPABILITY_PROBE_VERSION,
+        )
+
+    probed: list[tuple[str, str]] = []
+
+    async def fake_probe(*args, **kwargs):
+        probed.append((kwargs["provider"], kwargs["model"]))
+        return {
+            "provider": kwargs["provider"],
+            "model": kwargs["model"],
+            "status": "passed",
+        }
+
+    monkeypatch.setattr(
+        "tusker_gateway.tool_qualification.probe_image_tool_model", fake_probe
+    )
+
+    async def go():
+        return await run(
+            base_url="http://gateway.test",
+            model_pairs=set(blocked) | set(unproven),
+            max_age_secs=86_400.0,
+            limit=8,
+        )
+
+    asyncio.run(go())
+
+    assert len(probed) == 8
+    # The routes with no evidence are the ones a missing record blocks, so
+    # they own the batch instead of being crowded out by the cooled provider.
+    assert all(provider == "ollama-cloud" for provider, _ in probed)
+    assert len(set(probed)) == 8
+
+
+def test_composite_probe_batch_spans_providers_when_all_are_unproven(
+    monkeypatch, tmp_path
+):
+    """With no evidence anywhere, a bounded batch still samples every provider."""
+    db, run = _composite_runner(monkeypatch, tmp_path)
+    pairs = (
+        {("ollama-cloud", f"a-{index}") for index in range(6)}
+        | {("openai-codex", f"b-{index}") for index in range(6)}
+        | {("apim", f"c-{index}") for index in range(6)}
+    )
+    probed: list[tuple[str, str]] = []
+
+    async def fake_probe(*args, **kwargs):
+        probed.append((kwargs["provider"], kwargs["model"]))
+        return {
+            "provider": kwargs["provider"],
+            "model": kwargs["model"],
+            "status": "passed",
+        }
+
+    monkeypatch.setattr(
+        "tusker_gateway.tool_qualification.probe_image_tool_model", fake_probe
+    )
+
+    async def go():
+        return await run(
+            base_url="http://gateway.test",
+            model_pairs=pairs,
+            max_age_secs=86_400.0,
+            limit=6,
+        )
+
+    asyncio.run(go())
+
+    assert len(probed) == 6
+    assert {provider for provider, _ in probed} == {
+        "ollama-cloud",
+        "openai-codex",
+        "apim",
+    }

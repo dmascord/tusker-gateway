@@ -368,6 +368,8 @@ async def run_modality_maintenance_cycle(
         "unsupported": counts.get("unsupported", 0),
         "unavailable": counts.get("unavailable", 0),
     }
+
+
 async def run_composite_maintenance_cycle(
     *,
     pool_names: tuple[str, ...],
@@ -396,7 +398,9 @@ async def run_composite_maintenance_cycle(
         "passed": passed,
         "failed": len(results) - passed,
     }
-def _composite_qualification_settings() -> tuple[bool, int, float, float, float]:
+
+
+def _composite_qualification_settings() -> tuple[bool, int, float, float, float, float]:
     raw = os.environ.get("TUSKER_COMPOSITE_QUALIFICATION_ENABLED", "0")
     enabled = raw.strip().lower() not in {"0", "false", "no", "off"}
     return (
@@ -405,8 +409,8 @@ def _composite_qualification_settings() -> tuple[bool, int, float, float, float]
         _env_float("TUSKER_COMPOSITE_QUALIFICATION_TIMEOUT_SECS", 45.0, minimum=5.0),
         _env_float("TUSKER_COMPOSITE_QUALIFICATION_MAX_AGE_SECS", 86_400.0, minimum=60.0),
         _env_float("TUSKER_COMPOSITE_QUALIFICATION_INTERVAL_SECS", 43_200.0, minimum=60.0),
+        _env_float("TUSKER_COMPOSITE_QUALIFICATION_INITIAL_DELAY_SECS", 600.0, minimum=0.0),
     )
-
 
 
 async def qualification_maintenance_loop(
@@ -459,12 +463,15 @@ async def qualification_maintenance_loop(
         composite_timeout_secs,
         composite_max_age_secs,
         composite_interval_secs,
+        composite_initial_delay_secs,
     ) = _composite_qualification_settings()
     if composite_enabled:
         logger.info(
-            "composite qualification enabled pools=%s limit=%d timeout=%.0fs max_age=%.0fs interval=%.0fs",
+            "composite qualification enabled pools=%s limit=%d timeout=%.0fs "
+            "max_age=%.0fs interval=%.0fs initial_delay=%.0fs",
             ",".join(pools), composite_limit, composite_timeout_secs,
             composite_max_age_secs, composite_interval_secs,
+            composite_initial_delay_secs,
         )
     structured_enabled = _structured_qualification_enabled(config)
     structured_pool = _structured_pool_name(config)
@@ -557,8 +564,13 @@ async def qualification_maintenance_loop(
     modality_next_due_at = (
         time.monotonic() + modality_initial_delay_secs if modality_enabled else None
     )
+    # Composite runs on its own ``initial_delay`` + ``interval`` clock, like
+    # the modality probe. Scheduling the first run at the full interval left
+    # a pod that lives hours with no composite evidence at all, so every
+    # image-plus-tools request was filtered down to the curated routes that
+    # the static pool already listed.
     composite_next_due_at = (
-        time.monotonic() + composite_interval_secs if composite_enabled else None
+        time.monotonic() + composite_initial_delay_secs if composite_enabled else None
     )
     while not stop_event.is_set():
         # The tool/structured probes run on a coarse cadence (typically

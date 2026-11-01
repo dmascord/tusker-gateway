@@ -829,6 +829,55 @@ def _record_durable_auth_failure(
         logger.debug("persistent permanent failure marker failed", exc_info=True)
 
 
+def _interleave_probe_candidates(
+    pairs: list[tuple[str, str]],
+    capability_db: ModelCapabilityDB,
+) -> list[tuple[str, str]]:
+    """Order probe candidates so one provider cannot starve the others.
+
+    The probe batch is bounded (``TUSKER_COMPOSITE_QUALIFICATION_LIMIT``),
+    so the order decides which routes are ever examined. Sorting by provider
+    name let a provider whose routes are all quota-blocked consume every
+    slot: on 2026-11-01 the eight ``github-copilot-enterprise`` routes all
+    carried ``unavailable`` evidence (a 3600s account quota cooldown), so
+    each cycle re-probed those same eight and the twelve ``ollama-cloud``
+    routes - which had no composite evidence at all - were never reached.
+
+    Routes without any evidence come first: they are the ones a missing
+    record actually blocks. The remainder is then interleaved provider by
+    provider so a bounded batch still spans every provider.
+    """
+    unproven: list[tuple[str, str]] = []
+    proven: list[tuple[str, str]] = []
+    for pair in pairs:
+        record = capability_db.get(*pair, COMPOSITE_CAPABILITY)
+        if record is None or record.status in {"unsupported", "passed"}:
+            unproven.append(pair)
+        else:
+            proven.append(pair)
+
+    def by_provider(group: list[tuple[str, str]]) -> list[tuple[str, str]]:
+        buckets: dict[str, list[tuple[str, str]]] = {}
+        for pair in group:
+            buckets.setdefault(pair[0], []).append(pair)
+        ordered: list[tuple[str, str]] = []
+        # Round-robin across providers so the batch spans them all.
+        index = 0
+        while True:
+            added = False
+            for provider in sorted(buckets):
+                bucket = buckets[provider]
+                if index < len(bucket):
+                    ordered.append(bucket[index])
+                    added = True
+            if not added:
+                break
+            index += 1
+        return ordered
+
+    return by_provider(unproven) + by_provider(proven)
+
+
 async def run_image_tool_qualification(
     *,
     base_url: str = "http://127.0.0.1:8642",
@@ -876,8 +925,9 @@ async def run_image_tool_qualification(
         )
         if max_age_secs is not None:
             now = time.time()
-            pairs = [
-                pair for pair in pairs
+            due = [
+                pair
+                for pair in pairs
                 if (
                     (record := capability_db.get(*pair, COMPOSITE_CAPABILITY)) is None
                     or record.probe_version != COMPOSITE_CAPABILITY_PROBE_VERSION
@@ -885,6 +935,7 @@ async def run_image_tool_qualification(
                     or record.status == "unavailable"
                 )
             ]
+            pairs = _interleave_probe_candidates(due, capability_db)
         if limit is not None:
             pairs = pairs[: max(0, limit)]
         async def one(pair: tuple[str, str]) -> dict[str, Any]:

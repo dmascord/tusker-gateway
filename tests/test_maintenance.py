@@ -19,12 +19,23 @@ def test_composite_qualification_settings_default_off(monkeypatch):
     from tusker_gateway.maintenance import _composite_qualification_settings
 
     monkeypatch.delenv("TUSKER_COMPOSITE_QUALIFICATION_ENABLED", raising=False)
-    enabled, limit, timeout, max_age, interval = _composite_qualification_settings()
+    (
+        enabled,
+        limit,
+        timeout,
+        max_age,
+        interval,
+        initial_delay,
+    ) = _composite_qualification_settings()
     assert enabled is False
     assert limit == 8
     assert timeout == 45.0
     assert max_age == 86_400.0
     assert interval == 43_200.0
+    # The first composite run is scheduled off this delay rather than the
+    # full interval; at the interval a short-lived pod never produced any
+    # image-plus-tool evidence at all.
+    assert initial_delay == 600.0
 
 
 @pytest.mark.asyncio
@@ -375,3 +386,67 @@ async def test_modality_cycle_forwards_credential_rotators(monkeypatch):
     )
 
     assert captured["credential_rotators"] is sentinel
+
+
+@pytest.mark.asyncio
+async def test_composite_probe_runs_on_initial_delay_not_full_interval(monkeypatch):
+    """The first composite probe must not wait a full interval.
+
+    Scheduling it at the interval meant a pod that lived less than the
+    interval never produced any image-plus-tool evidence, so every
+    image+tools request fell back to the two curated routes the static
+    pool listed. On 2026-11-01 the privacy pool had 59 routes and the
+    gate filtered 29 of them for missing evidence, leaving a single
+    candidate (rid req_304a0bb081a76e27).
+    """
+    import asyncio
+    import time
+
+    from tusker_gateway.maintenance import qualification_maintenance_loop
+
+    monkeypatch.setenv("TUSKER_COMPOSITE_QUALIFICATION_ENABLED", "1")
+    monkeypatch.setenv("TUSKER_COMPOSITE_QUALIFICATION_INITIAL_DELAY_SECS", "0")
+    monkeypatch.setenv("TUSKER_COMPOSITE_QUALIFICATION_INTERVAL_SECS", "43200")
+    # Keep the unrelated tool/modality cycles from interfering.
+    monkeypatch.setenv("TUSKER_QUALIFICATION_MAINTENANCE_INITIAL_DELAY_SECS", "3600")
+    monkeypatch.setenv("TUSKER_QUALIFICATION_MAINTENANCE_INTERVAL_SECS", "3600")
+    monkeypatch.setenv("TUSKER_MODALITY_QUALIFICATION_ENABLED", "0")
+    monkeypatch.setenv("TUSKER_STRUCTURED_QUALIFICATION_ENABLED", "0")
+
+    calls: list[float] = []
+    started = time.monotonic()
+
+    async def fake_composite(**kwargs):
+        calls.append(time.monotonic())
+        return {"pools": "privacy", "tested": 1, "passed": 1, "failed": 0}
+
+    async def fake_tool(**kwargs):
+        return {"pool": "code", "tested": 0, "passed": 0, "failed": 0}
+
+    monkeypatch.setattr(
+        "tusker_gateway.maintenance.run_composite_maintenance_cycle",
+        fake_composite,
+    )
+    monkeypatch.setattr(
+        "tusker_gateway.maintenance.run_maintenance_cycle",
+        fake_tool,
+    )
+
+    stop = asyncio.Event()
+    task = asyncio.create_task(
+        qualification_maintenance_loop(stop)
+    )
+    for _ in range(100):
+        await asyncio.sleep(0.01)
+        if calls:
+            break
+    stop.set()
+    task.cancel()
+    try:
+        await task
+    except (asyncio.CancelledError, Exception):
+        pass
+
+    assert calls, "composite probe never ran"
+    # It fired on the initial delay, not one interval later.
+    assert calls[0] - started < 60.0
