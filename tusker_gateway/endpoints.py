@@ -8142,9 +8142,17 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                     # ``error_detail`` because this path recorded nothing.
                     request["_stream_error"] = status
                     request["_stream_error_code"] = stream_error_code or status
-                    await stream_resp.write(
-                        sse_frame(format_openai_chunk(message, model="tusker-gateway"))
-                    )
+                    if request.headers.get("X-Tusker-Tool-Qualification"):
+                        error_chunk = format_openai_chunk(
+                            message,
+                            model="tusker-gateway",
+                        )
+                        error_chunk["x_tusker_stream_error"] = (
+                            stream_error_code or status
+                        )
+                    else:
+                        error_chunk = format_openai_chunk(message, model="tusker-gateway")
+                    await stream_resp.write(sse_frame(error_chunk))
                     await stream_resp.write(
                         sse_frame(
                             format_openai_chunk(

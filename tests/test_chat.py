@@ -2872,6 +2872,33 @@ async def test_chat_stream_provider_setup_error_is_actionable_text_not_in_band_e
     assert b'"error"' not in body
     assert b"data: [DONE]" in body
 
+@pytest.mark.asyncio
+async def test_chat_stream_circuit_open_marks_qualification_only(app, client):
+    """A pre-dispatch breaker rejection must remain transient to qualification."""
+    breaker = MagicMock()
+    breaker.check.return_value = SimpleNamespace(allowed=False, reason="cooldown")
+    app["breaker"] = breaker
+
+    response = await client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "openai-codex/gpt-6-astra",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": True,
+        },
+        headers={
+            **HEADERS_AUTH,
+            "X-Tusker-Tool-Qualification": "stream-tool-contract-v1",
+        },
+    )
+    body = await response.read()
+
+    assert response.status == 200
+    assert b'"x_tusker_stream_error": "circuit_open"' in body
+    assert b"circuit open for openai-codex/gpt-6-astra" in body
+    assert b"data: [DONE]" in body
+
+
 
 @pytest.mark.asyncio
 async def test_chat_stream_no_healthy_models_is_assistant_text_not_in_band_error(
