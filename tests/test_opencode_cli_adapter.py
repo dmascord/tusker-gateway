@@ -104,7 +104,7 @@ async def test_route_is_opt_in(monkeypatch):
 @pytest.mark.asyncio
 async def test_text_result_parses_opencode_json_event_stream(monkeypatch):
     monkeypatch.setenv("TUSKER_OPENCODE_CLI_ENABLED", "true")
-    monkeypatch.setenv("OPENCODE_ZEN_API_KEY", "test-zen-key")
+    monkeypatch.setenv("TUSKER_OPENCODE_CLI_API_KEY", "test-zen-key")
     stdout = b'\n'.join([
         json.dumps({"type": "step_start", "part": {}}).encode(),
         json.dumps({"type": "text", "part": {"text": "hello "}}).encode(),
@@ -124,7 +124,7 @@ async def test_text_result_parses_opencode_json_event_stream(monkeypatch):
     env = spawn.await_args.kwargs["env"]
     assert env["OPENCODE_DISABLE_PROJECT_CONFIG"] == "true"
     assert env["OPENCODE_DISABLE_DEFAULT_PLUGINS"] == "true"
-    assert "OPENCODE_API_KEY" not in env
+    assert env["OPENCODE_API_KEY"] == "test-zen-key"
     assert "OPENCODE_ZEN_API_KEY" not in env
     assert spawn.await_args.kwargs["cwd"]
 
@@ -172,7 +172,7 @@ async def test_opencode_stream_surfaces_model_retirement(monkeypatch):
 async def test_explicit_opencode_api_key_is_forwarded_without_aliasing_zen_key(monkeypatch):
     monkeypatch.setenv("TUSKER_OPENCODE_CLI_ENABLED", "true")
     monkeypatch.setenv("OPENCODE_API_KEY", "explicit-cli-key")
-    monkeypatch.setenv("OPENCODE_ZEN_API_KEY", "gateway-provider-key")
+    monkeypatch.setenv("TUSKER_OPENCODE_CLI_API_KEY", "gateway-provider-key")
     stdout = json.dumps({"type": "text", "part": {"text": "ok"}}).encode()
     with patch("tusker_gateway.provider_adapters.opencode_cli.shutil.which", return_value="/opt/opencode"), \
          patch("tusker_gateway.provider_adapters.opencode_cli.asyncio.create_subprocess_exec",
@@ -190,7 +190,6 @@ async def test_deployment_scoped_zen_key_is_forwarded_only_when_explicitly_enabl
     monkeypatch.setenv("TUSKER_OPENCODE_CLI_ENABLED", "true")
     monkeypatch.delenv("OPENCODE_API_KEY", raising=False)
     monkeypatch.setenv("TUSKER_OPENCODE_CLI_API_KEY", "worker-scoped-key")
-    monkeypatch.setenv("OPENCODE_ZEN_API_KEY", "unaliased-provider-key")
     stdout = json.dumps({"type": "text", "part": {"text": "ok"}}).encode()
     with patch("tusker_gateway.provider_adapters.opencode_cli.shutil.which", return_value="/opt/opencode"), \
          patch("tusker_gateway.provider_adapters.opencode_cli.asyncio.create_subprocess_exec",

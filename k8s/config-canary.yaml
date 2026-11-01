@@ -305,12 +305,6 @@ items:
                 key: OPENCODE_GO_API_KEY
                 name: tusker-env-vault
                 optional: true
-          - name: PROVIDER_OPENCODE_ZEN_API_KEY
-            valueFrom:
-              secretKeyRef:
-                key: OPENCODE_ZEN_API_KEY
-                name: tusker-env-vault
-                optional: true
           - name: CF_ACCOUNT_ID
             valueFrom:
               secretKeyRef:

@@ -22,7 +22,6 @@ from tusker_gateway.catalog import (
     CodexCatalog,
     CopilotCatalog,
     ModelsDevCatalog,
-    OpenCodeCatalog,
     OpenCodeCLICatalog,
     OpenCodeGoCatalog,
     KiloCLICatalog,
@@ -734,13 +733,6 @@ async def test_openrouter_catalog_extracts_pricing():
     assert by_model["stealth/ox-alpha"].cost_output == 0.0
     assert by_model["anthropic/claude-sonnet-4.6"].cost_output == pytest.approx(1.5e-5)
 
-@pytest.mark.asyncio
-async def test_opencode_zen_catalog_parses_models():
-    body = {"data": [{"id": "muse-spark-1.2"}, {"id": "big-pickle"}]}
-    session = FakeSession({"default": FakeResponse(200, body)})
-    entries = await OpenCodeCatalog().fetch(session)
-    assert {e.model for e in entries} == {"muse-spark-1.2", "big-pickle"}
-    assert all(e.provider == "opencode-zen" for e in entries)
 
 
 @pytest.mark.asyncio
@@ -1268,7 +1260,7 @@ def test_registry_default_includes_all_providers():
     reg = CatalogRegistry.default()
     for prov in (
         "openai-codex", "github-copilot", "github-copilot-enterprise",
-        "openrouter", "opencode-zen", "opencode-go", "xiaomi", "models.dev",
+        "openrouter", "opencode-go", "xiaomi", "models.dev",
     ):
         assert reg.get_client(prov) is not None
 
@@ -1907,33 +1899,18 @@ def test_poolmanager_auto_catalog_does_not_add_non_zdr_catalog_to_privacy():
     assert pm.models["privacy"] == []
 
 
-def test_poolmanager_auto_catalog_includes_opencode_zen_and_go():
-    """auto_catalog treats the entire OpenCode Zen/Go catalog as free-for-key,
-    since /v1/models is key-filtered (no per-model pricing field)."""
+def test_poolmanager_auto_catalog_includes_opencode_go():
+    """Auto-catalog retains OpenCode Go while Zen models use the CLI catalog."""
     from tusker_gateway.config import PoolConfig
     from tusker_gateway.pools import PoolManager
     cfg = {
-        "pools": {
-            "code": PoolConfig(name="code", models=[], auto_catalog=True),
-        },
+        "pools": {"code": PoolConfig(name="code", models=[], auto_catalog=True)},
         "excluded_providers": [],
-        # Bearer-kind providers are dropped from pools without keys.
-        "provider_api_keys": {
-            "openrouter": "k-openrouter",
-            "opencode-zen": "k-zen",
-            "opencode-go": "k-go",
-        },
+        "provider_api_keys": {"openrouter": "k-openrouter", "opencode-go": "k-go"},
         "quality_db_path": "/tmp/_unused.db",
     }
     pm = PoolManager(cfg)
-
     reg = CatalogRegistry()
-    zen = OpenCodeCatalog()
-    zen._entries = [
-        CatalogEntry(provider="opencode-zen", model="muse-spark-1.2"),
-        CatalogEntry(provider="opencode-zen", model="big-pickle"),
-    ]
-    reg.register("opencode-zen", zen)
     go = OpenCodeGoCatalog()
     go._entries = [
         CatalogEntry(provider="opencode-go", model="minimax-m3"),
@@ -1941,12 +1918,8 @@ def test_poolmanager_auto_catalog_includes_opencode_zen_and_go():
     ]
     reg.register("opencode-go", go)
     pm.catalog_registry = reg
-
     pm.extend_pools_with_auto_catalog()
-
     pool_models = {(m["provider"], m["model"]) for m in pm.pools["code"].models}
-    assert ("opencode-zen", "muse-spark-1.2") in pool_models
-    assert ("opencode-zen", "big-pickle") in pool_models
     assert ("opencode-go", "minimax-m3") in pool_models
     assert ("opencode-go", "kimi-k2.6") in pool_models
 

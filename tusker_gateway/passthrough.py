@@ -82,7 +82,7 @@ def _note_upstream_progress() -> None:
 
 
 _OPENCODE_GO_PROVIDER = "opencode-go"
-_OPENCODE_SESSION_PROVIDERS = frozenset({_OPENCODE_GO_PROVIDER, "opencode-zen"})
+_OPENCODE_SESSION_PROVIDERS = frozenset({_OPENCODE_GO_PROVIDER})
 _OPENCODE_SESSION_HEADER = "x-opencode-session"
 _OPENCODE_REASONING_EFFORT_ALIASES = {
     # OpenAI-compatible clients sometimes use `minimal`/`maximal`, while

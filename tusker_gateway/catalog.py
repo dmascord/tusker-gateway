@@ -75,7 +75,6 @@ DEFAULT_TTLS: dict[str, float] = {
     "github-copilot": 300.0,       # Copilot: 5 min
     "github-copilot-enterprise": 300.0,
     "openrouter": 3600.0,          # OpenRouter: 60 min
-    "opencode-zen": 3600.0,       # OpenCode: 60 min (key-filtered)
     "opencode-go": 3600.0,
     "opencode-cli": 3600.0,      # CLI free set: 60 min
     "kilo-cli": 3600.0,          # CLI account set: 60 min
@@ -933,67 +932,28 @@ class ProviderModelsCatalog(CatalogClient):
 
 
 # ---------------------------------------------------------------------------
-class OpenCodeCatalog(CatalogClient):
-    """OpenCode Zen / Go catalog from opencode.ai/zen/v1/models and /go/v1/models.
 
-    ``/v1/models`` is key-filtered: the response only contains models
-    the configured API key can access. For the gateway's free-tier
-    key, that's the full "free for this key" set, and every entry is
-    treated as auto-free-eligible (no per-model pricing field).
 
-    Subclasses set ``provider`` ("opencode-zen" or "opencode-go")
-    and ``ENDPOINT``. The catalog refresh relies on
-    ``set_api_key()`` being called with the matching env-derived
-    Bearer token; without auth the endpoint returns a different
-    (paid) model list and the auto-free merge would be wrong.
-    """
+class OpenCodeGoCatalog(CatalogClient):
+    """Authenticated OpenCode Go model catalog."""
 
-    provider = "opencode-zen"
-    ttl_secs = DEFAULT_TTLS["opencode-zen"]
-
-    ENDPOINT = "https://opencode.ai/zen/v1/models"
-
-    # Model discovery is not a user conversation, but OpenCode Go still
-    # requires the session header on every request. Keep one stable
-    # maintenance-session ID so repeated catalog refreshes are associated
-    # with the same client session without pretending they are chat turns.
+    provider = "opencode-go"
+    ttl_secs = DEFAULT_TTLS["opencode-go"]
+    ENDPOINT = "https://opencode.ai/inference/go/v1/models"
     OPENCODE_GO_CATALOG_SESSION = "tusker-catalog-opencode-go"
 
     async def fetch(self, session: aiohttp.ClientSession) -> list[CatalogEntry]:
         headers = self._auth_headers({
             "User-Agent": "tusker-gateway/1.0 (catalog-refresh)",
             "accept": "application/json",
+            "x-opencode-session": self.OPENCODE_GO_CATALOG_SESSION,
         })
-        if self.provider == "opencode-go":
-            headers["x-opencode-session"] = self.OPENCODE_GO_CATALOG_SESSION
         async with session.get(self.ENDPOINT, headers=headers) as resp:
             if resp.status != 200:
                 raise CatalogError(f"opencode {self.provider} HTTP {resp.status}")
             data = await resp.json()
         models = data.get("data", []) if isinstance(data, dict) else data
-        out: list[CatalogEntry] = []
-        for m in models:
-            if not isinstance(m, dict):
-                continue
-            slug = m.get("id") or m.get("name")
-            if not isinstance(slug, str) or not slug.strip():
-                continue
-            out.append(CatalogEntry(
-                provider=self.provider,
-                model=slug.strip(),
-                raw=m,
-            ))
-        return out
-
-
-class OpenCodeGoCatalog(OpenCodeCatalog):
-    """OpenCode Go inference catalog under the Console Go base URL."""
-
-    provider = "opencode-go"
-    ttl_secs = DEFAULT_TTLS["opencode-go"]
-
-    ENDPOINT = "https://opencode.ai/inference/go/v1/models"
-
+        return [CatalogEntry(provider=self.provider, model=slug.strip(), raw=model) for model in models if isinstance(model, dict) for slug in [model.get("id") or model.get("name")] if isinstance(slug, str) and slug.strip()]
 
 # ---------------------------------------------------------------------------
 # OpenCode CLI (free models served through the local CLI adapter)
@@ -1665,8 +1625,6 @@ class CatalogRegistry:
             )
         if "openrouter" in provider_registry:
             reg.register("openrouter", OpenRouterCatalog())
-        if "opencode-zen" in provider_registry:
-            reg.register("opencode-zen", OpenCodeCatalog())
         if "opencode-go" in provider_registry:
             reg.register("opencode-go", OpenCodeGoCatalog())
         if (
@@ -1691,7 +1649,6 @@ class CatalogRegistry:
             "github-copilot",
             "github-copilot-enterprise",
             "openrouter",
-            "opencode-zen",
             "opencode-go",
             "opencode-cli",
             "kilo-cli",

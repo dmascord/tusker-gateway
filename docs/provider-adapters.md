@@ -143,11 +143,10 @@ short model name such as `big-pickle` is expanded to `opencode/big-pickle`. Set
 `TUSKER_OPENCODE_CLI_ENABLED=true` to enable it. The executable defaults to
 `opencode` on `PATH`, with `TUSKER_OPENCODE_CLI_PATH` and
 `TUSKER_OPENCODE_CLI_TIMEOUT_SECS` available for operator overrides. The CLI
-uses its existing OpenCode login by default. An explicit `OPENCODE_API_KEY`
-is forwarded to the child. Deployments may deliberately set
-`TUSKER_OPENCODE_CLI_API_KEY` to provide the CLI-specific credential; the
-adapter maps only that explicit variable to `OPENCODE_API_KEY` in its child.
-It never silently aliases the gateway's `OPENCODE_ZEN_API_KEY`.
+uses `OPENCODE_API_KEY` when supplied. Production maps the vault's
+`OPENCODE_ZEN_API_KEY` into `TUSKER_OPENCODE_CLI_API_KEY`, and the adapter
+forwards that value to the child as `OPENCODE_API_KEY`. There is no separate
+gateway HTTP `opencode-zen` provider.
 
 Each request runs from a private temporary working directory with project
 configuration and default plugins disabled. Text-only requests do not inject
@@ -167,10 +166,8 @@ gateway image includes the pinned OpenCode v2 CLI executable (currently
 `space-bunny-free`, `step-5-preview-free`) in the code pool. The listed Zen
 seed is a starting set, not a contract: the auto-catalog adopts whatever
 `opencode models` reports after a CLI bump, so the live free set is driven by
-the pinned binary (see `docs/deployment-k8s.md`). Zen's free tier
-rejects the gateway's direct HTTP provider path (`opencode-zen`) with
-`FreeTierError` regardless of client headers, so the free models are served
-exclusively through this CLI route; tool qualification for them runs through
+the pinned binary (see `docs/deployment-k8s.md`). Zen free-tier models are
+served exclusively through this CLI route; tool qualification runs through
 the CLI via the normal `tool_qualification --provider opencode-cli` path.
 
 OpenCode CLI models accept text and base64 image data URLs in the gateway

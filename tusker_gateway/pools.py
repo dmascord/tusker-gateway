@@ -639,7 +639,7 @@ class PoolManager:
                 tuple(providers())
                 if callable(providers)
                 else tuple(getattr(self.catalog_registry, "_clients", {}))
-                or ("openrouter", "opencode-zen", "opencode-go", "xiaomi", "kilo-cli")
+                or ("openrouter", "opencode-go", "xiaomi", "kilo-cli")
             )
             for provider in catalog_providers:
                 if provider == "models.dev":
@@ -670,16 +670,9 @@ class PoolManager:
                     # free-price catalogue. Tool-bearing requests still need
                     # a passing behavioral qualification record.
                     mode = "catalog"
-                elif provider in {"opencode-zen", "opencode-go"} and not pool.zdr:
-                    # OpenCode's catalog is key-filtered, so it is useful for
-                    # ordinary cheap pools. Privacy pools must opt providers
-                    # in explicitly via auto_catalog_providers, even when a
-                    # provider is marked ZDR-capable in the registry.
+                elif provider in {"opencode-go"} and not pool.zdr:
                     mode = "all"
                 elif pool.zdr:
-                    # Do not implicitly discover authenticated providers into
-                    # privacy pools. The explicit allowlist above is the
-                    # privacy policy boundary.
                     continue
                 elif provider == "xiaomi":
                     mode = "xiaomi"
