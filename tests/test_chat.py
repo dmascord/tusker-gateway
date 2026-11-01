@@ -40,6 +40,7 @@ from tusker_gateway.endpoints import (
     _validate_chat_body,
     _validate_complete_tool_response,
     _validate_tool_call_contract,
+    _retry_after_seconds_for_exc,
 )
 from tusker_gateway.config import PoolConfig
 from tusker_gateway.pools import PoolManager
@@ -2556,6 +2557,65 @@ async def test_chat_preserves_provider_429_with_retry_after(client):
     assert payload["error"]["type"] == "rate_limit_error"
     # The upstream body must never be echoed back verbatim.
     assert "custom-upstream-quota-token" not in payload["error"]["message"]
+
+
+@pytest.mark.parametrize(
+    "body, expected",
+    [
+        # The provider states a per-minute window; "retry shortly" (5s)
+        # re-entered the same 429 while the route stayed quarantined.
+        (
+            '{"statusCode":429,"message":"Token limit is exceeded. Try again in 23 seconds."}',
+            60,
+        ),
+        # An account-quota window must not be advertised as seconds away.
+        ("quota exceeded for this billing period", 3600),
+    ],
+)
+def test_client_retry_after_matches_gateway_cooldown(body, expected):
+    """The backoff a client is told must equal the window the gateway enforces.
+
+    A fixed 5s default told clients to retry while the route was still
+    quarantined (2026-11-01 privacy pool: upstream asked for 23s, client was
+    told 5s and retried straight back into the same 429).
+    """
+    from tusker_gateway.cooldown import _cooldown_seconds_for_429
+
+    exc = RateLimitError(body=body)
+    assert _retry_after_seconds_for_exc(exc) == expected
+    # Same derivation the cooldown tracker applies, so the two cannot drift.
+    assert _cooldown_seconds_for_429({"body": body, "headers": {}}) == expected
+
+
+def test_client_retry_after_prefers_provider_header():
+    """A provider's explicit Retry-After stays authoritative over body prose."""
+    exc = RateLimitError(
+        body='{"statusCode":429,"message":"Token limit is exceeded."}',
+        headers={"Retry-After": "30"},
+    )
+    assert _retry_after_seconds_for_exc(exc) == 30
+    # Case-insensitive, like the rest of the header handling.
+    exc_lower = RateLimitError(body="", headers={"retry-after": "17"})
+    assert _retry_after_seconds_for_exc(exc_lower) == 17
+
+
+def test_stream_rate_limit_frame_names_the_real_backoff():
+    """The in-band stream frame must not promise something sooner than the
+    cooldown window either; both 429 surfaces share one derivation."""
+    exc = RateLimitError(
+        body='{"statusCode":429,"message":"Token limit is exceeded. Try again in 23 seconds."}'
+    )
+    exc.provider = "apim"
+    message, code = _public_stream_error(
+        exc, request_id="req_test", provider="apim", model="gpt-5.6-luna"
+    )
+    assert code == "rate_limit_exceeded"
+    assert "retry in about 60s" in message
+    assert "retry shortly" not in message
+    # Sanitized: the upstream token-estimate prose stays hidden.
+    assert "Token limit" not in message
+    assert "Request ID: req_test." in message
+
 
 @pytest.mark.asyncio
 async def test_chat_rate_limit_429_includes_request_id(client, caplog):
