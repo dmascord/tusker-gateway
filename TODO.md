@@ -8,12 +8,19 @@ team workspace); adoption and per-seat model exclusions now key on
 `account_user_id`/`user_id`/`email`/`label`. See
 `docs/incidents/2026-11-01-privacy-pool-codex-seat-collapse.md`.
 
-Operator follow-up: verify the three `openai-codex` rows still hold *distinct*
-refresh tokens. The pre-fix adoption path overwrote seats 2 and 3 with seat
-1's rotated tokens, so a seat whose stored refresh token now equals another
-seat's must be re-enrolled with
-`python3 -m tusker_gateway.tools.enroll_codex_credential --replace-email` from
-inside the pod. A revoked refresh token still fails that seat alone.
+Seat state verified 2026-11-01 after deploying `4d41477`: the three
+`openai-codex` rows carry distinct `account_user_id` values
+(`user-Vlm93hV`, `user-u1gl2kn`, `user-KRQL5rV`) and distinct refresh- and
+access-token fingerprints. The pre-fix collapse did not persist into the store
+- adoption copied tokens in memory only - so no re-enrollment is needed to
+restore seat distinctness.
+
+Open: all three seats now take their own 429 from the *same* team quota.
+`gpt-5.6-luna` returns `usage_limit_reached` with `plan_type: team` and
+`limit_window_minutes: 10080`, so each seat cools individually (3600s) and the
+`code` pool falls through to other providers for `gpt-5.6-luna`. That is the
+team plan's weekly usage limit, not the gateway collapsing the pool: per-seat
+isolation is now visible in the logs, which the pre-fix rotator could not show.
 
 
 ## GitHub Copilot Enterprise credential quota (2026-10-31)
