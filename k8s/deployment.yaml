@@ -616,7 +616,7 @@ spec:
         - name: TUSKER_LOCAL_LLM_MAX_CONCURRENT
           value: '1'
         - name: TUSKER_MLX_MAC_MAX_CONCURRENT
-          value: '1'
+          value: '2'
         # Default to Pro (3) to avoid 429 "too many concurrent requests" while
         # still allowing reasonable parallelism.
         - name: TUSKER_OLLAMA_CLOUD_MAX_CONCURRENT
