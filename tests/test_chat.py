@@ -3790,3 +3790,85 @@ async def test_pool_records_accepted_payload_after_success(tmp_path):
     assert (
         breaker.payload_ceiling_bytes("openai-codex", "gpt-5.6-luna") == 80_000
     )
+
+
+@pytest.mark.asyncio
+async def test_appcheck_header_requests_pass_through_gateway(app, client):
+    """App Check header values must not alter the turn on the gateway side.
+
+    The workstation curl that hit Apache's ``Size of a request header field
+    exceeds server limit`` never transited the gateway. This proves the same
+    header shape is byte-transparent through the gateway when it fits the
+    server's per-header line limit (aiohttp enforces 8190 bytes).
+    """
+    from .appcheck_fixtures import appcheck_token
+
+    pool_manager = MagicMock()
+    pool_manager.select.return_value = ("openai", "gpt-4o-mini")
+    app["pool_manager"] = pool_manager
+
+    token = appcheck_token(oversized=False)
+    assert len(token) > 500
+    with patch(
+        "tusker_gateway.endpoints.PassthroughClient.chat",
+        new_callable=AsyncMock,
+    ) as mock_chat:
+        mock_chat.return_value = {
+            "id": "appcheck",
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+        }
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-code",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": (
+                            "X-apiKey: q5f1464f-c903-4d2a-9d09-efd45bd6ed9f\n"
+                            "X-Firebase-AppCheck: " + token
+                        ),
+                    }
+                ],
+            },
+            headers={**HEADERS_AUTH, "X-Firebase-AppCheck": token},
+        )
+
+    assert response.status == 200
+    payload = await response.json()
+    assert payload["choices"][0]["message"]["content"] == "ok"
+    forwarded = mock_chat.call_args.args[2][0]["content"]
+    assert forwarded.endswith(token)
+    assert "[TUSKER" not in json.dumps(payload)
+    mock_chat.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_oversized_appcheck_header_is_rejected_at_line_limit(app, client):
+    """An oversized header must be rejected at the HTTP boundary, not routed.
+
+    aiohttp enforces aiohttp.http_parser's 8190-byte header line cap, the same
+    class of limit Apache applied in the incident. The endpoint handler must
+    never see the request, so no provider call happens and the client gets
+    HTTP 400 with the upstream parser's diagnostic.
+    """
+    from .appcheck_fixtures import appcheck_token
+
+    pool_manager = MagicMock()
+    pool_manager.select.return_value = ("openai", "gpt-4o-mini")
+    app["pool_manager"] = pool_manager
+
+    token = appcheck_token(oversized=True)
+    assert len(token) > 8190
+    with patch(
+        "tusker_gateway.endpoints.PassthroughClient.chat",
+        new_callable=AsyncMock,
+    ) as mock_chat:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": "hermes-code", "messages": [{"role": "user", "content": "hi"}]},
+            headers={**HEADERS_AUTH, "X-Firebase-AppCheck": token},
+        )
+
+    assert response.status == 400
+    mock_chat.assert_not_awaited()
