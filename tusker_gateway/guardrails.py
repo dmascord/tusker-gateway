@@ -565,6 +565,7 @@ def load_guardrails_config_from_env(env: dict[str, str] | None = None) -> dict[s
         "redaction_credit_card": _flag("TUSKER_REDACTION_CREDIT_CARD", True),
         "redact_api_keys": _flag("TUSKER_REDACTION_API_KEYS", True),
         "redaction_format_preserving": _flag("TUSKER_REDACTION_FORMAT_PRESERVING", False),
+        "redaction_format_preserving_app_check": _flag("TUSKER_REDACTION_FORMAT_PRESERVING_APPCHECK", True),
         "_env": e,
     }
 
@@ -589,6 +590,9 @@ def init_guard_pipeline(config: dict[str, Any]) -> GuardPipeline:
                 redact_credit_cards=config.get("redaction_credit_card", True),
                 redact_api_keys=config.get("redact_api_keys", True),
                 format_preserving_aliases=config.get("redaction_format_preserving", False),
+                format_preserving_app_check=config.get(
+                    "redaction_format_preserving_app_check", True
+                ),
             )
             guards.append(SecretRedactionGuard(
                 tokenizer=Tokenizer(key=key, rules=rules),

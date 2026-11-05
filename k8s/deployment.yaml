@@ -272,6 +272,10 @@ spec:
         # Keep disabled unless clients require syntax-shaped redaction aliases.
         - name: TUSKER_REDACTION_FORMAT_PRESERVING
           value: 'false'
+        # Keep JWT-shaped App Check placeholders copyable during model replay;
+        # the payload remains authenticated ciphertext and never a credential.
+        - name: TUSKER_REDACTION_FORMAT_PRESERVING_APPCHECK
+          value: 'true'
         # Entropy-gated fallback for unprefixed secrets: opt-in, because the
         # rule can false-positive on long identifiers in code.
         - name: TUSKER_REDACTION_ENTROPY_FALLBACK

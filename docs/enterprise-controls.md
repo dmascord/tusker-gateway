@@ -406,12 +406,17 @@ encryption is deterministic — the same value always maps to the same token.
   `AIza…`, `xox…`, `npm_…`, `github_pat_…`).
 - `TUSKER_REDACTION_FORMAT_PRESERVING` (default `false`) uses authenticated,
   deterministic aliases shaped like `u@<ciphertext>.redact.invalid` for emails
-  and the original provider prefix plus `z<ciphertext>` for API keys. The
-  gateway restores these aliases at the client/tool boundary and verifies the
-  AES-SIV tag before restoring; tampered aliases pass through unchanged. The
-  `.invalid` domain is deliberately non-deliverable. This mode keeps encrypted
-  values syntactically usable to OMP while never sending the alias to the
-  actual tool execution endpoint.
+  and the original provider prefix plus `z<ciphertext>` for API keys. The gateway
+  restores these aliases at the client/tool boundary and verifies the AES-SIV
+  tag; tampered aliases pass through unchanged.
+- `TUSKER_REDACTION_FORMAT_PRESERVING_APPCHECK` (default `true`) gives
+  `X-Firebase-AppCheck` JWT-shaped values a three-segment alias: a standard JWT
+  header, authenticated opaque ciphertext in the payload segment, and a fixed
+  non-signature marker. It is not a valid credential and exposes no claims. The
+  gateway restores it at the client/tool boundary and verifies the AES-SIV tag;
+  tampered aliases pass through unchanged. This makes the value copyable by a
+  model without sending a usable alias to tool execution. Set it to `false` if
+  an upstream model/provider rejects JWT-shaped placeholders.
 - `TUSKER_REDACTION_KEY` (32-byte hex or raw) is the AES-SIV key. **A missing
   or invalid key disables redaction entirely (fail-open)** — the gateway never
   tokenizes data it cannot restore. Store it in `tusker-env-vault`; rotate by

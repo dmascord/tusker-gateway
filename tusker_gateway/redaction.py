@@ -69,6 +69,22 @@ _KEY_ALIAS_RE = re.compile(
     r"(z[A-Za-z0-9_-]{32,})"
     r"(?![A-Za-z0-9_-])"
 )
+TOKEN_TYPE_JWT = "jwt"
+_APP_CHECK_ALIAS_HEADER = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9"
+_APP_CHECK_ALIAS_MARKER = "dHVza2VyLXJlZGFjdGVk"
+_APP_CHECK_RE = re.compile(
+    r"(?P<context>X-Firebase-AppCheck[\"']?\s*:\s*[\"']?)"
+    r"(?P<token>[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)"
+    r"(?![A-Za-z0-9_-])",
+    re.IGNORECASE,
+)
+_APP_CHECK_ALIAS_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])"
+    + re.escape(_APP_CHECK_ALIAS_HEADER)
+    + r"\.(?P<core>[A-Za-z0-9_-]+)\."
+    + re.escape(_APP_CHECK_ALIAS_MARKER)
+    + r"(?![A-Za-z0-9_-])"
+)
 
 _EMAIL_RE = re.compile(
     r"(?<![a-zA-Z0-9._%+-])"
@@ -148,6 +164,9 @@ class RedactionRuleSet:
     format_preserving_aliases: bool = False
     redact_credit_cards: bool = True
     redact_api_keys: bool = True
+    # The guard pipeline enables this by default; direct tokenizer callers can
+    # opt in explicitly without changing legacy standalone behavior.
+    format_preserving_app_check: bool = False
     # Entropy-gated fallback: a context-word ("key", "token", "secret", ...)
     # within 80 chars before a 32+ char unprefixed run. Disabled by default
     # to avoid sealing ordinary identifiers in code.
@@ -184,6 +203,18 @@ class Tokenizer:
             return pt.decode("utf-8")
         except Exception:
             return None
+
+    def _app_check_alias(self, value: str) -> str:
+        """Return a JWT-shaped alias containing authenticated ciphertext."""
+        core = self._seal(value, TOKEN_TYPE_JWT).split(":", 2)[2][:-1]
+        return f"{_APP_CHECK_ALIAS_HEADER}.{core}.{_APP_CHECK_ALIAS_MARKER}"
+
+    def _restore_app_check_aliases(self, text: str, emit: Any) -> str:
+        def restore(match: re.Match[str]) -> str:
+            value = self._open(TOKEN_TYPE_JWT, match.group("core"))
+            return emit(value) if value is not None else match.group(0)
+
+        return _APP_CHECK_ALIAS_RE.sub(restore, text)
 
     def _alias(self, value: str, kind: str) -> str:
         """Return a syntax-shaped alias carrying authenticated ciphertext."""
@@ -224,10 +255,17 @@ class Tokenizer:
         return _KEY_ALIAS_RE.sub(key_restore, _EMAIL_ALIAS_RE.sub(email_restore, text))
 
     def tokenize_text(self, text: str) -> str:
-        """Escape client tokens, then tokenize detected secrets."""
         if not isinstance(text, str) or not text:
             return text
         out = text
+        if self.rules.format_preserving_aliases:
+            def app_check_replace(match: re.Match[str]) -> str:
+                token = match.group("token")
+                if _APP_CHECK_ALIAS_RE.fullmatch(token):
+                    return match.group(0)
+                return match.group("context") + self._app_check_alias(token)
+
+            out = _APP_CHECK_RE.sub(app_check_replace, out)
         if self.rules.redact_emails:
             out = _EMAIL_RE.sub(
                 lambda m: (
@@ -292,6 +330,7 @@ class Tokenizer:
             return m.group(0) if value is None else _emit(value)
 
         restored = self._restore_aliases(_TOKEN_CORE_RE.sub(_restore, text), _emit)
+        restored = self._restore_app_check_aliases(restored, _emit)
 
         def _restore_bare(m: re.Match[str]) -> str:
             encoded = m.group(1)
@@ -368,7 +407,14 @@ class _BufferedRestorer:
         bare_tail = re.search(r"[A-Za-z0-9_-]+={0,2}$", self._pending)
         if bare_tail is not None:
             safe = min(safe, bare_tail.start())
-        # Hold partial format-preserving aliases across SSE deltas.
+        app_check_tail = re.search(
+            r"(?<![A-Za-z0-9_-])"
+            + re.escape(_APP_CHECK_ALIAS_HEADER)
+            + r"(?:\.[A-Za-z0-9_-]*){0,2}$",
+            self._pending,
+        )
+        if app_check_tail is not None:
+            safe = min(safe, app_check_tail.start())
         email_tail = re.search(
             r"(?<![A-Za-z0-9._%+-])u@[A-Za-z2-7.]*$",
             self._pending,
