@@ -471,10 +471,9 @@ def _child_env() -> dict[str, str]:
         "OPENCODE_DISABLE_PROJECT_CONFIG": "true",
         "OPENCODE_DISABLE_DEFAULT_PLUGINS": "true",
     }
-    # Respect OpenCode's own auth store by default. OPENCODE_ZEN_API_KEY is the
-    # gateway HTTP provider credential and is not interchangeable with the CLI's
-    # OPENCODE_API_KEY; silently aliasing it can override a valid CLI login with
-    # a key that Zen rejects for CLI use.
+    # The OpenCode CLI is the sole Zen transport. Its API key is supplied by
+    # the deployment's TUSKER_OPENCODE_CLI_API_KEY mapping.
+    # Do not pass unrelated provider credentials into the child process.
     opencode_api_key = (
         os.environ.get("OPENCODE_API_KEY")
         or os.environ.get("TUSKER_OPENCODE_CLI_API_KEY")

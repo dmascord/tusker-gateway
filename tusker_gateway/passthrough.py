@@ -82,7 +82,7 @@ def _note_upstream_progress() -> None:
 
 
 _OPENCODE_GO_PROVIDER = "opencode-go"
-_OPENCODE_SESSION_PROVIDERS = frozenset({_OPENCODE_GO_PROVIDER, "opencode-zen"})
+_OPENCODE_SESSION_PROVIDERS = frozenset({_OPENCODE_GO_PROVIDER})
 _OPENCODE_SESSION_HEADER = "x-opencode-session"
 _OPENCODE_REASONING_EFFORT_ALIASES = {
     # OpenAI-compatible clients sometimes use `minimal`/`maximal`, while
@@ -1281,6 +1281,21 @@ class CodexTokenRotator:
             return True
         if expiry <= time.time():
             self._credential_cooldowns.pop(fingerprint, None)
+            return True
+        return False
+
+    def clear_credential_cooldown(self, label: str) -> bool:
+        """Clear cooldown entries for one non-secret credential label."""
+        target = str(label or "").strip()
+        for index, cred in enumerate(self._creds):
+            if self._credential_label(cred, index) != target:
+                continue
+            token = _creds_access_token(cred)
+            identity = self._credential_identity(cred, token)
+            keys = {self.fingerprint(token), f"identity:{identity}" if identity else None}
+            for key in keys:
+                if key:
+                    self._credential_cooldowns.pop(key, None)
             return True
         return False
 

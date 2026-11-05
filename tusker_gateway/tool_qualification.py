@@ -201,13 +201,13 @@ def _catalog_registry(
     return registry
 
 
-# Inline SSE error frames the chat-completions stream writes onto an
-# already-started HTTP 200 response, and the probe-only ``x_tusker_stream_error``
-# marker on a post-commit synthesized error chunk: a disabled or blacklisted
-# route, an open circuit, a mid-stream provider failure, an approval stop, an
-# empty stream, or a stream rejected by tool-call validation. None of these
-# describe the model's tool-calling behavior, so a probe that sees one and
-# captures no tool call must record transient availability, not a permanent
+# Inline SSE error frames the chat stream writes onto an already-started HTTP
+# 200 response, and the probe-only ``x_tusker_stream_error`` marker on a
+# synthesized error chunk: a disabled or blacklisted route, an open circuit,
+# a pre-dispatch gateway failure, a mid-stream provider failure, an approval
+# stop, an empty stream, or a stream rejected by tool-call validation. None of
+# these describe the model's tool-calling behavior, so a probe that sees one
+# and captures no tool call must record transient availability, not a permanent
 # capability failure that would exclude the model from the tool pool
 # indefinitely.
 _TRANSIENT_STREAM_ERROR_CODES = {
@@ -648,7 +648,7 @@ async def probe_model(
         "X-Tusker-Cache": "bypass",
         "X-Tusker-Tool-Qualification": TOOL_CAPABILITY_PROBE_VERSION,
     }
-    if provider in {"opencode-zen", "opencode-go"}:
+    if provider == "opencode-go":
         headers["X-Opencode-Session"] = f"probe-{uuid.uuid4().hex[:8]}"
     try:
         async with session.post(url, json=payload, headers=headers) as response:

@@ -361,7 +361,6 @@ def load_config() -> dict[str, Any]:
         "synthetic": ["SYNTHETIC_API_KEY"],
         "ollama-cloud": ["OLLAMA_API_KEY", "OLLAMA_MAC_API_KEY"],
         "opencode-go": ["OPENCODE_GO_API_KEY"],
-        "opencode-zen": ["OPENCODE_ZEN_API_KEY"],
         "workers-ai": ["CF_API_TOKEN"],
         "github-copilot": ["GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN"],
         "github-copilot-enterprise": ["GITHUB_COPILOT_ENTERPRISE_TOKEN"],
@@ -785,13 +784,6 @@ DEFAULT_PROVIDER_REGISTRY: dict[str, ProviderConfig] = {
         "/openai/v1/chat/completions",
         auth_env="OPENCODE_GO_API_KEY",
         zdr_ok=True,
-    ),
-    "opencode-zen": ProviderConfig(
-        "opencode-zen",
-        "bearer",
-        "https://opencode.ai/zen",
-        "/v1/chat/completions",
-        auth_env="OPENCODE_ZEN_API_KEY",
     ),
     "openai-codex": ProviderConfig(
         "openai-codex",

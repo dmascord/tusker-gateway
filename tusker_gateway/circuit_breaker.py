@@ -210,8 +210,21 @@ class CircuitBreaker:
 
     # -- public API ------------------------------------------------------
 
-    def check(self, provider: str, model: str) -> BreakerDecision:
-        """Decide whether a request to (provider, model) should proceed."""
+    def check(
+        self,
+        provider: str,
+        model: str,
+        *,
+        allow_open_probe: bool = False,
+    ) -> BreakerDecision:
+        """Decide whether a request to (provider, model) should proceed.
+
+        ``allow_open_probe`` is reserved for an explicit operator or
+        maintenance qualification request. It admits one half-open probe
+        before the normal cooldown expires, while retaining the same atomic
+        lease and success/failure accounting as an ordinary recovery probe.
+        Normal traffic leaves this disabled.
+        """
         if not self._config.enabled:
             return BreakerDecision(allowed=True, state=BreakerState.CLOSED)
         now = time.time()
@@ -231,15 +244,22 @@ class CircuitBreaker:
                 if row and row.get("cooldown_secs")
                 else policy.cooldown_secs
             )
-            if opened_at is None or (now - opened_at) >= cooldown:
+            cooldown_expired = opened_at is None or (now - opened_at) >= cooldown
+            if allow_open_probe or cooldown_expired:
                 # Transition to HALF_OPEN and atomically reserve a probe slot.
                 if self._reserve_probe(provider, model, max_probes, from_open=True):
                     self.stats.half_open_probes += 1
-                    logger.info("breaker %s/%s -> HALF_OPEN (probe)", provider, model)
+                    reason = "forced_probe" if not cooldown_expired else "half_open_probe"
+                    logger.info(
+                        "breaker %s/%s -> HALF_OPEN (%s)",
+                        provider,
+                        model,
+                        reason,
+                    )
                     return BreakerDecision(
                         allowed=True,
                         state=BreakerState.HALF_OPEN,
-                        reason="half_open_probe",
+                        reason=reason,
                     )
                 self.stats.short_circuits += 1
                 return BreakerDecision(
@@ -344,6 +364,7 @@ class CircuitBreaker:
                 window_total=0,
                 window_started_at=time.time(),
                 opened_at=None,
+                cooldown_secs=None,
                 half_open_probe_inflight=0,
                 half_open_probes=0,
             )
@@ -357,6 +378,7 @@ class CircuitBreaker:
             window_failures=new_window["window_failures"],
             window_total=new_window["window_total"],
             window_started_at=new_window["window_started_at"],
+            cooldown_secs=None,
         )
 
     def record_failure(
@@ -447,6 +469,25 @@ class CircuitBreaker:
         if not self._config.enabled:
             return
         self._update(provider, model, half_open_probe_inflight=0)
+
+    def is_active(self, provider: str, model: str, *, now: float | None = None) -> bool:
+        """Return whether the route is still inside an OPEN quarantine window.
+
+        Expired OPEN rows remain persisted until the next request probes them;
+        callers such as health diagnostics must not report those historical rows
+        as active or exclude the route before the probe is due.
+        """
+        if not self._config.enabled:
+            return False
+        row = self._read(provider, model)
+        if row is None or row.get("state") != BreakerState.OPEN.value:
+            return False
+        opened_at = row.get("opened_at")
+        if opened_at is None:
+            return False
+        policy = self._policy_for(provider)
+        cooldown = row.get("cooldown_secs") or policy.cooldown_secs
+        return (now if now is not None else time.time()) - float(opened_at) < float(cooldown)
 
     def snapshot(self) -> dict[str, dict[str, Any]]:
         """Return current breaker state for the dashboard."""

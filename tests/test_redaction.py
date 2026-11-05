@@ -11,6 +11,7 @@ from tusker_gateway.redaction import (
     load_redaction_key,
     restore_response,
 )
+from .appcheck_fixtures import appcheck_token
 
 KEY_HEX = "ab" * 32
 
@@ -132,6 +133,48 @@ def test_api_key_redaction():
     tok = t.tokenize_text("use " + key + " now")
     assert key not in tok
     assert t.restore_text(tok) == "use " + key + " now"
+
+def test_appcheck_tokens_of_realistic_and_large_sizes_are_opaque():
+    t = _tokenizer()
+    for oversized in (False, True):
+        token = appcheck_token(oversized=oversized)
+        assert len(token) > (500 if not oversized else 8_000)
+        request = (
+            "X-apiKey: q5f1464f-c903-4d2a-9d09-efd45bd6ed9f\n"
+            "X-Firebase-AppCheck: " + token
+        )
+        assert t.tokenize_text(request) == request
+        assert t.restore_text(request) == request
+
+def test_guard_replays_appcheck_tool_argument_byte_exact():
+    """A curl tool argument carrying an App Check token must round-trip."""
+    token = appcheck_token(oversized=True)
+    command = (
+        "curl -k 'https://tam-sqc.example.test/MpcServices/appConfig/v1/ETA' "
+        "-H 'X-Firebase-AppCheck: " + token + "'"
+    )
+    body = {
+        "model": "m",
+        "messages": [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {
+                            "name": "bash",
+                            "arguments": json.dumps({"command": command}),
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+    out = asyncio.run(_guard_body(_tokenizer(), body))
+    args = out["messages"][0]["tool_calls"][0]["function"]["arguments"]
+    assert json.loads(args)["command"] == command
+    assert token in json.dumps(out)
 
 
 def test_client_forged_token_untouched():

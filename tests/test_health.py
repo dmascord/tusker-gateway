@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 from .conftest import HEADERS_AUTH, HEADERS_NO_AUTH
+from tusker_gateway.circuit_breaker import BreakerConfig, BreakerPolicy, CircuitBreaker
 from tusker_gateway.config import DEFAULT_PROVIDER_REGISTRY, PoolConfig
 from tusker_gateway.cooldown import global_tracker
 from tusker_gateway.health import health_handler, ready_handler
@@ -148,6 +149,52 @@ def test_health_provider_breakdown_exposes_cooldown_without_key_material():
     assert provider["selectable_candidates"] == 0
     assert provider["cooldown_models"] == ["m"]
     assert "secret-value" not in response.text
+
+
+def test_health_breaker_diagnostics_only_report_active_quarantines(tmp_path):
+    cfg = {
+        "providers": {"opencode-go": DEFAULT_PROVIDER_REGISTRY["opencode-go"]},
+        "provider_api_keys": {"opencode-go": "secret-value"},
+        "pools": {
+            "code": PoolConfig(
+                "code",
+                [
+                    {"provider": "opencode-go", "model": "expired"},
+                    {"provider": "opencode-go", "model": "active"},
+                ],
+            )
+        },
+    }
+    manager = SimpleNamespace(
+        models={
+            "code": [
+                SimpleNamespace(provider="opencode-go", model="expired", zdr_ok=True),
+                SimpleNamespace(provider="opencode-go", model="active", zdr_ok=True),
+            ]
+        },
+        pools=cfg["pools"],
+    )
+    breaker = CircuitBreaker(
+        BreakerConfig(
+            enabled=True,
+            path=str(tmp_path / "breaker.db"),
+            policy=BreakerPolicy(consecutive_failures=1, cooldown_secs=60),
+        )
+    )
+    breaker.record_failure("opencode-go", "expired", cooldown_secs=1)
+    breaker.record_failure("opencode-go", "active", cooldown_secs=60)
+    expired = breaker._read("opencode-go", "expired")
+    assert expired is not None
+    breaker._update("opencode-go", "expired", opened_at=expired["opened_at"] - 2)
+
+    response = health_handler(
+        SimpleNamespace(app={"config": cfg, "pool_manager": manager, "breaker": breaker})
+    )
+    provider = json.loads(response.text)["provider_health"]["opencode-go"]
+
+    assert provider["configured_candidates"] == 2
+    assert provider["selectable_candidates"] == 1
+    assert provider["breaker_open_models"] == ["active"]
 
 
 @pytest.mark.asyncio

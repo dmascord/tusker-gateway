@@ -438,6 +438,15 @@ def test_load_config_guard_flags_override():
     assert cfg["injection_guard"] is False
 
 
+def test_appcheck_format_preserving_flag_defaults_on_and_can_disable():
+    assert load_guardrails_config_from_env(env={})[
+        "redaction_format_preserving_app_check"
+    ] is True
+    assert load_guardrails_config_from_env(
+        env={"TUSKER_REDACTION_FORMAT_PRESERVING_APPCHECK": "false"}
+    )["redaction_format_preserving_app_check"] is False
+
+
 def test_init_pipeline_email_flag_includes_pii_guard():
     p = init_guard_pipeline({"enabled": True, "pii_email_redaction": True})
     kinds = [type(g).__name__ for g in p.guards]

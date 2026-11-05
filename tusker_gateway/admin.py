@@ -395,6 +395,18 @@ async def admin_breakers(request: web.Request) -> web.Response:
     return web.json_response({"breakers": breaker.snapshot()})
 
 
+async def admin_codex_credential_reset(request: web.Request) -> web.Response:
+    """POST /admin/codex/credentials/{label}/reset-cooldown."""
+    label = request.match_info.get("label", "").strip()
+    rotator = request.app.get("credential_rotators", {}).get("openai-codex")
+    if rotator is None or not label:
+        return web.json_response(openai_error_shape("Codex credential not found", "not_found"), status=404)
+    cleared = rotator.clear_credential_cooldown(label)
+    if not cleared:
+        return web.json_response(openai_error_shape("Codex credential not found", "not_found"), status=404)
+    return web.json_response({"provider": "openai-codex", "credential": label, "cooldown_cleared": True})
+
+
 async def admin_keys(request: web.Request) -> web.Response:
     """GET /admin/keys — API key fingerprints, principals, and identity metadata.
 
@@ -1688,6 +1700,7 @@ def register_admin_config_routes(app: web.Application) -> None:
     app.router.add_post("/admin/audit/execution", admin_audit_execution)
     app.router.add_post("/admin/protocol/probe", admin_protocol_probe)
     app.router.add_get("/admin/protocol/evidence", admin_protocol_evidence)
+    app.router.add_post("/admin/codex/credentials/{label}/reset-cooldown", admin_codex_credential_reset)
     app.router.add_get("/admin/config", admin_config)
     app.router.add_get("/admin/captures", admin_captures)
     app.router.add_get("/admin/captures/{capture_id}", admin_capture_detail)

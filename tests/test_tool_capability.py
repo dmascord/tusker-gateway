@@ -321,21 +321,6 @@ async def test_probe_model_treats_post_commit_marker_as_transient():
     assert result["failure_class"] == "provider_error"
 
 
-def test_opencode_probe_sends_isolated_session_header():
-    session = _ProbeSession()
-
-    asyncio.run(
-        probe_model(
-            session,
-            base_url="https://opencode.test",
-            api_key="test-key",
-            provider="opencode-zen",
-            model="test-model",
-        )
-    )
-
-    assert session.headers is not None
-    assert session.headers["X-Opencode-Session"].startswith("probe-")
 
 def test_composite_runner_refreshes_stale_or_unavailable_records(monkeypatch, tmp_path):
     from types import SimpleNamespace

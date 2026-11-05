@@ -6,16 +6,41 @@ import re
 
 import pytest
 
-from tusker_gateway.redaction import RedactionRuleSet, Tokenizer, _BufferedRestorer
+from tests.appcheck_fixtures import appcheck_token
+from tusker_gateway.redaction import RedactionRuleSet, Tokenizer, _BufferedRestorer, restore_response
 
 KEY = b"0123456789abcdef0123456789abcdef"
 EMAIL = "mail" + chr(64) + "example.test"
 
 
-
-
 def tokenizer() -> Tokenizer:
     return Tokenizer(KEY, RedactionRuleSet(format_preserving_aliases=True))
+
+
+def test_appcheck_alias_preserves_jwt_shape_without_plaintext_claims():
+    t = tokenizer()
+    original = appcheck_token()
+    alias = t.tokenize_text("X-Firebase-AppCheck: " + original)
+    value = alias.split(": ", 1)[1]
+    header, payload, signature = value.split(".")
+    assert len((header, payload, signature)) == 3
+    assert header == "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9"
+    assert signature == "dHVza2VyLXJlZGFjdGVk"
+    assert original not in alias
+    assert "projects/" not in alias
+    assert t.tokenize_text(alias) == alias
+    assert t.restore_text(alias) == "X-Firebase-AppCheck: " + original
+
+
+def test_appcheck_alias_rejects_tampering_and_streams_back_original():
+    t = tokenizer()
+    original = appcheck_token()
+    wire = t.tokenize_text("X-Firebase-AppCheck: " + original)
+    alias = wire.split(": ", 1)[1]
+    assert t.restore_text(alias[:-1] + "x") == alias[:-1] + "x"
+    restorer = _BufferedRestorer(t)
+    restored = "".join(restorer.feed(wire[i : i + 5]) for i in range(0, len(wire), 5))
+    assert restored + restorer.flush() == "X-Firebase-AppCheck: " + original
 
 
 @pytest.mark.parametrize("original", [EMAIL, "other" + chr(64) + "example.test"])
@@ -51,6 +76,39 @@ def test_key_alias_preserves_prefix_and_restores(prefix: str, body: str) -> None
     assert t.tokenize_text(alias) == alias
     assert t.restore_text(alias) == original
 
+
+@pytest.mark.asyncio
+async def test_appcheck_alias_replays_in_tool_arguments():
+    from tusker_gateway.guardrails import SecretRedactionGuard
+
+    t = tokenizer()
+    original = appcheck_token()
+    body = {
+        "messages": [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "bash",
+                            "arguments": json.dumps(
+                                {"command": "curl -H 'X-Firebase-AppCheck: " + original + "'"}
+                            ),
+                        },
+                    }
+                ],
+            }
+        ]
+    }
+    guarded = await SecretRedactionGuard(tokenizer=t).check(body)
+    modified = guarded.modified_body
+    assert modified is not None
+    serialized = json.dumps(modified)
+    assert original not in serialized
+    alias = t.tokenize_text("X-Firebase-AppCheck: " + original).split(": ", 1)[1]
+    assert alias in serialized
+    assert json.dumps(restore_response(modified, t)) == json.dumps(body)
 
 @pytest.mark.parametrize("chunk", [1, 2, 3, 7, 19, 4096])
 def test_streamed_alias_round_trip(chunk: int) -> None:
