@@ -187,6 +187,73 @@ def test_ollama_cloud_pricing_overlay_filters_heavyweight_from_code_pool():
     assert selected[1] in light
 
 
+def test_ollama_cloud_peak_pricing_marks_dated_heavy_variants_heavy():
+    """Regression: `deepseek-v4-pro:0813` was admitted to the cheap code
+    pool at weight 1.0 because the pricing overlay stored Ollama's
+    off-peak rates ($0.66/$1.98). Peak rates ($1.32/$3.96) put it above
+    the $1/$3 thresholds, and the slug override now catches the dated
+    variant too. Both layers must agree before the model is heavy."""
+    from tusker_gateway.catalog import (
+        OLLAMA_CLOUD_PRICING,
+        CatalogEntry,
+        CatalogRegistry,
+        ProviderModelsCatalog,
+    )
+    from tusker_gateway.heavyweight import is_heavyweight
+
+    # Overlay carries peak rates, so the pricing gate alone catches it.
+    cost_input, cost_output = OLLAMA_CLOUD_PRICING["deepseek-v4-pro:0813"]
+    assert cost_input >= 1.0 and cost_output >= 3.0
+    assert is_heavyweight("deepseek-v4-pro:0813") is True
+
+    # The slug gate alone catches it too (tag inheritance).
+    assert is_heavyweight(
+        "deepseek-v4-pro:0813", cost_input=0.66, cost_output=1.98
+    ) is True
+
+    # Cheap Ollama routes stay cheap under peak pricing.
+    for slug in ("deepseek-v4-flash:0731", "glm-5.3-flash", "gemma4:31b",
+                 "mimo-v2.6-flash", "minimax-m3.1-flash", "gpt-oss:20b"):
+        assert is_heavyweight(slug) is False, slug
+
+    # The auto-catalog must not promote the dated variant to weight 1.0.
+    cfg = {
+        "pools": {
+            "code": PoolConfig(
+                name="code", models=[], auto_catalog=True,
+                auto_catalog_providers=["ollama-cloud"],
+            ),
+        },
+        "excluded_providers": [],
+        "provider_api_keys": {"ollama-cloud": "k"},
+        "quality_db_path": tempfile.mktemp(suffix=".db"),
+    }
+    pm = PoolManager(cfg)
+    registry = CatalogRegistry()
+    ollama = ProviderModelsCatalog(
+        provider="ollama-cloud",
+        endpoint="https://ollama.com/v1/models",
+    )
+    ollama._entries = [
+        CatalogEntry(provider="ollama-cloud", model="deepseek-v4-pro:0813",
+                     cost_input=1.32, cost_output=3.96),
+        CatalogEntry(provider="ollama-cloud", model="glm-5.3-flash",
+                     cost_input=0.15, cost_output=0.50),
+    ]
+    registry.register("ollama-cloud", ollama)
+    pm.catalog_registry = registry
+    pm.extend_pools_with_auto_catalog()
+
+    pool_by_pair = {
+        (m["provider"], m["model"]): m
+        for m in pm.pools["code"].models
+    }
+    assert pool_by_pair[("ollama-cloud", "deepseek-v4-pro:0813")]["heavyweight"] is True
+    assert pool_by_pair[("ollama-cloud", "glm-5.3-flash")]["heavyweight"] is False
+    selected = pm.select("code")
+    assert selected == ("ollama-cloud", "glm-5.3-flash")
+
+
 def test_premium_heavyweight_only_adopts_heavy_catalog_entries():
     """Regression: a premium-tier pool with heavyweight_only=True opt-in
     auto-adopts only heavyweight catalog entries (docs/solution.md:

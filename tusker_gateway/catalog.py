@@ -91,24 +91,52 @@ AUTO_DISCOVERED_HEAVYWEIGHT_WEIGHT: float = 0.05
 # Ollama Cloud publishes per-1M-token prices on ollama.com/library pages but
 # neither its /v1/models payload nor models.dev carries cost data, so the
 # pricing-based heavyweight classifier ($1/M in, $3/M out) would see None
-# and treat every model as cheap. Verified 2026-09-09; base tier for
-# deepseek (peak varies). Slugs not listed here (gemma4, gpt-oss, kimi-k2.5,
-# minimax-m2.5, nemotron-3-nano/super, qwen3.5:397b, mistral-large-3:675b)
-# publish no price and stay non-heavyweight by the conservative default.
+# and treat every model as cheap. Verified 2026-09-09.
+#
+# The prices below are the PEAK rates from ollama.com/pricing (verified
+# 2026-11-07), not the off-peak rates. Off-peak pricing applies outside
+# 12:00-18:00 UTC on weekdays and all day on weekends, so an off-peak row
+# understates the cost of the same request at peak. Storing off-peak rates
+# let `deepseek-v4-pro` ($1.32/$3.96 peak vs $0.66/$1.98 off-peak) fall
+# under both thresholds and be admitted to the cheap code pool at weight 1.0,
+# where it burned the subscription's "extra high usage" allowance. The
+# heavyweight gate must see the rate a request is actually charged at the
+# worst time of day, so peak wins.
+#
+# Slugs with no price in the table above (clef, qwen3.5:397b) stay
+# non-heavyweight by the conservative default. `deepseek-v4-flash` and
+# `mistral-large-3:675b` are retired upstream but kept here so a stale
+# catalog row still classifies as cheap rather than unknown.
 OLLAMA_CLOUD_PRICING: dict[str, tuple[float, float]] = {
+    "beam": (0.125, 0.40),
     "deepseek-v4-flash": (0.22, 0.66),
     "deepseek-v4-flash:0731": (0.22, 0.66),
-    "deepseek-v4-pro": (0.66, 1.98),
-    "deepseek-v4-pro:0813": (0.66, 1.98),
+    "deepseek-v4.1-flash": (0.30, 1.20),
+    "deepseek-v4.1-flash:1017": (0.30, 1.20),
+    "deepseek-v4-pro": (1.32, 3.96),
+    "deepseek-v4-pro:0813": (1.32, 3.96),
+    "gemma4": (0.14, 0.40),
+    "gemma4:31b": (0.14, 0.40),
     "glm-5.1": (1.00, 3.20),
     "glm-5.2": (1.40, 4.40),
     "glm-5.3": (1.40, 4.40),
     "glm-5.3-flash": (0.15, 0.50),
+    "gpt-oss:20b": (0.07, 0.30),
+    "gpt-oss:120b": (0.15, 0.60),
     "kimi-k2.6": (0.95, 4.00),
     "kimi-k2.7-code": (0.95, 4.00),
     "kimi-k3": (3.00, 15.00),
+    "kimi-k3.1-pro": (2.00, 10.00),
+    "mimo-v2.6-flash": (0.14, 0.28),
+    "mimo-v2.6-pro": (0.435, 0.87),
     "minimax-m2.7": (0.30, 1.20),
     "minimax-m3": (0.60, 2.40),
+    "minimax-m3.1-flash": (0.15, 0.60),
+    "mistral-large-3:675b": (0.50, 1.50),
+    "mistral-large-4": (0.70, 2.10),
+    "muse-spark-open": (1.25, 4.25),
+    "nemotron-3-nano:30b": (0.06, 0.24),
+    "nemotron-3-super": (0.015, 0.60),
     "nemotron-3-ultra": (0.10, 3.00),
 }
 

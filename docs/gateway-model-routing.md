@@ -73,7 +73,14 @@ A model is **heavyweight** when *either*:
 
 1. Its slug is in `tusker_gateway.heavyweight.HEAVYWEIGHT_SLUG_OVERRIDES`, or
 2. Its pricing (per 1M tokens) exceeds `cost_input >= $1` OR `cost_output >= $3`
-   AND pricing data is available from models.dev.
+   AND pricing data is available from models.dev or the provider's pricing
+   overlay.
+
+**Tagged variants inherit their base slug's classification.** A slug such as
+`deepseek-v4-pro:0813` is matched against the override set by its base
+(`deepseek-v4-pro`) as well as the full string, so a dated or platform-tagged
+build of a heavy model cannot slip past the gate. Cheap bases stay cheap:
+`deepseek-v4-flash:0731`, `glm-5.3-flash` and `gemma4:31b` are not heavy.
 
 | Family | Heavy slugs |
 |---|---|
@@ -84,17 +91,35 @@ A model is **heavyweight** when *either*:
 | Other | `mistral-large-3:675b`, `deepseek-v4-pro` |
 | Synthetic.new (usage-heavy) | `Kimi-K3`, `syn:large:vision` |
 | Ollama Cloud (usage-heavy) | `kimi-k2.6`, `kimi-k2.7-code`, `kimi-k3` |
+
 **Ollama Cloud pricing overlay.** Neither ollama's `/v1/models` payload nor
 models.dev carries cost data for ollama-cloud, so pricing-based detection
 would classify every model as cheap. `OLLAMA_CLOUD_PRICING`
 (`tusker_gateway/catalog.py`) overlays ollama.com's published per-1M-token
-prices onto catalog entries. Under the $1/$3 thresholds this marks
-`glm-5.1`, `glm-5.2`, `glm-5.3`, `kimi-k2.6`, `kimi-k2.7-code`, `kimi-k3`, and
-`nemotron-3-ultra` heavyweight by pricing. Slug entries also cover
-`kimi-k2.6`, `kimi-k2.7-code`, `kimi-k3` (synthetic), and `Kimi-K3` so static
-pool lists (no cost data) stay filtered. `glm-5.3-flash`, `deepseek-v4-flash`,
-and the cheap minimax variants stay cheap-tier. Slugs with no published price
-stay non-heavyweight (conservative default).
+prices onto catalog entries.
+
+The overlay stores **peak** rates, not off-peak rates. Ollama applies off-peak
+pricing outside 12:00-18:00 UTC on weekdays and all day on weekends, so an
+off-peak row understates what the same request costs at peak. The gate must
+see the rate a request is actually charged at the worst time of day.
+
+This matters because Ollama's "extra high usage" models are exactly the ones
+priced above $1/M in or $3/M out at peak. The overlay previously stored
+off-peak rates, which put `deepseek-v4-pro` at $0.66/$1.98 — under both
+thresholds — so it was admitted to the cheap `code` pool at weight 1.0 and
+drained the subscription's weekly allowance (reported 2026-11-07). At peak
+($1.32/$3.96) it is correctly heavy, and the slug override catches the
+`:0813` tag as well.
+
+Under the $1/$3 thresholds the overlay marks `deepseek-v4-pro`,
+`glm-5.1`, `glm-5.2`, `glm-5.3`, `kimi-k2.6`, `kimi-k2.7-code`, `kimi-k3`,
+`kimi-k3.1-pro`, `muse-spark-open` and `nemotron-3-ultra` heavyweight by
+pricing. Slug entries also cover `kimi-k2.6`, `kimi-k2.7-code`, `kimi-k3`
+(synthetic), and `Kimi-K3` so static pool lists (no cost data) stay filtered.
+`glm-5.3-flash`, `deepseek-v4-flash`, `gemma4`, `mimo-v2.6-flash`,
+`minimax-m3`, `mistral-large-3` and the cheap minimax variants stay
+cheap-tier. Slugs with no published price stay non-heavyweight (conservative
+default).
 
 **Not** in the override set (cheap-tier codex slugs):
 
