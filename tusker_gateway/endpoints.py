@@ -1946,7 +1946,7 @@ async def _normalize_stream(
                     and not saw_tool_call
                     and not has_tools
                     and not pending_tool_frames
-                    and not saw_visible_content
+                    and (not saw_visible_content or len(cleaned_content) < 10)
                     and not saw_tool_markup
                 ):
                     # The model spent its whole output budget on reasoning and
