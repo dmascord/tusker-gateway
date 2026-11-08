@@ -1941,6 +1941,24 @@ async def _normalize_stream(
                     raise unusable_tool_error("reasoning_only_or_empty")
                 if not tools_requested and not saw_tool_call and not saw_visible_content and not has_delta_text:
                     raise empty_stream_error()
+                if (
+                    fr == "length"
+                    and not saw_tool_call
+                    and not has_tools
+                    and not pending_tool_frames
+                    and not saw_visible_content
+                    and not saw_tool_markup
+                ):
+                    # The model spent its whole output budget on reasoning and
+                    # emitted a blank answer (OMP caption/compaction turns hit
+                    # this on reasoning-heavy candidates, 2026-11-07). The
+                    # client drops such a turn and retries the identical
+                    # request, so handing over the `length` terminal only
+                    # starts a retry loop that cannot succeed. Reject before
+                    # the frame is yielded so the client sees an actionable
+                    # error instead of a "retry the same thing" signal.
+                    emitted_finish_reason = "length"
+                    raise unusable_tool_error("reasoning_only_or_empty")
                 if has_delta_text:
                     content_delta = {
                         key: value
@@ -4897,8 +4915,11 @@ def _validation_stream_message(
     ):
         route = f" {provider}/{model}" if provider and model else ""
         return (
-            f"The provider{route} ran out of output room before answering; the prompt "
-            "nearly filled its context window. Retry, or compact the conversation. "
+            f"The provider{route} spent its whole output budget on reasoning "
+            "without producing an answer. The output budget was exhausted: "
+            "either the requested max output tokens were too small, or the "
+            "prompt filled the context window. Retry with a larger output "
+            "budget, or compact the conversation. "
             f"Request ID: {request_id}."
         )
     else:

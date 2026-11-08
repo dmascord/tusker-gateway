@@ -1,6 +1,20 @@
 # Project TODOs
 
 
+## Reasoning-only `length` turns (2026-11-07)
+
+Fixed. A reasoning-heavy candidate spent the client's whole 120-token output
+budget on reasoning and stopped with `finish_reason=length` and no visible
+text. The gateway forwarded that dead terminal, and OMP retried the
+identical request three times before raising "Length-stop recovery gave up".
+
+The gateway now rejects a `length` terminal that carries no visible output
+or tool call, so the client receives an actionable error instead of a
+terminal it cannot recover from, and the reasoning-model floor now covers the
+DeepSeek V4 family and five other models confirmed in production logs to
+stream a reasoning channel. Full analysis, evidence and verification:
+`docs/incidents/2026-11-08-reasoning-only-length-stop.md`.
+
 ## Codex seat enrollment after identity fix (2026-11-01)
 
 `CodexTokenRotator` no longer identifies a seat by `account_id` (the ChatGPT

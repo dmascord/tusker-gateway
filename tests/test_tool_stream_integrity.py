@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import pathlib
 from unittest.mock import patch
 
 import pytest
@@ -313,3 +314,110 @@ async def test_unusable_tool_turns_fail_over_before_client_output(
     assert len(fallbacks) == 2
     assert "attempt=1" in fallbacks[0]
     assert "attempt=2" in fallbacks[1]
+
+
+def _reasoning_only_length_frames() -> list[bytes]:
+    """The upstream bytes of the failing 2026-11-07 DeepSeek V4 turn.
+
+    Captured verbatim from the production turn-capture store (capture
+    ``c16bddd22ee54ceb926fcad161a10a9a``, provider
+    ``synthetic/hf:deepseek-ai/DeepSeek-V4.1-Flash-1017``) and stored as
+    ``tests/fixtures/reasoning_only_length_turn.sse``.
+
+    The model streamed 24 reasoning deltas and then stopped with
+    ``finish_reason=length`` without emitting a single visible content
+    character or tool call. The upstream usage frame reports
+    ``completion_tokens: 120`` with ``reasoning_tokens: 120``: the client's
+    120-token caption cap was spent entirely on reasoning. This is a
+    no-tools caption turn, matching the captured request.
+    """
+    fixture = (
+        pathlib.Path(__file__).parent
+        / "fixtures"
+        / "reasoning_only_length_turn.sse"
+    )
+    raw = fixture.read_bytes()
+    frames = [
+        part if part.startswith(b"data: ") else b"data: " + part
+        for part in (chunk.strip() for chunk in raw.split(b"\n\n"))
+        if part
+    ]
+    return [frame + b"\n\n" for frame in frames]
+
+
+@pytest.mark.asyncio
+async def test_reasoning_only_length_turn_never_reaches_the_client_as_length(
+    client, app, caplog,
+):
+    """A reasoning-only ``length`` turn must not reach the client as ``length``.
+
+    The 2026-11-07 incident: a reasoning-heavy candidate burned the client's
+    whole 120-token caption budget on reasoning and stopped with
+    ``finish_reason=length`` and no text. The client received that terminal,
+    discarded the turn as "nothing delivered", and retried the identical
+    request three times before raising "Length-stop recovery gave up".
+
+    The gateway must reject the turn before the terminal frame is yielded, so
+    the client sees an actionable error instead of a "retry the same thing"
+    signal. A ``length`` terminal must never reach the client: it only starts
+    a retry loop that cannot succeed.
+
+    The route is not re-dispatched here: the reasoning bytes already reached
+    the client, so the "never splice providers after visible output" invariant
+    still holds. What changes is the terminal the client sees.
+    """
+    from unittest.mock import MagicMock
+
+    handled: list[tuple[str, str]] = []
+    budgets: list[dict] = []
+
+    async def fake_chat(
+        _client, provider, model, messages, *, stream, tools, tool_choice, extra_body,
+        conversation_id, metrics_registry, request_id, pool,
+    ):
+        handled.append((provider, model))
+        budgets.append(dict(extra_body or {}))
+
+        async def upstream_stream():
+            for frame in _reasoning_only_length_frames():
+                yield frame
+
+        return upstream_stream()
+
+    pool_manager = MagicMock()
+    pool_manager.fallback_pools.return_value = ()
+    pool_manager.select.side_effect = [
+        ("synthetic", "hf:deepseek-ai/DeepSeek-V4.1-Flash-1017"),
+    ]
+    app["pool_manager"] = pool_manager
+
+    with patch("tusker_gateway.endpoints.PassthroughClient.chat", new=fake_chat):
+        with caplog.at_level(logging.WARNING, logger="tusker_gateway.endpoints"):
+            response = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "hermes-code",
+                    "messages": [{"role": "user", "content": "caption this"}],
+                    "max_tokens": 120,
+                    "stream": True,
+                },
+                headers=HEADERS_AUTH,
+            )
+            body = await response.read()
+
+    assert response.status == 200
+    assert handled == [("synthetic", "hf:deepseek-ai/DeepSeek-V4.1-Flash-1017")]
+
+    # The reasoning floor lifts the client's 120-token cap so the model has
+    # room for an answer after thinking.
+    assert budgets[0].get("max_tokens") == 2000, budgets
+
+    finish_reasons = [
+        choice.get("finish_reason")
+        for event in _read_sse_data(body)
+        for choice in event.get("choices", [])
+        if choice.get("finish_reason")
+    ]
+    assert "length" not in finish_reasons, finish_reasons
+    assert finish_reasons == ["stop"], finish_reasons
+    assert b"spent its whole output budget on reasoning" in body, body[-400:]

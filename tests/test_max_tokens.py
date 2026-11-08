@@ -59,6 +59,30 @@ class TestIsReasoningModel:
         assert is_reasoning_model("GLM-5.2")
         assert is_reasoning_model("glm-air")
 
+    def test_deepseek_v4_family_is_reasoning(self):
+        # The DeepSeek V4 family streams reasoning before the answer. On
+        # 2026-11-07 hf:deepseek-ai/DeepSeek-V4.1-Flash-1017 spent an OMP
+        # caption turn's whole 120-token budget on reasoning, ended with
+        # finish_reason=length and no text, and OMP retried until
+        # "Length-stop recovery gave up". The floor has to cover the family.
+        assert is_reasoning_model("hf:deepseek-ai/DeepSeek-V4.1-Flash-1017")
+        assert is_reasoning_model("deepseek-v4.1-flash")
+        assert is_reasoning_model("DeepSeek-V4-pro")
+        assert is_reasoning_model("deepseek-v4-flash-0731")
+
+    def test_confirmed_reasoning_streams_are_floored(self):
+        # Every model below streamed a reasoning channel in production
+        # gateway logs (tool diagnostics `fields=reasoning_content`). Each
+        # can spend a small client output budget entirely on reasoning and
+        # stop with finish_reason=length and no visible text.
+        assert is_reasoning_model("ollama-cloud/beam")
+        assert is_reasoning_model("ollama-cloud/gemma4:31b")
+        assert is_reasoning_model("synthetic/hf:moonshotai/Kimi-K3.1-Pro")
+        assert is_reasoning_model("mlx-mac/ornith-1.5:35b")
+        assert is_reasoning_model(
+            "mlx-mac/shirdel-coder-9b-claude-fable-5:text-only-20261102"
+        )
+
     def test_non_reasoning_models(self):
 
 
