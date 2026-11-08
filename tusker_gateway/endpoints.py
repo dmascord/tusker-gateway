@@ -80,6 +80,7 @@ from tusker_gateway.context_limits import (
     fit_output_budget,
     required_context_tokens,
 )
+from tusker_gateway.inband_thinking import InbandThinkingTracker, has_visible_text
 from tusker_gateway.max_tokens import apply_max_tokens_floor
 from tusker_gateway.native_question import (
     question_authorized,
@@ -1209,7 +1210,11 @@ async def _normalize_stream(
     saw_tool_call = False
     saw_tool_markup = False
     saw_tool_markup_opening = False
-    saw_visible_content = False
+    # Tracks how much streamed content the client will render as text rather
+    # than as leaked reasoning. MiniMax-M3 and friends stream their thinking
+    # in the content channel, so "content was seen" does not mean "the client
+    # has something to show".
+    inband_thinking = InbandThinkingTracker()
     reasoning_window = ""
     promoted_reasoning_window = ""
     reasoning_chars = 0
@@ -1516,10 +1521,10 @@ async def _normalize_stream(
                     raise required_tool_error()
                 if tools_requested and saw_tool_markup_opening and not saw_tool_call:
                     raise malformed_tool_error()
-                if tools_requested and not saw_tool_call and not saw_visible_content:
+                if tools_requested and not saw_tool_call and not inband_thinking.has_visible_text:
                     if not saw_tool_markup or saw_tool_markup_opening:
                         raise unusable_tool_error("reasoning_only_or_empty")
-                if not tools_requested and not saw_tool_call and not saw_visible_content:
+                if not tools_requested and not saw_tool_call and not inband_thinking.has_visible_text:
                     raise empty_stream_error()
                 if emitted_finish_reason is None:
                     emitted_finish_reason = "tool_calls" if saw_tool_call else "stop"
@@ -1606,6 +1611,12 @@ async def _normalize_stream(
                 if isinstance(value, str) and value:
                     auxiliary_sources.append((field, value))
 
+            if auxiliary_sources:
+                # Native reasoning sits next to the text, so a bare reasoning
+                # close tag later in the stream is a stray, not the end of an
+                # implied thinking section.
+                inband_thinking.note_other_content()
+
             details_text = _reasoning_details_text(delta.get("reasoning_details"))
             if details_text:
                 # OpenRouter normally duplicates `reasoning` in this array.
@@ -1646,6 +1657,8 @@ async def _normalize_stream(
             if isinstance(raw_tc, list):
                 delta["tool_calls"] = tc
             has_tools = isinstance(tc, list) and bool(tc)
+            if has_tools:
+                inband_thinking.note_other_content()
             if restorer is not None and isinstance(tc, list):
                 for call in tc:
                     if not isinstance(call, dict):
@@ -1687,6 +1700,13 @@ async def _normalize_stream(
                 # preserves token-boundary spaces in ordinary reasoning.
                 if _TOOL_MARKUP_HINT_RE.search(cleaned):
                     cleaned = strip_tool_text(cleaned)
+                if field == "content":
+                    # Classify before the restorer, not after it: the
+                    # restorer holds a trailing run back until the stream
+                    # ends, so a short answer can reach the client only in
+                    # the tail frame. What the client renders is the same
+                    # text either way.
+                    inband_thinking.feed(cleaned)
                 if restorer is not None:
                     key = (choice_index, field)
                     buf = _field_restorers.get(key)
@@ -1701,8 +1721,6 @@ async def _normalize_stream(
                 cleaned_content = clean_text(raw_content, "content")
                 if cleaned_content:
                     delta["content"] = cleaned_content
-                    if cleaned_content.strip():
-                        saw_visible_content = True
                 else:
                     delta.pop("content", None)
             for field, value in auxiliary_sources:
@@ -1780,7 +1798,8 @@ async def _normalize_stream(
                         prose = _extract_inner_prose(block) or strip_tool_text(block)
                         if prose:
                             pending_prose_frames.append(_content_frame(prose, new_obj))
-                            saw_visible_content = True
+                            # The prose reaches the client as ordinary text.
+                            inband_thinking.feed(prose)
                 elif not eligible:
                     if require_tool_call and not has_tools and not saw_tool_call:
                         raise required_tool_error()
@@ -1789,7 +1808,8 @@ async def _normalize_stream(
                     prose = _extract_inner_prose(block)
                     if prose:
                         pending_prose_frames.append(_content_frame(prose, new_obj))
-                        saw_visible_content = True
+                        # The prose reaches the client as ordinary text.
+                        inband_thinking.feed(prose)
 
             # Do this after draining complete blocks so a tool call that ends
             # the reasoning stream wins over the loop detector.
@@ -1935,18 +1955,16 @@ async def _normalize_stream(
                 if (
                     tools_requested
                     and not saw_tool_call
-                    and not saw_visible_content
+                    and not inband_thinking.has_visible_text
                     and saw_tool_markup_opening
                 ):
                     raise unusable_tool_error("reasoning_only_or_empty")
-                if not tools_requested and not saw_tool_call and not saw_visible_content and not has_delta_text:
-                    raise empty_stream_error()
                 if (
                     fr == "length"
                     and not saw_tool_call
                     and not has_tools
                     and not pending_tool_frames
-                    and (not saw_visible_content or len(cleaned_content) < 10)
+                    and not inband_thinking.has_visible_text
                     and not saw_tool_markup
                 ):
                     # The model spent its whole output budget on reasoning and
@@ -1957,8 +1975,20 @@ async def _normalize_stream(
                     # starts a retry loop that cannot succeed. Reject before
                     # the frame is yielded so the client sees an actionable
                     # error instead of a "retry the same thing" signal.
+                    #
+                    # The test is the client's own: OMP counts a turn as
+                    # delivered when it holds text, a tool call, or an image.
+                    # Reasoning is not deliverable, and MiniMax-M3 leaks its
+                    # thinking into the content channel, so the visible-text
+                    # test has to ignore in-band reasoning tags as well.
+                    #
+                    # This check comes before the empty-stream guard so the
+                    # client gets the actionable "output budget exhausted"
+                    # error rather than a bare "empty response".
                     emitted_finish_reason = "length"
                     raise unusable_tool_error("reasoning_only_or_empty")
+                if not tools_requested and not saw_tool_call and not inband_thinking.has_visible_text and not has_delta_text:
+                    raise empty_stream_error()
                 if has_delta_text:
                     content_delta = {
                         key: value
@@ -2074,10 +2104,10 @@ async def _normalize_stream(
         raise required_tool_error()
     if tools_requested and saw_tool_markup_opening and not saw_tool_call:
         raise malformed_tool_error()
-    if tools_requested and not saw_tool_call and not saw_visible_content:
+    if tools_requested and not saw_tool_call and not inband_thinking.has_visible_text:
         if not saw_tool_markup or saw_tool_markup_opening:
             raise unusable_tool_error("reasoning_only_or_empty")
-    if not tools_requested and not saw_tool_call and not saw_visible_content:
+    if not tools_requested and not saw_tool_call and not inband_thinking.has_visible_text:
         raise empty_stream_error()
     for tail_frame in _text_tail_frames():
         yield tail_frame
@@ -3278,7 +3308,12 @@ def _response_tool_calls(response: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _response_has_visible_content(response: dict[str, Any]) -> bool:
-    """Return whether a complete response contains client-visible text."""
+    """Return whether a complete response contains client-visible text.
+
+    Reasoning leaked into the content channel is not visible: OMP heals it
+    into a thinking block, and a turn holding nothing but thinking is not
+    deliverable.
+    """
     choices = response.get("choices")
     if not isinstance(choices, list):
         return False
@@ -3289,7 +3324,7 @@ def _response_has_visible_content(response: dict[str, Any]) -> bool:
         if not isinstance(message, dict):
             continue
         content = message.get("content")
-        if isinstance(content, str) and content.strip():
+        if isinstance(content, str) and has_visible_text(content):
             return True
     return False
 

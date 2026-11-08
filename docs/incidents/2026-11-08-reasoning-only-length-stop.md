@@ -1,4 +1,4 @@
-# Reasoning-only `length` turns start an unwinnable client retry loop (2026-11-07)
+# Reasoning-only `length` turns start an unwinnable client retry loop (2026-11-07, 2026-11-08)
 
 Client symptom:
 
@@ -84,12 +84,15 @@ if (
     and not saw_tool_call
     and not has_tools
     and not pending_tool_frames
-    and not saw_visible_content
+    and not inband_thinking.has_visible_text
     and not saw_tool_markup
 ):
     emitted_finish_reason = "length"
     raise unusable_tool_error("reasoning_only_or_empty")
 ```
+
+The `inband_thinking` test replaced the original `not saw_visible_content`
+test on 2026-11-08; see the recurrence section below for why.
 
 Setting `emitted_finish_reason = "length"` before raising makes
 `unusable_tool_error` reclassify the failure as `output_budget_exhausted`:
@@ -126,7 +129,96 @@ both remedies (raise the output budget, or compact the conversation).
 - Reverting only the `endpoints.py` guard fails that test.
 - Reverting only the `max_tokens.py` floor fails that test and the two
   reasoning-model tests. Both changes are independently required.
-- Full offline suite: 2100 passed, 8 skipped.
+
+## Recurrence: MiniMax-M3 leaks its thinking into the content channel
+
+The same client error came back on 2026-11-08. The failing turn was
+`minimax/MiniMax-M3` at 05:46:59Z, and its usage frame read:
+
+```json
+"completion_tokens": 16384,
+"completion_tokens_details": {"reasoning_tokens": 16384}
+```
+
+The whole 16384-token budget went to reasoning and no answer was produced.
+The budget floor from the first fix does not apply here: the client had
+already asked for 16384 tokens.
+
+The turn reached the `length` guard with `saw_visible_content` **true**, so
+the guard let it through. MiniMax-M3 does not use the `reasoning_content`
+channel: it streams its chain of thought in the OpenAI `content` channel,
+wrapped in `<think>`. The gateway saw "content" and concluded the client had
+something to show.
+
+It did not. OMP heals the leak: a `<think>` block in the content channel is
+moved into a thinking block, and OMP's `assistantTurnDelivered` counts only
+text, tool calls, and images. A turn holding nothing but a thinking block is
+not delivered, so the client retried the identical request three times and
+surrendered with the same message.
+
+The gateway was therefore measuring the wrong thing. "Content was seen" is
+not "the client has something to show" once the provider leaks its thinking
+into the content channel.
+
+### `tusker_gateway/inband_thinking.py` — classify the content the client will render
+
+New module. `InbandThinkingTracker` mirrors the tag vocabulary of OMP's
+`ThinkingInbandScanner` (`<think>`, `<thinking>`, `<scratchpad>`, the
+`` ```thinking `` fence) and tracks, across stream frames, how much of the
+content channel the client will render as ordinary text:
+
+- an opener starts a thinking section; the text inside it is reasoning;
+- a bare closer with no opener means the provider template prefilled the
+  opener into the prompt (DeepSeek-R1, Qwen3-Thinking), so the text in front
+  of it was reasoning;
+- a bare closer that arrives next to native reasoning or a tool call is a
+  stray, because OMP only reclassifies a bare closer when the message holds
+  nothing but that one text block;
+- text after a closer is the answer.
+
+The tracker never changes the bytes the gateway forwards. It only decides
+whether the client is left with something it can show.
+
+The length guard now uses it:
+
+```python
+if (
+    fr == "length"
+    and not saw_tool_call
+    and not has_tools
+    and not pending_tool_frames
+    and not inband_thinking.has_visible_text
+    and not saw_tool_markup
+):
+    emitted_finish_reason = "length"
+    raise unusable_tool_error("reasoning_only_or_empty")
+```
+
+The guard also runs *before* the generic empty-stream guard, so the client
+gets the actionable "output budget exhausted" error rather than a bare
+"empty response".
+
+The classification is fed **before** the redaction restorer, not after it.
+The restorer holds a trailing run of text back until the stream ends, so a
+short answer ("42") can reach the client only in the tail frame; classifying
+the restored bytes would miss it.
+
+### Non-streaming path
+
+`_response_has_visible_content` applies the same test to a complete
+response, so a non-streaming turn that holds only leaked reasoning is
+rejected the same way.
+
+### Verification
+
+- `tests/test_inband_thinking.py` — 16 unit tests over the tracker's tag,
+  split-frame, implied-close, stray-close, and native-reasoning rules.
+- `tests/test_tool_stream_integrity.py` — the MiniMax shapes end to end
+  through the public handler: thinking-only turn rejected, bare close
+  followed by an answer delivered, one-word answer delivered, thinking tag
+  split across frames rejected, native reasoning keeps the text visible.
+- Reverting the tracker to `saw_visible_content` fails the MiniMax tests.
+- Full offline suite: 2124 passed, 8 skipped.
 
 ## Scope notes
 
