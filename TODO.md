@@ -20,6 +20,11 @@ streams its chain of thought in the OpenAI `content` channel instead of
 something to show; OMP moved the leaked thinking into a thinking block and
 found nothing deliverable. `tusker_gateway/inband_thinking.py` now classifies
 the content the client will actually render, using the same tag rules as OMP.
+
+Confirmed live on the deployed image against real MiniMax-M3 traffic: the
+guard rejected the turn with `reason=output_budget_exhausted` and
+`reasoning_chars=0 content_chars=7380`, and the client received a `stop`
+terminal carrying an actionable message instead of `length`.
 Full analysis, evidence and verification:
 `docs/incidents/2026-11-08-reasoning-only-length-stop.md`.
 

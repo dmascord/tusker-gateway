@@ -439,7 +439,7 @@ def _thinking_only_length_frames(text: str) -> list[bytes]:
     ]
 
 
-async def _post_stream(client, app, *, provider: str, model: str, frames):
+async def _post_stream(client, app, *, provider: str, model: str, frames, tools=()):
     """Drive one streaming request through the public handler."""
     from unittest.mock import MagicMock
 
@@ -470,6 +470,7 @@ async def _post_stream(client, app, *, provider: str, model: str, frames):
                 "messages": [{"role": "user", "content": "explain the stack"}],
                 "max_tokens": 16384,
                 "stream": True,
+                **({"tools": list(tools)} if tools else {}),
             },
             headers=HEADERS_AUTH,
         )
@@ -750,3 +751,49 @@ async def test_native_reasoning_keeps_the_text_visible(
     ]
     assert finish_reasons == ["length"], finish_reasons
     assert b"The answer is 42." in body, body[-400:]
+
+
+@pytest.mark.asyncio
+async def test_tools_sent_thinking_only_length_turn_is_rejected(
+    client, app,
+):
+    """A tools-enabled turn that only produced thinking must be rejected.
+
+    The failing route (``hermes-code``) sends a full tool catalogue, so the
+    guard has to hold on that path too: a turn that streamed only leaked
+    thinking and then stopped at ``length`` is not deliverable, and handing
+    over ``length`` starts the retry loop that ends in the client's
+    "Length-stop recovery gave up".
+    """
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read a file.",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
+        },
+    }]
+    thinking = "<think>" + ("reasoning that never ends. " * 200)
+    response, body, handled = await _post_stream(
+        client,
+        app,
+        provider="minimax",
+        model="MiniMax-M3",
+        frames=_thinking_only_length_frames(thinking),
+        tools=tools,
+    )
+
+    assert response.status == 200
+    assert handled == [("minimax", "MiniMax-M3")]
+    finish_reasons = [
+        choice.get("finish_reason")
+        for event in _read_sse_data(body)
+        for choice in event.get("choices", [])
+        if choice.get("finish_reason")
+    ]
+    assert "length" not in finish_reasons, finish_reasons
+    assert b"spent its whole output budget on reasoning" in body, body[-400:]

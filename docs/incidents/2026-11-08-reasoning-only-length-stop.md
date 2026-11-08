@@ -217,8 +217,46 @@ rejected the same way.
   through the public handler: thinking-only turn rejected, bare close
   followed by an answer delivered, one-word answer delivered, thinking tag
   split across frames rejected, native reasoning keeps the text visible.
-- Reverting the tracker to `saw_visible_content` fails the MiniMax tests.
-- Full offline suite: 2124 passed, 8 skipped.
+- `tests/test_tool_stream_integrity.py::test_tools_sent_thinking_only_length_turn_is_rejected`
+  covers the tools-enabled path, which is the shape the failing
+  `hermes-code` route actually sends (13 tools). The length guard tests
+  `has_tools`, which is frame-level (`delta.tool_calls`), so a
+  tools-requested turn that never produced a tool call still has
+  `has_tools=False` and reaches the guard. Reverting the tracker to
+  `saw_visible_content` fails this test.
+- Reverting the tracker to `saw_visible_content` fails the MiniMax tests
+  as well.
+- Full offline suite: 2125 passed, 8 skipped.
+
+### Production evidence
+
+The guard was confirmed live against the deployed image
+(`sha256:b2252f0a870f386910d8391482cea73555ae09c8abf56ae7bd0c81699e8ad7d4`,
+commit `431296e`), on real MiniMax-M3 traffic:
+
+```
+unusable tool response rejected provider=minimax model=MiniMax-M3
+  request_id=req_095bfc8b273e7810 reason=output_budget_exhausted
+  reasoning_chars=0 content_chars=7380 chunks=831
+```
+
+`reasoning_chars=0` with `content_chars=7380` is the leak in one line:
+MiniMax put its whole chain of thought in the OpenAI `content` channel.
+The gateway rejected the turn instead of forwarding the terminal.
+
+The client-visible result for the same shape is a `stop` terminal carrying
+an actionable message, never `length`:
+
+```
+data: {"delta": {"content": "The provider minimax/MiniMax-M3 spent its whole
+  output budget on reasoning without producing an answer. The output budget
+  was exhausted: ... Request ID: req_a52677d72ffb18d4."}}
+data: {"delta": {}, "finish_reason": "stop"}
+data: [DONE]
+```
+
+OMP's length-stop recovery never starts, because the turn carries text and
+the terminal is `stop`.
 
 ## Scope notes
 
