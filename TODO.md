@@ -1156,3 +1156,26 @@ instead of sending an unauthenticated request. Regression tests:
 `test_canary_rotator_adopts_expired_seat_from_store`,
 `test_canary_never_rotates_a_token_it_adopted`,
 `test_codex_expired_seat_with_store_fails_before_sending_request`.
+
+## MLX Mac capacity queue (2026-11-11)
+
+`req_670cb08d95d0f14e` surfaced as "Upstream provider capacity is unavailable"
+on `hermes-privacy`. Only one arm was the gateway's own doing: the usage
+ledger shows `mlx-mac/qwen3.8-27b` took 80 requests that day with 77 local
+capacity rejections, while the backend answered 7.1s cold and 1.7s warm.
+`CapacityController.acquire()` was fail-fast, so a third concurrent request
+never reached the Mac and the group was quarantined for 15s.
+
+Shipped: bounded FIFO admission (`TUSKER_<GROUP>_QUEUE_DEPTH` /
+`_QUEUE_WAIT_SECS`), opt-in per group; production sets depth 3 / 120s for
+`mlx-mac` only, with the attempt, request, and MLX stream-idle budgets raised
+to 420s so a queued request is not pre-empted before its first byte.
+Deployed at `1d5a611`; four concurrent direct `mlx-mac` generations all
+succeeded where two would previously have been rejected, and the original
+image-plus-tools shape answered in 8.2s.
+
+Open, not addressed by this fix: `github-copilot-enterprise` quota
+exhaustion remains an account condition the gateway cannot route around, and
+`mlx-mac/qwen3.8-27b` still carries a `no_tool_call` composite-probe verdict,
+so image-plus-tools turns select it only through the bounded recovery pass.
+See `docs/incidents/2026-11-11-mlx-mac-capacity-queue.md`.
