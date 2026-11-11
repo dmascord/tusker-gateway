@@ -115,6 +115,21 @@ All seven new tests fail against the pre-fix source. Full offline suite:
   gateway cannot route around; it only stops the pool from spending attempts on
   routes that will 429.
 
+The GHE cooldown was still in force at 09:05Z (`/health` reported `0 of 60`
+selectable candidates, `cooldown_provider: true`), so the pool depends on the
+other auto-discovered providers for image+tools traffic until the account quota
+resets. Two defects had been hiding exactly those providers, and both are now
+fixed in `ba4f53a` (see `docs/gateway-model-routing.md`, "Nested MIME modality
+shape"): the catalog did not read OpenCode Go's nested `modalities` block with
+MIME types, and pool selection folded the composite `input_image_tools`
+capability into the modality set, fabricating an `image_tools` modality that
+tripped the explicit-claim hard negative.
+
+After deploying `ba4f53a` the same image+tools privacy walk (65,470-token
+context) went from zero `opencode-go` candidates to four, and live requests
+served real image-derived tool calls on both `hermes-privacy` and
+`opencode-go/gpt-6-luna`.
+
 The composite qualification scheduler had a second-order starvation defect:
 its bounded batch ordered all stale routes from the same provider before the
 next provider. A provider-wide quota cooldown could therefore consume every

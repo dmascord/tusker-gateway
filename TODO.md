@@ -140,8 +140,14 @@ unproven and stale-record tiers, with oldest evidence first within each
 provider. Regression coverage:
 `tests/test_tool_capability.py::test_composite_probe_retries_stale_routes_fairly_across_providers`.
 
-Status: implemented and focused tests pass. Production rollout is pending; the
-live pod is still commit `1d5a611` and was not mutated by this investigation.
+Status: shipped in `ba4f53a` and deployed with it. Focused tests pass and the
+full offline suite is green (`2139 passed, 8 skipped`).
+
+Also fixed in the same session: `req_670cb08d95d0f14e` was an MLX Mac
+local-admission rejection (already deployed as `d131051`, see
+`docs/incidents/2026-11-11-mlx-mac-capacity-queue.md`), compounded by a
+GHE account-wide quota cooldown (`0 of 60` selectable, `cooldown_provider:
+true` in live `/health` at 09:0xZ) and by the catalog-shape defect below.
 
 ## Auto-discovered routes held out by catalog shape (2026-11-11)
 
@@ -165,8 +171,14 @@ inside the production pod: the image+tools privacy walk went from zero
 `opencode-go` candidates to four (`glm-5.3-flash`, `deepseek-v4.1-flash`,
 `gpt-5.6-luna`, `gpt-6-luna`).
 
-Status: implemented, full offline suite green (`2139 passed, 8 skipped`).
-Production rollout is pending; the live pod still runs commit `1d5a611`.
+Status: shipped. Full offline suite green (`2139 passed, 8 skipped`); deployed
+as commit `ba4f53a` (image digest `sha256:21ff6cc2...`), pinned in
+`k8s/deployment.yaml` by `e80822f`. `k8s/verify-provenance.sh` reports the
+tracked manifest, live Deployment, pod imageIDs, registry tag, `/health` and git
+HEAD in agreement. Live on the deployed pod: the image+tools privacy walk now
+includes four `opencode-go` routes, and both `hermes-privacy` and
+`opencode-go/gpt-6-luna` serve a real image-derived tool call
+(`report{"colour":"green"}`).
 
 
 
