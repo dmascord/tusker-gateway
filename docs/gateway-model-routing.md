@@ -507,7 +507,7 @@ the privacy pool unless an explicit deployment policy enables them.
 
 | Provider prefix | Backend | Catalog |
 |---|---|---|
-| `local-llm/` | Jetson Orin Nano Ollama, `http://10.0.0.212:11434` | `/api/tags` |
+| `local-llm/` | Jetson Orin Nano Ollama, `http://10.0.0.39:11434` | `/api/tags` |
 | `mlx-mac/` | Mac M4 Max (Ollama + MLX Metal backend), `http://10.0.0.141:11434` | `/api/tags` |
 
 Both use `/v1/chat/completions` and never substitute a gateway pool. The MLX
