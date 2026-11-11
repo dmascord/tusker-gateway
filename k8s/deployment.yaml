@@ -6,9 +6,9 @@ metadata:
   labels:
     app: tusker-gateway
   annotations:
-    tusker.net.au/commit: 431296edd48c1edba6ecea7ab0292f74fe1d46b8
-    tusker.net.au/image-tag: swarm-alpine-431296edd48c1edba6ecea7ab0292f74fe1d46b8
-    tusker.net.au/image-digest: sha256:b2252f0a870f386910d8391482cea73555ae09c8abf56ae7bd0c81699e8ad7d4
+    tusker.net.au/commit: 6e0aaaab39cf151911311c8c34a6670aa0075bee
+    tusker.net.au/image-tag: swarm-alpine-6e0aaaaa39
+    tusker.net.au/image-digest: sha256:fdfb6db3919d89b26106ce6cbde3721321648ab8f7cc1e05355dd3de7045de8e
 spec:
   replicas: 1
   selector:
@@ -34,7 +34,7 @@ spec:
       terminationGracePeriodSeconds: 90
       containers:
       - name: tusker-gateway
-        image: registry.tusker.net.au:5000/tusker-gateway@sha256:b2252f0a870f386910d8391482cea73555ae09c8abf56ae7bd0c81699e8ad7d4
+        image: registry.tusker.net.au:5000/tusker-gateway@sha256:fdfb6db3919d89b26106ce6cbde3721321648ab8f7cc1e05355dd3de7045de8e
         imagePullPolicy: Always
         envFrom:
         - secretRef:
@@ -164,7 +164,7 @@ spec:
           # Both hardware routes use Ollama's OpenAI-compatible API on the LAN.
           # Ollama itself uses Apple MLX (Metal GPU) as its inference backend,
           # so no separate mlx_lm/mlx_vlm servers are needed on the Mac.
-          value: '{"local-llm":{"kind":"local","base_url":"http://10.0.0.212:11434","chat_path":"/v1/chat/completions","models_path":"/api/tags","embed_path":"/v1/embeddings","zdr_ok":true},"mlx-mac":{"kind":"local","base_url":"http://10.0.0.141:11434","chat_path":"/v1/chat/completions","models_path":"/api/tags","embed_path":"/v1/embeddings","zdr_ok":true},"groq":{"kind":"bearer","base_url":"https://api.groq.com/openai","chat_path":"/v1/chat/completions","zdr_ok":true},"workers-ai":{"kind":"bearer","base_url":"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai","chat_path":"/v1/chat/completions","zdr_ok":true},"alibaba":{"kind":"bearer","base_url":"https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode","chat_path":"/v1/chat/completions","zdr_ok":false},"apim":{"kind":"api_key","base_url":"https://mcoeapim.azure-api.net/foundry/openai/v1","chat_path":"/chat/completions","auth_env":"PROVIDER_APIM_API_KEY","api_key_header":"api-key","models_path":"/models","catalog_models":["gpt-5.6-luna","gpt-6-luna"],"zdr_ok":true}}'
+          value: '{"local-llm":{"kind":"local","base_url":"http://10.0.0.39:11434","chat_path":"/v1/chat/completions","models_path":"/api/tags","embed_path":"/v1/embeddings","zdr_ok":true},"mlx-mac":{"kind":"local","base_url":"http://10.0.0.141:11434","chat_path":"/v1/chat/completions","models_path":"/api/tags","embed_path":"/v1/embeddings","zdr_ok":true},"groq":{"kind":"bearer","base_url":"https://api.groq.com/openai","chat_path":"/v1/chat/completions","zdr_ok":true},"workers-ai":{"kind":"bearer","base_url":"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai","chat_path":"/v1/chat/completions","zdr_ok":true},"alibaba":{"kind":"bearer","base_url":"https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode","chat_path":"/v1/chat/completions","zdr_ok":false},"apim":{"kind":"api_key","base_url":"https://mcoeapim.azure-api.net/foundry/openai/v1","chat_path":"/chat/completions","auth_env":"PROVIDER_APIM_API_KEY","api_key_header":"api-key","models_path":"/models","catalog_models":["gpt-5.6-luna","gpt-6-luna"],"zdr_ok":true}}'
         - name: TUSKER_AUTO_CATALOG_EXCLUDED_PROVIDERS
           value: nvidia
         # Do not poll provider catalogs that are intentionally unavailable or
