@@ -104,7 +104,7 @@ items:
           - name: TUSKER_COPILOT_BUSINESS
             value: 'true'
           - name: PROVIDER_REGISTRY_JSON
-            value: '{"local-llm":{"kind":"local","base_url":"http://10.0.0.39:11434","chat_path":"/v1/chat/completions","models_path":"/api/tags","zdr_ok":true},"mlx-mac":{"kind":"local","base_url":"http://10.0.0.141:11435","chat_path":"/v1/chat/completions","models_path":"/v1/models","zdr_ok":true,"model_aliases":{"qwen3-coder-30b-a3b-instruct-4bit":"/Users/tusker/models/Qwen3-Coder-30B-A3B-Instruct-4bit"}}}'
+            value: '{"local-llm":{"kind":"local","base_url":"http://10.0.0.212:11434","chat_path":"/v1/chat/completions","models_path":"/api/tags","zdr_ok":true},"mlx-mac":{"kind":"local","base_url":"http://10.0.0.141:11435","chat_path":"/v1/chat/completions","models_path":"/v1/models","zdr_ok":true,"model_aliases":{"qwen3-coder-30b-a3b-instruct-4bit":"/Users/tusker/models/Qwen3-Coder-30B-A3B-Instruct-4bit"}}}'
           - name: TUSKER_AUTO_CATALOG_EXCLUDED_PROVIDERS
             value: nvidia
           - name: TUSKER_CATALOG_DISABLED_PROVIDERS
