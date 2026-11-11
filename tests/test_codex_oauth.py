@@ -1182,3 +1182,44 @@ async def test_canary_never_rotates_a_token_it_adopted(
     assert "prod-refresh" in rotator._initial_refresh_tokens
     assert rotator._canary_skip_rotation(rotator._creds[0]) is True
     refresh.assert_not_awaited()
+
+
+async def test_admin_reset_clears_refresh_failure_cooldown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The operator reset must clear the permanent refresh cooldown too.
+
+    ``reset-cooldown`` cleared only the quota-fingerprint map, so a seat
+    cooled down by ``refresh_token_reused`` stayed unusable for 24h after the
+    operator re-enrolled it elsewhere.
+    """
+    import tusker_gateway.codex_oauth as codex_oauth
+    from tusker_gateway.codex_oauth import CodexOAuthError
+    from tusker_gateway.passthrough import CodexTokenRotator
+
+    refresh = AsyncMock(
+        side_effect=CodexOAuthError(
+            "Codex OAuth refresh rejected", status=401, code="refresh_token_reused"
+        )
+    )
+    monkeypatch.setattr(codex_oauth, "refresh_codex_token", refresh)
+
+    rotator = CodexTokenRotator(
+        [
+            {
+                "label": "codex-1",
+                "access_token": "expired-access",
+                "refresh_token": "dead-refresh",
+                "expires_at_ms": int((time.time() - 60) * 1000),
+            }
+        ],
+        http_client=object(),
+        provider="openai-codex",
+    )
+    rotator._persist = MagicMock()
+
+    assert await rotator.get_token() is None
+    assert rotator._refresh_failed_until.get(0, 0.0) > time.time() + 3600
+
+    assert rotator.clear_credential_cooldown("codex-1") is True
+    assert 0 not in rotator._refresh_failed_until

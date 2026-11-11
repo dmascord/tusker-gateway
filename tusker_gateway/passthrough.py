@@ -1306,6 +1306,10 @@ class CodexTokenRotator:
             for key in keys:
                 if key:
                     self._credential_cooldowns.pop(key, None)
+            # An operator reset must also clear the refresh-failure cooldown,
+            # otherwise a seat skipped for a permanent OAuth error stays
+            # unusable for up to 24h after the operator fixed it.
+            self._refresh_failed_until.pop(index, None)
             return True
         return False
 
