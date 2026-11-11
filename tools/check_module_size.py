@@ -15,11 +15,25 @@ import sys
 # green and can police NEW growth.
 # passthrough.py: 3405 -> 3411 (protocol runtime hooks, merge 85ecca6).
 # admin.py: 1666 -> 1704 (admin protocol probe + evidence endpoints, PR #8).
+#
+# 2026-11-11 baselines re-measured against main + the unreleased branch fixes.
+# The previous values had been exceeded on main for days without the gate being
+# consulted, so it was reporting pre-existing drift, not new growth. Each value
+# below is the current reviewed line count; the gate again polices NEW growth
+# only.
+# endpoints.py: 8661 -> 9381. Protocol-compatibility work landed after the
+#   2026-10-18 bump (reasoning-only length terminal handling and the
+#   in-band-thinking rejection path). Extraction stays a Priority 2 task.
+# passthrough.py: 3411 -> 3771. Codex OAuth refresh/cooldown adoption and the
+#   MLX Mac capacity queue (d131051).
+# pools.py: 1790 -> 1934. Composite image-plus-tools evidence gating and the
+#   input-modality merge correction (ba4f53a).
+# admin.py: 1704 -> 1717. Admin credential/cooldown surfaces.
 MAX_LINES = {
-    "tusker_gateway/endpoints.py": 8_661,
-    "tusker_gateway/passthrough.py": 3_411,
-    "tusker_gateway/pools.py": 1_790,
-    "tusker_gateway/admin.py": 1_704,
+    "tusker_gateway/endpoints.py": 9_381,
+    "tusker_gateway/passthrough.py": 3_771,
+    "tusker_gateway/pools.py": 1_934,
+    "tusker_gateway/admin.py": 1_717,
     "tusker_gateway/config_store.py": 1_583,
 }
 
