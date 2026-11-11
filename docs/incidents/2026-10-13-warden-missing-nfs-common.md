@@ -60,3 +60,15 @@ rollout completed. No pod deletion, cordon, or manual reschedule was needed.
   v1.12.1 (`allow-instance-manager-automatic-upgrade: false`,
   `concurrent-automatic-engine-upgrade-per-node-limit: 0`). Engine upgrade is a
   separate, planned decision.
+
+## Live version audit (2026-11-06)
+
+The engine-version statement above is stale. Live Longhorn now has only
+`ei-2f3240cb` (`longhorn-engine:v1.13.0`) deployed, with refcount 174; the
+degraded attached volumes inspected on 2026-11-06 also specify v1.13.0. The
+current Longhorn manager/chart is v1.13.0, while the stored
+`latest-longhorn-version` and stable-version list still report v1.12.1. The
+history and intended engine upgrade are unknown. This mismatch is being
+investigated alongside the storage incident in
+`docs/incidents/2026-11-06-longhorn-storage-instability.md`; do not rely on the
+older statement above when planning an engine or control-plane change.

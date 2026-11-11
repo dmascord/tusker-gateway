@@ -63,14 +63,18 @@ also showed unrelated Kubernetes API/node-readiness query errors (`DNS` and an
 uninitialized `nodes` variable) while still printing `All checks passed`; those
 checker defects should be fixed before treating it as a reliable alert.
 
-## Current result and scheduling gate
+## Current result and scheduling policy
 
-`wynk` continues to use its internal `/srv/data` Longhorn disk. The USB disk is
-registered for health observation only. No replica is scheduled on it. The
-recovery agent can remount and validate the path after a drop, but automatic
-recovery is not evidence that the USB device is safe for replicas.
+The disk remains registered for health observation and replica placement. The
+operator policy permits scheduling when the recorded SMART evidence is healthy
+and Longhorn reports the disk `Ready=True`. During the 2026-11-06 Longhorn
+incident investigation, live evidence met that bar: the Samsung 990 EVO Plus
+reported `PASSED`, 0% used, zero media/data-integrity errors, and zero
+error-log entries; Longhorn reported `Ready=True`. The live gate was therefore
+confirmed as `allowScheduling=true` with `evictionRequested=false`.
 
-Do not set `allow_scheduling_after_recovery` to true until a defined soak
-period completes without USB disconnects or ext4/JBD2 I/O errors. The visor
-USB monitor does not cover this disk; the disk is on `wynk` and requires
-wynk-local monitoring.
+Existing replicas were intentionally left in place; no filesystem operation,
+replica eviction, rebuild, or deletion was performed. The disk-health CronJob
+does not prove full Longhorn data-path integrity, and the current degraded
+volume investigation remains separate. Continue wynk-local monitoring for USB
+disconnects and ext4/JBD2 I/O errors; disable scheduling if those checks fail.

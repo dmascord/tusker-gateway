@@ -1,0 +1,163 @@
+# Dedicated PostgreSQL for Hindsight memory state.
+# The password and DATABASE_URL are supplied by the separately-created
+# hindsight-postgres-auth Secret; no credentials belong in this repository.
+apiVersion: v1
+kind: Service
+metadata:
+  name: hindsight-postgres
+  namespace: hindsight
+  labels:
+    app: hindsight-postgres
+spec:
+  ports:
+  - name: postgres
+    port: 5432
+    targetPort: postgres
+  selector:
+    app: hindsight-postgres
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: hindsight-postgres-data
+  namespace: hindsight
+  labels:
+    app: hindsight-postgres
+spec:
+  accessModes:
+  - ReadWriteOnce
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 50Gi
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: hindsight-postgres
+  namespace: hindsight
+  labels:
+    app: hindsight-postgres
+spec:
+  serviceName: hindsight-postgres
+  replicas: 1
+  podManagementPolicy: OrderedReady
+  selector:
+    matchLabels:
+      app: hindsight-postgres
+  template:
+    metadata:
+      labels:
+        app: hindsight-postgres
+    spec:
+      terminationGracePeriodSeconds: 90
+      containers:
+      - name: postgres
+        image: pgvector/pgvector:pg18
+        imagePullPolicy: IfNotPresent
+        args:
+        - postgres
+        - -c
+        - listen_addresses=*
+        - -c
+        - shared_buffers=512MB
+        - -c
+        - work_mem=8MB
+        - -c
+        - effective_cache_size=2GB
+        - -c
+        - max_connections=100
+        - -c
+        - wal_level=replica
+        - -c
+        - max_wal_size=2GB
+        - -c
+        - checkpoint_completion_target=0.9
+        - -c
+        - fsync=on
+        - -c
+        - synchronous_commit=on
+        - -c
+        - full_page_writes=on
+        - -c
+        - log_min_duration_statement=1000
+        - -c
+        - log_checkpoints=on
+        - -c
+        - log_lock_waits=on
+        env:
+        - name: POSTGRES_DB
+          value: hindsight
+        - name: POSTGRES_USER
+          value: hindsight
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: hindsight-postgres-auth
+              key: POSTGRES_PASSWORD
+        - name: PGDATA
+          value: /var/lib/postgresql/data/pgdata
+        ports:
+        - name: postgres
+          containerPort: 5432
+        volumeMounts:
+        - name: postgres-data
+          mountPath: /var/lib/postgresql/data
+        readinessProbe:
+          exec:
+            command:
+            - sh
+            - -ec
+            - pg_isready -U hindsight -d hindsight
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 12
+        livenessProbe:
+          exec:
+            command:
+            - sh
+            - -ec
+            - pg_isready -U hindsight -d hindsight
+          periodSeconds: 20
+          timeoutSeconds: 3
+          failureThreshold: 6
+        lifecycle:
+          preStop:
+            exec:
+              command:
+              - sh
+              - -ec
+              - su postgres -s /bin/sh -c 'pg_ctl -D "$PGDATA" -m fast stop -t 60' || true
+        resources:
+          requests:
+            cpu: 250m
+            memory: 1Gi
+          limits:
+            cpu: 2
+            memory: 4Gi
+      volumes:
+      - name: postgres-data
+        persistentVolumeClaim:
+          claimName: hindsight-postgres-data
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-hindsight-api-to-postgres
+  namespace: hindsight
+  labels:
+    app: hindsight-postgres
+spec:
+  podSelector:
+    matchLabels:
+      app: hindsight-postgres
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: hindsight
+    ports:
+    - protocol: TCP
+      port: 5432
