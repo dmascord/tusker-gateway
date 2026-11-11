@@ -540,24 +540,49 @@ the default for other deployments remains round-robin.
 
 #### Single-concurrency capacity gate
 
-Both `local-llm` and `mlx-mac` are isolated into their own capacity groups
-(`local-llm` and `mlx-mac`) and run at
-`TUSKER_LOCAL_LLM_MAX_CONCURRENT=1` / `TUSKER_MLX_MAC_MAX_CONCURRENT=1`.
-The Jetson Orin Nano and the MLX Mac both saturate RAM and CPU while
-cold-loading a 7B-class model; queueing concurrent requests just stalls all
-of them, so the gateway fails fast to the next pool candidate (or returns
-`503 service_unavailable` with `Retry-After: 5` for explicit routes) instead
-of holding the request open while the local backend thrashes.
+`local-llm` and `mlx-mac` are isolated into their own capacity groups and run
+at `TUSKER_LOCAL_LLM_MAX_CONCURRENT=1` / `TUSKER_MLX_MAC_MAX_CONCURRENT=2`.
+Both backends saturate RAM and CPU while loading or running a model, so
+in-flight concurrency stays small; what happens to the *excess* load differs.
 
-Per-attempt idle budget for these providers is `240s` (raised via
-`TUSKER_PROVIDER_ATTEMPT_TIMEOUT_OVERRIDES_JSON={"local-llm": 240,
-"mlx-mac": 240}`). Alibaba reasoning requests use a model-specific `120s`
-override for `alibaba/qwen3.8-max`; the request deadline remains the hard cap.
-Cloud candidates still return in well under the default deadline; the longer
-budget only affects the explicitly slow routes. After a capacity failure the
-route is in capacity cooldown (`TUSKER_PROVIDER_CAPACITY_COOLDOWN_SECS=300`)
-so a hot backend can finish its current request and the gateway stops
-hammering it.
+The Jetson keeps the original fail-fast behaviour: it is an 8 GiB device with
+short requests, so a saturated `local-llm` route rejects immediately and the
+gateway falls over to the next pool candidate (or returns `503
+service_unavailable` with `Retry-After: 5` for explicit routes) instead of
+holding the request open while the backend thrashes.
+
+The MLX Mac queues. `TUSKER_MLX_MAC_QUEUE_DEPTH=3` holds up to three waiters
+in arrival order, and each freed slot goes to the oldest one. The wait is
+bounded by `TUSKER_MLX_MAC_QUEUE_WAIT_SECS` (120s); on expiry the request
+rejects like any other capacity failure, so a wedged backend still yields to
+the next candidate rather than pinning the caller's deadline.
+
+Queueing is opt-in per group (`TUSKER_<GROUP>_QUEUE_DEPTH`, default `0` =
+fail fast, and `TUSKER_<GROUP>_QUEUE_WAIT_SECS`). The rationale is measured:
+on 2026-11-11 `mlx-mac/qwen3.8-27b` recorded 77 capacity rejections across 80
+privacy-pool attempts while the model itself answered in 7.1s cold and 1.7s
+warm. Those requests were discarded work the backend would have served
+(`req_670cb08d95d0f14e` failed that way after 11 attempts). Fail-fast remains
+the default because a *cold-loading* backend that queues every request does
+stall all of them — the queue is sized for steady-state contention, not for
+loads that cannot be served at all.
+
+Per-attempt idle budget for these providers is `240s` for `local-llm` and
+`420s` for `mlx-mac` (raised via
+`TUSKER_PROVIDER_ATTEMPT_TIMEOUT_OVERRIDES_JSON`). The mlx-mac budget is
+larger because a queued request spends its slot wait before the first upstream
+byte, and the idle clock does not reset until then; the request deadline is
+`TUSKER_REQUEST_TIMEOUT_MS=420000` so that budget is reachable. Alibaba
+reasoning requests use a model-specific `120s` override for
+`alibaba/qwen3.8-max`; the request deadline remains the hard cap. Cloud
+candidates still return in well under the default deadline; the longer budget
+only affects the explicitly slow routes. After a capacity failure the route is
+in capacity cooldown (`TUSKER_PROVIDER_CAPACITY_COOLDOWN_SECS=300`) so a hot
+backend can finish its current request and the gateway stops hammering it.
+
+Queue state is visible in `/status` and `/admin/diagnostics` under
+`provider_capacity.<group>`: `active`, `limit`, `rejections`, `queued`,
+`queue_depth`, `queue_wait_timeouts`.
 
 The attempt budget is not the only idle timer on a stream. An upstream read
 has two more — aiohttp's `sock_read` and the SSE per-chunk budget — and a

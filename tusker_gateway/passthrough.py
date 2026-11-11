@@ -2311,12 +2311,18 @@ class PassthroughClient:
                 exc_info=True,
             )
 
-    def _reserve_capacity(
+    async def _reserve_capacity(
         self,
         provider: str,
         model: str,
     ) -> tuple[str | None, CapacityLease | None]:
-        """Reserve a local slot or fail fast for a saturated provider group."""
+        """Reserve a local slot for this request.
+
+        Groups with a configured queue depth wait in arrival order for a slot;
+        every other group keeps the original fail-fast behaviour. The wait is
+        bounded inside the controller, so a saturated backend that never frees
+        a slot still yields to the next pool candidate.
+        """
         group = capacity_group_for_route(provider, model)
         if group is None:
             return None, None
@@ -2334,7 +2340,7 @@ class PassthroughClient:
                 group=group,
             )
             raise error
-        lease = capacity_controller().acquire(group)
+        lease = await capacity_controller().acquire_queued(group)
         if lease is None:
             # This is a local admission decision, not an upstream request.
             # Quarantine the group briefly so pool fallback moves directly to
@@ -2485,7 +2491,7 @@ class PassthroughClient:
                     ensure_ascii=False,
                 ).encode("utf-8"),
             )
-            _, capacity_lease = self._reserve_capacity(provider, model)
+            _, capacity_lease = await self._reserve_capacity(provider, model)
             try:
                 result = await adapter.chat(
                     provider=provider,
@@ -2605,7 +2611,7 @@ class PassthroughClient:
             payload=json.dumps(body).encode("utf-8"),
         )
 
-        capacity_group, capacity_lease = self._reserve_capacity(provider, model)
+        capacity_group, capacity_lease = await self._reserve_capacity(provider, model)
         start = time.monotonic()
         if stream:
             try:

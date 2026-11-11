@@ -588,12 +588,23 @@ spec:
         # alibaba/qwen3.8-max reasoning runs silent past the 45s default on
         # non-stream calls (no chunks to reset the idle clock until the full
         # completion is ready), so it gets a 120s window.
+        #
+        # mlx-mac carries 420s because a request there can now spend up to
+        # TUSKER_MLX_MAC_QUEUE_WAIT_SECS waiting for a slot before its
+        # generation starts. The queue wait happens before the first upstream
+        # byte, and the idle clock does not reset until then, so the wait and
+        # the cold TTFT draw on this one budget.
         # The request deadline caps every provider budget; other remote
         # candidates still return immediately and are not delayed.
         - name: TUSKER_REQUEST_TIMEOUT_MS
-          value: '240000'
+          value: '420000'
+        # The deadline loader clamps the default down to this value, so it
+        # must be lifted with it; leaving the 300s built-in would restore a
+        # 300s cap and pre-empt an mlx-mac request that queued.
+        - name: TUSKER_MAX_REQUEST_TIMEOUT_MS
+          value: '600000'
         - name: TUSKER_PROVIDER_ATTEMPT_TIMEOUT_OVERRIDES_JSON
-          value: '{"local-llm": 240, "mlx-mac": 240, "zai": 90, "opencode-go": 90, "kilo-cli": 120, "alibaba/qwen3.8-max": 120, "ollama-cloud": 180, "synthetic": 180}'
+          value: '{"local-llm": 240, "mlx-mac": 420, "zai": 90, "opencode-go": 90, "kilo-cli": 120, "alibaba/qwen3.8-max": 120, "ollama-cloud": 180, "synthetic": 180}'
         # Real context windows of servers whose window differs from the pool
         # default (keys: provider or provider/model; ":latest" optional).
         # Ollama ignores num_ctx on /v1, so this must track the host config:
@@ -609,18 +620,35 @@ spec:
         # Per-provider streaming per-chunk idle budget overrides (seconds).
         # xiaomi/mimo large contexts regularly exceed the default 120s wall
         # clock — extend the per-chunk budget so streaming generation completes
-        # without an artificial kill mid-response.
+        # without an artificial kill mid-response. mlx-mac's entry keeps its
+        # socket idle window equal to its 420s attempt budget so neither timer
+        # pre-empts the other.
         - name: TUSKER_PROVIDER_STREAM_TIMEOUT_OVERRIDES_JSON
-          value: '{"xiaomi": 600, "ollama-cloud": 300, "synthetic": 300}'
-        # Single-request worker budgets on local backends. Cold-loading a
-        # 7B-class model on the Jetson or MLX Mac saturates RAM and CPU;
-        # queueing concurrent requests just stalls all of them. The gateway
-        # fails fast to the next pool candidate instead of holding the
-        # request open while the local backend thrashes.
+          value: '{"xiaomi": 600, "ollama-cloud": 300, "synthetic": 300, "mlx-mac": 420}'
+        # Local backend worker budgets. Cold-loading a 7B-class model on the
+        # Jetson or MLX Mac saturates RAM and CPU, so in-flight concurrency
+        # stays small and the rest of the load waits instead of thrashing.
+        #
+        # The Jetson still fails fast: it is a single 8 GiB device whose
+        # requests are short, and a queue there would only add latency.
+        #
+        # The MLX Mac queues up to TUSKER_MLX_MAC_QUEUE_DEPTH waiters in
+        # arrival order and hands each freed slot to the oldest one. Before
+        # queueing, 77 of 80 privacy-pool attempts against qwen3.8-27b were
+        # rejected locally as "provider capacity unavailable" while the model
+        # itself answered in 7.1s cold and 1.7s warm (2026-11-11,
+        # req_670cb08d95d0f14e): the gateway was discarding work the backend
+        # would have served. The wait is bounded by
+        # TUSKER_MLX_MAC_QUEUE_WAIT_SECS so a wedged backend still yields to
+        # the next pool candidate rather than holding the request.
         - name: TUSKER_LOCAL_LLM_MAX_CONCURRENT
           value: '1'
         - name: TUSKER_MLX_MAC_MAX_CONCURRENT
           value: '2'
+        - name: TUSKER_MLX_MAC_QUEUE_DEPTH
+          value: '3'
+        - name: TUSKER_MLX_MAC_QUEUE_WAIT_SECS
+          value: '120'
         # Default to Pro (3) to avoid 429 "too many concurrent requests" while
         # still allowing reasonable parallelism.
         - name: TUSKER_OLLAMA_CLOUD_MAX_CONCURRENT
