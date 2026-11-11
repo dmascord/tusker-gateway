@@ -1,6 +1,87 @@
 # Project TODOs
 
 
+## Reasoning-only `length` turns (2026-11-07, 2026-11-08)
+
+Fixed, twice. A reasoning-heavy candidate spent the client's whole 120-token output
+budget on reasoning and stopped with `finish_reason=length` and no visible
+text. The gateway forwarded that dead terminal, and OMP retried the
+identical request three times before raising "Length-stop recovery gave up".
+
+The gateway now rejects a `length` terminal that carries no visible output
+or tool call, so the client receives an actionable error instead of a
+terminal it cannot recover from, and the reasoning-model floor now covers the
+DeepSeek V4 family and five other models confirmed in production logs to
+stream a reasoning channel.
+
+The same error recurred on 2026-11-08 against `minimax/MiniMax-M3`, which
+streams its chain of thought in the OpenAI `content` channel instead of
+`reasoning_content`. The gateway saw "content" and concluded the client had
+something to show; OMP moved the leaked thinking into a thinking block and
+found nothing deliverable. `tusker_gateway/inband_thinking.py` now classifies
+the content the client will actually render, using the same tag rules as OMP.
+
+Confirmed live on the deployed image against real MiniMax-M3 traffic: the
+guard rejected the turn with `reason=output_budget_exhausted` and
+`reasoning_chars=0 content_chars=7380`, and the client received a `stop`
+terminal carrying an actionable message instead of `length`.
+Full analysis, evidence and verification:
+`docs/incidents/2026-11-08-reasoning-only-length-stop.md`.
+
+
+## Longhorn registry recovery (2026-11-06)
+
+The registry pod and API are available. The registry Longhorn volume is
+`attached/healthy` with two `RW` replicas on `wanderer` and `warlock`; the
+extra `WO` replica on `wraith` remains Longhorn-managed and is rebuilding,
+currently at 99% and still in progress. The Nov 1 registry backup remains
+preserved. No replica, snapshot, volume, PVC, backup, or replica count was
+manually changed.
+
+The kubelet pull failure was a node DNS/configuration split, not a registry
+filesystem failure. A durable `registry-host-pin.service` and
+`registry-host-pin.sh` were installed and enabled on all 11 nodes. Fleet
+verification reported `enabled active` and
+`registry.tusker.net.au -> 10.103.195.90` on every node. Forced-placement
+`imagePullPolicy: Always` checks succeeded on all five previously affected
+nodes: `warlock`, `wraith`, `wanderer`, `wisp`, and `warden`.
+
+The live gateway Service selector was restored from the temporary canary
+selector to `app=tusker-gateway`, matching `k8s/service.yaml`. Production
+`/health`, `/ready`, and the Service path returned `200` after the cutover.
+
+The Longhorn RPC/rebuild instability was traced to Calico pod-to-pod traffic
+hairpinning through `10.0.0.1` because node-to-node mesh was disabled. The
+durable manifest and live setting now have `nodeToNodeMeshEnabled: true`;
+measured pod RTT/loss improved from 105–148 ms/10% loss to 0.3–2.0 ms/0%,
+and rebuild throughput improved from 1.45 to 25.5 MB/s. The live mesh remains
+enabled, all instance-manager pods are Ready, and no new registry-specific
+RPC failure was observed during the final check.
+
+Release review found no stable `v1.13.1` or `v1.12.2` release. The only
+available newer 1.12 artifact is `v1.12.2-rc4`, explicitly marked unsupported
+for upgrades. No Longhorn upgrade or downgrade was attempted. The supported
+rollout plan is: preserve/verify backups, wait for the registry WO rebuild to
+finish, confirm a stable release bundles the status-RPC retry fix, canary the
+Longhorn control-plane release during a maintenance window, then roll engines
+with `scripts/maintenance/longhorn-live-upgrade-roll.sh` one volume at a time
+and verify every affected volume plus registry pulls.
+
+Open: observe the extra `WO` replica to completion/reconciliation and retain
+the supported-release watch. Do not force-detach, delete replicas, alter
+replica counts, or change Longhorn retry/concurrency settings.
+
+
+## Hindsight memory startup failure (2026-11-06)
+
+Resolved operationally. A live-only `HINDSIGHT_API_DATABASE_URL` override pointed
+the embedded-pg0 Hindsight deployment at fixed `127.0.0.1:5432`, causing startup
+migrations to fail. Removed the override; the `hindsight-data` PVC and image were
+untouched. Hindsight returned to `Database: pg0`, reached `1/1 Ready`, and the
+gateway pod reached the cluster-internal `/health` route. Full evidence and the
+configuration guardrail are in `docs/incidents/2026-11-06-hindsight-memory-startup.md`.
+
+
 ## Codex seat enrollment after identity fix (2026-11-01)
 
 `CodexTokenRotator` no longer identifies a seat by `account_id` (the ChatGPT
@@ -49,28 +130,62 @@ served Ollama Cloud models now resolve image input, and the local
 privacy pool has Ollama and MLX routes available while the GHE credential
 is in cooldown.
 
+## Composite qualification starvation (2026-11-11)
+
+The bounded image-plus-tools qualification batch could spend every cycle on
+stale routes from one provider (notably GHE while its account quota was in a
+3600-second cooldown), leaving other auto-discovered privacy routes without
+evidence. `_interleave_probe_candidates` now interleaves providers in both the
+unproven and stale-record tiers, with oldest evidence first within each
+provider. Regression coverage:
+`tests/test_tool_capability.py::test_composite_probe_retries_stale_routes_fairly_across_providers`.
+
+Status: shipped in `ba4f53a` and deployed with it. Focused tests pass and the
+full offline suite is green (`2139 passed, 8 skipped`).
+
+Also fixed in the same session: `req_670cb08d95d0f14e` was an MLX Mac
+local-admission rejection (already deployed as `d131051`, see
+`docs/incidents/2026-11-11-mlx-mac-capacity-queue.md`), compounded by a
+GHE account-wide quota cooldown (`0 of 60` selectable, `cooldown_provider:
+true` in live `/health` at 09:0xZ) and by the catalog-shape defect below.
+
+## Auto-discovered routes held out by catalog shape (2026-11-11)
+
+Two independent defects kept `opencode-go` and other auto-discovered routes out
+of every image request even though those providers advertise image input:
+
+1. `tusker_gateway/catalog.py` never read `modalities: {input: [...], output:
+   [...]}`, the shape OpenCode Go publishes, and it did not understand MIME
+   entries (`image/jpeg`, `video/mp4`). A route whose own catalog states image
+   support parsed as modality-unknown.
+2. `tusker_gateway/pools.py` folded the composite `input_image_tools`
+   capability into the modality set, producing a bogus `image_tools` modality.
+   That non-empty set then tripped the "explicit claim" hard negative, so a
+   passing `input_image` probe no longer admitted the route.
+
+Regression coverage:
+`tests/test_catalog.py::test_catalog_capability_helpers_read_nested_mime_modalities`
+and `tests/test_pools.py::test_composite_evidence_does_not_become_input_modality`
+(both fail against the pre-fix source). Measured on the live catalog snapshot
+inside the production pod: the image+tools privacy walk went from zero
+`opencode-go` candidates to four (`glm-5.3-flash`, `deepseek-v4.1-flash`,
+`gpt-5.6-luna`, `gpt-6-luna`).
+
+Status: shipped. Full offline suite green (`2139 passed, 8 skipped`); deployed
+as commit `ba4f53a` (image digest `sha256:21ff6cc2...`), pinned in
+`k8s/deployment.yaml` by `e80822f`. `k8s/verify-provenance.sh` reports the
+tracked manifest, live Deployment, pod imageIDs, registry tag, `/health` and git
+HEAD in agreement. Live on the deployed pod: the image+tools privacy walk now
+includes four `opencode-go` routes, and both `hermes-privacy` and
+`opencode-go/gpt-6-luna` serve a real image-derived tool call
+(`report{"colour":"green"}`).
+
+
+
 ## Privacy image-plus-tools fallback hardening (2026-10-27)
 
 - Pool-selection exhaustion diagnostics now identify maintenance qualification scans separately from live request routing.
 - Added regression coverage proving an image-plus-tools capacity failure preserves both constraints while rotating to the next candidate.
-- Remaining operational review: confirm ZDR eligibility for excluded Ollama Cloud/Codex routes before changing privacy policy.
-
-## Engineering review remediation (2026-10-16)
-
-### Priority 0: restore a clean deterministic suite
-
-- [ ] Resolve `TestIdempotency.test_deadline_cancellation_releases_processing_claim`. The cancellation can occur while a non-cancellable worker-thread database operation is in flight. The fix must cover claim acquisition, lease renewal and abandonment for SQLite and PostgreSQL without delaying an unrelated 504 indefinitely.
-- [ ] Run the complete deterministic suite on Python 3.11 and 3.12 and retain the 50 slowest-test report added to CI.
-- [ ] Investigate `test_sync_zero_seed_ttl_disables_retention`, which was active when the review run exceeded its execution window. Confirm whether it is slow, blocked or merely the interruption point.
-- [ ] Make required CI checks and branch protection explicit for `main`.
-- [ ] Make OpenCode CLI adapter tests hermetic. Seven warm-service tests currently fail when the `opencode` executable is absent, despite using mocked warm-service behaviour; either mock executable discovery consistently or mark true runtime integration tests explicitly.
-
-### Priority 1: protocol and streaming correctness
-
-- [ ] Add state-machine coverage for fragmented tool names/arguments, mixed reasoning and tool content, failover before first byte, failure after first byte, incomplete streams, duplicate tool results and provider finish-reason disagreements.
-- [ ] Define one shared timeout budget across qualification, candidate selection, provider attempts, fallback and persistence cleanup.
-- [ ] Document which failures permit fallback and prove that no provider splice occurs after client-visible output.
-
 ### Priority 2: architecture hotspots
 
 - [ ] Follow `docs/architecture-remediation-roadmap.md`; do not rewrite the gateway wholesale.
@@ -638,12 +753,20 @@ python3 -m pytest tests/ -p no:cacheprovider --ignore=tests/test_passthrough_pro
   different encryption key than the existing rows were encrypted with —
   this permanently bricks the row.
 
-## Longhorn disk `usb-longhorn` on node `wynk` soak test
+## Longhorn disk `usb-longhorn` on node `wynk`
 
-The USB disk was re-registered on 2026-09-12 as an unschedulable Longhorn
-disk. The host auto-recovery agent is active and the disk-health CronJob is
-running every five minutes. No filesystem repair or formatting was performed;
-no replica is scheduled on this disk.
+The operator policy is to allow scheduling on USB disks that pass the recorded
+SMART and current Longhorn readiness checks. On 2026-11-06, `usb-longhorn` had
+drifted to scheduling enabled and was reviewed rather than quarantined: the
+Samsung 990 EVO Plus SMART record was `PASSED` with zero media/data-integrity
+and error-log entries, Longhorn reported `Ready=True`, and the live gate was
+restored/confirmed as `allowScheduling=true` with `evictionRequested=false`.
+Existing replicas were not evicted or rebuilt.
+
+This does not make the disk or its volumes proven healthy. The disk-health
+CronJob covers node/disk health, not full Longhorn data-path integrity. The
+current degraded-volume investigation and host-side I/O/network correlation
+remain separate work.
 
 ### Soak items
 
@@ -656,7 +779,11 @@ no replica is scheduled on this disk.
 - [x] Fix and deploy the disk-health checker so Kubernetes API failures fail
       the job instead of printing a false success.
 - [ ] Complete a sustained soak without USB disconnects or ext4/JBD2 I/O
-      errors before enabling Longhorn scheduling.
+      errors while scheduling remains enabled.
+- [x] Review and confirm the scheduling gate after the 2026-11-06 drift,
+      without evicting existing replicas.
+- [ ] Decide and execute, with owner approval and backup evidence, migration
+      or eviction of existing USB-disk replicas.
 - [x] Document the current soak status under
       `docs/incidents/2026-09-12-wynk-usb-disk.md`.
 
@@ -664,8 +791,10 @@ no replica is scheduled on this disk.
 
 - `/dev/sdb1` is mounted read-write at `/mnt/kubelet`; ext4 reported `clean`.
 - `/mnt/kubelet/longhorn/longhorn-disk.cfg` exists with `state: "ready"`.
-- Longhorn reports `Ready=True`; `storageScheduled=0`.
-- `allowScheduling=false` remains the explicit safety gate.
+- Longhorn reports `Ready=True`; the disk's `allowScheduling=true` gate is
+  confirmed under the SMART-healthy USB policy and `evictionRequested=false`.
+- Existing USB-disk replicas remain listed by Longhorn, including the
+  registry replica; the gate does not evict them.
 - The local recovery agent is `active`, state `MONITORING`.
 - The corrected health job reports real failures; its latest run caught a
   transient DNS/API failure instead of falsely passing.
@@ -673,8 +802,13 @@ no replica is scheduled on this disk.
 ### Destructive actions (require confirmation)
 
 - Any filesystem-level change to `/mnt/kubelet/longhorn` on `wynk`.
-- Enabling scheduling on this USB disk before the soak period completes.
+- Disabling scheduling or changing recovery policy without recording the
+  SMART/Longhorn evidence and operator decision.
+- Evicting/migrating existing replicas without workload-owner and backup
+  evidence.
 - Removing the disk entry again or deleting the Longhorn node registration.
+
+
 
 ## 2026-09-14 audit findings (revisited 2026-09-22)
 
@@ -1050,3 +1184,50 @@ Source changes (`tusker_gateway/endpoints.py`,
 
 Historical note: Gap C and Gap D are implemented. Capability enforcement
 remains disabled unless `TUSKER_MEDIA_CAPABILITY_GATE_ENABLED=true`.
+
+## Codex OAuth refresh reliability (2026-11-11)
+
+Automatic token refresh failed in a way that left the whole Codex pool dead
+while the database held live credentials. Two gates treated the per-process
+refresh-failure cooldown as if it also forbade reading the store:
+
+- `CodexTokenRotator.has_available_credential()` excluded any expired seat with
+  an active `_refresh_failed_until` entry, so the request path raised
+  `oauth_credential_unavailable` before `get_token()` could adopt.
+- `get_token()` ran `_maybe_adopt_from_store()` only when `retry_at <= now`,
+  so a permanent (>24h) cooldown skipped the store read entirely.
+- The canary branch skipped an expired seat without ever reading the store, and
+  an adopted token was never added to the canary skip set.
+
+Fixed: adoption now runs for every near-expiry entry ahead of all skip
+policies, the cooldown gates only the OAuth round-trip, adopted tokens join the
+canary skip set, and the request path fails fast when adoption yields no token
+instead of sending an unauthenticated request. Regression tests:
+`test_rotator_adopts_store_credential_while_refresh_cooldown_active`,
+`test_has_available_credential_allows_adoption_during_refresh_cooldown`,
+`test_canary_rotator_adopts_expired_seat_from_store`,
+`test_canary_never_rotates_a_token_it_adopted`,
+`test_codex_expired_seat_with_store_fails_before_sending_request`.
+
+## MLX Mac capacity queue (2026-11-11)
+
+`req_670cb08d95d0f14e` surfaced as "Upstream provider capacity is unavailable"
+on `hermes-privacy`. Only one arm was the gateway's own doing: the usage
+ledger shows `mlx-mac/qwen3.8-27b` took 80 requests that day with 77 local
+capacity rejections, while the backend answered 7.1s cold and 1.7s warm.
+`CapacityController.acquire()` was fail-fast, so a third concurrent request
+never reached the Mac and the group was quarantined for 15s.
+
+Shipped: bounded FIFO admission (`TUSKER_<GROUP>_QUEUE_DEPTH` /
+`_QUEUE_WAIT_SECS`), opt-in per group; production sets depth 3 / 120s for
+`mlx-mac` only, with the attempt, request, and MLX stream-idle budgets raised
+to 420s so a queued request is not pre-empted before its first byte.
+Deployed at `1d5a611`; four concurrent direct `mlx-mac` generations all
+succeeded where two would previously have been rejected, and the original
+image-plus-tools shape answered in 8.2s.
+
+Open, not addressed by this fix: `github-copilot-enterprise` quota
+exhaustion remains an account condition the gateway cannot route around, and
+`mlx-mac/qwen3.8-27b` still carries a `no_tool_call` composite-probe verdict,
+so image-plus-tools turns select it only through the bounded recovery pass.
+See `docs/incidents/2026-11-11-mlx-mac-capacity-queue.md`.

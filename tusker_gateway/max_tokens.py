@@ -35,6 +35,12 @@ _REASONING_SLUGS: tuple[str, ...] = (
     # DeepSeek
     "deepseek-r1",
     "-r1",  # catch-all for R1 variants
+    # DeepSeek V4 family (V4, V4.1-Flash, ...): streams reasoning deltas
+    # before the answer. hf:deepseek-ai/DeepSeek-V4.1-Flash-1017 spent a
+    # 120-token OMP caption cap entirely on reasoning (2026-11-07), ending
+    # in finish_reason=length with no text, which OMP retried until
+    # "Length-stop recovery gave up".
+    "deepseek-v4",
     # Anthropic (extended thinking by default)
     "claude-opus",
     # Google (thinking models)
@@ -49,6 +55,16 @@ _REASONING_SLUGS: tuple[str, ...] = (
     # response budget, which surfaced as silent empty turns on
     # ollama-cloud/glm-5.3-flash in 2026-10-16 captures.
     "glm",
+    # Models confirmed to stream a reasoning channel in production gateway
+    # logs (tool diagnostics `fields=reasoning_content`). Each one can burn
+    # a small client output budget entirely on reasoning and stop with
+    # finish_reason=length and no visible text, which is the 2026-11-07
+    # "Length-stop recovery gave up" failure.
+    "kimi-k3",  # synthetic/hf:moonshotai/Kimi-K3.1-Pro
+    "claude-fable",  # mlx-mac/shirdel-coder-9b-claude-fable-5:*
+    "ornith",  # mlx-mac/ornith-1.5:35b
+    "gemma4",  # ollama-cloud/gemma4:31b
+    "beam",  # ollama-cloud/beam
 )
 
 _REASONING_RE = re.compile(

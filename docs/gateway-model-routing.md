@@ -73,7 +73,14 @@ A model is **heavyweight** when *either*:
 
 1. Its slug is in `tusker_gateway.heavyweight.HEAVYWEIGHT_SLUG_OVERRIDES`, or
 2. Its pricing (per 1M tokens) exceeds `cost_input >= $1` OR `cost_output >= $3`
-   AND pricing data is available from models.dev.
+   AND pricing data is available from models.dev or the provider's pricing
+   overlay.
+
+**Tagged variants inherit their base slug's classification.** A slug such as
+`deepseek-v4-pro:0813` is matched against the override set by its base
+(`deepseek-v4-pro`) as well as the full string, so a dated or platform-tagged
+build of a heavy model cannot slip past the gate. Cheap bases stay cheap:
+`deepseek-v4-flash:0731`, `glm-5.3-flash` and `gemma4:31b` are not heavy.
 
 | Family | Heavy slugs |
 |---|---|
@@ -84,17 +91,35 @@ A model is **heavyweight** when *either*:
 | Other | `mistral-large-3:675b`, `deepseek-v4-pro` |
 | Synthetic.new (usage-heavy) | `Kimi-K3`, `syn:large:vision` |
 | Ollama Cloud (usage-heavy) | `kimi-k2.6`, `kimi-k2.7-code`, `kimi-k3` |
+
 **Ollama Cloud pricing overlay.** Neither ollama's `/v1/models` payload nor
 models.dev carries cost data for ollama-cloud, so pricing-based detection
 would classify every model as cheap. `OLLAMA_CLOUD_PRICING`
 (`tusker_gateway/catalog.py`) overlays ollama.com's published per-1M-token
-prices onto catalog entries. Under the $1/$3 thresholds this marks
-`glm-5.1`, `glm-5.2`, `glm-5.3`, `kimi-k2.6`, `kimi-k2.7-code`, `kimi-k3`, and
-`nemotron-3-ultra` heavyweight by pricing. Slug entries also cover
-`kimi-k2.6`, `kimi-k2.7-code`, `kimi-k3` (synthetic), and `Kimi-K3` so static
-pool lists (no cost data) stay filtered. `glm-5.3-flash`, `deepseek-v4-flash`,
-and the cheap minimax variants stay cheap-tier. Slugs with no published price
-stay non-heavyweight (conservative default).
+prices onto catalog entries.
+
+The overlay stores **peak** rates, not off-peak rates. Ollama applies off-peak
+pricing outside 12:00-18:00 UTC on weekdays and all day on weekends, so an
+off-peak row understates what the same request costs at peak. The gate must
+see the rate a request is actually charged at the worst time of day.
+
+This matters because Ollama's "extra high usage" models are exactly the ones
+priced above $1/M in or $3/M out at peak. The overlay previously stored
+off-peak rates, which put `deepseek-v4-pro` at $0.66/$1.98 — under both
+thresholds — so it was admitted to the cheap `code` pool at weight 1.0 and
+drained the subscription's weekly allowance (reported 2026-11-07). At peak
+($1.32/$3.96) it is correctly heavy, and the slug override catches the
+`:0813` tag as well.
+
+Under the $1/$3 thresholds the overlay marks `deepseek-v4-pro`,
+`glm-5.1`, `glm-5.2`, `glm-5.3`, `kimi-k2.6`, `kimi-k2.7-code`, `kimi-k3`,
+`kimi-k3.1-pro`, `muse-spark-open` and `nemotron-3-ultra` heavyweight by
+pricing. Slug entries also cover `kimi-k2.6`, `kimi-k2.7-code`, `kimi-k3`
+(synthetic), and `Kimi-K3` so static pool lists (no cost data) stay filtered.
+`glm-5.3-flash`, `deepseek-v4-flash`, `gemma4`, `mimo-v2.6-flash`,
+`minimax-m3`, `mistral-large-3` and the cheap minimax variants stay
+cheap-tier. Slugs with no published price stay non-heavyweight (conservative
+default).
 
 **Not** in the override set (cheap-tier codex slugs):
 
@@ -482,7 +507,7 @@ the privacy pool unless an explicit deployment policy enables them.
 
 | Provider prefix | Backend | Catalog |
 |---|---|---|
-| `local-llm/` | Jetson Orin Nano Ollama, `http://10.0.0.212:11434` | `/api/tags` |
+| `local-llm/` | Jetson Orin Nano Ollama, `http://10.0.0.39:11434` | `/api/tags` |
 | `mlx-mac/` | Mac M4 Max (Ollama + MLX Metal backend), `http://10.0.0.141:11434` | `/api/tags` |
 
 Both use `/v1/chat/completions` and never substitute a gateway pool. The MLX
@@ -515,24 +540,49 @@ the default for other deployments remains round-robin.
 
 #### Single-concurrency capacity gate
 
-Both `local-llm` and `mlx-mac` are isolated into their own capacity groups
-(`local-llm` and `mlx-mac`) and run at
-`TUSKER_LOCAL_LLM_MAX_CONCURRENT=1` / `TUSKER_MLX_MAC_MAX_CONCURRENT=1`.
-The Jetson Orin Nano and the MLX Mac both saturate RAM and CPU while
-cold-loading a 7B-class model; queueing concurrent requests just stalls all
-of them, so the gateway fails fast to the next pool candidate (or returns
-`503 service_unavailable` with `Retry-After: 5` for explicit routes) instead
-of holding the request open while the local backend thrashes.
+`local-llm` and `mlx-mac` are isolated into their own capacity groups and run
+at `TUSKER_LOCAL_LLM_MAX_CONCURRENT=1` / `TUSKER_MLX_MAC_MAX_CONCURRENT=2`.
+Both backends saturate RAM and CPU while loading or running a model, so
+in-flight concurrency stays small; what happens to the *excess* load differs.
 
-Per-attempt idle budget for these providers is `240s` (raised via
-`TUSKER_PROVIDER_ATTEMPT_TIMEOUT_OVERRIDES_JSON={"local-llm": 240,
-"mlx-mac": 240}`). Alibaba reasoning requests use a model-specific `120s`
-override for `alibaba/qwen3.8-max`; the request deadline remains the hard cap.
-Cloud candidates still return in well under the default deadline; the longer
-budget only affects the explicitly slow routes. After a capacity failure the
-route is in capacity cooldown (`TUSKER_PROVIDER_CAPACITY_COOLDOWN_SECS=300`)
-so a hot backend can finish its current request and the gateway stops
-hammering it.
+The Jetson keeps the original fail-fast behaviour: it is an 8 GiB device with
+short requests, so a saturated `local-llm` route rejects immediately and the
+gateway falls over to the next pool candidate (or returns `503
+service_unavailable` with `Retry-After: 5` for explicit routes) instead of
+holding the request open while the backend thrashes.
+
+The MLX Mac queues. `TUSKER_MLX_MAC_QUEUE_DEPTH=3` holds up to three waiters
+in arrival order, and each freed slot goes to the oldest one. The wait is
+bounded by `TUSKER_MLX_MAC_QUEUE_WAIT_SECS` (120s); on expiry the request
+rejects like any other capacity failure, so a wedged backend still yields to
+the next candidate rather than pinning the caller's deadline.
+
+Queueing is opt-in per group (`TUSKER_<GROUP>_QUEUE_DEPTH`, default `0` =
+fail fast, and `TUSKER_<GROUP>_QUEUE_WAIT_SECS`). The rationale is measured:
+on 2026-11-11 `mlx-mac/qwen3.8-27b` recorded 77 capacity rejections across 80
+privacy-pool attempts while the model itself answered in 7.1s cold and 1.7s
+warm. Those requests were discarded work the backend would have served
+(`req_670cb08d95d0f14e` failed that way after 11 attempts). Fail-fast remains
+the default because a *cold-loading* backend that queues every request does
+stall all of them — the queue is sized for steady-state contention, not for
+loads that cannot be served at all.
+
+Per-attempt idle budget for these providers is `240s` for `local-llm` and
+`420s` for `mlx-mac` (raised via
+`TUSKER_PROVIDER_ATTEMPT_TIMEOUT_OVERRIDES_JSON`). The mlx-mac budget is
+larger because a queued request spends its slot wait before the first upstream
+byte, and the idle clock does not reset until then; the request deadline is
+`TUSKER_REQUEST_TIMEOUT_MS=420000` so that budget is reachable. Alibaba
+reasoning requests use a model-specific `120s` override for
+`alibaba/qwen3.8-max`; the request deadline remains the hard cap. Cloud
+candidates still return in well under the default deadline; the longer budget
+only affects the explicitly slow routes. After a capacity failure the route is
+in capacity cooldown (`TUSKER_PROVIDER_CAPACITY_COOLDOWN_SECS=300`) so a hot
+backend can finish its current request and the gateway stops hammering it.
+
+Queue state is visible in `/status` and `/admin/diagnostics` under
+`provider_capacity.<group>`: `active`, `limit`, `rejections`, `queued`,
+`queue_depth`, `queue_wait_timeouts`.
 
 The attempt budget is not the only idle timer on a stream. An upstream read
 has two more — aiohttp's `sock_read` and the SSE per-chunk budget — and a
@@ -804,6 +854,41 @@ Covered by `tests/test_catalog.py::test_catalog_capability_helpers_read_ollama_c
 `tests/test_catalog.py::test_provider_models_catalog_prefers_collection_carrying_capabilities`
 and `tests/test_pools.py::test_ollama_capability_shape_admits_image_tool_privacy_candidates`
 (which fails without the parser change).
+
+### Nested MIME modality shape (OpenCode Go)
+
+OpenCode Go publishes modalities under a nested key with MIME types instead
+of names:
+
+```json
+{"modalities": {"input": ["text", "image/jpeg", "image/png", "application/pdf"],
+                "output": ["text"]}}
+```
+
+`_advertised_modalities` read only flat `input_modalities` /
+`inputModalities` keys (and OpenRouter's `architecture` block), so this row
+parsed as modality-unknown and every OpenCode Go route was held out of image
+requests. `_modality_values` now collapses a MIME entry to its major type
+(`image/jpeg` → `image`, `video/mp4` → `video`) and keeps named modalities
+verbatim; non-media types such as `application/pdf` describe a document, not
+an input modality this gateway requires, so they are dropped.
+
+A second defect compounded it. `_model_capabilities` merged every
+`input_*` capability record into the modality set, including the composite
+`input_image_tools` contract, which produced a bogus `image_tools` modality.
+That set is then treated as the provider's explicit claim, so the
+`modality not in advertised_modalities` hard negative rejected a route whose
+composite probe had just passed. The merge now keeps only
+`INPUT_MODALITY_CAPABILITIES` (text/image/audio/video) and leaves the
+composite contract to `_image_tools_evidence_allows`.
+
+Covered by
+`tests/test_catalog.py::test_catalog_capability_helpers_read_nested_mime_modalities`
+and `tests/test_pools.py::test_composite_evidence_does_not_become_input_modality`;
+both fail against the pre-fix source. Against the live catalog snapshot, the
+image+tools privacy walk gained four OpenCode Go candidates
+(`glm-5.3-flash`, `deepseek-v4.1-flash`, `gpt-5.6-luna`, `gpt-6-luna`).
+
 
 ### Composite probe scheduling and batch composition
 

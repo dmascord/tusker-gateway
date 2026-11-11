@@ -243,3 +243,18 @@ def test_syn_large_vision_is_heavyweight_slug():
 def test_syn_small_vision_is_not_heavyweight_slug():
     """syn:small:vision is the lightweight sibling — kept in cheap pools."""
     assert is_heavyweight_slug("syn:small:vision") is False
+
+
+def test_tagged_variant_inherits_base_slug_classification():
+    """Dated/tagged builds of a heavy model are heavy (deepseek-v4-pro:0813
+    burned Ollama Cloud "extra high usage" quota through the cheap gate)."""
+    assert is_heavyweight_slug("deepseek-v4-pro:0813") is True
+    assert is_heavyweight_slug("kimi-k2.6:cloud") is True
+    # Even when pricing says cheap ($0.66/$1.98), the slug wins.
+    assert is_heavyweight("deepseek-v4-pro:0813", cost_input=0.66, cost_output=1.98) is True
+
+
+def test_tagged_variant_of_cheap_base_stays_light():
+    assert is_heavyweight_slug("deepseek-v4-flash:0731") is False
+    assert is_heavyweight_slug("glm-5.3-flash") is False
+    assert is_heavyweight_slug("gemma4:31b") is False

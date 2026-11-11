@@ -142,11 +142,11 @@ spec:
             env:
             # Keep in sync with the Dockerfile ARGs (test_cli_drift_wiring).
             - name: CLAUDE_CODE_CLI_VERSION
-              value: "2.1.301"
+              value: "2.1.319"
             - name: OPENCODE_CLI_VERSION
-              value: "2.0.30"
+              value: "2.2.6"
             - name: KILO_CLI_VERSION
-              value: "7.8.12"
+              value: "7.8.27"
             volumeMounts:
             - name: script
               mountPath: /check

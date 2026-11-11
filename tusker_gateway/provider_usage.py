@@ -7,6 +7,9 @@ without retaining request bodies or credentials.
 """
 from __future__ import annotations
 
+import asyncio
+import collections
+import logging
 import os
 import re
 import threading
@@ -16,6 +19,9 @@ from pathlib import Path
 from typing import Any
 
 from tusker_gateway.storage import shared_database
+
+logger = logging.getLogger(__name__)
+
 NVIDIA_CAPACITY_GROUP = "nvidia"
 LOCAL_LLM_CAPACITY_GROUP = "local-llm"
 MLX_MAC_CAPACITY_GROUP = "mlx-mac"
@@ -30,6 +36,15 @@ DEFAULT_SYNTHETIC_MAX_CONCURRENT = 4
 DEFAULT_CLI_MAX_CONCURRENT = 1
 DEFAULT_CAPACITY_COOLDOWN_SECS = 300.0
 DEFAULT_CAPACITY_BUSY_COOLDOWN_SECS = 2.0
+# Queued admission is opt-in per group through ``TUSKER_<GROUP>_QUEUE_DEPTH``.
+# A single-request local backend rejects far more often than it is genuinely
+# unreachable: on 2026-11-11 ``mlx-mac/qwen3.8-27b`` recorded 77 capacity
+# rejections across 80 privacy-pool attempts while the model itself answered
+# in 7.1s cold and 1.7s warm. Waiting for a slot is the right behaviour for a
+# backend that is merely busy; rejecting is right only when the wait would
+# outlast the caller's own budget.
+DEFAULT_CAPACITY_QUEUE_DEPTH = 0
+DEFAULT_CAPACITY_QUEUE_WAIT_SECS = 60.0
 _CAPACITY_HINTS = (
     "resourceexhausted",
     "worker local total request limit",
@@ -150,6 +165,35 @@ def capacity_limit(group: str) -> int:
         return default
 
 
+def capacity_queue_depth(group: str) -> int:
+    """Return how many waiters a saturated group may hold; zero disables queueing.
+
+    Queued admission trades a bounded wait for a fallback attempt. It is only
+    worth it when the backend is busy rather than broken and the caller's own
+    budget still has room, so it stays opt-in per capacity group.
+    """
+    raw = os.environ.get(
+        f"TUSKER_{group.upper().replace('-', '_')}_QUEUE_DEPTH",
+        str(DEFAULT_CAPACITY_QUEUE_DEPTH),
+    )
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return DEFAULT_CAPACITY_QUEUE_DEPTH
+
+
+def capacity_queue_wait_seconds(group: str) -> float:
+    """Return the longest a waiter may hold a queue slot before giving up."""
+    raw = os.environ.get(
+        f"TUSKER_{group.upper().replace('-', '_')}_QUEUE_WAIT_SECS",
+        str(DEFAULT_CAPACITY_QUEUE_WAIT_SECS),
+    )
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return DEFAULT_CAPACITY_QUEUE_WAIT_SECS
+
+
 @dataclass
 class CapacityLease:
     """An idempotent reservation for one provider request."""
@@ -168,25 +212,149 @@ class CapacityLease:
 
 
 class CapacityController:
-    """Process-local, fail-fast concurrency accounting by provider group."""
+    """Process-local concurrency accounting by provider group.
+
+    Admission is fail-fast by default. A group with
+    ``TUSKER_<GROUP>_QUEUE_DEPTH`` set also holds up to that many waiters in
+    arrival order, and each released slot is taken by the oldest waiter
+    instead of being handed away by ``release``. The wait is bounded by
+    ``TUSKER_<GROUP>_QUEUE_WAIT_SECS`` so a genuinely stuck backend still
+    yields to the next pool candidate.
+
+    ``_active`` is only ever incremented by a successful slot claim and only
+    decremented by ``release``. Queueing therefore cannot double-release a
+    slot, which handoff futures would have to guard against on every timeout
+    and cancellation path.
+    """
+
+    # Waiters poll rather than receive a direct handoff: a released slot is
+    # claimed by the oldest live waiter on its next tick. The ceiling keeps
+    # queue latency well under a second while a 1.7-7s local generation runs.
+    _POLL_SECS = 0.1
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._active: dict[str, int] = {}
         self._rejections: dict[str, int] = {}
+        self._waiters: dict[str, list[int]] = {}
+        self._queue_wait_timeouts: dict[str, int] = {}
+        self._next_ticket = 0
 
-    def acquire(self, group: str) -> CapacityLease | None:
-        """Reserve a slot or return ``None`` without waiting."""
-        limit = capacity_limit(group)
-        if limit <= 0:
-            return CapacityLease(self, group, counted=False)
+    def _try_take(self, group: str) -> CapacityLease | None:
+        """Claim a slot without counting a rejection when none is free."""
         with self._lock:
             active = self._active.get(group, 0)
-            if active >= limit:
-                self._rejections[group] = self._rejections.get(group, 0) + 1
+            if active >= capacity_limit(group):
                 return None
             self._active[group] = active + 1
         return CapacityLease(self, group)
+
+    def _record_rejection(self, group: str) -> None:
+        with self._lock:
+            self._rejections[group] = self._rejections.get(group, 0) + 1
+
+    def acquire(self, group: str) -> CapacityLease | None:
+        """Reserve a slot or return ``None`` without waiting."""
+        if capacity_limit(group) <= 0:
+            return CapacityLease(self, group, counted=False)
+        lease = self._try_take(group)
+        if lease is None:
+            self._record_rejection(group)
+        return lease
+
+    async def acquire_queued(self, group: str) -> CapacityLease | None:
+        """Reserve a slot, waiting in arrival order when the group is saturated.
+
+        Returns ``None`` exactly like a fail-fast rejection: queueing is
+        disabled for the group, the queue is already full, or the wait
+        outlasted the group's wait budget. An unlimited group never queues.
+        """
+        if capacity_limit(group) <= 0:
+            return CapacityLease(self, group, counted=False)
+        depth = capacity_queue_depth(group)
+        # Claim-or-enqueue is one critical section so a fresh arrival can never
+        # take a slot ahead of waiters that are already queued.
+        ticket = self._claim_or_enqueue(group, depth)
+        if isinstance(ticket, CapacityLease):
+            return ticket
+        if ticket is None:
+            self._record_rejection(group)
+            return None
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + capacity_queue_wait_seconds(group)
+        try:
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    self._record_queue_timeout(group)
+                    self._record_rejection(group)
+                    logger.info(
+                        "capacity queue wait expired group=%s waiters=%d",
+                        group,
+                        self.waiting(group),
+                    )
+                    return None
+                lease = self._take_when_head(group, ticket)
+                if lease is not None:
+                    return lease
+                await asyncio.sleep(min(self._POLL_SECS, remaining))
+        finally:
+            self._unregister_waiter(group, ticket)
+
+    def _claim_or_enqueue(
+        self, group: str, depth: int
+    ) -> "CapacityLease | int | None":
+        """Take a free slot, else queue; ``None`` when the queue is full."""
+        with self._lock:
+            active = self._active.get(group, 0)
+            if active < capacity_limit(group):
+                self._active[group] = active + 1
+                return CapacityLease(self, group)
+            if depth <= 0:
+                return None
+            waiters = self._waiters.setdefault(group, [])
+            if len(waiters) >= depth:
+                if not waiters:
+                    self._waiters.pop(group, None)
+                return None
+            ticket = self._next_ticket
+            self._next_ticket += 1
+            waiters.append(ticket)
+            return ticket
+
+    def _take_when_head(self, group: str, ticket: int) -> CapacityLease | None:
+        """Claim a slot only if ``ticket`` is the oldest waiter queued."""
+        with self._lock:
+            waiters = self._waiters.get(group)
+            if not waiters or waiters[0] != ticket:
+                return None
+            active = self._active.get(group, 0)
+            if active >= capacity_limit(group):
+                return None
+            self._active[group] = active + 1
+            return CapacityLease(self, group)
+
+    def _unregister_waiter(self, group: str, ticket: int) -> None:
+        with self._lock:
+            waiters = self._waiters.get(group)
+            if waiters is None:
+                return
+            try:
+                waiters.remove(ticket)
+            except ValueError:
+                return
+            if not waiters:
+                self._waiters.pop(group, None)
+
+    def _record_queue_timeout(self, group: str) -> None:
+        with self._lock:
+            self._queue_wait_timeouts[group] = self._queue_wait_timeouts.get(group, 0) + 1
+
+    def waiting(self, group: str) -> int:
+        """Return how many requests are queued for ``group`` right now."""
+        with self._lock:
+            return len(self._waiters.get(group, ()))
 
     def release(self, group: str) -> None:
         with self._lock:
@@ -199,12 +367,20 @@ class CapacityController:
     def snapshot(self) -> dict[str, dict[str, int]]:
         """Return bounded process-local capacity counters."""
         with self._lock:
-            groups = set(self._active) | set(self._rejections)
+            groups = (
+                set(self._active)
+                | set(self._rejections)
+                | set(self._waiters)
+                | set(self._queue_wait_timeouts)
+            )
             return {
                 group: {
                     "active": self._active.get(group, 0),
                     "limit": capacity_limit(group),
                     "rejections": self._rejections.get(group, 0),
+                    "queued": len(self._waiters.get(group, ())),
+                    "queue_depth": capacity_queue_depth(group),
+                    "queue_wait_timeouts": self._queue_wait_timeouts.get(group, 0),
                 }
                 for group in sorted(groups)
             }
@@ -214,6 +390,8 @@ class CapacityController:
         with self._lock:
             self._active.clear()
             self._rejections.clear()
+            self._waiters.clear()
+            self._queue_wait_timeouts.clear()
 
 
 _CAPACITY_CONTROLLER = CapacityController()

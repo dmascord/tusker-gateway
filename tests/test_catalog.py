@@ -111,6 +111,21 @@ def test_catalog_capability_helpers_read_copilot_supports_shape():
     assert advertised_input_modalities(text_only) is None
     assert advertised_tool_support(text_only) is True
 
+def test_catalog_capability_helpers_read_nested_mime_modalities():
+    """OpenCode Go publishes image support under modalities.input as MIME types."""
+    entry = CatalogEntry(
+        provider="opencode-go",
+        model="gpt-6-luna",
+        raw={
+            "modalities": {
+                "input": ["text", "image/jpeg", "image/png", "application/pdf"],
+                "output": ["text"],
+            }
+        },
+    )
+    assert advertised_input_modalities(entry) == frozenset({"text", "image"})
+    assert advertised_output_modalities(entry) == frozenset({"text"})
+
 
 
 def test_catalog_capability_helpers_read_ollama_capability_list():

@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1832,3 +1833,55 @@ class TestApimToolReasoningCompatibility:
         body = {"model": "gpt-5.6-luna-2026-07-09", "reasoning_effort": "high", "tools": tool}
         _adapt_apim_tool_reasoning(body, "apim")
         assert body["reasoning_effort"] == "none"
+
+@pytest.mark.asyncio
+async def test_codex_expired_seat_with_store_fails_before_sending_request(
+    mock_http, quality_db, caplog,
+):
+    """An expired seat the store cannot recover must not spend a request.
+
+    ``has_available_credential`` admits an expired entry when a store is
+    wired, because adoption may recover it. When adoption finds nothing
+    newer, the header build produces no ``Authorization`` value; the request
+    must fail as an empty pool instead of going upstream to collect a 401.
+    """
+    from tusker_gateway import passthrough as passthrough_module
+    from tusker_gateway.passthrough import CodexTokenRotator
+
+    passthrough_module._OAUTH_NO_CREDENTIAL_LOGGED_AT.clear()
+    rotator = CodexTokenRotator(
+        [
+            {
+                "label": "codex-1",
+                "account_user_id": "seat-1",
+                "access_token": "expired-access",
+                "refresh_token": "consumed-refresh",
+                "expires_at_ms": int((time.time() - 60) * 1000),
+            }
+        ],
+        provider="openai-codex",
+        load_credentials=lambda _provider: None,
+    )
+    # A permanent OAuth rejection armed the long cooldown, so no refresh runs.
+    rotator._refresh_failed_until[0] = time.time() + 86400
+    assert rotator.has_available_credential("gpt-5.6-luna") is True
+
+    client = PassthroughClient(
+        _base_config(), quality_db, mock_http,
+        credential_rotators={"openai-codex": rotator},
+    )
+    mock_http.request = AsyncMock()
+
+    with caplog.at_level("WARNING", logger="tusker_gateway.passthrough"):
+        with pytest.raises(ProviderError) as excinfo:
+            await client._chat_codex(
+                provider="openai-codex",
+                model="gpt-5.6-luna",
+                messages=[{"role": "user", "content": "hello"}],
+                stream=False,
+                api_key=None,
+            )
+
+    assert excinfo.value.code == "oauth_credential_unavailable"
+    assert excinfo.value.upstream_status == 503
+    assert mock_http.request.await_count == 0

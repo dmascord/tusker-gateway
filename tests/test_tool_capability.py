@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 import pytest
 
 from tusker_gateway.config import PoolConfig
@@ -1270,4 +1271,55 @@ def test_composite_probe_batch_spans_providers_when_all_are_unproven(
         "ollama-cloud",
         "openai-codex",
         "apim",
+    }
+
+def test_composite_probe_retries_stale_routes_fairly_across_providers(
+    monkeypatch, tmp_path
+):
+    """Stale transient evidence must not let one provider starve another."""
+    db, run = _composite_runner(monkeypatch, tmp_path)
+    now = time.time()
+    blocked = [("github-copilot-enterprise", f"blocked-{index}") for index in range(8)]
+    other = [("ollama-cloud", f"other-{index}") for index in range(4)]
+    for provider, model in blocked:
+        db.record(
+            provider=provider,
+            model=model,
+            capability=COMPOSITE_CAPABILITY,
+            status="unavailable",
+            source="composite_probe",
+            probe_version=COMPOSITE_CAPABILITY_PROBE_VERSION,
+            checked_at=now - 86_401,
+        )
+    for provider, model in other:
+        db.record(
+            provider=provider,
+            model=model,
+            capability=COMPOSITE_CAPABILITY,
+            status="unavailable",
+            source="composite_probe",
+            probe_version=COMPOSITE_CAPABILITY_PROBE_VERSION,
+            checked_at=now - 86_401,
+        )
+
+    probed: list[tuple[str, str]] = []
+
+    async def fake_probe(*args, **kwargs):
+        probed.append((kwargs["provider"], kwargs["model"]))
+        return {"provider": kwargs["provider"], "model": kwargs["model"], "status": "passed"}
+
+    monkeypatch.setattr(
+        "tusker_gateway.tool_qualification.probe_image_tool_model", fake_probe
+    )
+    asyncio.run(
+        run(
+            base_url="http://gateway.test",
+            model_pairs=set(blocked) | set(other),
+            max_age_secs=86_400.0,
+            limit=4,
+        )
+    )
+    assert {provider for provider, _ in probed} == {
+        "github-copilot-enterprise",
+        "ollama-cloud",
     }

@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import pathlib
 from unittest.mock import patch
 
 import pytest
@@ -313,3 +314,486 @@ async def test_unusable_tool_turns_fail_over_before_client_output(
     assert len(fallbacks) == 2
     assert "attempt=1" in fallbacks[0]
     assert "attempt=2" in fallbacks[1]
+
+
+def _reasoning_only_length_frames() -> list[bytes]:
+    """The upstream bytes of the failing 2026-11-07 DeepSeek V4 turn.
+
+    Captured verbatim from the production turn-capture store (capture
+    ``c16bddd22ee54ceb926fcad161a10a9a``, provider
+    ``synthetic/hf:deepseek-ai/DeepSeek-V4.1-Flash-1017``) and stored as
+    ``tests/fixtures/reasoning_only_length_turn.sse``.
+
+    The model streamed 24 reasoning deltas and then stopped with
+    ``finish_reason=length`` without emitting a single visible content
+    character or tool call. The upstream usage frame reports
+    ``completion_tokens: 120`` with ``reasoning_tokens: 120``: the client's
+    120-token caption cap was spent entirely on reasoning. This is a
+    no-tools caption turn, matching the captured request.
+    """
+    fixture = (
+        pathlib.Path(__file__).parent
+        / "fixtures"
+        / "reasoning_only_length_turn.sse"
+    )
+    raw = fixture.read_bytes()
+    frames = [
+        part if part.startswith(b"data: ") else b"data: " + part
+        for part in (chunk.strip() for chunk in raw.split(b"\n\n"))
+        if part
+    ]
+    return [frame + b"\n\n" for frame in frames]
+
+
+@pytest.mark.asyncio
+async def test_reasoning_only_length_turn_never_reaches_the_client_as_length(
+    client, app, caplog,
+):
+    """A reasoning-only ``length`` turn must not reach the client as ``length``.
+
+    The 2026-11-07 incident: a reasoning-heavy candidate burned the client's
+    whole 120-token caption budget on reasoning and stopped with
+    ``finish_reason=length`` and no text. The client received that terminal,
+    discarded the turn as "nothing delivered", and retried the identical
+    request three times before raising "Length-stop recovery gave up".
+
+    The gateway must reject the turn before the terminal frame is yielded, so
+    the client sees an actionable error instead of a "retry the same thing"
+    signal. A ``length`` terminal must never reach the client: it only starts
+    a retry loop that cannot succeed.
+
+    The route is not re-dispatched here: the reasoning bytes already reached
+    the client, so the "never splice providers after visible output" invariant
+    still holds. What changes is the terminal the client sees.
+    """
+    from unittest.mock import MagicMock
+
+    handled: list[tuple[str, str]] = []
+    budgets: list[dict] = []
+
+    async def fake_chat(
+        _client, provider, model, messages, *, stream, tools, tool_choice, extra_body,
+        conversation_id, metrics_registry, request_id, pool,
+    ):
+        handled.append((provider, model))
+        budgets.append(dict(extra_body or {}))
+
+        async def upstream_stream():
+            for frame in _reasoning_only_length_frames():
+                yield frame
+
+        return upstream_stream()
+
+    pool_manager = MagicMock()
+    pool_manager.fallback_pools.return_value = ()
+    pool_manager.select.side_effect = [
+        ("synthetic", "hf:deepseek-ai/DeepSeek-V4.1-Flash-1017"),
+    ]
+    app["pool_manager"] = pool_manager
+
+    with patch("tusker_gateway.endpoints.PassthroughClient.chat", new=fake_chat):
+        with caplog.at_level(logging.WARNING, logger="tusker_gateway.endpoints"):
+            response = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "hermes-code",
+                    "messages": [{"role": "user", "content": "caption this"}],
+                    "max_tokens": 120,
+                    "stream": True,
+                },
+                headers=HEADERS_AUTH,
+            )
+            body = await response.read()
+
+    assert response.status == 200
+    assert handled == [("synthetic", "hf:deepseek-ai/DeepSeek-V4.1-Flash-1017")]
+
+    # The reasoning floor lifts the client's 120-token cap so the model has
+    # room for an answer after thinking.
+    assert budgets[0].get("max_tokens") == 2000, budgets
+
+    finish_reasons = [
+        choice.get("finish_reason")
+        for event in _read_sse_data(body)
+        for choice in event.get("choices", [])
+        if choice.get("finish_reason")
+    ]
+    assert "length" not in finish_reasons, finish_reasons
+    assert finish_reasons == ["stop"], finish_reasons
+    assert b"spent its whole output budget on reasoning" in body, body[-400:]
+
+
+def _thinking_only_length_frames(text: str) -> list[bytes]:
+    """Upstream bytes of a MiniMax-style turn that never leaves its thinking.
+
+    MiniMax-M3 streams its chain of thought in the OpenAI ``content``
+    channel, wrapped in ``<think>``. When the output budget runs out inside
+    the thinking, the tag is never closed and no visible answer follows.
+    OMP heals the leak into a thinking block, so the client is left with
+    nothing to show.
+    """
+    return [
+        _sse({"choices": [{"index": 0, "delta": {"role": "assistant"}}]}),
+        _sse({"choices": [{"index": 0, "delta": {"content": text}}]}),
+        _sse({"choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]}),
+    ]
+
+
+async def _post_stream(client, app, *, provider: str, model: str, frames, tools=()):
+    """Drive one streaming request through the public handler."""
+    from unittest.mock import MagicMock
+
+    handled: list[tuple[str, str]] = []
+
+    async def fake_chat(
+        _client, provider, model, messages, *, stream, tools, tool_choice, extra_body,
+        conversation_id, metrics_registry, request_id, pool,
+    ):
+        handled.append((provider, model))
+
+        async def upstream_stream():
+            for frame in frames:
+                yield frame
+
+        return upstream_stream()
+
+    pool_manager = MagicMock()
+    pool_manager.fallback_pools.return_value = ()
+    pool_manager.select.side_effect = [(provider, model)]
+    app["pool_manager"] = pool_manager
+
+    with patch("tusker_gateway.endpoints.PassthroughClient.chat", new=fake_chat):
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "hermes-code",
+                "messages": [{"role": "user", "content": "explain the stack"}],
+                "max_tokens": 16384,
+                "stream": True,
+                **({"tools": list(tools)} if tools else {}),
+            },
+            headers=HEADERS_AUTH,
+        )
+        body = await response.read()
+    return response, body, handled
+
+
+@pytest.mark.asyncio
+async def test_inband_thinking_length_turn_never_reaches_the_client_as_length(
+    client, app, caplog,
+):
+    """A turn that only ever produced thinking must not reach the client.
+
+    The 2026-11-08 recurrence: MiniMax-M3 spent its whole 16384-token
+    budget inside a ``<think>`` block and stopped with
+    ``finish_reason=length``. OMP healed the leaked thinking into a thinking
+    block, saw no text and no tool call, and retried the identical request
+    three times before raising "Length-stop recovery gave up".
+
+    The gateway must reject the turn before the terminal frame is yielded so
+    the client sees an actionable error instead of a retry signal.
+    """
+    thinking = "<think>" + ("reasoning that never ends. " * 200)
+    response, body, handled = await _post_stream(
+        client,
+        app,
+        provider="minimax",
+        model="MiniMax-M3",
+        frames=_thinking_only_length_frames(thinking),
+    )
+
+    assert response.status == 200
+    assert handled == [("minimax", "MiniMax-M3")]
+
+    finish_reasons = [
+        choice.get("finish_reason")
+        for event in _read_sse_data(body)
+        for choice in event.get("choices", [])
+        if choice.get("finish_reason")
+    ]
+    assert "length" not in finish_reasons, finish_reasons
+    assert b"spent its whole output budget on reasoning" in body, body[-400:]
+
+
+@pytest.mark.asyncio
+async def test_visible_text_length_turn_is_delivered_to_the_client(
+    client, app,
+):
+    """A truncated turn that did deliver text must reach the client.
+
+    The deployed guard of 2026-11-08 rejected any ``length`` terminal whose
+    own frame carried less than ten characters, which threw away a MiniMax
+    turn that had already delivered 57k characters of answer. The client
+    keeps a truncated turn it can show, so the gateway must not reject it.
+    """
+    answer = "The stack order is ingress to egress. " * 40
+    response, body, handled = await _post_stream(
+        client,
+        app,
+        provider="minimax",
+        model="MiniMax-M3",
+        frames=[
+            _sse({"choices": [{"index": 0, "delta": {"role": "assistant"}}]}),
+            _sse({"choices": [{"index": 0, "delta": {"content": answer}}]}),
+            _sse({"choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]}),
+        ],
+    )
+
+    assert response.status == 200
+    assert handled == [("minimax", "MiniMax-M3")]
+
+    finish_reasons = [
+        choice.get("finish_reason")
+        for event in _read_sse_data(body)
+        for choice in event.get("choices", [])
+        if choice.get("finish_reason")
+    ]
+    assert finish_reasons == ["length"], finish_reasons
+    assert answer.encode() in body, body[-400:]
+
+
+@pytest.mark.asyncio
+async def test_thinking_followed_by_an_answer_length_turn_is_delivered(
+    client, app,
+):
+    """Thinking followed by a real answer stays deliverable after a cut."""
+    frames = [
+        _sse({"choices": [{"index": 0, "delta": {"role": "assistant"}}]}),
+        _sse({"choices": [{"index": 0, "delta": {"content": "<think>reasoning</think>"}}]}),
+        _sse({"choices": [{"index": 0, "delta": {"content": "The answer is 42."}}]}),
+        _sse({"choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]}),
+    ]
+    response, body, handled = await _post_stream(
+        client,
+        app,
+        provider="minimax",
+        model="MiniMax-M3",
+        frames=frames,
+    )
+
+    assert response.status == 200
+    finish_reasons = [
+        choice.get("finish_reason")
+        for event in _read_sse_data(body)
+        for choice in event.get("choices", [])
+        if choice.get("finish_reason")
+    ]
+    assert finish_reasons == ["length"], finish_reasons
+    assert b"The answer is 42." in body, body[-400:]
+
+
+@pytest.mark.asyncio
+async def test_prefilled_template_reasoning_turn_is_rejected(
+    client, app,
+):
+    """Reasoning behind a prefilled opener, cut off before any answer.
+
+    DeepSeek-R1, Qwen3-Thinking and friends get the ``<think>`` opener
+    prefilled into the prompt, so the model streams the reasoning and then
+    the bare ``</think>`` that closes it. When the output budget runs out
+    before the answer, the whole turn is reasoning and OMP reclassifies the
+    single text block as a thinking block, finds nothing deliverable, and
+    retries the identical request three times.
+
+    The gateway must reject the turn with an actionable error instead of
+    handing over a ``length`` terminal.
+    """
+    frames = [
+        _sse({"choices": [{"index": 0, "delta": {"role": "assistant"}}]}),
+        _sse({"choices": [{"index": 0, "delta": {"content": "reasoning that never ends. " * 50}}]}),
+        _sse({"choices": [{"index": 0, "delta": {"content": "</think>"}}]}),
+        _sse({"choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]}),
+    ]
+    response, body, handled = await _post_stream(
+        client,
+        app,
+        provider="minimax",
+        model="MiniMax-M3",
+        frames=frames,
+    )
+
+    assert response.status == 200
+    finish_reasons = [
+        choice.get("finish_reason")
+        for event in _read_sse_data(body)
+        for choice in event.get("choices", [])
+        if choice.get("finish_reason")
+    ]
+    assert "length" not in finish_reasons, finish_reasons
+    assert b"spent its whole output budget on reasoning" in body, body[-400:]
+
+
+@pytest.mark.asyncio
+async def test_bare_close_followed_by_an_answer_is_delivered(
+    client, app,
+):
+    """A bare ``</think>`` with visible text after it stays deliverable."""
+    frames = [
+        _sse({"choices": [{"index": 0, "delta": {"role": "assistant"}}]}),
+        _sse({"choices": [{"index": 0, "delta": {"content": "</think>"}}]}),
+        _sse({"choices": [{"index": 0, "delta": {"content": "The answer is 42."}}]}),
+        _sse({"choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]}),
+    ]
+    response, body, handled = await _post_stream(
+        client,
+        app,
+        provider="minimax",
+        model="MiniMax-M3",
+        frames=frames,
+    )
+
+    assert response.status == 200
+    finish_reasons = [
+        choice.get("finish_reason")
+        for event in _read_sse_data(body)
+        for choice in event.get("choices", [])
+        if choice.get("finish_reason")
+    ]
+    assert finish_reasons == ["length"], finish_reasons
+    assert b"The answer is 42." in body, body[-400:]
+
+
+@pytest.mark.asyncio
+async def test_short_answer_length_turn_is_delivered(
+    client, app,
+):
+    """A one-word answer must survive the length guard.
+
+    The redaction restorer holds a trailing run of text back until the
+    stream ends, so the client can receive a short answer only in the tail
+    frame. The guard has to judge what the client will receive, not what a
+    single frame happened to carry.
+    """
+    frames = [
+        _sse({"choices": [{"index": 0, "delta": {"role": "assistant"}}]}),
+        _sse({"choices": [{"index": 0, "delta": {"content": "42"}}]}),
+        _sse({"choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]}),
+    ]
+    response, body, handled = await _post_stream(
+        client,
+        app,
+        provider="minimax",
+        model="MiniMax-M3",
+        frames=frames,
+    )
+
+    assert response.status == 200
+    finish_reasons = [
+        choice.get("finish_reason")
+        for event in _read_sse_data(body)
+        for choice in event.get("choices", [])
+        if choice.get("finish_reason")
+    ]
+    assert finish_reasons == ["length"], finish_reasons
+    assert b"42" in body, body[-400:]
+
+
+@pytest.mark.asyncio
+async def test_thinking_tag_split_across_frames_is_not_visible_text(
+    client, app,
+):
+    """A reasoning tag split across frames must still be recognised."""
+    frames = [
+        _sse({"choices": [{"index": 0, "delta": {"role": "assistant"}}]}),
+        _sse({"choices": [{"index": 0, "delta": {"content": "<thi"}}]}),
+        _sse({"choices": [{"index": 0, "delta": {"content": "nk>reasoning"}}]}),
+        _sse({"choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]}),
+    ]
+    response, body, handled = await _post_stream(
+        client,
+        app,
+        provider="minimax",
+        model="MiniMax-M3",
+        frames=frames,
+    )
+
+    assert response.status == 200
+    finish_reasons = [
+        choice.get("finish_reason")
+        for event in _read_sse_data(body)
+        for choice in event.get("choices", [])
+        if choice.get("finish_reason")
+    ]
+    assert "length" not in finish_reasons, finish_reasons
+    assert b"spent its whole output budget on reasoning" in body, body[-400:]
+
+
+@pytest.mark.asyncio
+async def test_native_reasoning_keeps_the_text_visible(
+    client, app,
+):
+    """Native reasoning next to the text means the text stays deliverable.
+
+    OMP only reclassifies a bare closing tag when the message holds nothing
+    but that one text block. A turn with native reasoning holds more, so the
+    text survives and the client can use it.
+    """
+    frames = [
+        _sse({"choices": [{"index": 0, "delta": {"role": "assistant"}}]}),
+        _sse({"choices": [{"index": 0, "delta": {"reasoning_content": "thinking"}}]}),
+        _sse({"choices": [{"index": 0, "delta": {"content": "The answer is 42."}}]}),
+        _sse({"choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]}),
+    ]
+    response, body, handled = await _post_stream(
+        client,
+        app,
+        provider="minimax",
+        model="MiniMax-M3",
+        frames=frames,
+    )
+
+    assert response.status == 200
+    finish_reasons = [
+        choice.get("finish_reason")
+        for event in _read_sse_data(body)
+        for choice in event.get("choices", [])
+        if choice.get("finish_reason")
+    ]
+    assert finish_reasons == ["length"], finish_reasons
+    assert b"The answer is 42." in body, body[-400:]
+
+
+@pytest.mark.asyncio
+async def test_tools_sent_thinking_only_length_turn_is_rejected(
+    client, app,
+):
+    """A tools-enabled turn that only produced thinking must be rejected.
+
+    The failing route (``hermes-code``) sends a full tool catalogue, so the
+    guard has to hold on that path too: a turn that streamed only leaked
+    thinking and then stopped at ``length`` is not deliverable, and handing
+    over ``length`` starts the retry loop that ends in the client's
+    "Length-stop recovery gave up".
+    """
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read a file.",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
+        },
+    }]
+    thinking = "<think>" + ("reasoning that never ends. " * 200)
+    response, body, handled = await _post_stream(
+        client,
+        app,
+        provider="minimax",
+        model="MiniMax-M3",
+        frames=_thinking_only_length_frames(thinking),
+        tools=tools,
+    )
+
+    assert response.status == 200
+    assert handled == [("minimax", "MiniMax-M3")]
+    finish_reasons = [
+        choice.get("finish_reason")
+        for event in _read_sse_data(body)
+        for choice in event.get("choices", [])
+        if choice.get("finish_reason")
+    ]
+    assert "length" not in finish_reasons, finish_reasons
+    assert b"spent its whole output budget on reasoning" in body, body[-400:]

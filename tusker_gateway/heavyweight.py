@@ -85,10 +85,15 @@ HEAVY_OUTPUT_USD: float = 3.0  # $3/M output threshold (was $8)
 def is_heavyweight_slug(slug: str) -> bool:
     """Return True if the slug is in the heavyweight override set.
 
-    Slug matching is exact (case-sensitive) — we don't fuzzy-match because
-    the slug set is curated by humans.
+    Matching is exact and case-sensitive — the set is curated by humans — but
+    a variant tag (``deepseek-v4-pro:0813``, ``kimi-k2.6:cloud``) inherits the
+    classification of its base slug, so dated/tagged upstream builds of a
+    heavy model cannot slip past the gate.
     """
-    return slug in HEAVYWEIGHT_SLUG_OVERRIDES
+    if slug in HEAVYWEIGHT_SLUG_OVERRIDES:
+        return True
+    base, sep, _tag = slug.partition(":")
+    return bool(sep) and base in HEAVYWEIGHT_SLUG_OVERRIDES
 
 
 def is_heavyweight_pricing(

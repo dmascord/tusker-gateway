@@ -23,6 +23,12 @@ Read in order when picking up the repo:
 | `docs/incidents/2026-10-21-codex-rotation-and-grok-429-leak.md` | Codex refresh-token rotation + xAI/Grok `{"statusCode":429,...}` envelope leak (req_50a994b481aa7fe3). Operator runbook + hardened cooldown suppression. |
 | `docs/incidents/2026-11-01-privacy-pool-codex-seat-collapse.md` | Codex team-seat collapse (`account_id` vs `account_user_id`) + uncorrelated capacity SSE frame (req_ef7626de7c191781). |
 | `docs/incidents/2026-11-01-composite-probe-starvation.md` | Composite image-plus-tool evidence never collected: first run scheduled a full interval out, and a bounded probe batch spent every slot on one quota-cooled provider. |
+| `docs/incidents/2026-11-08-reasoning-only-length-stop.md` | Reasoning-only `length` turns: dead terminal forwarded to the client + reasoning models below the output floor. |
+| `docs/incidents/2026-11-06-longhorn-storage-instability.md` | Longhorn data-path errors degraded the internal registry volume; gateway image pulls failed behind it. Investigation + remediation record. |
+| `docs/incidents/2026-11-06-hindsight-memory-startup.md` | Hindsight CrashLoopBackOff from an explicit `HINDSIGHT_API_DATABASE_URL` pointing at a fixed port while embedded `pg0` was still starting. |
+| `docs/migrations/2026-11-06-hindsight-postgresql/` | Moving Hindsight from embedded `pg0` to the dedicated `hindsight-postgres` StatefulSet. |
+| `docs/incidents/2026-11-11-codex-refresh-cooldown-adoption-deadlock.md` | Codex OAuth refresh-failure cooldown blocked store adoption; the whole pool read as empty while the DB held live credentials. |
+| `docs/incidents/2026-11-11-mlx-mac-capacity-queue.md` | MLX Mac capacity rejections discarded servable work (77/80 privacy attempts locally rejected); bounded FIFO admission queue. |
 | `TODO.md` | Active cross-session work items. |
 
 

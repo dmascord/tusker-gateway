@@ -985,3 +985,241 @@ async def test_rotator_initialised_log_redacts_tokens(caplog: pytest.LogCaptureF
     assert "other-access" not in line
     assert "refresh_fps=" in line
     assert "access_fps=" in line
+
+
+@pytest.mark.asyncio
+async def test_rotator_adopts_store_credential_while_refresh_cooldown_active(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A permanent refresh failure must not block store adoption.
+
+    When this process burns its copy of a shared refresh token it records a
+    24h permanent cooldown. Another process may still rotate that seat and
+    persist the result, so the cooldown must gate *refreshing* only: the
+    rotator has to keep reading the store, otherwise the pod stays dead for
+    24h holding a credential that is valid in the database.
+    """
+    import tusker_gateway.codex_oauth as codex_oauth
+    from tusker_gateway.codex_oauth import CodexOAuthError
+    from tusker_gateway.passthrough import CodexTokenRotator
+
+    refresh = AsyncMock(
+        side_effect=CodexOAuthError(
+            "Codex OAuth refresh rejected",
+            status=401,
+            code="refresh_token_reused",
+        )
+    )
+    monkeypatch.setattr(codex_oauth, "refresh_codex_token", refresh)
+
+    seat = {
+        "label": "codex-1",
+        "account_user_id": "user-1",
+        "access_token": "expired-access",
+        "refresh_token": "consumed-refresh",
+        "expires_at_ms": int((time.time() - 60) * 1000),
+    }
+    rotated_by_peer = {
+        **seat,
+        "access_token": "peer-access",
+        "refresh_token": "peer-refresh",
+        "expires_at_ms": int((time.time() + 3600) * 1000),
+    }
+    store: list[dict[str, Any]] = []
+
+    rotator = CodexTokenRotator(
+        [dict(seat)],
+        http_client=object(),
+        provider="openai-codex",
+        load_credentials=lambda _provider: [dict(entry) for entry in store],
+    )
+    rotator._persist = MagicMock()  # type: ignore[method-assign]
+
+    # First pass: no peer rotation yet, so the refresh runs and is rejected
+    # permanently, arming the 24h cooldown.
+    assert await rotator.get_token() is None
+    assert rotator._refresh_failed_until.get(0, 0.0) > time.time() + 3600
+
+    # Peer rotates the same seat and persists it.
+    store.append(rotated_by_peer)
+
+    # The permanent cooldown must not stop the store read.
+    assert await rotator.get_token() == "peer-access"
+    # Adoption, not a second refresh, produced the token.
+    refresh.assert_awaited_once()
+    assert rotator._creds[0]["refresh_token"] == "peer-refresh"
+    # A successful adoption clears the cooldown so the seat is fully live.
+    assert 0 not in rotator._refresh_failed_until
+
+
+def test_has_available_credential_allows_adoption_during_refresh_cooldown():
+    """A cooled-down expired seat stays selectable while a store is wired.
+
+    ``has_available_credential`` gates the request path before ``get_token``
+    runs. Reporting False for a seat that the store can still refresh would
+    short-circuit the only recovery path.
+    """
+    from tusker_gateway.passthrough import CodexTokenRotator
+
+    stale = {
+        "label": "codex-1",
+        "account_user_id": "user-1",
+        "access_token": "expired-access",
+        "refresh_token": "consumed-refresh",
+        "expires_at_ms": int((time.time() - 60) * 1000),
+    }
+
+    with_store = CodexTokenRotator(
+        [dict(stale)],
+        http_client=object(),
+        provider="openai-codex",
+        load_credentials=lambda _provider: [],
+    )
+    with_store._refresh_failed_until[0] = time.time() + 86400
+    assert with_store.has_available_credential("gpt-5.6-luna") is True
+
+    without_store = CodexTokenRotator(
+        [dict(stale)],
+        http_client=object(),
+        provider="openai-codex",
+    )
+    without_store._refresh_failed_until[0] = time.time() + 86400
+    assert without_store.has_available_credential("gpt-5.6-luna") is False
+
+
+@pytest.mark.asyncio
+async def test_canary_rotator_adopts_expired_seat_from_store(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Canary policy forbids rotating, not reading: adopt and serve.
+
+    The canary pod must never rotate a refresh token production also holds,
+    but production rotates it regularly and persists the result. An expired
+    canary copy that refused to read the store stayed dead with the live
+    credential sitting in the database.
+    """
+    import tusker_gateway.codex_oauth as codex_oauth
+    from tusker_gateway.passthrough import CodexTokenRotator
+
+    refresh = AsyncMock(
+        side_effect=AssertionError("canary must never rotate a shared refresh token")
+    )
+    monkeypatch.setattr(codex_oauth, "refresh_codex_token", refresh)
+    monkeypatch.setenv("TUSKER_CONFIG_CANARY", "true")
+
+    stale = {
+        "label": "codex-1",
+        "account_user_id": "user-1",
+        "access_token": "expired-access",
+        "refresh_token": "shared-refresh",
+        "expires_at_ms": int((time.time() - 60) * 1000),
+    }
+    rotated = {
+        **stale,
+        "access_token": "prod-access",
+        "refresh_token": "prod-refresh",
+        "expires_at_ms": int((time.time() + 3600) * 1000),
+    }
+
+    rotator = CodexTokenRotator(
+        [dict(stale)],
+        http_client=object(),
+        provider="openai-codex",
+        load_credentials=lambda _provider: [dict(rotated)],
+    )
+
+    assert await rotator.get_token() == "prod-access"
+    refresh.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_canary_never_rotates_a_token_it_adopted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A canary that adopted a token must not later rotate that same token.
+
+    The skip set is re-baselined whenever credentials reload from the store.
+    Without adding an adopted refresh token to it, a subsequent reload plus
+    expiry would let the canary rotate a token the other holder still owns,
+    invalidating it there (the seat-collapse failure class).
+    """
+    import tusker_gateway.codex_oauth as codex_oauth
+    from tusker_gateway.passthrough import CodexTokenRotator
+
+    refresh = AsyncMock(
+        side_effect=AssertionError("canary must never rotate a shared refresh token")
+    )
+    monkeypatch.setattr(codex_oauth, "refresh_codex_token", refresh)
+    monkeypatch.setenv("TUSKER_CONFIG_CANARY", "true")
+
+    stale = {
+        "label": "codex-1",
+        "account_user_id": "user-1",
+        "access_token": "expired-access",
+        "refresh_token": "shared-refresh",
+        "expires_at_ms": int((time.time() - 60) * 1000),
+    }
+    rotated = {
+        **stale,
+        "access_token": "prod-access",
+        "refresh_token": "prod-refresh",
+        "expires_at_ms": int((time.time() + 3600) * 1000),
+    }
+
+    rotator = CodexTokenRotator(
+        [dict(stale)],
+        http_client=object(),
+        provider="openai-codex",
+        load_credentials=lambda _provider: [dict(rotated)],
+    )
+
+    assert await rotator.get_token() == "prod-access"
+    assert "prod-refresh" in rotator._initial_refresh_tokens
+
+    # Reload from the store keeps the adopted token in the skip set, so the
+    # entry is skipped once its access token dies rather than rotated.
+    rotator.reload([dict(rotated)])
+    assert "prod-refresh" in rotator._initial_refresh_tokens
+    assert rotator._canary_skip_rotation(rotator._creds[0]) is True
+    refresh.assert_not_awaited()
+
+
+async def test_admin_reset_clears_refresh_failure_cooldown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The operator reset must clear the permanent refresh cooldown too.
+
+    ``reset-cooldown`` cleared only the quota-fingerprint map, so a seat
+    cooled down by ``refresh_token_reused`` stayed unusable for 24h after the
+    operator re-enrolled it elsewhere.
+    """
+    import tusker_gateway.codex_oauth as codex_oauth
+    from tusker_gateway.codex_oauth import CodexOAuthError
+    from tusker_gateway.passthrough import CodexTokenRotator
+
+    refresh = AsyncMock(
+        side_effect=CodexOAuthError(
+            "Codex OAuth refresh rejected", status=401, code="refresh_token_reused"
+        )
+    )
+    monkeypatch.setattr(codex_oauth, "refresh_codex_token", refresh)
+
+    rotator = CodexTokenRotator(
+        [
+            {
+                "label": "codex-1",
+                "access_token": "expired-access",
+                "refresh_token": "dead-refresh",
+                "expires_at_ms": int((time.time() - 60) * 1000),
+            }
+        ],
+        http_client=object(),
+        provider="openai-codex",
+    )
+    rotator._persist = MagicMock()
+
+    assert await rotator.get_token() is None
+    assert rotator._refresh_failed_until.get(0, 0.0) > time.time() + 3600
+
+    assert rotator.clear_credential_cooldown("codex-1") is True
+    assert 0 not in rotator._refresh_failed_until

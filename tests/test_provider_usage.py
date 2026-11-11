@@ -108,6 +108,7 @@ async def test_local_capacity_error_is_client_safe(monkeypatch, tmp_path):
     from tusker_gateway.quality import QualityDB
 
     monkeypatch.setenv("TUSKER_NVIDIA_MAX_CONCURRENT", "1")
+    monkeypatch.delenv("TUSKER_NVIDIA_QUEUE_DEPTH", raising=False)
     controller = capacity_controller()
     controller.reset()
     config = {
@@ -125,7 +126,7 @@ async def test_local_capacity_error_is_client_safe(monkeypatch, tmp_path):
     assert lease is not None
     try:
         with pytest.raises(ProviderCapacityError) as caught:
-            client._reserve_capacity("nvidia", "meta/llama")
+            await client._reserve_capacity("nvidia", "meta/llama")
     finally:
         lease.release()
 
@@ -185,7 +186,8 @@ def test_process_backed_providers_share_cli_capacity_group(monkeypatch):
     assert capacity_limit(CLI_CAPACITY_GROUP) == 1
 
 
-def test_process_backed_capacity_gate_rejects_fourth_concurrent_request(monkeypatch, tmp_path):
+@pytest.mark.asyncio
+async def test_process_backed_capacity_gate_rejects_fourth_concurrent_request(monkeypatch, tmp_path):
     from unittest.mock import MagicMock
 
     from tusker_gateway.passthrough import PassthroughClient
@@ -193,6 +195,7 @@ def test_process_backed_capacity_gate_rejects_fourth_concurrent_request(monkeypa
     from tusker_gateway.provider_usage import CLI_CAPACITY_GROUP
 
     monkeypatch.setenv("TUSKER_CLI_MAX_CONCURRENT", "3")
+    monkeypatch.delenv("TUSKER_CLI_QUEUE_DEPTH", raising=False)
     monkeypatch.delenv("TUSKER_KILO_WORKER_URL", raising=False)
     controller = capacity_controller()
     controller.reset()
@@ -211,7 +214,7 @@ def test_process_backed_capacity_gate_rejects_fourth_concurrent_request(monkeypa
     assert all(lease is not None for lease in leases)
     try:
         with pytest.raises(ProviderCapacityError) as caught:
-            client._reserve_capacity("opencode-cli", "openai/gpt-5")
+            await client._reserve_capacity("opencode-cli", "openai/gpt-5")
     finally:
         for lease in leases:
             lease.release()
@@ -220,6 +223,187 @@ def test_process_backed_capacity_gate_rejects_fourth_concurrent_request(monkeypa
     assert controller.snapshot()[CLI_CAPACITY_GROUP]["active"] == 0
     controller.reset()
 
+
+
+@pytest.mark.asyncio
+async def test_queue_disabled_group_still_rejects_immediately(monkeypatch):
+    monkeypatch.setenv("TUSKER_LOCAL_LLM_MAX_CONCURRENT", "1")
+    monkeypatch.delenv("TUSKER_LOCAL_LLM_QUEUE_DEPTH", raising=False)
+    controller = capacity_controller()
+    controller.reset()
+
+    held = controller.acquire("local-llm")
+    assert held is not None
+    try:
+        assert await controller.acquire_queued("local-llm") is None
+    finally:
+        held.release()
+
+    assert controller.snapshot()["local-llm"]["rejections"] == 1
+    assert controller.snapshot()["local-llm"]["queued"] == 0
+    controller.reset()
+
+
+@pytest.mark.asyncio
+async def test_queued_waiter_takes_the_slot_when_it_frees(monkeypatch):
+    monkeypatch.setenv("TUSKER_MLX_MAC_MAX_CONCURRENT", "1")
+    monkeypatch.setenv("TUSKER_MLX_MAC_QUEUE_DEPTH", "3")
+    monkeypatch.setenv("TUSKER_MLX_MAC_QUEUE_WAIT_SECS", "5")
+    controller = capacity_controller()
+    controller.reset()
+
+    held = controller.acquire("mlx-mac")
+    assert held is not None
+
+    async def release_after_delay():
+        await asyncio.sleep(0.15)
+        assert controller.waiting("mlx-mac") == 1
+        held.release()
+
+    releaser = asyncio.create_task(release_after_delay())
+    try:
+        lease = await controller.acquire_queued("mlx-mac")
+        assert lease is not None
+        lease.release()
+    finally:
+        await releaser
+
+    idle = controller.snapshot().get("mlx-mac", {})
+    assert idle.get("active", 0) == 0
+    assert idle.get("queued", 0) == 0
+    assert controller.waiting("mlx-mac") == 0
+    controller.reset()
+
+
+@pytest.mark.asyncio
+async def test_queue_honours_arrival_order(monkeypatch):
+    """Waiters are served oldest-first; latency jitter must not reorder them."""
+    monkeypatch.setenv("TUSKER_MLX_MAC_MAX_CONCURRENT", "1")
+    monkeypatch.setenv("TUSKER_MLX_MAC_QUEUE_DEPTH", "3")
+    monkeypatch.setenv("TUSKER_MLX_MAC_QUEUE_WAIT_SECS", "5")
+    controller = capacity_controller()
+    controller.reset()
+
+    order: list[str] = []
+    held = controller.acquire("mlx-mac")
+    assert held is not None
+
+    async def waiter(name: str):
+        lease = await controller.acquire_queued("mlx-mac")
+        assert lease is not None
+        order.append(name)
+        lease.release()
+
+    # Start each waiter in turn and confirm it actually queued before the next
+    # one arrives, so the test asserts arrival order rather than task order.
+    tasks = []
+    for name in ("first", "second", "third"):
+        tasks.append(asyncio.create_task(waiter(name)))
+        for _ in range(200):
+            if controller.waiting("mlx-mac") == len(tasks):
+                break
+            await asyncio.sleep(0.01)
+        assert controller.waiting("mlx-mac") == len(tasks)
+
+    held.release()
+    # Serialise the waiters: each must finish before the next slot is free.
+    for task in tasks:
+        await asyncio.wait_for(task, 5)
+    assert order == ["first", "second", "third"]
+    controller.reset()
+
+
+@pytest.mark.asyncio
+async def test_queue_rejects_beyond_configured_depth(monkeypatch):
+    monkeypatch.setenv("TUSKER_MLX_MAC_MAX_CONCURRENT", "1")
+    monkeypatch.setenv("TUSKER_MLX_MAC_QUEUE_DEPTH", "1")
+    monkeypatch.setenv("TUSKER_MLX_MAC_QUEUE_WAIT_SECS", "5")
+    controller = capacity_controller()
+    controller.reset()
+
+    held = controller.acquire("mlx-mac")
+    assert held is not None
+    queued = asyncio.create_task(controller.acquire_queued("mlx-mac"))
+    try:
+        await asyncio.sleep(0.05)
+        assert controller.waiting("mlx-mac") == 1
+        # The queue is full, so this request fails over immediately.
+        assert await controller.acquire_queued("mlx-mac") is None
+    finally:
+        held.release()
+        lease = await queued
+        assert lease is not None
+        lease.release()
+
+    controller.reset()
+
+
+@pytest.mark.asyncio
+async def test_queue_wait_expiry_returns_rejection(monkeypatch):
+    monkeypatch.setenv("TUSKER_MLX_MAC_MAX_CONCURRENT", "1")
+    monkeypatch.setenv("TUSKER_MLX_MAC_QUEUE_DEPTH", "3")
+    monkeypatch.setenv("TUSKER_MLX_MAC_QUEUE_WAIT_SECS", "0.2")
+    controller = capacity_controller()
+    controller.reset()
+
+    held = controller.acquire("mlx-mac")
+    assert held is not None
+    try:
+        assert await controller.acquire_queued("mlx-mac") is None
+    finally:
+        held.release()
+
+    snapshot = controller.snapshot()["mlx-mac"]
+    assert snapshot["queue_wait_timeouts"] == 1
+    assert snapshot["queued"] == 0
+    assert snapshot["active"] == 0
+    controller.reset()
+
+
+@pytest.mark.asyncio
+async def test_queued_reserve_holds_slot_for_the_request(monkeypatch, tmp_path):
+    """The queued path must hand the caller a real lease, not a free pass."""
+    from unittest.mock import MagicMock
+
+    from tusker_gateway.passthrough import PassthroughClient
+    from tusker_gateway.quality import QualityDB
+
+    monkeypatch.setenv("TUSKER_MLX_MAC_MAX_CONCURRENT", "1")
+    monkeypatch.setenv("TUSKER_MLX_MAC_QUEUE_DEPTH", "3")
+    monkeypatch.setenv("TUSKER_MLX_MAC_QUEUE_WAIT_SECS", "5")
+    controller = capacity_controller()
+    controller.reset()
+    config = {
+        "api_keys": ["gateway-test"],
+        "provider_api_keys": {},
+        "codex_credentials": [],
+        "quality_db_path": str(tmp_path / "quality.db"),
+    }
+    client = PassthroughClient(
+        config,
+        QualityDB(config["quality_db_path"]),
+        MagicMock(),
+    )
+
+    held = controller.acquire("mlx-mac")
+    assert held is not None
+
+    async def release_after_delay():
+        await asyncio.sleep(0.15)
+        held.release()
+
+    releaser = asyncio.create_task(release_after_delay())
+    try:
+        group, lease = await client._reserve_capacity("mlx-mac", "qwen3.8-27b")
+        assert group == "mlx-mac"
+        assert lease is not None
+        assert controller.snapshot()["mlx-mac"]["active"] == 1
+        lease.release()
+    finally:
+        await releaser
+
+    assert controller.snapshot().get("mlx-mac", {}).get("active", 0) == 0
+    controller.reset()
 
 @pytest.mark.asyncio
 async def test_process_backed_dispatch_holds_lease_until_stream_ends(monkeypatch, tmp_path):

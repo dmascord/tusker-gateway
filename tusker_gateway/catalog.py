@@ -91,24 +91,52 @@ AUTO_DISCOVERED_HEAVYWEIGHT_WEIGHT: float = 0.05
 # Ollama Cloud publishes per-1M-token prices on ollama.com/library pages but
 # neither its /v1/models payload nor models.dev carries cost data, so the
 # pricing-based heavyweight classifier ($1/M in, $3/M out) would see None
-# and treat every model as cheap. Verified 2026-09-09; base tier for
-# deepseek (peak varies). Slugs not listed here (gemma4, gpt-oss, kimi-k2.5,
-# minimax-m2.5, nemotron-3-nano/super, qwen3.5:397b, mistral-large-3:675b)
-# publish no price and stay non-heavyweight by the conservative default.
+# and treat every model as cheap. Verified 2026-09-09.
+#
+# The prices below are the PEAK rates from ollama.com/pricing (verified
+# 2026-11-07), not the off-peak rates. Off-peak pricing applies outside
+# 12:00-18:00 UTC on weekdays and all day on weekends, so an off-peak row
+# understates the cost of the same request at peak. Storing off-peak rates
+# let `deepseek-v4-pro` ($1.32/$3.96 peak vs $0.66/$1.98 off-peak) fall
+# under both thresholds and be admitted to the cheap code pool at weight 1.0,
+# where it burned the subscription's "extra high usage" allowance. The
+# heavyweight gate must see the rate a request is actually charged at the
+# worst time of day, so peak wins.
+#
+# Slugs with no price in the table above (clef, qwen3.5:397b) stay
+# non-heavyweight by the conservative default. `deepseek-v4-flash` and
+# `mistral-large-3:675b` are retired upstream but kept here so a stale
+# catalog row still classifies as cheap rather than unknown.
 OLLAMA_CLOUD_PRICING: dict[str, tuple[float, float]] = {
+    "beam": (0.125, 0.40),
     "deepseek-v4-flash": (0.22, 0.66),
     "deepseek-v4-flash:0731": (0.22, 0.66),
-    "deepseek-v4-pro": (0.66, 1.98),
-    "deepseek-v4-pro:0813": (0.66, 1.98),
+    "deepseek-v4.1-flash": (0.30, 1.20),
+    "deepseek-v4.1-flash:1017": (0.30, 1.20),
+    "deepseek-v4-pro": (1.32, 3.96),
+    "deepseek-v4-pro:0813": (1.32, 3.96),
+    "gemma4": (0.14, 0.40),
+    "gemma4:31b": (0.14, 0.40),
     "glm-5.1": (1.00, 3.20),
     "glm-5.2": (1.40, 4.40),
     "glm-5.3": (1.40, 4.40),
     "glm-5.3-flash": (0.15, 0.50),
+    "gpt-oss:20b": (0.07, 0.30),
+    "gpt-oss:120b": (0.15, 0.60),
     "kimi-k2.6": (0.95, 4.00),
     "kimi-k2.7-code": (0.95, 4.00),
     "kimi-k3": (3.00, 15.00),
+    "kimi-k3.1-pro": (2.00, 10.00),
+    "mimo-v2.6-flash": (0.14, 0.28),
+    "mimo-v2.6-pro": (0.435, 0.87),
     "minimax-m2.7": (0.30, 1.20),
     "minimax-m3": (0.60, 2.40),
+    "minimax-m3.1-flash": (0.15, 0.60),
+    "mistral-large-3:675b": (0.50, 1.50),
+    "mistral-large-4": (0.70, 2.10),
+    "muse-spark-open": (1.25, 4.25),
+    "nemotron-3-nano:30b": (0.06, 0.24),
+    "nemotron-3-super": (0.015, 0.60),
     "nemotron-3-ultra": (0.10, 3.00),
 }
 
@@ -208,6 +236,16 @@ def _capability_values(value: Any) -> frozenset[str] | None:
     return frozenset(values)
 
 
+# A few catalogs nest modalities as ``modalities: {input: [...], output: [...]}``
+# and list MIME types rather than modality names (OpenCode Go publishes
+# ``image/jpeg``, ``application/pdf``, ``audio/mpeg``, ``video/mp4``). Map the
+# major type so a MIME list still answers "can this accept an image?".
+_MIME_MODALITY_PREFIXES = {
+    "image": "image",
+    "audio": "audio",
+    "video": "video",
+}
+
 # Ollama publishes a flat capability vocabulary (``completion``, ``tools``,
 # ``vision``, ``thinking``, ``embedding``) instead of modality arrays. Only
 # ``vision`` maps to a non-text input modality; Ollama chat models emit text.
@@ -231,6 +269,38 @@ _CAPABILITY_ROW_KEYS = (
     "supported_parameters",
     "supportedParameters",
 )
+
+def _modality_values(value: Any) -> frozenset[str] | None:
+    """Normalize a modality list, collapsing MIME types to their major type.
+
+    Catalogs publish either modality names (``text``, ``image``) or the MIME
+    types the endpoint accepts (``image/jpeg``, ``application/pdf``). Both
+    answer the same routing question, so reduce a MIME entry to its major
+    type and keep named modalities verbatim. Non-media types such as
+    ``application/pdf`` describe a document, not an input modality this
+    gateway requires, so they are dropped.
+    """
+    values = _capability_values(value)
+    if values is None:
+        return None
+    modalities = {
+        _MIME_MODALITY_PREFIXES[major]
+        for value in values
+        for major in [value.split("/", 1)[0].strip()]
+        if "/" in value and major in _MIME_MODALITY_PREFIXES
+    }
+    modalities.update(value for value in values if "/" not in value)
+    return frozenset(modalities) or None
+
+
+def _nested_modalities(raw: Any, direction: str) -> frozenset[str] | None:
+    """Read ``modalities: {<direction>: [...]}`` from a catalog row."""
+    if not isinstance(raw, dict):
+        return None
+    nested = raw.get("modalities")
+    if not isinstance(nested, dict):
+        return None
+    return _modality_values(nested.get(direction))
 
 
 def _flat_capability_list(raw: Any) -> frozenset[str] | None:
@@ -312,12 +382,20 @@ def _advertised_modalities(
             sources.append(inner)
     field_name = f"{direction}_modalities"
     camel_field_name = f"{direction}Modalities"
+    # ``modalities: {input: [...], output: [...]}`` is the shape OpenCode Go
+    # and other multi-modal catalogs publish. It carries MIME types rather
+    # than modality names, and the flat keys below never match it, so without
+    # this read a route whose own catalog states ``image/jpeg`` stayed
+    # "undeclared" and was held out of every image request.
+    nested_modalities = _nested_modalities(raw, direction)
+    if nested_modalities is not None:
+        return nested_modalities
     for source in sources:
         # An explicit modality array is the most precise claim available,
         # so it wins over the coarser shapes below even when a payload
         # publishes several of them for the same model.
         for key in (field_name, camel_field_name):
-            values = _capability_values(source.get(key))
+            values = _modality_values(source.get(key))
             if values is not None:
                 return values
 

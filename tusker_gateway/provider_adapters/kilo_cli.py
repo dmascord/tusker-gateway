@@ -9,8 +9,9 @@ import os
 import shutil
 import sys
 import tempfile
-from urllib.parse import urljoin
 from pathlib import Path
+from typing import Any
+from urllib.parse import urljoin
 from tusker_gateway.errors import (
     BadRequestError,
     GatewayError,
