@@ -24,6 +24,7 @@ Read in order when picking up the repo:
 | `docs/incidents/2026-11-01-privacy-pool-codex-seat-collapse.md` | Codex team-seat collapse (`account_id` vs `account_user_id`) + uncorrelated capacity SSE frame (req_ef7626de7c191781). |
 | `docs/incidents/2026-11-01-composite-probe-starvation.md` | Composite image-plus-tool evidence never collected: first run scheduled a full interval out, and a bounded probe batch spent every slot on one quota-cooled provider. |
 | `docs/incidents/2026-11-08-reasoning-only-length-stop.md` | Reasoning-only `length` turns: dead terminal forwarded to the client + reasoning models below the output floor. |
+| `docs/incidents/2026-11-11-codex-refresh-cooldown-adoption-deadlock.md` | Codex OAuth refresh-failure cooldown blocked store adoption; the whole pool read as empty while the DB held live credentials. |
 | `TODO.md` | Active cross-session work items. |
 
 
