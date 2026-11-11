@@ -32,6 +32,7 @@ from tusker_gateway.context_limits import declared_context_window
 from tusker_gateway.cooldown import CooldownTracker, global_tracker, is_permanently_failed
 from tusker_gateway.heavyweight import is_heavyweight
 from tusker_gateway.model_capability import (
+    INPUT_MODALITY_CAPABILITIES,
     STRUCTURED_OUTPUT_CAPABILITY,
     STRUCTURED_OUTPUT_PROBE_VERSION,
 )
@@ -868,10 +869,17 @@ class PoolManager:
                     if model_capability_records is not None
                     else self._model_capability_db.for_model(spec.provider, spec.model)
                 )
+                # ``input_image_tools`` is the composite image-plus-tool
+                # contract, not an input modality: it is consumed separately
+                # by ``_image_tools_evidence_allows``. Folding it in here
+                # added a bogus ``image_tools`` modality and still left the
+                # set without ``image``, so an OpenCode Go route whose
+                # composite probe passed was rejected by the modality gate.
                 evidenced_modalities = {
                     record.capability.removeprefix("input_")
                     for record in records
                     if record.capability.startswith("input_")
+                    and record.capability in INPUT_MODALITY_CAPABILITIES
                     and record.status in {"advertised", "discovered", "passed"}
                 }
                 if evidenced_modalities:

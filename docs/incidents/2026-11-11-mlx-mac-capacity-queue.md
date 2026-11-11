@@ -114,3 +114,12 @@ All seven new tests fail against the pre-fix source. Full offline suite:
 - `github-copilot-enterprise` quota exhaustion is an account condition the
   gateway cannot route around; it only stops the pool from spending attempts on
   routes that will 429.
+
+The composite qualification scheduler had a second-order starvation defect:
+its bounded batch ordered all stale routes from the same provider before the
+next provider. A provider-wide quota cooldown could therefore consume every
+probe slot indefinitely, leaving other auto-discovered routes without evidence
+and unavailable for image-plus-tools traffic. `_interleave_probe_candidates`
+now interleaves providers in both the no-record and stale-record tiers, ordering
+oldest evidence first within each provider. Regression coverage is in
+`tests/test_tool_capability.py::test_composite_probe_retries_stale_routes_fairly_across_providers`.

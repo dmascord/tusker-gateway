@@ -855,6 +855,41 @@ Covered by `tests/test_catalog.py::test_catalog_capability_helpers_read_ollama_c
 and `tests/test_pools.py::test_ollama_capability_shape_admits_image_tool_privacy_candidates`
 (which fails without the parser change).
 
+### Nested MIME modality shape (OpenCode Go)
+
+OpenCode Go publishes modalities under a nested key with MIME types instead
+of names:
+
+```json
+{"modalities": {"input": ["text", "image/jpeg", "image/png", "application/pdf"],
+                "output": ["text"]}}
+```
+
+`_advertised_modalities` read only flat `input_modalities` /
+`inputModalities` keys (and OpenRouter's `architecture` block), so this row
+parsed as modality-unknown and every OpenCode Go route was held out of image
+requests. `_modality_values` now collapses a MIME entry to its major type
+(`image/jpeg` → `image`, `video/mp4` → `video`) and keeps named modalities
+verbatim; non-media types such as `application/pdf` describe a document, not
+an input modality this gateway requires, so they are dropped.
+
+A second defect compounded it. `_model_capabilities` merged every
+`input_*` capability record into the modality set, including the composite
+`input_image_tools` contract, which produced a bogus `image_tools` modality.
+That set is then treated as the provider's explicit claim, so the
+`modality not in advertised_modalities` hard negative rejected a route whose
+composite probe had just passed. The merge now keeps only
+`INPUT_MODALITY_CAPABILITIES` (text/image/audio/video) and leaves the
+composite contract to `_image_tools_evidence_allows`.
+
+Covered by
+`tests/test_catalog.py::test_catalog_capability_helpers_read_nested_mime_modalities`
+and `tests/test_pools.py::test_composite_evidence_does_not_become_input_modality`;
+both fail against the pre-fix source. Against the live catalog snapshot, the
+image+tools privacy walk gained four OpenCode Go candidates
+(`glm-5.3-flash`, `deepseek-v4.1-flash`, `gpt-5.6-luna`, `gpt-6-luna`).
+
+
 ### Composite probe scheduling and batch composition
 
 Image-plus-tool evidence is refreshed by its own bounded cycle. Two defects

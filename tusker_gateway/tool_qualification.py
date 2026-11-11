@@ -833,40 +833,38 @@ def _interleave_probe_candidates(
     pairs: list[tuple[str, str]],
     capability_db: ModelCapabilityDB,
 ) -> list[tuple[str, str]]:
-    """Order probe candidates so one provider cannot starve the others.
+    """Order due routes so one provider cannot consume the whole bounded batch.
 
-    The probe batch is bounded (``TUSKER_COMPOSITE_QUALIFICATION_LIMIT``),
-    so the order decides which routes are ever examined. Sorting by provider
-    name let a provider whose routes are all quota-blocked consume every
-    slot: on 2026-11-01 the eight ``github-copilot-enterprise`` routes all
-    carried ``unavailable`` evidence (a 3600s account quota cooldown), so
-    each cycle re-probed those same eight and the twelve ``ollama-cloud``
-    routes - which had no composite evidence at all - were never reached.
+    The probe batch is bounded (``TUSKER_COMPOSITE_QUALIFICATION_LIMIT``), so
+    ordering decides which routes are ever examined. A provider whose routes
+    are all quota-blocked must not consume every slot: on 2026-11-01 the eight
+    ``github-copilot-enterprise`` privacy routes all carried ``unavailable``
+    evidence (a 3600s account quota cooldown), so each cycle re-probed those
+    same eight and the twelve ``ollama-cloud`` routes - which had no composite
+    evidence at all - were never reached.
 
-    Routes without any evidence come first: they are the ones a missing
-    record actually blocks. The remainder is then interleaved provider by
-    provider so a bounded batch still spans every provider.
+    Routes with no record come first: they are the ones a missing record
+    actually blocks. Every other due route follows, oldest evidence first
+    within its provider. Both tiers are interleaved provider by provider, so
+    a bounded batch still spans every provider instead of spending itself on
+    the provider with the most stale records.
     """
-    unproven: list[tuple[str, str]] = []
-    proven: list[tuple[str, str]] = []
+    unprobed: dict[str, list[tuple[str, str]]] = {}
+    stale: dict[str, list[tuple[float, tuple[str, str]]]] = {}
     for pair in pairs:
         record = capability_db.get(*pair, COMPOSITE_CAPABILITY)
-        if record is None or record.status in {"unsupported", "passed"}:
-            unproven.append(pair)
+        if record is None:
+            unprobed.setdefault(pair[0], []).append(pair)
         else:
-            proven.append(pair)
+            stale.setdefault(pair[0], []).append((float(record.checked_at), pair))
 
-    def by_provider(group: list[tuple[str, str]]) -> list[tuple[str, str]]:
-        buckets: dict[str, list[tuple[str, str]]] = {}
-        for pair in group:
-            buckets.setdefault(pair[0], []).append(pair)
+    def interleave(groups: dict[str, list[tuple[str, str]]]) -> list[tuple[str, str]]:
         ordered: list[tuple[str, str]] = []
-        # Round-robin across providers so the batch spans them all.
         index = 0
         while True:
             added = False
-            for provider in sorted(buckets):
-                bucket = buckets[provider]
+            for provider in sorted(groups):
+                bucket = groups[provider]
                 if index < len(bucket):
                     ordered.append(bucket[index])
                     added = True
@@ -875,7 +873,11 @@ def _interleave_probe_candidates(
             index += 1
         return ordered
 
-    return by_provider(unproven) + by_provider(proven)
+    ordered_stale = {
+        provider: [pair for _, pair in sorted(entries, key=lambda item: item[0])]
+        for provider, entries in stale.items()
+    }
+    return interleave(unprobed) + interleave(ordered_stale)
 
 
 async def run_image_tool_qualification(

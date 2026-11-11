@@ -389,6 +389,53 @@ def test_verified_modality_evidence_controls_pool_selection():
             "vision-candidate",
         )
 
+def test_composite_evidence_does_not_become_input_modality(tmp_path):
+    """A passed image-plus-tools probe must not fabricate an input modality.
+
+    ``input_image_tools`` is the composite contract. Folding its name into the
+    modality set produced ``{"image_tools"}``, which is non-empty, so a route
+    whose catalog says nothing about modality lost its permissive "unknown"
+    status and the bogus entry overrode a passing ``input_image`` probe.
+    """
+    manager = PoolManager(
+        {
+            "pools": {
+                "privacy": PoolConfig(
+                    name="privacy",
+                    zdr=True,
+                    models=[{"provider": "synthetic", "model": "vision-tools"}],
+                ),
+            },
+            "quality_db_path": str(tmp_path / "quality.db"),
+            "model_capability_db_path": str(tmp_path / "model-capability.db"),
+            "excluded_providers": [],
+            "provider_api_keys": {"synthetic": "test"},
+        }
+    )
+    manager._model_capability_db.record(
+        provider="synthetic",
+        model="vision-tools",
+        capability="input_image",
+        status="passed",
+        source="modality_probe",
+    )
+    manager._model_capability_db.record(
+        provider="synthetic",
+        model="vision-tools",
+        capability="input_image_tools",
+        status="passed",
+        source="composite_probe",
+        probe_version="image-tool-contract-v2",
+    )
+    modalities, _ = manager._model_capabilities(
+        manager.models["privacy"][0], {}, None
+    )
+    assert modalities == frozenset({"image"})
+    assert manager.select("privacy", required_input_modalities={"image"}) == (
+        "synthetic",
+        "vision-tools",
+    )
+
 def test_image_tools_selection_requires_composite_probe(tmp_path):
     manager = PoolManager(
         {

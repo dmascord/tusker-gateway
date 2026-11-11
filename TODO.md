@@ -130,6 +130,46 @@ served Ollama Cloud models now resolve image input, and the local
 privacy pool has Ollama and MLX routes available while the GHE credential
 is in cooldown.
 
+## Composite qualification starvation (2026-11-11)
+
+The bounded image-plus-tools qualification batch could spend every cycle on
+stale routes from one provider (notably GHE while its account quota was in a
+3600-second cooldown), leaving other auto-discovered privacy routes without
+evidence. `_interleave_probe_candidates` now interleaves providers in both the
+unproven and stale-record tiers, with oldest evidence first within each
+provider. Regression coverage:
+`tests/test_tool_capability.py::test_composite_probe_retries_stale_routes_fairly_across_providers`.
+
+Status: implemented and focused tests pass. Production rollout is pending; the
+live pod is still commit `1d5a611` and was not mutated by this investigation.
+
+## Auto-discovered routes held out by catalog shape (2026-11-11)
+
+Two independent defects kept `opencode-go` and other auto-discovered routes out
+of every image request even though those providers advertise image input:
+
+1. `tusker_gateway/catalog.py` never read `modalities: {input: [...], output:
+   [...]}`, the shape OpenCode Go publishes, and it did not understand MIME
+   entries (`image/jpeg`, `video/mp4`). A route whose own catalog states image
+   support parsed as modality-unknown.
+2. `tusker_gateway/pools.py` folded the composite `input_image_tools`
+   capability into the modality set, producing a bogus `image_tools` modality.
+   That non-empty set then tripped the "explicit claim" hard negative, so a
+   passing `input_image` probe no longer admitted the route.
+
+Regression coverage:
+`tests/test_catalog.py::test_catalog_capability_helpers_read_nested_mime_modalities`
+and `tests/test_pools.py::test_composite_evidence_does_not_become_input_modality`
+(both fail against the pre-fix source). Measured on the live catalog snapshot
+inside the production pod: the image+tools privacy walk went from zero
+`opencode-go` candidates to four (`glm-5.3-flash`, `deepseek-v4.1-flash`,
+`gpt-5.6-luna`, `gpt-6-luna`).
+
+Status: implemented, full offline suite green (`2139 passed, 8 skipped`).
+Production rollout is pending; the live pod still runs commit `1d5a611`.
+
+
+
 ## Privacy image-plus-tools fallback hardening (2026-10-27)
 
 - Pool-selection exhaustion diagnostics now identify maintenance qualification scans separately from live request routing.
