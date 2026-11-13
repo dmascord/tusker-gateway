@@ -44,6 +44,10 @@ MODEL_SCOPED_COOLDOWN_PROVIDERS = frozenset({
     "anthropic",    # supported by custom provider registries
     "cohere",       # rerank quota is per-model; a rerank exhaustion must not
                     # also quarantine future cohere chat/embedding routes
+    "opencode-go",  # free and paid models carry independent quotas; a 429 on
+                    # one model (e.g. glm-5.3-flash) must not quarantine the
+                    # whole provider and block healthy siblings such as the
+                    # *-free models
 })
 # Bodies that indicate a long-lived quota / usage-limit window (hours or
 # days), not a transient rate-limit blip. Backing off 60s for these would
