@@ -256,17 +256,20 @@ async def test_nonzero_exit_logs_bounded_stderr_preview(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_kilo_forwards_base64_image_as_file(monkeypatch):
+async def test_kilo_describes_base64_image_via_vision_bridge(monkeypatch):
     monkeypatch.setenv("TUSKER_KILO_CLI_ENABLED", "true")
     monkeypatch.delenv("TUSKER_KILO_WORKER_URL", raising=False)
     stdout = json.dumps({"type": "text", "part": {"text": "seen"}}).encode()
-    captured: dict[str, bytes] = {}
+    captured: dict[str, Any] = {}
     async def _spawn(*args, **kwargs):
-        image_path = args[args.index("--file") + 1]
-        captured["image"] = Path(image_path).read_bytes()
+        captured["args"] = args
+        captured["stdin"] = kwargs.get("stdin")
         return _FakeProcess(stdout)
+    async def _fake_describe(url):
+        return "a small red square"
     with patch("tusker_gateway.provider_adapters.kilo_cli.shutil.which", return_value="kilo"), \
-         patch("tusker_gateway.provider_adapters.kilo_cli.asyncio.create_subprocess_exec", new=_spawn):
+         patch("tusker_gateway.provider_adapters.kilo_cli.asyncio.create_subprocess_exec", new=_spawn), \
+         patch("tusker_gateway.provider_adapters.kilo_cli._describe_image_with_vision", new=_fake_describe):
         result = await KiloCLIAdapter().chat(
             provider="kilo-cli", model="kilo/kilo-auto/free",
             messages=[{"role": "user", "content": [
@@ -275,4 +278,4 @@ async def test_kilo_forwards_base64_image_as_file(monkeypatch):
             ]}], stream=False,
         )
     assert result["choices"][0]["message"]["content"] == "seen"
-    assert captured["image"] == b"hi"
+    assert "--file" not in captured["args"]

@@ -33,6 +33,104 @@ logger = logging.getLogger(__name__)
 
 
 
+
+
+async def _describe_image_with_vision(image_data_url):
+    import aiohttp
+    api_key = os.environ.get("API_KEYS", "").split(",")[0].strip()
+    if not api_key:
+        return None
+    base_url = os.environ.get("TUSKER_SELF_BASE_URL", "http://127.0.0.1:8642").rstrip("/")
+    vision_model = os.environ.get("TUSKER_KILO_IMAGE_VISION_MODEL", "openai-codex/gpt-5.6-luna")
+    payload = {
+        "model": vision_model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this image concisely in one or two sentences, focusing on the main subject, colors, and any text visible. Reply with only the description."},
+                    {"type": "image_url", "image_url": {"url": image_data_url}},
+                ],
+            }
+        ],
+        "max_tokens": 128,
+        "stream": False,
+    }
+    timeout = aiohttp.ClientTimeout(total=60)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                base_url + "/v1/chat/completions",
+                json=payload,
+                headers={"Authorization": "Bearer " + api_key, "Content-Type": "application/json"},
+            ) as response:
+                if response.status >= 400:
+                    return None
+                data = await response.json()
+                choices = data.get("choices") if isinstance(data, dict) else None
+                if not isinstance(choices, list) or not choices:
+                    return None
+                content = choices[0].get("message", {}).get("content")
+                if not isinstance(content, str) or not content.strip():
+                    return None
+                return content.strip()
+    except Exception as exc:
+        logger.warning("kilo vision bridge call failed (%s)", type(exc).__name__)
+        return None
+
+
+async def _describe_images_for_kilo(messages):
+    new_messages = []
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            new_messages.append(message)
+            continue
+        new_parts = []
+        for part in content:
+            if not isinstance(part, dict):
+                new_parts.append(part)
+                continue
+            kind = str(part.get("type") or "").strip().lower()
+            if kind not in {"image_url", "input_image"}:
+                new_parts.append(part)
+                continue
+            url = part.get("image_url")
+            if isinstance(url, dict):
+                url = url.get("url")
+            if not isinstance(url, str) or not url:
+                new_parts.append({"type": "text", "text": "[image]"})
+                continue
+            description = await _describe_image_with_vision(url)
+            if description:
+                new_parts.append({"type": "text", "text": "[Image: " + description + "]"})
+            else:
+                new_parts.append({"type": "text", "text": "[image]"})
+        new_message = dict(message)
+        new_message["content"] = new_parts
+        new_messages.append(new_message)
+    return new_messages
+
+
+def _drop_image_parts(messages):
+    new_messages = []
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            new_messages.append(message)
+            continue
+        new_parts = []
+        for part in content:
+            if isinstance(part, dict) and str(part.get("type") or "").lower() in {"image_url", "input_image"}:
+                new_parts.append({"type": "text", "text": "[image]"})
+            else:
+                new_parts.append(part)
+        new_message = dict(message)
+        new_message["content"] = new_parts
+        new_messages.append(new_message)
+    return new_messages
+
+
 def _model_retired_indicated(*parts: bytes | str) -> bool:
     """Detect deterministic Kilo model retirement/rejection wording."""
     text = " ".join(
@@ -216,6 +314,17 @@ class KiloCLIAdapter:
             raise ProviderRouteDisabledError(provider)
         cli_model = _model_for_cli(model)
         has_images = _has_image_parts(messages)
+        # Kilo CLI models are text-only. Bridge image inputs by describing them
+        # with a vision-capable model first, so kilo receives a textual
+        # description instead of a binary attachment it cannot read.
+        if has_images:
+            try:
+                messages = await _describe_images_for_kilo(messages)
+                has_images = _has_image_parts(messages)
+            except Exception as exc:  # never fail the request because of the bridge
+                logger.warning("kilo image-description bridge failed (%s); proceeding without images", type(exc).__name__)
+                messages = _drop_image_parts(messages)
+                has_images = False
         worker_url = os.environ.get("TUSKER_KILO_WORKER_URL", "").strip()
         if worker_url and not has_images:
             if stream:
@@ -302,7 +411,7 @@ class KiloCLIAdapter:
                 messages, temp_dir, provider_label="kilo-cli",
             )
             call_file: Path | None = None
-            config: dict[str, Any] = {"permission": {"*": "deny"}, "plugin": []}
+            config: dict[str, Any] = {"permission": {"*": "deny", "external_directory": "allow"}, "plugin": []}
             if tool_manifest:
                 manifest_file = temp_dir / "tools.json"
                 call_file = temp_dir / "tool-call.json"
@@ -360,7 +469,7 @@ class KiloCLIAdapter:
             )
             call_file: Path | None = None
             config: dict[str, Any] = {
-                "permission": {"*": "deny"},
+                "permission": {"*": "deny", "external_directory": "allow"},
                 "plugin": [],
             }
             if tool_manifest:
