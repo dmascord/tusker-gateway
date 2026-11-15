@@ -320,7 +320,12 @@ spec:
         - name: TUSKER_POOL_PREMIUM
           value: '{"models":[{"provider":"github-copilot-enterprise","model":"claude-sonnet-4.6"},{"provider":"github-copilot-enterprise","model":"claude-opus-4.6"},{"provider":"openai-codex","model":"gpt-5.6-sol"},{"provider":"openai-codex","model":"gpt-5.6-terra"},{"provider":"openai-codex","model":"gpt-5.5"},{"provider":"openai-codex","model":"gpt-5.4"},{"provider":"github-copilot-enterprise","model":"gpt-5.5"},{"provider":"github-copilot-enterprise","model":"gpt-5.4"},{"provider":"opencode-go","model":"deepseek-v4-pro"},{"provider":"synthetic","model":"syn:large:text","input_modalities":["text"]},{"provider":"synthetic","model":"syn:large:vision","input_modalities":["text","image"]},{"provider":"synthetic","model":"syn:small:vision","input_modalities":["text","image"]},{"provider":"minimax","model":"MiniMax-M2.7-highspeed","input_modalities":["text"]},{"provider":"minimax","model":"MiniMax-M2.7","input_modalities":["text"]},{"provider":"google","model":"gemini-3-pro"},{"provider":"alibaba","model":"glm-5.2","input_modalities":["text","image"]},{"provider":"alibaba","model":"qwen3.8-max","input_modalities":["text","image"]},{"provider":"alibaba","model":"qwen3.7-max","input_modalities":["text"]},{"provider":"alibaba","model":"glm-5.3","input_modalities":["text","image"]}],"context_window":128000,"auto_catalog":true,"auto_catalog_providers":["ollama-cloud"],"heavyweight_only":true}'
         - name: TUSKER_POOL_SWARM
-          value: '{"models":[{"provider":"opencode-go","model":"deepseek-v4-flash"},{"provider":"xiaomi","model":"mimo-v2.5","input_modalities":["text","image"]}],"context_window":128000}'
+          # xiaomi/mimo-v2.5 removed 2026-11-16: upstream retired the model on
+          # 2026-10-18 ("400 Unsupported model mimo-v2.5"); /v1/models now lists
+          # only mimo-v2.6-* (themselves quota-exhausted since Nov 9). The dead
+          # static route produced 0% success across 31k requests. Re-add only
+          # after the upstream catalog serves a chat model again.
+          value: '{"models":[{"provider":"opencode-go","model":"deepseek-v4-flash"}],"context_window":128000}'
         - name: TUSKER_LOCAL_LLM_TIMEOUT_SECS
           value: '240'
         - name: PROVIDER_GITHUB_COPILOT_API_KEY
