@@ -11,3 +11,24 @@ spec:
   dnsNames:
   - ai.tusker.net.au
   - memory.tusker.net.au
+---
+# The hermes hostname is served by its own IngressRoutes (hermes-api-compat
+# and hermes-redirect-websecure) and by nothing else, so it needs its own
+# certificate rather than the gateway SANs.
+#
+# This secret was created outside cert-manager and had no Certificate
+# object, so it was never renewed: it expired on 2026-10-29 and Cloudflare
+# answered 526 for hermes.tusker.net.au. cert-manager adopts the existing
+# secret, reissues it, and renews it from then on.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: hermes-tls
+  namespace: hermes
+spec:
+  secretName: hermes-tls
+  issuerRef:
+    name: letsencrypt-cloudflare
+    kind: ClusterIssuer
+  dnsNames:
+  - hermes.tusker.net.au
