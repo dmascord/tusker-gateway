@@ -257,6 +257,9 @@ Operational knobs:
 
 - `TUSKER_AUDIT_FAIL_CLOSED=true` rejects unprepared responses if audit
   persistence fails. The default is fail-open with an error log.
+- Both async and synchronous audit appends retry transient shared-volume
+  I/O errors (4 attempts with exponential backoff) before failing closed;
+  only exhausted retries reject the request.
 - `TUSKER_AUDIT_FSYNC=false` trades durability for write latency.
 - `TUSKER_AUDIT_EXCLUDE_PATHS` defaults to `/health,/ready,/metrics`.
 

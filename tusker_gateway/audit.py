@@ -29,6 +29,11 @@ _MAX_LEGACY_RECORD_BYTES = 1024 * 1024
 # fail-closed contract from turning that into a client-visible 503.
 _APPEND_RETRY_ATTEMPTS = 4
 _APPEND_RETRY_BACKOFF_SECS = 0.02
+# Tool-approval interception can call ``write_sync`` from inside a synchronous
+# response validator, where the async retry loop is unreachable; the same
+# shared-volume EIO would otherwise fail the request closed on the first
+# transient blip.
+_SYNC_APPEND_RETRY_ATTEMPTS = 4
 
 try:  # pragma: no cover - Linux in production; fallback keeps local portability.
     import fcntl
@@ -239,13 +244,24 @@ class AuditLogger:
         """
         if not self.config.enabled:
             return None
-        try:
-            return self._append(event)
-        except Exception as exc:
-            logger.error("audit write failed: %s", exc.__class__.__name__)
-            if self.config.fail_closed:
-                raise AuditWriteError("required audit persistence failed") from exc
-            return None
+        last_error: BaseException | None = None
+        for attempt in range(_SYNC_APPEND_RETRY_ATTEMPTS):
+            try:
+                return self._append(event)
+            except OSError as exc:
+                # Mirror the async path: a shared/NFS-backed audit volume can
+                # transiently reject an append; retry before failing closed.
+                last_error = exc
+                logger.warning(
+                    "audit sync append retry %d/%d after %s",
+                    attempt + 1,
+                    _SYNC_APPEND_RETRY_ATTEMPTS,
+                    exc.__class__.__name__,
+                )
+        logger.error("audit write failed: %s", last_error.__class__.__name__)
+        if self.config.fail_closed and last_error is not None:
+            raise AuditWriteError("required audit persistence failed") from last_error
+        return None
 
     @classmethod
     def verify_file(cls, config: AuditConfig) -> tuple[bool, int]:
