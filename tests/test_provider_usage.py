@@ -359,6 +359,42 @@ async def test_queue_wait_expiry_returns_rejection(monkeypatch):
     assert snapshot["active"] == 0
     controller.reset()
 
+@pytest.mark.asyncio
+async def test_queue_wait_expiry_records_quality_failure(monkeypatch, tmp_path):
+    from unittest.mock import MagicMock
+
+    from tusker_gateway.passthrough import PassthroughClient
+    from tusker_gateway.quality import QualityDB
+
+    monkeypatch.setenv("TUSKER_MLX_MAC_MAX_CONCURRENT", "1")
+    monkeypatch.setenv("TUSKER_MLX_MAC_QUEUE_DEPTH", "1")
+    monkeypatch.setenv("TUSKER_MLX_MAC_QUEUE_WAIT_SECS", "0.01")
+    controller = capacity_controller()
+    controller.reset()
+    db = QualityDB(str(tmp_path / "quality.db"))
+    client = PassthroughClient(
+        {
+            "api_keys": ["gateway-test"],
+            "provider_api_keys": {},
+            "codex_credentials": [],
+            "quality_db_path": str(tmp_path / "quality.db"),
+        },
+        db,
+        MagicMock(),
+    )
+    held = controller.acquire("mlx-mac")
+    assert held is not None
+    try:
+        with pytest.raises(ProviderCapacityError) as caught:
+            await client._reserve_capacity("mlx-mac", "qwen3.8-27b")
+        assert caught.value.capacity_rejected is True
+    finally:
+        held.release()
+        controller.reset()
+
+    assert db.get_quality("mlx-mac", "qwen3.8-27b") is not None
+    assert db.rank([("mlx-mac", "qwen3.8-27b")])[0][2] < 30.0
+
 
 @pytest.mark.asyncio
 async def test_queued_reserve_holds_slot_for_the_request(monkeypatch, tmp_path):

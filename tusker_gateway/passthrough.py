@@ -2339,7 +2339,9 @@ class PassthroughClient:
                 capacity_rejected=True,
                 group=group,
             )
+            await self._record_quality(provider, model, False, 0.0)
             raise error
+        queue_started = time.monotonic()
         lease = await capacity_controller().acquire_queued(group)
         if lease is None:
             # This is a local admission decision, not an upstream request.
@@ -2347,6 +2349,15 @@ class PassthroughClient:
             # another provider instead of trying every sibling Nvidia model.
             busy_window = capacity_busy_cooldown_seconds()
             tracker.cooldown_group(group, busy_window)
+            # The caller paid the whole queue wait for nothing. Feed that to
+            # the quality score so a route that keeps saturating sinks below
+            # healthy candidates instead of being retried first every time.
+            await self._record_quality(
+                provider,
+                model,
+                False,
+                (time.monotonic() - queue_started) * 1000,
+            )
             error = ProviderCapacityError(
                 group=group,
                 capacity_rejected=True,

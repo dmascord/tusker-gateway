@@ -16,6 +16,9 @@ from tusker_gateway.storage import shared_database
 logger = logging.getLogger(__name__)
 
 QUALITY_WINDOW = 20
+QUALITY_RECENT_FAILURE_WINDOW_SECS = 300.0
+QUALITY_RECENT_FAILURE_PENALTY = 30.0
+
 
 
 @dataclass
@@ -178,12 +181,13 @@ class QualityDB:
             conn.commit()
 
     def _recompute_score(self, conn: Any, provider: str, model: str) -> None:
-        """Recompute quality_score = success_rate * 80 + latency_bonus * 20.
+        """Recompute quality score from recent success and latency evidence.
 
-        Both factors are computed over the most recent events (a sliding
-        window), so old failures stop weighting the score once enough new
-        successes arrive. Lifetime totals in ``model_quality`` remain
-        observable but do not gate the score.
+        Latency remains bounded so a slow success cannot dominate a route, but
+        it continues to distinguish seconds from minutes instead of flattening
+        at the exponential tail. Local capacity rejections are recorded as
+        failures by the passthrough client, so repeated saturation also
+        demotes a route without removing it from the final fallback set.
         """
         window = conn.execute(
             """
@@ -202,9 +206,7 @@ class QualityDB:
         )
         if not total_window:
             return
-        # latency_bonus: 1.0 at 0ms, 0.5 at 1000ms, exp decay
-        import math
-        latency_bonus = math.exp(-avg_latency / 1500.0)
+        latency_bonus = 1.0 / (1.0 + max(0.0, avg_latency) / 1500.0)
         score = success_rate * 80.0 + latency_bonus * 20.0
         conn.execute(
             """
@@ -244,17 +246,28 @@ class QualityDB:
             return None
         return int(row[0] or 0), float(row[1]) if row[1] is not None else 0.0
 
+    def _recent_failure_count(
+        self, provider: str, model: str, *, now: float | None = None
+    ) -> int:
+        """Count recent failed attempts used for short-horizon demotion."""
+        cutoff = (time.time() if now is None else now) - QUALITY_RECENT_FAILURE_WINDOW_SECS
+        with self._db.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) FROM model_events
+                WHERE provider = ? AND model = ? AND success = 0 AND created_at >= ?
+                """,
+                (provider, model, cutoff),
+            ).fetchone()
+        return int(row[0] or 0) if row else 0
+
     def rank(
         self,
         candidates: list[tuple[str, str]],
         *,
         default_score: float | None = None,
     ) -> list[tuple[str, str, float]]:
-        """Sort (provider, model) candidates by quality score (highest first).
-
-        Candidates with no recorded data use an adaptive floor computed
-        from the median score of the pool, clamped between 10.0 and 50.0.
-        """
+        """Sort candidates by quality with expiring recent-failure demotion."""
         scored: list[tuple[str, str, float]] = []
         known_scores: list[float] = []
         for provider, model in candidates:
@@ -263,21 +276,23 @@ class QualityDB:
                 known_scores.append(q)
                 scored.append((provider, model, q))
             else:
-                scored.append((provider, model, -1.0))  # placeholder
+                scored.append((provider, model, -1.0))
         if known_scores:
             known_scores.sort()
             n = len(known_scores)
             median = known_scores[n // 2] if n % 2 else (known_scores[n // 2 - 1] + known_scores[n // 2]) / 2.0
-            floor = max(10.0, median - 20.0)
-            # Cap the adaptive floor so a pool with uniformly mediocre models
-            # doesn't promote unknown catalog entries above proven ones.
-            floor = min(floor, 50.0)
+            floor = min(max(10.0, median - 20.0), 50.0)
         else:
-            floor = 50.0  # no data at all — keep legacy default
+            floor = 50.0
         if default_score is not None:
             floor = default_score
-        # Replace placeholders with floor
-        result = [(p, m, s if s >= 0 else floor) for p, m, s in scored]
+        result: list[tuple[str, str, float]] = []
+        for provider, model, score in scored:
+            if score < 0:
+                score = floor
+            recent_failures = self._recent_failure_count(provider, model)
+            score -= min(QUALITY_RECENT_FAILURE_PENALTY, recent_failures * QUALITY_RECENT_FAILURE_PENALTY)
+            result.append((provider, model, score))
         result.sort(key=lambda x: x[2], reverse=True)
         logger.debug('ranked %d candidates', len(result))
         return result

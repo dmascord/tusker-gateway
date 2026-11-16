@@ -44,6 +44,41 @@ def test_quality_db_ranking():
         assert ranked[0][0] in {"p1", "p2"}
         assert ranked[1][0] in {"p1", "p2"}
 
+def test_quality_rank_keeps_minute_latency_below_fast_route():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = QualityDB(os.path.join(tmpdir, "test.db"))
+        for _ in range(QUALITY_WINDOW):
+            db.record("fast", "model", True, 1_000.0)
+            db.record("slow", "model", True, 120_000.0)
+
+        ranked = db.rank([("fast", "model"), ("slow", "model")])
+
+        assert ranked[0][:2] == ("fast", "model")
+        assert ranked[1][:2] == ("slow", "model")
+        assert ranked[0][2] - ranked[1][2] > 10.0
+
+def test_quality_rank_temporarily_demotes_recent_failures(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = QualityDB(os.path.join(tmpdir, "test.db"))
+        db.record("healthy", "model", True, 1_000.0)
+        db.record("saturated", "model", True, 1_000.0)
+        monkeypatch.setattr("tusker_gateway.quality.time.time", lambda: 1_000.0)
+        db.record("saturated", "model", False, 120_000.0)
+
+        ranked = db.rank([("healthy", "model"), ("saturated", "model")])
+
+        assert ranked[0][:2] == ("healthy", "model")
+        assert ranked[1][2] <= ranked[0][2] - 25.0
+
+        monkeypatch.setattr("tusker_gateway.quality.time.time", lambda: 1_301.0)
+        recovered = dict(
+            (provider, score)
+            for provider, _model, score in db.rank(
+                [("healthy", "model"), ("saturated", "model")]
+            )
+        )
+        assert recovered["saturated"] - ranked[1][2] == 30.0
+
 def test_quality_rank_adaptive_floor_is_bounded():
     """Unknown candidates use a floor no lower than 10 or higher than 50."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -173,8 +208,8 @@ def test_degraded_state_store_does_not_crash_quality_reads(monkeypatch):
 
     monkeypatch.setattr(storage, "_pool_for", _unavailable)
     monkeypatch.setattr(storage, "_STORAGE_STATUS", dict(storage._STORAGE_STATUS))
+    monkeypatch.setenv("TUSKER_STORAGE_MODE", "postgres")
     monkeypatch.setenv("TUSKER_STATE_DATABASE_URL", "postgresql://state.invalid/tusker")
-
     db = QualityDB("quality.db")
 
     db.prime_model("p1", "m1")  # raised TypeError before the fix

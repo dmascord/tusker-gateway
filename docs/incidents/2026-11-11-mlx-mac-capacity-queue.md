@@ -164,3 +164,21 @@ covers the production chain and fails against the pre-fix implementation with
 This is separate from the bounded FIFO admission change above: the queue
 correctly waited for a slot, but no slot could become free until the nested
 stream wrappers closed the guarded provider iterator.
+
+## Follow-up: bounded queue fallback and recent-failure demotion (2026-11-16)
+
+The queue wait was reduced from 120 seconds to 20 seconds in the deployment
+manifest. A request that cannot obtain an MLX slot now reaches the next pool
+candidate within a bounded window instead of holding the client connection for
+two minutes. Queue expiry and shared-capacity cooldown rejection are recorded
+as provider quality failures.
+
+Quality ranking now applies a 30-point, five-minute selection penalty when a
+route has a recent failure. The route remains eligible as a last-resort
+fallback, and the penalty expires without changing the persisted base score.
+Latency scoring also uses a rational decay so minute-scale latency remains
+distinguishable from normal seconds-scale responses.
+
+Regression coverage is in `tests/test_quality.py` and
+`tests/test_provider_usage.py`; the deployment value must be propagated to the
+DB-backed runtime configuration before it affects a live pod.
