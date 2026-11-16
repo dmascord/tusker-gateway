@@ -36,6 +36,47 @@ async def test_concurrent_appends_all_persist_and_chain_verifies(tmp_path):
     assert valid is True
     assert count == 32
 
+async def test_write_sync_transient_oserror_is_retried(tmp_path, monkeypatch):
+    """The sync path must survive the same transient EIO that the async path retries.
+
+    Production: a tool-approval policy event hit ``OSError(EIO)`` on the shared
+    audit volume and, with fail-closed on, aborted a healthy stream.
+    """
+    path = tmp_path / "audit.jsonl"
+    logger = AuditLogger(_config(path))
+    attempts = {"count": 0}
+    original = logger._append
+
+    def flaky_append(event):
+        attempts["count"] += 1
+        if attempts["count"] <= 2:
+            raise OSError(5, "Input/output error")
+        return original(event)
+
+    monkeypatch.setattr(logger, "_append", flaky_append)
+
+    result = logger.write_sync({"sequence": 0})
+
+    assert result is not None
+    assert attempts["count"] == 3
+    assert path.read_text().strip()
+
+
+async def test_write_sync_persistent_oserror_still_fails_closed(
+    tmp_path, monkeypatch
+):
+    """Exhausting the sync retries must still raise under fail-closed."""
+    path = tmp_path / "audit.jsonl"
+    logger = AuditLogger(_config(path))
+
+    def always_fail(_event):
+        raise OSError(5, "Input/output error")
+
+    monkeypatch.setattr(logger, "_append", always_fail)
+
+    with pytest.raises(AuditWriteError):
+        logger.write_sync({"sequence": 0})
+
 
 async def test_transient_oserror_is_retried_instead_of_failing_closed(
     tmp_path, monkeypatch

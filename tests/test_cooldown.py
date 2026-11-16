@@ -257,3 +257,12 @@ def test_429_short_cooldown_preserved_when_body_lacks_quota_phrasing():
     assert _cooldown_seconds_for_429(
         {"body": "Service warming up. Try again in 3 seconds.", "headers": {}}
     ) == 3.0
+
+
+def test_opencode_go_model_scoped_cooldown_does_not_block_sibling_models():
+    tracker = CooldownTracker()
+    tracker.cooldown("opencode-go", "glm-5.3-flash", 60)
+
+    assert tracker.is_cooldown("opencode-go", "glm-5.3-flash")
+    assert not tracker.is_cooldown("opencode-go", "beam-free")
+    assert not tracker.is_cooldown("opencode-go", "deepseek-v4.1-flash-free")
