@@ -138,3 +138,29 @@ and unavailable for image-plus-tools traffic. `_interleave_probe_candidates`
 now interleaves providers in both the no-record and stale-record tiers, ordering
 oldest evidence first within each provider. Regression coverage is in
 `tests/test_tool_capability.py::test_composite_probe_retries_stale_routes_fairly_across_providers`.
+
+## Follow-up: abandoned normalized streams stranded leases (2026-11-16)
+
+The queue fix exposed a second, independent saturation path. On 2026-11-16,
+the live gateway reported `mlx-mac active=2/2`, with `queue_wait_timeouts`
+increasing, while the Mac's `/api/ps` returned `{"models": []}`. Two requests
+had entered the MLX route and then failed over after the client-side stream
+preparation path stopped consuming them; the capacity leases were not released.
+
+The provider lease was held by `_guard_stream_lease`, whose release runs when
+the underlying `_stream_events` generator closes. The endpoint closed the
+normalizer returned by `_normalize_stream`, but two plain async-generator
+wrappers did not forward `aclose()` to their sources: the normalizer's
+`diagnostic_raw_stream` and `_attempt_touch_iterator`. An async generator that
+had not started its iteration therefore never ran the source cleanup, leaving
+the lease counted indefinitely. Every subsequent MLX request waited 120
+seconds and fell back with `503 provider capacity unavailable`.
+
+Both wrappers now close their source in `finally` blocks. The regression
+`tests/test_provider_usage.py::test_normalize_stream_close_releases_capacity_lease`
+covers the production chain and fails against the pre-fix implementation with
+`active=1`.
+
+This is separate from the bounded FIFO admission change above: the queue
+correctly waited for a slot, but no slot could become free until the nested
+stream wrappers closed the guarded provider iterator.

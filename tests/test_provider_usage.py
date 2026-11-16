@@ -594,3 +594,49 @@ async def test_guard_stream_lease_releases_for_unstarted_generator():
 
     assert controller.snapshot().get("mlx-mac", {}).get("active", 0) == 0
     controller.reset()
+
+
+@pytest.mark.asyncio
+async def test_normalize_stream_close_releases_capacity_lease():
+    """Closing a normalized stream must release the shared MLX lease.
+
+    Regression (2026-11-16): the endpoint's ``finally`` block calls
+    ``aclose`` on the stream it consumed. That stream is built by
+    ``_normalize_stream`` over ``_attempt_touch_iterator`` over
+    ``_guard_stream_lease``. Neither the normalizer nor the touch wrapper
+    forwarded ``aclose`` to its source, so the provider capacity lease
+    under the guard was stranded for the life of the process. On mlx-mac
+    (limit 2) that made the whole group read as saturated while the
+    backend had no model loaded at all.
+    """
+    from tusker_gateway.endpoints import (
+        _AttemptActivity,
+        _attempt_touch_iterator,
+        _normalize_stream,
+    )
+    from tusker_gateway.passthrough import _guard_stream_lease
+
+    controller = capacity_controller()
+    controller.reset()
+    lease = controller.acquire("mlx-mac")
+    assert lease is not None
+    assert controller.snapshot()["mlx-mac"]["active"] == 1
+
+    async def _events():
+        yield b'data: {"choices":[{"index":0,"delta":{"content":"hi"}}]}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    guarded = _guard_stream_lease(_events(), lease)
+    touched = _attempt_touch_iterator(guarded, _AttemptActivity())
+    normalized = _normalize_stream(
+        touched,
+        provider="mlx-mac",
+        model="qwen3.8-27b",
+        request_id="req-lease-regression",
+    )
+    await anext(normalized)
+    await normalized.aclose()
+    await asyncio.sleep(0.05)
+
+    assert controller.snapshot().get("mlx-mac", {}).get("active", 0) == 0
+    controller.reset()
