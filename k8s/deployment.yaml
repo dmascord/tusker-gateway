@@ -576,7 +576,29 @@ spec:
         # produces no image-plus-tool evidence at all.
         - name: TUSKER_COMPOSITE_QUALIFICATION_INITIAL_DELAY_SECS
           value: '600'
-        # Media routes are qualified out of band; no cold probe is added to requests.
+        # Media routes are qualified out of band; no cold probe is added to
+        # requests.
+        # Quality warm-up: local providers (MLX Mac, local LLM) never appear
+        # in LLM Stats leaderboards and only earn quality rows when real
+        # traffic reaches them. The rank boost is clamped to the pool's top
+        # learned quality, so local routes need learned evidence to join the
+        # top selection tier. This cycle probes candidates with no or stale
+        # evidence through the gateway boundary; the ordinary passthrough
+        # quality recording does the bookkeeping.
+        - name: TUSKER_QUALITY_WARMUP_ENABLED
+          value: 'true'
+        - name: TUSKER_QUALITY_WARMUP_PROVIDERS
+          value: mlx-mac,local-llm
+        - name: TUSKER_QUALITY_WARMUP_LIMIT
+          value: '8'
+        - name: TUSKER_QUALITY_WARMUP_TIMEOUT_SECS
+          value: '60'
+        - name: TUSKER_QUALITY_WARMUP_MAX_AGE_SECS
+          value: '604800'
+        - name: TUSKER_QUALITY_WARMUP_INITIAL_DELAY_SECS
+          value: '600'
+        - name: TUSKER_QUALITY_WARMUP_INTERVAL_SECS
+          value: '21600'
         - name: TUSKER_MEDIA_QUALIFICATION_ENABLED
           value: 'true'
         # Enforce fresh explicit media qualification failures during routing.

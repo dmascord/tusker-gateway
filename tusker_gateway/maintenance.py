@@ -399,6 +399,170 @@ async def run_composite_maintenance_cycle(
         "failed": len(results) - passed,
     }
 
+async def run_quality_warmup_cycle(
+    *,
+    pool_names: tuple[str, ...],
+    base_url: str = "http://127.0.0.1:8642",
+    providers: frozenset[str] = frozenset({"mlx-mac", "local-llm"}),
+    limit: int = 8,
+    timeout_secs: float = 60.0,
+    max_age_secs: float = 604_800.0,
+) -> dict[str, Any]:
+    """Send cheap chat probes to candidates with no or stale quality evidence.
+
+    Local providers (MLX Mac, the local LLM host) never appear in LLM Stats
+    leaderboards and earn quality rows only when real traffic reaches them.
+    If selection tiering keeps them below the top quality tier, that traffic
+    never comes and the routes stay permanently under-scored. This cycle
+    routes a small number of real ``/v1/chat/completions`` calls through the
+    gateway, so the ordinary passthrough quality recording populates their
+    evidence and the next selection tier reflects learned behavior instead
+    of the adaptive floor.
+
+    Candidates qualify when the quality DB has no row for them, or when
+    their thin evidence (``total_calls <= 1``) has not seen a success within
+    ``max_age_secs``. Quarantined and permanently failed routes are skipped,
+    matching the other maintenance runners. Probes run sequentially so a
+    single local host is never probed fan-out.
+    """
+    config = load_config()
+    api_key = os.environ.get("API_KEYS", "").split(",", 1)[0].strip()
+    if not api_key:
+        raise RuntimeError("API_KEYS must contain the gateway caller key")
+
+    from pathlib import Path as _Path
+
+    from tusker_gateway.cooldown import global_tracker, is_permanently_failed
+    from tusker_gateway.pools import PoolManager
+    from tusker_gateway.quality import QualityDB
+
+    quality_db = QualityDB(config.get("quality_db_path", "data/quality.db"))
+    cooldown_store = None
+    quality_path = config.get("quality_db_path", "data/quality.db")
+    if quality_path != ":memory:":
+        cooldown_store = PersistentCooldownStore(
+            db_path=_Path(quality_path).parent / "cooldowns.db"
+        )
+
+    manager = PoolManager(config)
+    manager.extend_pools_with_auto_catalog()
+    now = time.time()
+    pairs: list[tuple[str, str]] = []
+    for pool_name in pool_names:
+        for spec in manager.models.get(pool_name, []):
+            if spec.provider.lower() not in providers:
+                continue
+            pair = (spec.provider, spec.model)
+            if pair in pairs:
+                continue
+            evidence = quality_db.evidence(*pair)
+            if evidence is None:
+                pairs.append(pair)
+                continue
+            total_calls, last_success = evidence
+            if total_calls <= 1 and (now - last_success) > max_age_secs:
+                pairs.append(pair)
+    pairs.sort()
+
+    skipped_quarantine = 0
+    probed: list[tuple[str, str]] = []
+    for pair in pairs:
+        if is_permanently_failed(*pair):
+            continue
+        try:
+            if global_tracker().is_cooldown(*pair):
+                skipped_quarantine += 1
+                continue
+        except Exception:
+            logger.debug("warmup cooldown check failed", exc_info=True)
+        if cooldown_store is not None:
+            try:
+                if cooldown_store.is_active(*pair) or cooldown_store.is_provider_active(
+                    pair[0]
+                ):
+                    skipped_quarantine += 1
+                    continue
+            except Exception:
+                logger.debug("warmup persistent cooldown check failed", exc_info=True)
+        probed.append(pair)
+        if len(probed) >= limit:
+            break
+
+    results: dict[str, int] = {"ok": 0, "failed": 0}
+    timeout = aiohttp.ClientTimeout(total=timeout_secs, sock_read=timeout_secs)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for provider, model in probed:
+            payload = {
+                "model": f"{provider}/{model}",
+                "messages": [
+                    {"role": "user", "content": "Reply with the single word: ok"}
+                ],
+                "max_tokens": 128,
+                "temperature": 0,
+                "stream": False,
+            }
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "X-Tusker-Cache": "bypass",
+            }
+            url = f"{base_url.rstrip('/')}/v1/chat/completions"
+            try:
+                async with session.post(url, json=payload, headers=headers) as resp:
+                    if resp.status == 200:
+                        body = await resp.json()
+                        content = (
+                            body.get("choices", [{}])[0]
+                            .get("message", {})
+                            .get("content", "")
+                        )
+                        if isinstance(content, str) and content.strip():
+                            results["ok"] += 1
+                        else:
+                            # Dead terminal: the ordinary failure path has
+                            # already recorded the outcome downstream.
+                            results["failed"] += 1
+                    else:
+                        results["failed"] += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug(
+                    "quality warmup probe failed %s/%s: %s",
+                    provider,
+                    model,
+                    type(exc).__name__,
+                )
+                results["failed"] += 1
+    return {
+        "pools": ",".join(pool_names),
+        "providers": ",".join(sorted(providers)),
+        "eligible": len(pairs),
+        "skipped_quarantine": skipped_quarantine,
+        "probed": len(probed),
+        **results,
+}
+
+
+def _quality_warmup_settings() -> tuple[bool, frozenset[str], int, float, float, float, float, float]:
+    raw = os.environ.get("TUSKER_QUALITY_WARMUP_ENABLED", "0")
+    enabled = raw.strip().lower() not in {"0", "false", "no", "off"}
+    raw_providers = os.environ.get("TUSKER_QUALITY_WARMUP_PROVIDERS", "mlx-mac,local-llm")
+    providers = frozenset(
+        p.strip().lower().replace("_", "-")
+        for p in raw_providers.split(",")
+        if p.strip()
+    )
+    return (
+        enabled,
+        providers,
+        _env_int("TUSKER_QUALITY_WARMUP_LIMIT", 8),
+        _env_float("TUSKER_QUALITY_WARMUP_TIMEOUT_SECS", 60.0, minimum=5.0),
+        _env_float("TUSKER_QUALITY_WARMUP_MAX_AGE_SECS", 604_800.0, minimum=60.0),
+        _env_float("TUSKER_QUALITY_WARMUP_INTERVAL_SECS", 21_600.0, minimum=60.0),
+        _env_float("TUSKER_QUALITY_WARMUP_INITIAL_DELAY_SECS", 600.0, minimum=0.0),
+    )
+
 
 def _composite_qualification_settings() -> tuple[bool, int, float, float, float, float]:
     raw = os.environ.get("TUSKER_COMPOSITE_QUALIFICATION_ENABLED", "0")
@@ -465,6 +629,23 @@ async def qualification_maintenance_loop(
         composite_interval_secs,
         composite_initial_delay_secs,
     ) = _composite_qualification_settings()
+    (
+        warmup_enabled,
+        warmup_providers,
+        warmup_limit,
+        warmup_timeout_secs,
+        warmup_max_age_secs,
+        warmup_interval_secs,
+        warmup_initial_delay_secs,
+    ) = _quality_warmup_settings()
+    if warmup_enabled:
+        logger.info(
+            "quality warmup enabled providers=%s limit=%d timeout=%.0fs "
+            "max_age=%.0fs interval=%.0fs initial_delay=%.0fs",
+            ",".join(sorted(warmup_providers)), warmup_limit,
+            warmup_timeout_secs, warmup_max_age_secs,
+            warmup_interval_secs, warmup_initial_delay_secs,
+        )
     if composite_enabled:
         logger.info(
             "composite qualification enabled pools=%s limit=%d timeout=%.0fs "
@@ -572,6 +753,9 @@ async def qualification_maintenance_loop(
     composite_next_due_at = (
         time.monotonic() + composite_initial_delay_secs if composite_enabled else None
     )
+    warmup_next_due_at = (
+        time.monotonic() + warmup_initial_delay_secs if warmup_enabled else None
+    )
     while not stop_event.is_set():
         # The tool/structured probes run on a coarse cadence (typically
         # every few hours) while the modality probe runs on its own
@@ -591,7 +775,11 @@ async def qualification_maintenance_loop(
             composite_delay = max(0.0, composite_next_due_at - time.monotonic())
         else:
             composite_delay = float("inf")
-        delay = min(tool_delay, modality_delay, composite_delay)
+        if warmup_enabled and warmup_next_due_at is not None:
+            warmup_delay = max(0.0, warmup_next_due_at - time.monotonic())
+        else:
+            warmup_delay = float("inf")
+        delay = min(tool_delay, modality_delay, composite_delay, warmup_delay)
         first_cycle = False
         if await _wait_or_stop(stop_event, delay):
             return
@@ -690,3 +878,29 @@ async def qualification_maintenance_loop(
                 )
             finally:
                 modality_next_due_at = time.monotonic() + modality_interval_secs
+        # Quality warm-up: independent cadence, last so a slow earlier cycle
+        # never delays its clock. Reschedule relative to *now*.
+        if (
+            warmup_enabled
+            and warmup_next_due_at is not None
+            and now_mono >= warmup_next_due_at
+        ):
+            try:
+                warmup_summary = await run_quality_warmup_cycle(
+                    pool_names=tuple(pools),
+                    base_url=base_url,
+                    providers=warmup_providers,
+                    limit=warmup_limit,
+                    timeout_secs=warmup_timeout_secs,
+                    max_age_secs=warmup_max_age_secs,
+                )
+                logger.info("quality warmup result=%s", warmup_summary)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "quality warmup cycle failed error_class=%s",
+                    type(exc).__name__,
+                )
+            finally:
+                warmup_next_due_at = time.monotonic() + warmup_interval_secs
