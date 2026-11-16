@@ -148,7 +148,7 @@ TABLE_SPECS: tuple[TableSpec, ...] = (
     TableSpec(
         "learned_context_window_db",
         "learned_context_windows",
-        ("provider", "model", "window", "source", "updated_at"),
+        ("provider", "model", "\"window\"", "source", "updated_at"),
         "learned_context_windows",
     ),
     TableSpec(

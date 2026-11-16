@@ -175,7 +175,7 @@ class _LearnedContextWindowStore:
                 CREATE TABLE IF NOT EXISTS learned_context_windows (
                     provider TEXT NOT NULL,
                     model TEXT NOT NULL,
-                    window INTEGER NOT NULL,
+                    "window" INTEGER NOT NULL,
                     source TEXT NOT NULL,
                     updated_at REAL NOT NULL,
                     PRIMARY KEY (provider, model)
@@ -189,7 +189,7 @@ class _LearnedContextWindowStore:
 
         with self._db.connection() as conn:
             rows = conn.execute(
-                "SELECT provider, model, window FROM learned_context_windows"
+                'SELECT provider, model, "window" FROM learned_context_windows'
             ).fetchall()
         out: dict[str, int] = {}
         for row in rows or []:
@@ -210,10 +210,10 @@ class _LearnedContextWindowStore:
             conn.execute(
                 """
                 INSERT INTO learned_context_windows
-                    (provider, model, window, source, updated_at)
+                    (provider, model, "window", source, updated_at)
                 VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(provider, model) DO UPDATE SET
-                    window=excluded.window,
+                    "window"=excluded."window",
                     source=excluded.source,
                     updated_at=excluded.updated_at
                 """,
