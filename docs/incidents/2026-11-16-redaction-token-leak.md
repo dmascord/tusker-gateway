@@ -47,16 +47,23 @@ reinforced the wrong pattern by telling the model to pass `[TUSKER:…]` values
 - Offline suite: 2145 passed, 8 skipped
   (`pytest tests/ -p no:cacheprovider --ignore=tests/test_passthrough_providers.py`,
   2026-11-16).
-- The exact leak path (a model mutating an alias into an unopenable token) is
-  not reproducible without the production `TUSKER_REDACTION_KEY`, so the
-  mangled-retype mechanism remains inference from the differing tokens on one
-  host in the same session.
+- Deployed: commit `8032f27a12c2bb32069e9ecb787cb009a2814f45`, image
+  `registry.tusker.net.au:5000/tusker-gateway@sha256:479cce1bf0308e154ec27e0325c6f987c30f2e0b0dbf97c545f94794977e2e9e`.
+  Branch `fix/redaction-token-leak-20261116`, manifest pin commit `bd844b0a`.
+- `k8s/verify-provenance.sh` on visor: tracked manifest, live Deployment,
+  gateway pod imageID, kilo-worker imageID, registry tag, `/health` and the
+  Deployment annotation all agree.
+- `k8s/smoke_production.sh`: `{"ok": true, "reason": "ok", "http_status": 200}`.
+- Runtime config DB re-synced with
+  `python -m tusker_gateway.tools.migrate_config_to_db --update`: 53 rows
+  updated, generation 1222.
+- In-pod check of the live tokenizer: `format_preserving_aliases=True`, alias
+  shape `u@<b32>.redact.invalid`, round-trip restore `True`.
 
 ### Open items
 
-- The DB-backed config store shadows env vars for pool/provider config;
-  `migrate_config_to_db --update` must run after the deploy so the alias flag
-  reaches the DB snapshot. Guardrail flags are read from the environment at
-  startup, so the deployment env change is what makes them effective.
+- The mangled-retype mechanism is inference from the two differing tokens on
+  one host in the same session. Reproducing it exactly needs the production
+  `TUSKER_REDACTION_KEY`, which is not available locally.
 - Older sessions keep historical `[TUSKER:email:…]` records; no cleanup is
   planned because they are private to the operator's own OMP storage.
