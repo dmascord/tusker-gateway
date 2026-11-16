@@ -1724,6 +1724,18 @@ class PoolManager:
             [(c.provider, c.model) for c in candidates],
         )
         if self._llm_stats is not None and quality_list:
+            # The boost must let ranked models reach the selection tier, not
+            # buy a tier win on its own: a rank-28 model with a stale
+            # quality of 80 must not outrank a perfect-quality model whose
+            # local route never appears in a public leaderboard window.
+            # Clamp every boosted score to the best learned quality in the
+            # pool so boosts create ties (rotation) instead of wins.
+            known_scores = [
+                float(score)
+                for _, _, score in quality_list
+                if score >= 0.0
+            ]
+            quality_ceiling = max(known_scores) if known_scores else None
             boosted: list[tuple[str, str, float]] = []
             for provider, model, score in quality_list:
                 rank = self._llm_stats_rank(model)
@@ -1731,7 +1743,17 @@ class PoolManager:
                     self._rank_boost(rank) if rank is not None else 0.0
                 )
                 if bonus > 0.0:
-                    score = float(score) + bonus
+                    unboosted = float(score)
+                    score = unboosted + bonus
+                    # Clamp only models the bonus lifts into the tier: a
+                    # below-ceiling model may reach it but never pass it.
+                    # Models already at the ceiling keep their boost so a
+                    # better rank still orders within-tier ties.
+                    if (
+                        quality_ceiling is not None
+                        and unboosted < quality_ceiling
+                    ):
+                        score = min(score, quality_ceiling)
                 boosted.append((provider, model, score))
             boosted.sort(key=lambda entry: (-entry[2], entry[0], entry[1]))
             quality_list = boosted

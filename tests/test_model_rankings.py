@@ -1213,3 +1213,47 @@ def test_probe_curve_conflict_detects_inverted_references():
         [{"score": 100.0, "rank": 3}, {"score": 70.0, "rank": 15}]
     )
     assert not _curve_conflict(good)
+
+
+def test_rank_boost_clamps_to_top_known_quality(tmp_path):
+    """A boosted stale-quality model must not buy the tier win outright.
+
+    Pre-fix regression: an additive LLM Stats rank bonus let a top-ranked
+    model with a stale learned quality outrank a perfect-quality model whose
+    local route never appears in a leaderboard window. The clamp caps
+    boosted scores at the pool's best learned quality, so the two tie at the
+    top and round-robin distributes traffic between them.
+    """
+    quality_path = os.path.join(str(tmp_path), "quality.db")
+    quality = QualityDB(quality_path)
+    for _ in range(10):
+        quality.record("ollama-cloud", "glm-5.3-flash", True, 900.0)
+
+    db = ModelRankingsDB(str(tmp_path / "llm_stats.db"))
+    db.replace_all(
+        [
+            _verdict("glm-5.3-flash", "pass", category_rank=3),
+        ],
+        time.time(),
+    )
+    manager = _pool_manager(
+        str(tmp_path),
+        [
+            {"provider": "ollama-cloud", "model": "glm-5.3-flash"},
+            {"provider": "local-llm", "model": "qwen3.8-27b"},
+        ],
+        llm_stats_enforcement="prefer",
+        provider_api_keys={"ollama-cloud": "k1", "local-llm": "k2"},
+    )
+    # Prime the perfect model so it holds a known score above the boosted one.
+    manager._quality.prime_model("local-llm", "qwen3.8-27b")
+
+    selected = [manager.select("code") for _ in range(4)]
+
+    # Round-robin starts at the first listed candidate; both share the tier.
+    assert selected == [
+        ("ollama-cloud", "glm-5.3-flash"),
+        ("local-llm", "qwen3.8-27b"),
+        ("ollama-cloud", "glm-5.3-flash"),
+        ("local-llm", "qwen3.8-27b"),
+    ]

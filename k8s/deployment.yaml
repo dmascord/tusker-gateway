@@ -6,9 +6,9 @@ metadata:
   labels:
     app: tusker-gateway
   annotations:
-    tusker.net.au/commit: 6579342bdad840e3ccf093d647c8ed575a2d6e7b
-    tusker.net.au/image-tag: swarm-alpine-20261116T0845
-    tusker.net.au/image-digest: sha256:8d3525c905270bc0afde9ff700724befab2005040709b90aaad7d08f27ab7860
+    tusker.net.au/commit: d8fd68630a8bc154d0a8b0c58d027e54e1a5a691
+    tusker.net.au/image-tag: swarm-alpine-d8fd68630a8bc154d0a8b0c58d027e54e1a5a691
+    tusker.net.au/image-digest: sha256:872546fab01096abe9d352a4ca09198ba52011ef4e0087bcc541c9423910a259
 spec:
   replicas: 1
   selector:
@@ -34,7 +34,7 @@ spec:
       terminationGracePeriodSeconds: 90
       containers:
       - name: tusker-gateway
-        image: registry.tusker.net.au:5000/tusker-gateway@sha256:8d3525c905270bc0afde9ff700724befab2005040709b90aaad7d08f27ab7860
+        image: registry.tusker.net.au:5000/tusker-gateway@sha256:872546fab01096abe9d352a4ca09198ba52011ef4e0087bcc541c9423910a259
         imagePullPolicy: Always
         envFrom:
         - secretRef:
@@ -576,7 +576,29 @@ spec:
         # produces no image-plus-tool evidence at all.
         - name: TUSKER_COMPOSITE_QUALIFICATION_INITIAL_DELAY_SECS
           value: '600'
-        # Media routes are qualified out of band; no cold probe is added to requests.
+        # Media routes are qualified out of band; no cold probe is added to
+        # requests.
+        # Quality warm-up: local providers (MLX Mac, local LLM) never appear
+        # in LLM Stats leaderboards and only earn quality rows when real
+        # traffic reaches them. The rank boost is clamped to the pool's top
+        # learned quality, so local routes need learned evidence to join the
+        # top selection tier. This cycle probes candidates with no or stale
+        # evidence through the gateway boundary; the ordinary passthrough
+        # quality recording does the bookkeeping.
+        - name: TUSKER_QUALITY_WARMUP_ENABLED
+          value: 'true'
+        - name: TUSKER_QUALITY_WARMUP_PROVIDERS
+          value: mlx-mac,local-llm
+        - name: TUSKER_QUALITY_WARMUP_LIMIT
+          value: '8'
+        - name: TUSKER_QUALITY_WARMUP_TIMEOUT_SECS
+          value: '60'
+        - name: TUSKER_QUALITY_WARMUP_MAX_AGE_SECS
+          value: '604800'
+        - name: TUSKER_QUALITY_WARMUP_INITIAL_DELAY_SECS
+          value: '600'
+        - name: TUSKER_QUALITY_WARMUP_INTERVAL_SECS
+          value: '21600'
         - name: TUSKER_MEDIA_QUALIFICATION_ENABLED
           value: 'true'
         # Enforce fresh explicit media qualification failures during routing.

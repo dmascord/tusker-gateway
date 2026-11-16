@@ -225,6 +225,25 @@ class QualityDB:
             ).fetchone()
             return row[0] if row else None
 
+    def evidence(self, provider: str, model: str) -> tuple[int, float] | None:
+        """Return (total_calls, last_success_at) for a pair, or None.
+
+        Used by the quality warm-up cycle to decide whether a candidate
+        has learned evidence at all (``None``) or stale/thin evidence
+        (``last_success_at`` older than the warm-up max age).
+        """
+        with self._db.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT total_calls, last_success_at
+                FROM model_quality WHERE provider = ? AND model = ?
+                """,
+                (provider, model),
+            ).fetchone()
+        if not row:
+            return None
+        return int(row[0] or 0), float(row[1]) if row[1] is not None else 0.0
+
     def rank(
         self,
         candidates: list[tuple[str, str]],
