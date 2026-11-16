@@ -14,8 +14,10 @@ ends ``finish_reason=length`` mid-reasoning (req_7b0d460047e30296).
 
 Routes with a declared window are skipped when the prompt estimate plus a
 minimum output reserve does not fit, and ``max_tokens`` is clamped so
-prompt + output stays inside the window. Routes without one are neither
-filtered nor clamped (the pool-wide ``context_window`` is only a guess).
+prompt + output stays inside the window. Conservative built-in defaults
+apply when no explicit override exists, so undeclared cloud routes are
+still protected from silent upstream truncation; explicit overrides always
+win.
 """
 
 from __future__ import annotations
@@ -80,11 +82,95 @@ def _route_key(value: str) -> str:
     return value[: -len(":latest")] if value.endswith(":latest") else value
 
 
+# Conservative built-in windows for routes commonly left undeclared in env.
+# Undeclared routes were neither filtered nor clamped, so prompts exceeding
+# the real upstream window were forwarded intact and providers silently
+# truncated earlier messages (166k+ prompts observed with window=undeclared).
+# Env overrides always win; model-specific hints can raise provider defaults.
+_BUILTIN_PROVIDER_CONTEXT_WINDOWS: dict[str, int] = {
+    "openai": 128_000,
+    "openai-codex": 128_000,
+    "github-copilot": 128_000,
+    "azure-openai": 128_000,
+    "apim": 128_000,
+    "anthropic": 200_000,
+    "claude": 200_000,
+    "google": 1_048_576,
+    "gemini": 1_048_576,
+    "vertexai": 1_048_576,
+    "opencode-go": 128_000,
+    "minimax": 128_000,
+    "moonshot": 128_000,
+    "kimi": 128_000,
+    "deepseek": 128_000,
+    "alibaba": 131_072,
+    "dashscope": 131_072,
+    "qwen": 131_072,
+    "xai": 131_072,
+    "grok": 131_072,
+    "together": 128_000,
+    "groq": 128_000,
+    "cerebras": 128_000,
+    "fireworks": 128_000,
+    "sambanova": 128_000,
+    "openrouter": 128_000,
+    "nvidia": 128_000,
+    "nebius": 128_000,
+    "sber": 128_000,
+}
+
+_BUILTIN_MODEL_CONTEXT_WINDOWS: tuple[tuple[str, int], ...] = (
+    ("gpt-4.1", 1_047_576),
+    ("gpt-4o", 128_000),
+    ("gpt-4", 128_000),
+    ("gpt-5", 128_000),
+    ("o1", 200_000),
+    ("o3", 200_000),
+    ("o4", 200_000),
+    ("claude", 200_000),
+    ("gemini-1.5", 1_048_576),
+    ("gemini-2", 1_048_576),
+    ("gemini-3", 1_048_576),
+    ("glm-4", 128_000),
+    ("glm-5", 202_752),
+    ("minimax", 1_000_000),
+    ("kimi", 262_144),
+    ("moonshot", 262_144),
+    ("deepseek", 128_000),
+    ("qwen", 131_072),
+)
+
+
+def _builtin_context_window(provider: str, model: str) -> int | None:
+    pkey = _route_key(provider)
+    mkey = _route_key(model)
+    value = _BUILTIN_PROVIDER_CONTEXT_WINDOWS.get(pkey)
+    for prefix, window in _BUILTIN_MODEL_CONTEXT_WINDOWS:
+        prefix_key = _route_key(prefix)
+        if mkey == prefix_key or mkey.startswith(prefix_key + "-") or mkey.startswith(prefix_key + "."):
+            if value is None or window > value:
+                value = window
+            break
+    return value
+
+
 def declared_context_window(provider: str, model: str) -> int | None:
-    """Return the operator-declared window for a route, if any."""
+    """Return the effective declared window for a route.
+
+    Operator overrides (``TUSKER_CONTEXT_WINDOW_OVERRIDES_JSON``) take
+    precedence. Conservative built-in defaults apply when no override exists
+    so routes are filtered/clamped instead of forwarding prompts that exceed
+    the real upstream window.
+    """
     overrides = _context_window_overrides()
     provider_key = _route_key(provider)
-    return overrides.get(_route_key(f"{provider}/{model}"), overrides.get(provider_key))
+    exact = overrides.get(_route_key(f"{provider}/{model}"))
+    if exact is not None:
+        return exact
+    provider_default = overrides.get(provider_key)
+    if provider_default is not None:
+        return provider_default
+    return _builtin_context_window(provider, model)
 
 
 def _content_size(content: Any) -> tuple[int, int]:

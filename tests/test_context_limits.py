@@ -27,7 +27,10 @@ def windows(monkeypatch):
 def test_model_key_wins_over_provider_key(windows):
     assert declared_context_window("mlx-mac", "ornith-1.5:35b") == 65536
     assert declared_context_window("MLX-Mac", "qwen3.8-27b") == 32768
-    assert declared_context_window("openai-codex", "gpt-5.6-luna") is None
+    # No explicit override: falls back to conservative built-in defaults so
+    # large prompts are not forwarded past a route's real upstream window.
+    assert declared_context_window("openai-codex", "gpt-5.6-luna") == 128_000
+    assert declared_context_window("openai-codex", "some-unknown-model") == 128_000
 
 
 def test_latest_tag_is_optional_on_either_side(monkeypatch):
@@ -88,8 +91,27 @@ def test_fitting_or_undeclared_routes_are_untouched(windows):
     body, budget = fit_output_budget(original, "mlx-mac", "qwen3.8-27b", 1000)
     assert body is original and not budget.clamped
 
-    body, budget = fit_output_budget({"max_tokens": 900000}, "openai-codex", "gpt-5.6-luna", 1000)
+    # Unknown provider/model with no built-in default remains untouched.
+    body, budget = fit_output_budget({"max_tokens": 900000}, "acme", "mystery-model", 1000)
     assert body["max_tokens"] == 900000 and budget.window is None
+
+
+def test_builtin_defaults_clamp_oversized_cloud_prompts(windows):
+    # Regression: 166k-token prompts were forwarded undeclared/clamped=False,
+    # letting upstreams silently truncate earlier context.
+    body, budget = fit_output_budget(
+        {"max_tokens": 16384}, "github-copilot", "gpt-5.6-luna", 166646
+    )
+    assert budget.window == 128_000
+    assert budget.clamped
+    assert body["max_tokens"] == max(1, 128_000 - 166646 - 256)
+
+    body, budget = fit_output_budget(
+        {"max_tokens": 16384}, "opencode-go", "glm-5.3-flash", 9451
+    )
+    assert budget.window == 202_752
+    assert not budget.clamped
+    assert body["max_tokens"] == 16384
 
 
 def test_unset_max_tokens_is_not_invented(windows):
@@ -102,6 +124,7 @@ def test_pool_skips_candidate_whose_declared_window_cannot_fit(monkeypatch, tmp_
     from tusker_gateway.pools import PoolManager
 
     local = ("openrouter", "openai/gpt-oss-20b:free")
+    big = ("openai-codex", "gpt-4.1-luna")
     monkeypatch.setenv(
         "TUSKER_CONTEXT_WINDOW_OVERRIDES_JSON", json.dumps({"openrouter": 32768})
     )
@@ -109,7 +132,7 @@ def test_pool_skips_candidate_whose_declared_window_cannot_fit(monkeypatch, tmp_
         "pools": {
             "code": PoolConfig(name="code", models=[
                 {"provider": local[0], "model": local[1]},
-                {"provider": "openai-codex", "model": "gpt-5.6-luna"},
+                {"provider": big[0], "model": big[1]},
             ]),
         },
         "excluded_providers": [],
@@ -125,8 +148,31 @@ def test_pool_skips_candidate_whose_declared_window_cannot_fit(monkeypatch, tmp_
 
     # The pool default says 128k, but the route declares 32k.
     assert local not in candidates(required_context_tokens(30000))
-    assert ("openai-codex", "gpt-5.6-luna") in candidates(required_context_tokens(30000))
+    assert big in candidates(required_context_tokens(30000))
     assert local in candidates(required_context_tokens(2000))
+
+
+def test_builtin_defaults_filter_candidates_that_cannot_fit(monkeypatch, tmp_path):
+    from tusker_gateway.config import PoolConfig
+    from tusker_gateway.pools import PoolManager
+
+    small = ("github-copilot", "gpt-5.6-luna")
+    big = ("openai-codex", "gpt-4.1-luna")
+    monkeypatch.delenv("TUSKER_CONTEXT_WINDOW_OVERRIDES_JSON", raising=False)
+    manager = PoolManager({
+        "pools": {
+            "code": PoolConfig(name="code", models=[
+                {"provider": small[0], "model": small[1]},
+                {"provider": big[0], "model": big[1]},
+            ]),
+        },
+        "excluded_providers": [],
+        "provider_api_keys": {"openai-codex": "k-codex"},
+        "quality_db_path": str(tmp_path / "q.db"),
+    })
+    # 166k prompt cannot fit a 128k builtin window but fits gpt-4.1 (1M).
+    choice = manager.select("code", context_tokens=required_context_tokens(166646))
+    assert choice == big
 
 
 def test_min_output_reserve_is_configurable(monkeypatch):
