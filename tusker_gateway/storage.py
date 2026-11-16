@@ -1,11 +1,15 @@
 """Small storage abstraction for gateway state.
 
-The gateway's original state stores are SQLite files.  SQLite remains the
-default for local development and tests, but production can point the shared
-state stores at PostgreSQL with ``TUSKER_STATE_DATABASE_URL``.  The adapter is
-deliberately synchronous because the existing store APIs are synchronous; the
-PostgreSQL connection pool keeps the short transactions bounded and shared
-between store instances in one worker.
+The gateway supports two explicit storage modes:
+
+* ``postgres`` (default): PostgreSQL is the only backend used for state.
+  SQLite files are never opened in this mode.
+* ``sqlite``: SQLite is the only backend used for state. PostgreSQL is never
+  contacted in this mode.
+
+Mode selection is controlled by ``TUSKER_STORAGE_MODE``.  Production defaults
+to PostgreSQL; local development and tests can opt into SQLite with
+``TUSKER_STORAGE_MODE=sqlite``.
 """
 from __future__ import annotations
 
@@ -13,6 +17,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 import logging
 import os
+from pathlib import Path
 import sqlite3
 import threading
 import time
@@ -26,6 +31,7 @@ _STATUS_LOCK = threading.Lock()
 _STORAGE_STATUS: dict[str, Any] = {
     "configured": False,
     "backend": "sqlite",
+    "mode": "postgres",
     "degraded": False,
     "last_error": None,
     "last_error_at": None,
@@ -35,11 +41,30 @@ _LOGGER = logging.getLogger(__name__)
 
 
 class StorageUnavailableError(RuntimeError):
-    """Raised when the authoritative PostgreSQL state store is unavailable."""
+    """Raised when the authoritative state store is unavailable."""
 
     def __init__(self, message: str, *, target: str | None = None):
         super().__init__(message)
         self.target = target
+
+
+class StorageModeError(RuntimeError):
+    """Raised when a storage operation is incompatible with the active mode."""
+
+
+def storage_mode(env: dict[str, str] | None = None) -> str:
+    """Return the active storage mode: ``postgres`` (default) or ``sqlite``."""
+    values = os.environ if env is None else env
+    mode = str(values.get("TUSKER_STORAGE_MODE", "postgres") or "postgres").strip().lower()
+    return mode if mode in {"postgres", "sqlite"} else "postgres"
+
+
+def postgres_storage_enabled(env: dict[str, str] | None = None) -> bool:
+    return storage_mode(env) == "postgres"
+
+
+def sqlite_storage_enabled(env: dict[str, str] | None = None) -> bool:
+    return storage_mode(env) == "sqlite"
 
 
 def _database_connect_timeout() -> float:
@@ -128,10 +153,12 @@ def storage_status() -> dict[str, Any]:
 def state_database_url(env: dict[str, str] | None = None) -> str:
     """Return the configured shared state DSN, if any.
 
-    ``TUSKER_DATABASE_URL`` is accepted as a compatibility alias so a
-    standard Kubernetes/PostgreSQL secret can use the conventional name.
+    In SQLite mode this always returns an empty string so PostgreSQL is never
+    contacted.
     """
     values = os.environ if env is None else env
+    if storage_mode(values) == "sqlite":
+        return ""
     return (
         values.get("TUSKER_STATE_DATABASE_URL", "").strip()
         or values.get("TUSKER_DATABASE_URL", "").strip()
@@ -144,13 +171,19 @@ def is_postgres_target(target: object) -> bool:
 
 
 def storage_error_types() -> tuple[type[BaseException], ...]:
-    """Return database exception classes without requiring psycopg for SQLite."""
+    """Return database exception classes appropriate for the active mode."""
     errors: list[type[BaseException]] = [
-        sqlite3.Error,
         StorageUnavailableError,
+        StorageModeError,
         OSError,
         TimeoutError,
     ]
+    if sqlite_storage_enabled():
+        errors.insert(0, sqlite3.Error)
+        return tuple(errors)
+    # Postgres mode: psycopg errors are authoritative; sqlite3.Error is kept
+    # for compatibility with mixed call sites but should not be produced.
+    errors.insert(0, sqlite3.Error)
     try:
         import psycopg
     except ImportError:
@@ -166,11 +199,26 @@ def storage_error_types() -> tuple[type[BaseException], ...]:
 
 
 def shared_state_target(path: str | os.PathLike[str]) -> str:
-    """Resolve a store's path to PostgreSQL when shared state is configured."""
+    """Resolve a store path to the active backend target.
+
+    PostgreSQL mode: returns the configured DSN for persistent stores.
+    SQLite mode: returns the local path (or ``:memory:``).
+    """
     raw_path = os.fspath(path)
+    mode = storage_mode()
+    if mode == "sqlite":
+        return raw_path
+    # Ephemeral in-memory stores are allowed for tests/tooling even in
+    # PostgreSQL mode; persistent state must use PostgreSQL.
     if raw_path == ":memory:":
         return raw_path
-    return state_database_url() or raw_path
+    dsn = state_database_url()
+    if not dsn:
+        raise StorageModeError(
+            "PostgreSQL mode requires TUSKER_STATE_DATABASE_URL "
+            "(or TUSKER_DATABASE_URL)"
+        )
+    return dsn
 
 
 def _pool_for(dsn: str) -> Any:
@@ -494,6 +542,35 @@ def shared_database(
     return database
 
 
+def purge_sqlite_state_files(
+    source_dir: str | os.PathLike[str],
+    *,
+    filenames: list[str] | tuple[str, ...] | None = None,
+) -> list[str]:
+    """Delete SQLite state files in ``source_dir`` and return removed paths.
+
+    This is used after a verified migration to PostgreSQL to avoid operator
+    confusion. Callers must perform the destructive confirmation.
+    """
+    base = Path(source_dir)
+    removed: list[str] = []
+    if filenames is None:
+        candidates = sorted(base.glob("*.db"))
+    else:
+        candidates = [base / name for name in filenames]
+    for db_path in candidates:
+        for candidate in (
+            db_path,
+            Path(str(db_path) + "-wal"),
+            Path(str(db_path) + "-shm"),
+            Path(str(db_path) + "-journal"),
+        ):
+            if candidate.exists():
+                candidate.unlink()
+                removed.append(str(candidate))
+    return removed
+
+
 def close_shared_pools() -> None:
     """Close process-wide PostgreSQL pools, primarily for controlled shutdowns."""
     with _POOL_LOCK:
@@ -506,12 +583,17 @@ def close_shared_pools() -> None:
 __all__ = [
     "Database",
     "DatabaseConnection",
+    "StorageModeError",
     "close_shared_pools",
     "is_postgres_target",
+    "postgres_storage_enabled",
+    "purge_sqlite_state_files",
     "shared_database",
     "shared_state_target",
+    "sqlite_storage_enabled",
     "state_database_url",
     "state_degraded_mode",
+    "storage_mode",
     "storage_status",
     "storage_error_types",
     "StorageUnavailableError",

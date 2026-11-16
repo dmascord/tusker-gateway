@@ -18,6 +18,9 @@ prompt + output stays inside the window. Conservative built-in defaults
 apply when no explicit override exists, so undeclared cloud routes are
 still protected from silent upstream truncation; explicit overrides always
 win.
+
+Learned windows are persisted in the active state backend so runtime signals
+survive restarts.
 """
 
 from __future__ import annotations
@@ -25,6 +28,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+from pathlib import Path
+import threading
 from dataclasses import dataclass
 from typing import Any
 
@@ -146,6 +151,122 @@ _BUILTIN_MODEL_CONTEXT_WINDOWS: tuple[tuple[str, int], ...] = (
 # act as a backup when the upstream/model does not tell us its window.
 _published_context_windows: dict[str, int] = {}
 _learned_context_windows: dict[str, int] = {}
+_learned_context_window_store: "_LearnedContextWindowStore | None" = None
+_learned_context_window_store_path: str | None = None
+_learned_context_window_lock = threading.RLock()
+
+
+class _LearnedContextWindowStore:
+    """Persist learned context windows in the active storage backend."""
+
+    def __init__(self, path: str):
+        from tusker_gateway.storage import shared_database
+
+        self._path = str(path)
+        self._db = shared_database(self._path, timeout=5.0, fallback_policy="advisory")
+        if not self._db.is_postgres and self._path != ":memory:":
+            Path(self._path).parent.mkdir(parents=True, exist_ok=True)
+        self._ensure_db()
+
+    def _ensure_db(self) -> None:
+        with self._db.connection() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS learned_context_windows (
+                    provider TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    window INTEGER NOT NULL,
+                    source TEXT NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY (provider, model)
+                )
+                """
+            )
+            conn.commit()
+
+    def load(self) -> dict[str, int]:
+        import time
+
+        with self._db.connection() as conn:
+            rows = conn.execute(
+                "SELECT provider, model, window FROM learned_context_windows"
+            ).fetchall()
+        out: dict[str, int] = {}
+        for row in rows or []:
+            try:
+                provider = str(row[0]).strip().lower().replace("_", "-")
+                model = str(row[1]).strip()
+                window = int(row[2])
+            except Exception:
+                continue
+            if provider and model and window > 0:
+                out[_route_model_key(provider, model)] = window
+        return out
+
+    def upsert(self, provider: str, model: str, window: int, source: str) -> None:
+        import time
+
+        with self._db.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO learned_context_windows
+                    (provider, model, window, source, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(provider, model) DO UPDATE SET
+                    window=excluded.window,
+                    source=excluded.source,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    str(provider).strip().lower().replace("_", "-"),
+                    str(model).strip(),
+                    int(window),
+                    str(source or "unknown"),
+                    float(time.time()),
+                ),
+            )
+            conn.commit()
+
+
+def default_learned_context_window_db_path() -> str:
+    configured = os.environ.get("TUSKER_LEARNED_CONTEXT_WINDOW_DB_PATH", "").strip()
+    if configured:
+        return configured
+    quality = os.environ.get("QUALITY_DB_PATH", "").strip()
+    if quality and quality != ":memory:":
+        return str(Path(quality).with_name("learned_context_windows.db"))
+    home = os.environ.get("HOME")
+    if home and os.path.isdir(os.path.join(home, ".hermes")):
+        return os.path.join(home, ".hermes", "learned_context_windows.db")
+    return "data/learned_context_windows.db"
+
+
+def configure_learned_context_window_store(path: str | None = None) -> None:
+    """Load and enable persistence for learned context windows."""
+    global _learned_context_window_store, _learned_context_window_store_path
+    db_path = str(path or default_learned_context_window_db_path())
+    with _learned_context_window_lock:
+        if (
+            _learned_context_window_store is not None
+            and _learned_context_window_store_path == db_path
+        ):
+            return
+        try:
+            store = _LearnedContextWindowStore(db_path)
+            loaded = store.load()
+        except Exception:
+            logger.warning(
+                "learned context window store unavailable path=%s", db_path, exc_info=True
+            )
+            return
+        _learned_context_window_store = store
+        _learned_context_window_store_path = db_path
+        for key, value in loaded.items():
+            current = _learned_context_windows.get(key)
+            if current is None or value >= current:
+                _learned_context_windows[key] = value
+        if loaded:
+            logger.info("loaded %d learned context windows from %s", len(loaded), db_path)
 
 
 def _route_model_key(provider: str, model: str) -> str:
@@ -178,7 +299,7 @@ def update_published_context_windows(windows: dict[tuple[str, str], int] | None)
 
 
 def record_learned_context_window(provider: str, model: str, window: int, *, source: str = "unknown") -> None:
-    """Record an observed context window for a route."""
+    """Record an observed context window for a route and persist it."""
     try:
         n = int(window)
     except (TypeError, ValueError):
@@ -186,18 +307,36 @@ def record_learned_context_window(provider: str, model: str, window: int, *, sou
     if n <= 0:
         return
     key = _route_model_key(provider, model)
-    current = _learned_context_windows.get(key)
-    # Prefer larger learned values (a header/error usually states the true
-    # limit); if equal, keep existing.
-    if current is None or n >= current:
-        _learned_context_windows[key] = n
-        logger.info(
-            "learned context window provider=%s model=%s window=%d source=%s",
-            provider,
-            model,
-            n,
-            source,
-        )
+    changed = False
+    with _learned_context_window_lock:
+        current = _learned_context_windows.get(key)
+        # Prefer larger learned values (a header/error usually states the true
+        # limit); if equal, keep existing.
+        if current is None or n >= current:
+            _learned_context_windows[key] = n
+            changed = True
+            store = _learned_context_window_store
+        else:
+            store = None
+    if not changed:
+        return
+    if store is not None:
+        try:
+            store.upsert(provider, model, n, source)
+        except Exception:
+            logger.warning(
+                "failed to persist learned context window provider=%s model=%s",
+                provider,
+                model,
+                exc_info=True,
+            )
+    logger.info(
+        "learned context window provider=%s model=%s window=%d source=%s",
+        provider,
+        model,
+        n,
+        source,
+    )
 
 
 def _lookup_known_window(mapping: dict[str, int], provider: str, model: str) -> int | None:

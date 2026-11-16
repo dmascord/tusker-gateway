@@ -21,16 +21,22 @@ from pathlib import Path
 import sqlite3
 from typing import Iterable
 
+from tusker_gateway.approval_store import ApprovalStore
 from tusker_gateway.budget import BudgetConfig, BudgetTracker
+from tusker_gateway.cache import CacheConfig, ResponseCache
 from tusker_gateway.circuit_breaker import BreakerConfig, CircuitBreaker
+from tusker_gateway.context_limits import _LearnedContextWindowStore
 from tusker_gateway.idempotency import IdempotencyConfig, IdempotencyStore
 from tusker_gateway.model_capability import ModelCapabilityDB
+from tusker_gateway.model_rankings import ModelRankingsDB
 from tusker_gateway.persistent_cooldown import PersistentCooldownStore
+from tusker_gateway.protocol_evidence import ProtocolEvidenceStore
 from tusker_gateway.provider_usage import ProviderUsageDB
 from tusker_gateway.quality import QualityDB
 from tusker_gateway.rate_limit import RateLimitConfig, RateLimiter
-from tusker_gateway.storage import Database
+from tusker_gateway.storage import Database, purge_sqlite_state_files
 from tusker_gateway.tool_capability import ToolCapabilityDB
+from tusker_gateway.turn_capture import TurnCaptureConfig, TurnCaptureStore
 
 logger = logging.getLogger("tusker_gateway.migrate_state")
 
@@ -139,6 +145,52 @@ TABLE_SPECS: tuple[TableSpec, ...] = (
         ),
         "idempotency_records",
     ),
+    TableSpec(
+        "learned_context_window_db",
+        "learned_context_windows",
+        ("provider", "model", "window", "source", "updated_at"),
+        "learned_context_windows",
+    ),
+    TableSpec(
+        "llm_stats_db",
+        "llm_stats_verdicts",
+        ("slug", "status", "category_rank", "category_name", "evidence", "synced_at"),
+        "llm_stats_verdicts",
+    ),
+    TableSpec(
+        "protocol_evidence_db",
+        "protocol_evidence",
+        (
+            "provider", "endpoint_id", "model", "feature", "status",
+            "probe_version", "checked_at",
+        ),
+        "protocol_evidence",
+    ),
+    TableSpec(
+        "cache_db",
+        "entries",
+        ("key", "body", "created_at", "expires_at", "hits"),
+        "cache_entries",
+    ),
+    TableSpec(
+        "turn_capture_db",
+        "turn_captures",
+        (
+            "capture_id", "request_id", "created_at", "expires_at", "provider",
+            "model", "pool", "request_source", "reason", "body_policy",
+            "replayable", "verdict", "request_bytes", "request_sha256",
+            "request_body", "request_truncated_bytes", "response_bytes",
+            "response_sha256", "response_body", "response_truncated_bytes",
+            "replay_runs",
+        ),
+        "turn_captures",
+    ),
+    TableSpec(
+        "approval_db",
+        "tusker_native_approvals",
+        ("approval_id", "payload", "expires_at", "updated_at"),
+        "approvals",
+    ),
 )
 
 
@@ -158,12 +210,19 @@ def _source_paths(source_dir: Path, args: argparse.Namespace) -> dict[str, Path]
         "ratelimit_db": source_dir / args.ratelimit_db,
         "budget_db": source_dir / args.budget_db,
         "idempotency_db": source_dir / args.idempotency_db,
+        "learned_context_window_db": source_dir / args.learned_context_window_db,
+        "llm_stats_db": source_dir / args.llm_stats_db,
+        "protocol_evidence_db": source_dir / args.protocol_evidence_db,
+        "cache_db": source_dir / args.cache_db,
+        "turn_capture_db": source_dir / args.turn_capture_db,
+        "approval_db": source_dir / args.approval_db,
     }
 
 
 def _initialize_target(dsn: str) -> None:
     """Create all runtime state tables in the target database."""
     os.environ["TUSKER_STATE_DATABASE_URL"] = dsn
+    os.environ["TUSKER_STORAGE_MODE"] = "postgres"
     # The paths are deliberately dummy paths: shared_database() resolves them
     # to the configured DSN, so no local SQLite files are created.
     QualityDB("/tmp/tusker-gateway-quality.db")
@@ -177,6 +236,16 @@ def _initialize_target(dsn: str) -> None:
     IdempotencyStore(
         IdempotencyConfig(enabled=True, path="/tmp/tusker-gateway-idempotency.db")
     )
+    _LearnedContextWindowStore("/tmp/tusker-gateway-learned-context-windows.db")
+    ModelRankingsDB("/tmp/tusker-gateway-llm-stats.db")
+    ProtocolEvidenceStore("/tmp/tusker-gateway-protocol-evidence.db")
+    ResponseCache(CacheConfig(enabled=True, path="/tmp/tusker-gateway-cache.db"))
+    TurnCaptureStore(TurnCaptureConfig(enabled=True, path="/tmp/tusker-gateway-turn-captures.db"))
+    try:
+        ApprovalStore("/tmp/tusker-gateway-approvals.db")
+    except Exception:
+        # Approvals store requires encryption key in postgres in some configs.
+        logger.warning("could not initialize approval store schema during migration", exc_info=True)
 
 
 def _open_source(path: Path) -> sqlite3.Connection:
@@ -282,6 +351,51 @@ def _insert_sql(spec: TableSpec, columns: tuple[str, ...]) -> str:
             if column != "record_key"
         )
         conflict = " ON CONFLICT(record_key) DO UPDATE SET " + updates
+    elif spec.conflict == "learned_context_windows":
+        updates = ", ".join(
+            f"{column} = excluded.{column}"
+            for column in columns
+            if column not in {"provider", "model"}
+        )
+        conflict = " ON CONFLICT(provider, model) DO UPDATE SET " + updates
+    elif spec.conflict == "llm_stats_verdicts":
+        updates = ", ".join(
+            f"{column} = excluded.{column}"
+            for column in columns
+            if column != "slug"
+        )
+        conflict = " ON CONFLICT(slug) DO UPDATE SET " + updates
+    elif spec.conflict == "protocol_evidence":
+        updates = ", ".join(
+            f"{column} = excluded.{column}"
+            for column in columns
+            if column not in {"provider", "endpoint_id", "model", "feature"}
+        )
+        conflict = (
+            " ON CONFLICT(provider, endpoint_id, model, feature) DO UPDATE SET "
+            + updates
+        )
+    elif spec.conflict == "cache_entries":
+        updates = ", ".join(
+            f"{column} = excluded.{column}"
+            for column in columns
+            if column != "key"
+        )
+        conflict = " ON CONFLICT(key) DO UPDATE SET " + updates
+    elif spec.conflict == "turn_captures":
+        updates = ", ".join(
+            f"{column} = excluded.{column}"
+            for column in columns
+            if column != "capture_id"
+        )
+        conflict = " ON CONFLICT(capture_id) DO UPDATE SET " + updates
+    elif spec.conflict == "approvals":
+        updates = ", ".join(
+            f"{column} = excluded.{column}"
+            for column in columns
+            if column != "approval_id"
+        )
+        conflict = " ON CONFLICT(approval_id) DO UPDATE SET " + updates
     else:  # pragma: no cover - fixed table spec guard
         raise ValueError(f"unknown conflict policy: {spec.conflict}")
     return f"INSERT INTO {spec.table} ({names}) VALUES ({placeholders}){conflict}"
@@ -378,10 +492,24 @@ def migrate(args: argparse.Namespace) -> int:
             "model_quality", "model_events", "model_capability",
             "model_tool_capability", "provider_usage_daily", "cooldowns",
             "provider_cooldowns", "capacity_group_cooldowns", "breakers",
-            "buckets", "usage", "idempotency_records",
+            "buckets", "usage", "idempotency_records", "learned_context_windows",
+            "llm_stats_verdicts", "protocol_evidence", "entries",
+            "turn_captures", "tusker_native_approvals",
         ):
-            count = connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-            logger.info("target %s rows=%d", table, count)
+            try:
+                count = connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                logger.info("target %s rows=%d", table, count)
+            except Exception:
+                logger.warning("could not count target table %s", table, exc_info=True)
+    if getattr(args, "purge_sqlite", False):
+        if not getattr(args, "yes_i_understand_this_is_destructive", False):
+            raise ValueError(
+                "--purge-sqlite requires --yes-i-understand-this-is-destructive"
+            )
+        removed = purge_sqlite_state_files(Path(args.source_dir))
+        logger.info("purged %d sqlite files from %s", len(removed), args.source_dir)
+        for path in removed:
+            logger.info("removed %s", path)
     return 0
 
 
@@ -398,6 +526,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ratelimit-db", default="ratelimit.db")
     parser.add_argument("--budget-db", default="budget.db")
     parser.add_argument("--idempotency-db", default="idempotency.db")
+    parser.add_argument("--learned-context-window-db", default="learned_context_windows.db")
+    parser.add_argument("--llm-stats-db", default="llm_stats.db")
+    parser.add_argument("--protocol-evidence-db", default="protocol-evidence.db")
+    parser.add_argument("--cache-db", default="cache.db")
+    parser.add_argument("--turn-capture-db", default="turn-captures.db")
+    parser.add_argument("--approval-db", default="approvals.db")
+    parser.add_argument(
+        "--purge-sqlite",
+        action="store_true",
+        help="Delete SQLite state files in --source-dir after successful migration.",
+    )
+    parser.add_argument(
+        "--yes-i-understand-this-is-destructive",
+        action="store_true",
+        help="Required confirmation for --purge-sqlite.",
+    )
     return parser
 
 

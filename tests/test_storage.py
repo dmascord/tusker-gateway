@@ -15,13 +15,17 @@ from tusker_gateway.rate_limit import RateLimitConfig, RateLimitPolicy, RateLimi
 
 def test_state_database_url_prefers_explicit_state_name():
     assert state_database_url({
+        "TUSKER_STORAGE_MODE": "postgres",
         "TUSKER_STATE_DATABASE_URL": "postgresql://state",
         "TUSKER_DATABASE_URL": "postgresql://alias",
     }) == "postgresql://state"
 
 
 def test_state_database_url_accepts_compatibility_alias():
-    assert state_database_url({"TUSKER_DATABASE_URL": "postgresql://alias"}) == (
+    assert state_database_url({
+        "TUSKER_STORAGE_MODE": "postgres",
+        "TUSKER_DATABASE_URL": "postgresql://alias",
+    }) == (
         "postgresql://alias"
     )
 
@@ -32,11 +36,13 @@ def test_state_degraded_mode_accepts_only_known_policies():
 
 
 def test_shared_state_target_preserves_memory_databases(monkeypatch):
+    monkeypatch.setenv("TUSKER_STORAGE_MODE", "postgres")
     monkeypatch.setenv("TUSKER_STATE_DATABASE_URL", "postgresql://state")
     assert shared_state_target(":memory:") == ":memory:"
 
 
 def test_shared_state_target_uses_postgres_when_configured(monkeypatch):
+    monkeypatch.setenv("TUSKER_STORAGE_MODE", "postgres")
     monkeypatch.setenv("TUSKER_STATE_DATABASE_URL", "postgresql://state")
     assert shared_state_target("/tmp/quality.db") == "postgresql://state"
     assert is_postgres_target("postgres://state")
@@ -45,6 +51,7 @@ def test_shared_state_target_uses_postgres_when_configured(monkeypatch):
 
 
 def test_advisory_postgres_outage_uses_noop_process_local_fallback(monkeypatch):
+    monkeypatch.setenv("TUSKER_STORAGE_MODE", "postgres")
     monkeypatch.setenv("TUSKER_STATE_DATABASE_URL", "postgresql://state")
     database = shared_database("/tmp/ignored-quality.db")
 
@@ -59,6 +66,7 @@ def test_advisory_postgres_outage_uses_noop_process_local_fallback(monkeypatch):
 
 
 def test_critical_postgres_outage_raises_without_sqlite_fallback(monkeypatch):
+    monkeypatch.setenv("TUSKER_STORAGE_MODE", "postgres")
     monkeypatch.setenv("TUSKER_STATE_DATABASE_URL", "postgresql://state")
     database = shared_database("/tmp/ignored-rate-limit.db", fallback_policy="critical")
 
@@ -72,6 +80,7 @@ def test_critical_postgres_outage_raises_without_sqlite_fallback(monkeypatch):
 
 
 def test_rate_limiter_stays_enabled_and_fails_closed_when_postgres_is_down(monkeypatch):
+    monkeypatch.setenv("TUSKER_STORAGE_MODE", "postgres")
     monkeypatch.setenv("TUSKER_STATE_DATABASE_URL", "postgresql://state")
     limiter = RateLimiter(
         RateLimitConfig(

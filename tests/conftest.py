@@ -35,6 +35,11 @@ def setup_auth_file(tmp_path, monkeypatch):
     # bypass; this value is supplied through test configuration only.
     monkeypatch.setenv("API_KEYS", "sk-secret-dev")
     monkeypatch.setenv("TUSKER_APPROVAL_HMAC_KEY", "test-approval-hmac-key")
+    # Default test suite to SQLite storage mode; production defaults to PostgreSQL.
+    # Tests that exercise PostgreSQL mode can override TUSKER_STORAGE_MODE/DSN.
+    monkeypatch.setenv("TUSKER_STORAGE_MODE", "sqlite")
+    monkeypatch.delenv("TUSKER_STATE_DATABASE_URL", raising=False)
+    monkeypatch.delenv("TUSKER_DATABASE_URL", raising=False)
     return auth_file
 
 

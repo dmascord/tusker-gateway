@@ -209,6 +209,14 @@ def create_app() -> web.Application:
     # SecretRedactionGuard; None when redaction is off or key is absent.
     app["redaction_tokenizer"] = _extract_redaction_tokenizer(app["guard_pipeline"])
 
+    # Persist learned route signals (context windows) in the active backend.
+    try:
+        from tusker_gateway.context_limits import configure_learned_context_window_store
+
+        configure_learned_context_window_store()
+    except Exception:
+        log.warning("learned context window store could not be configured", exc_info=True)
+
 
 
     # Shared PoolManager so catalog refresh + session stickiness +
