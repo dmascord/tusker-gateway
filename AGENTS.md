@@ -29,6 +29,7 @@ Read in order when picking up the repo:
 | `docs/migrations/2026-11-06-hindsight-postgresql/` | Moving Hindsight from embedded `pg0` to the dedicated `hindsight-postgres` StatefulSet. |
 | `docs/incidents/2026-11-11-codex-refresh-cooldown-adoption-deadlock.md` | Codex OAuth refresh-failure cooldown blocked store adoption; the whole pool read as empty while the DB held live credentials. |
 | `docs/incidents/2026-11-11-mlx-mac-capacity-queue.md` | MLX Mac capacity rejections discarded servable work (77/80 privacy attempts locally rejected); bounded FIFO admission queue. |
+| `docs/incidents/2026-11-16-redaction-token-leak.md` | Opaque `[TUSKER:email:…]` ciphertext reaching OMP sessions; syntax-shaped redaction aliases enabled in production. |
 | `TODO.md` | Active cross-session work items. |
 
 

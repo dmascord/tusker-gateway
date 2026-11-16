@@ -4,40 +4,21 @@ Caches the JSON body returned by `POST /v1/chat/completions` (and the
 non-streaming equivalent of streaming responses) keyed by a SHA-256 digest of
 the request shape.
 
-This is the Release-1 capability promised in `docs/feature-matrix-and-plan.md`.
-Semantic caching arrives in Release 3 and is intentionally out of scope here.
-
-Key composition (all parts canonicalised, then concatenated and SHA-256'd):
-    pool_name | model | canonical(messages) | canonical(tools) | extra_body_hash
-
-Storage:
-    SQLite at the configured path (default `$HOME/.hermes/cache.db` so the
-    container's persistent volume works without extra config). The directory
-    is created lazily; if creation fails (read-only filesystem), the cache
-    silently disables itself for this process and behaves as a no-op.
-
-Eviction:
-    Lazy: `get()` rejects expired rows and deletes them on access.
-    Bounded size: when inserting, if the entry count exceeds
-    `max_entries`, the oldest non-pinned rows are deleted to make room.
-
-Bypass:
-    `X-Tusker-Cache: bypass` header skips the lookup but still records the
-    new entry on write. This lets callers force-fresh responses without
-    disabling the cache globally.
+Storage uses the active gateway state backend (PostgreSQL in postgres mode,
+SQLite in sqlite mode).
 """
 from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
-import sqlite3
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import logging
+from tusker_gateway.storage import shared_database, storage_error_types
 
 logger = logging.getLogger(__name__)
 
@@ -126,26 +107,32 @@ class CacheStats:
 
 
 class ResponseCache:
-    """SQLite-backed exact-match cache for chat-completion responses."""
+    """Exact-match cache for chat-completion responses."""
 
     def __init__(self, config: CacheConfig):
         self._config = config
         self.stats = CacheStats()
+        self._db = None
         if not config.enabled:
             return
         try:
-            Path(config.path).parent.mkdir(parents=True, exist_ok=True)
+            self._db = shared_database(config.path, timeout=5.0, fallback_policy="advisory")
+            if not self._db.is_postgres and config.path != ":memory:":
+                Path(config.path).parent.mkdir(parents=True, exist_ok=True)
             self._ensure_db()
-        except (PermissionError, OSError) as exc:
-            # Read-only filesystem or similar: silently disable this instance.
-            logger.warning("cache disabled: cannot create %s: %s", config.path, exc)
+        except Exception as exc:
+            # Read-only filesystem/backend unavailable: silently disable this instance.
+            logger.warning("cache disabled: cannot initialise %s: %s", config.path, exc)
+            self._db = None
             self._config.enabled = False
 
     # -- schema ---------------------------------------------------------
 
     def _ensure_db(self) -> None:
-        with sqlite3.connect(self._config.path) as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
+        assert self._db is not None
+        with self._db.connection() as conn:
+            if not self._db.is_postgres:
+                conn.execute("PRAGMA journal_mode=WAL")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS entries (
@@ -166,78 +153,89 @@ class ResponseCache:
 
     def get(self, key: str) -> dict[str, Any] | None:
         """Return a cached response body or None if missing/expired."""
-        if not self._config.enabled:
+        if not self._config.enabled or self._db is None:
             return None
         now = time.time()
-        with sqlite3.connect(self._config.path) as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
-            row = conn.execute(
-                "SELECT body, expires_at FROM entries WHERE key = ?", (key,)
-            ).fetchone()
+        try:
+            with self._db.connection() as conn:
+                row = conn.execute(
+                    "SELECT body, expires_at FROM entries WHERE key = ?", (key,)
+                ).fetchone()
+        except storage_error_types():
+            self.stats.misses += 1
+            return None
         if row is None:
             self.stats.misses += 1
-            logger.debug('cache miss key=%s', key[:16])
+            logger.debug("cache miss key=%s", key[:16])
             return None
         body_json, expires_at = row
-        if expires_at <= now:
+        if float(expires_at) <= now:
             # Lazy eviction
-            with sqlite3.connect(self._config.path) as conn:
-                conn.execute("PRAGMA journal_mode=WAL")
-                conn.execute("DELETE FROM entries WHERE key = ?", (key,))
-                conn.commit()
+            try:
+                with self._db.connection() as conn:
+                    conn.execute("DELETE FROM entries WHERE key = ?", (key,))
+                    conn.commit()
+            except storage_error_types():
+                pass
             self.stats.misses += 1
             self.stats.evictions += 1
             return None
         # Bump hit counter (best-effort)
-        with sqlite3.connect(self._config.path) as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute(
-                "UPDATE entries SET hits = hits + 1 WHERE key = ?", (key,)
-            )
-            conn.commit()
+        try:
+            with self._db.connection() as conn:
+                conn.execute(
+                    "UPDATE entries SET hits = hits + 1 WHERE key = ?", (key,)
+                )
+                conn.commit()
+        except storage_error_types():
+            pass
         self.stats.hits += 1
-        logger.debug('cache hit key=%s', key[:16])
+        logger.debug("cache hit key=%s", key[:16])
         try:
             return json.loads(body_json)
-        except json.JSONDecodeError:
+        except Exception:
             return None
 
     def put(self, key: str, body: dict[str, Any]) -> None:
         """Store a response body with the configured TTL."""
-        if not self._config.enabled:
+        if not self._config.enabled or self._db is None:
             return
         now = time.time()
         expires_at = now + self._config.ttl_secs
-        with sqlite3.connect(self._config.path) as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
-            # Idempotent: same key overwrites in place and refreshes TTL.
-            conn.execute(
-                """
-                INSERT INTO entries (key, body, created_at, expires_at, hits)
-                VALUES (?, ?, ?, ?, 0)
-                ON CONFLICT(key) DO UPDATE SET
-                    body = excluded.body,
-                    created_at = excluded.created_at,
-                    expires_at = excluded.expires_at,
-                    hits = 0
-                """,
-                (key, json.dumps(body, ensure_ascii=False), now, expires_at),
-            )
-            conn.commit()
-        # Enforce size cap.
-        self._enforce_size_cap()
-        self.stats.writes += 1
-        logger.debug('cache store key=%s', key[:16])
+        try:
+            with self._db.connection() as conn:
+                # Idempotent: same key overwrites in place and refreshes TTL.
+                conn.execute(
+                    """
+                    INSERT INTO entries (key, body, created_at, expires_at, hits)
+                    VALUES (?, ?, ?, ?, 0)
+                    ON CONFLICT(key) DO UPDATE SET
+                        body = excluded.body,
+                        created_at = excluded.created_at,
+                        expires_at = excluded.expires_at,
+                        hits = 0
+                    """,
+                    (key, json.dumps(body, ensure_ascii=False), now, expires_at),
+                )
+                conn.commit()
+            # Enforce size cap.
+            self._enforce_size_cap()
+            self.stats.writes += 1
+            logger.debug("cache store key=%s", key[:16])
+        except storage_error_types() as exc:
+            logger.warning("cache write failed: %s", exc)
 
     def invalidate(self, key: str) -> None:
         """Remove a single entry (e.g. on tool-call response)."""
-        if not self._config.enabled:
+        if not self._config.enabled or self._db is None:
             return
-        with sqlite3.connect(self._config.path) as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("DELETE FROM entries WHERE key = ?", (key,))
-            conn.commit()
-        logger.debug('cache invalidate key=%s', key[:16])
+        try:
+            with self._db.connection() as conn:
+                conn.execute("DELETE FROM entries WHERE key = ?", (key,))
+                conn.commit()
+        except storage_error_types():
+            return
+        logger.debug("cache invalidate key=%s", key[:16])
 
     def stats_snapshot(self) -> dict[str, int]:
         return self.stats.snapshot()
@@ -246,26 +244,52 @@ class ResponseCache:
 
     def _enforce_size_cap(self) -> None:
         cap = self._config.max_entries
-        if cap <= 0:
+        if cap <= 0 or self._db is None:
             return
-        with sqlite3.connect(self._config.path) as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
-            count = conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
-            if count <= cap:
-                return
-            to_delete = count - cap
-            # Delete the oldest non-pinned rows first.
-            rows = conn.execute(
-                """
-                DELETE FROM entries
-                WHERE key IN (
-                    SELECT key FROM entries ORDER BY created_at ASC LIMIT ?
+        try:
+            with self._db.connection() as conn:
+                count = conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+                if int(count) <= cap:
+                    return
+                to_delete = int(count) - cap
+                # Delete the oldest rows first.
+                conn.execute(
+                    """
+                    DELETE FROM entries
+                    WHERE key IN (
+                        SELECT key FROM entries ORDER BY created_at ASC LIMIT ?
+                    )
+                    """,
+                    (to_delete,),
                 )
-                """,
-                (to_delete,),
-            ).rowcount
-            conn.commit()
-            self.stats.evictions += max(0, rows)
+                conn.commit()
+                self.stats.evictions += max(0, to_delete)
+        except storage_error_types():
+            return
+
+
+def load_cache_config_from_env(env: dict[str, str] | None = None) -> CacheConfig:
+    """Build a CacheConfig from the environment (or a dict for tests)."""
+    env = env if env is not None else __import__("os").environ
+    enabled_raw = env.get("TUSKER_CACHE_ENABLED", "false").strip().lower()
+    enabled = enabled_raw in ("1", "true", "yes", "on")
+    return CacheConfig(
+        enabled=enabled,
+        path=env.get("TUSKER_CACHE_PATH") or _default_path(),
+        ttl_secs=int(env.get("TUSKER_CACHE_TTL_SECS", "300")),
+        max_entries=int(env.get("TUSKER_CACHE_MAX_ENTRIES", "10000")),
+    )
+
+
+__all__ = [
+    "CacheConfig",
+    "CacheStats",
+    "ResponseCache",
+    "canonical_json",
+    "load_cache_config_from_env",
+    "make_caller_scope",
+    "make_cache_key",
+]
 
 
 def load_cache_config_from_env(env: dict[str, str] | None = None) -> CacheConfig:

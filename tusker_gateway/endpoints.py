@@ -1488,6 +1488,8 @@ async def _normalize_stream(
                     detail=f"{type(exc).__name__}: {exc}"[:300],
                 ) from exc
             raise
+        finally:
+            await _close_async_iterator(raw_stream)
 
     async for chunk in diagnostic_raw_stream():
         buffer += chunk
@@ -4304,10 +4306,12 @@ def _attempt_touch_iterator(
     """Wrap an upstream async iterator, bumping ``activity`` per chunk."""
 
     async def _wrapped() -> AsyncIterator[Any]:
-        async for chunk in stream:
-            activity.touch()
-            yield chunk
-
+        try:
+            async for chunk in stream:
+                activity.touch()
+                yield chunk
+        finally:
+            await _close_async_iterator(stream)
     return _wrapped()
 
 

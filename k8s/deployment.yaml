@@ -6,9 +6,9 @@ metadata:
   labels:
     app: tusker-gateway
   annotations:
-    tusker.net.au/commit: d8fd68630a8bc154d0a8b0c58d027e54e1a5a691
-    tusker.net.au/image-tag: swarm-alpine-d8fd68630a8bc154d0a8b0c58d027e54e1a5a691
-    tusker.net.au/image-digest: sha256:872546fab01096abe9d352a4ca09198ba52011ef4e0087bcc541c9423910a259
+    tusker.net.au/commit: b9e62a5e4c8eccbe3c50b015d7ea080a7b233062
+    tusker.net.au/image-tag: swarm-alpine-b9e62a5e4c8eccbe3c50b015d7ea080a7b233062
+    tusker.net.au/image-digest: sha256:864d057ee918cb63c93471d7f0841a9f34a0a6c18d9f62739a7504528aa1e26c
 spec:
   replicas: 1
   selector:
@@ -34,7 +34,7 @@ spec:
       terminationGracePeriodSeconds: 90
       containers:
       - name: tusker-gateway
-        image: registry.tusker.net.au:5000/tusker-gateway@sha256:872546fab01096abe9d352a4ca09198ba52011ef4e0087bcc541c9423910a259
+        image: registry.tusker.net.au:5000/tusker-gateway@sha256:864d057ee918cb63c93471d7f0841a9f34a0a6c18d9f62739a7504528aa1e26c
         imagePullPolicy: Always
         envFrom:
         - secretRef:
@@ -70,7 +70,9 @@ spec:
               name: tusker-env-vault
               key: OPENCODE_ZEN_API_KEY
         # Shared mutable gateway state lives in the dedicated PostgreSQL
-        # service. SQLite paths remain as local/test fallbacks only.
+        # service. SQLite is not used in PostgreSQL storage mode.
+        - name: TUSKER_STORAGE_MODE
+          value: "postgres"
         - name: TUSKER_STATE_DATABASE_URL
           valueFrom:
             secretKeyRef:
@@ -272,9 +274,12 @@ spec:
         - name: TUSKER_REDACTION_API_KEYS
           value: 'true'
         # Preserve email/key syntax for OMP while retaining authenticated ciphertext.
-        # Keep disabled unless clients require syntax-shaped redaction aliases.
+        # Syntax-shaped aliases keep redacted credentials copyable by models
+        # without exposing the plaintext; the gateway restores them at the
+        # client/tool boundary. Enabled 2026-11-16 after model-mangled
+        # [TUSKER:email:...] ciphertext reached OMP sessions.
         - name: TUSKER_REDACTION_FORMAT_PRESERVING
-          value: 'false'
+          value: 'true'
         # Keep JWT-shaped App Check placeholders copyable during model replay;
         # the payload remains authenticated ciphertext and never a credential.
         - name: TUSKER_REDACTION_FORMAT_PRESERVING_APPCHECK
@@ -682,7 +687,7 @@ spec:
         - name: TUSKER_MLX_MAC_QUEUE_DEPTH
           value: '3'
         - name: TUSKER_MLX_MAC_QUEUE_WAIT_SECS
-          value: '120'
+          value: '20'
         # Default to Pro (3) to avoid 429 "too many concurrent requests" while
         # still allowing reasonable parallelism.
         - name: TUSKER_OLLAMA_CLOUD_MAX_CONCURRENT

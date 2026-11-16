@@ -359,6 +359,42 @@ async def test_queue_wait_expiry_returns_rejection(monkeypatch):
     assert snapshot["active"] == 0
     controller.reset()
 
+@pytest.mark.asyncio
+async def test_queue_wait_expiry_records_quality_failure(monkeypatch, tmp_path):
+    from unittest.mock import MagicMock
+
+    from tusker_gateway.passthrough import PassthroughClient
+    from tusker_gateway.quality import QualityDB
+
+    monkeypatch.setenv("TUSKER_MLX_MAC_MAX_CONCURRENT", "1")
+    monkeypatch.setenv("TUSKER_MLX_MAC_QUEUE_DEPTH", "1")
+    monkeypatch.setenv("TUSKER_MLX_MAC_QUEUE_WAIT_SECS", "0.01")
+    controller = capacity_controller()
+    controller.reset()
+    db = QualityDB(str(tmp_path / "quality.db"))
+    client = PassthroughClient(
+        {
+            "api_keys": ["gateway-test"],
+            "provider_api_keys": {},
+            "codex_credentials": [],
+            "quality_db_path": str(tmp_path / "quality.db"),
+        },
+        db,
+        MagicMock(),
+    )
+    held = controller.acquire("mlx-mac")
+    assert held is not None
+    try:
+        with pytest.raises(ProviderCapacityError) as caught:
+            await client._reserve_capacity("mlx-mac", "qwen3.8-27b")
+        assert caught.value.capacity_rejected is True
+    finally:
+        held.release()
+        controller.reset()
+
+    assert db.get_quality("mlx-mac", "qwen3.8-27b") is not None
+    assert db.rank([("mlx-mac", "qwen3.8-27b")])[0][2] < 30.0
+
 
 @pytest.mark.asyncio
 async def test_queued_reserve_holds_slot_for_the_request(monkeypatch, tmp_path):
@@ -591,6 +627,52 @@ async def test_guard_stream_lease_releases_for_unstarted_generator():
     gc.collect()
     await asyncio.sleep(0.05)
     gc.collect()
+
+    assert controller.snapshot().get("mlx-mac", {}).get("active", 0) == 0
+    controller.reset()
+
+
+@pytest.mark.asyncio
+async def test_normalize_stream_close_releases_capacity_lease():
+    """Closing a normalized stream must release the shared MLX lease.
+
+    Regression (2026-11-16): the endpoint's ``finally`` block calls
+    ``aclose`` on the stream it consumed. That stream is built by
+    ``_normalize_stream`` over ``_attempt_touch_iterator`` over
+    ``_guard_stream_lease``. Neither the normalizer nor the touch wrapper
+    forwarded ``aclose`` to its source, so the provider capacity lease
+    under the guard was stranded for the life of the process. On mlx-mac
+    (limit 2) that made the whole group read as saturated while the
+    backend had no model loaded at all.
+    """
+    from tusker_gateway.endpoints import (
+        _AttemptActivity,
+        _attempt_touch_iterator,
+        _normalize_stream,
+    )
+    from tusker_gateway.passthrough import _guard_stream_lease
+
+    controller = capacity_controller()
+    controller.reset()
+    lease = controller.acquire("mlx-mac")
+    assert lease is not None
+    assert controller.snapshot()["mlx-mac"]["active"] == 1
+
+    async def _events():
+        yield b'data: {"choices":[{"index":0,"delta":{"content":"hi"}}]}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    guarded = _guard_stream_lease(_events(), lease)
+    touched = _attempt_touch_iterator(guarded, _AttemptActivity())
+    normalized = _normalize_stream(
+        touched,
+        provider="mlx-mac",
+        model="qwen3.8-27b",
+        request_id="req-lease-regression",
+    )
+    await anext(normalized)
+    await normalized.aclose()
+    await asyncio.sleep(0.05)
 
     assert controller.snapshot().get("mlx-mac", {}).get("active", 0) == 0
     controller.reset()
