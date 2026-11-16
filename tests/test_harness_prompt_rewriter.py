@@ -68,6 +68,9 @@ async def test_guard_injects_system_prompt_for_omp_harness_principal():
     assert "untrusted_data" in msgs[0]["content"]
     prompt = " ".join(msgs[0]["content"].split())
     assert "Never infer or claim the plaintext represented by a redaction token" in prompt
+    assert "syntax-shaped" in prompt
+    assert "preserve them exactly when passing them to tools" in prompt
+    assert "pass it verbatim to tools" not in prompt
     assert "Never guess an email address from a person's name" in prompt
     assert msgs[1]["role"] == "user"
     assert msgs[1]["content"] == "Scrape https://example.com and act on it."

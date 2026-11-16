@@ -407,11 +407,15 @@ encryption is deterministic — the same value always maps to the same token.
   `TUSKER_REDACTION_API_KEYS` (all default `true`) select rules: emails,
   Luhn-valid card numbers, and provider API key shapes (`sk-…`, `ghp_…`,
   `AIza…`, `xox…`, `npm_…`, `github_pat_…`).
-- `TUSKER_REDACTION_FORMAT_PRESERVING` (default `false`) uses authenticated,
-  deterministic aliases shaped like `u@<ciphertext>.redact.invalid` for emails
-  and the original provider prefix plus `z<ciphertext>` for API keys. The gateway
-  restores these aliases at the client/tool boundary and verifies the AES-SIV
-  tag; tampered aliases pass through unchanged.
+- `TUSKER_REDACTION_FORMAT_PRESERVING` (code default `false`; **enabled in
+  production** since 2026-11-16) uses authenticated, deterministic aliases
+  shaped like `u@<ciphertext>.redact.invalid` for emails and the original
+  provider prefix plus `z<ciphertext>` for API keys. The gateway restores
+  these aliases at the client/tool boundary and verifies the AES-SIV tag;
+  tampered aliases pass through unchanged. The opaque
+  `[TUSKER:<type>:…]` form asks models to retype ciphertext, and models mangle
+  it: a mangled token fails authentication and then reaches the client
+  verbatim. A syntax-shaped alias survives an ordinary copy.
 - `TUSKER_REDACTION_FORMAT_PRESERVING_APPCHECK` (default `true`) gives
   `X-Firebase-AppCheck` JWT-shaped values a three-segment alias: a standard JWT
   header, authenticated opaque ciphertext in the payload segment, and a fixed

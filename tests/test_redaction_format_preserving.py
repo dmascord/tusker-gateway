@@ -203,3 +203,17 @@ async def test_omp_tool_arguments_restore_aliases_without_encrypted_token_leakag
         )
     )
     assert json.loads(assembled)["to"] == EMAIL
+
+def test_deployment_enables_syntax_shaped_redaction_for_omp():
+    """Production must not regress to opaque ciphertext for OMP callers."""
+    import pathlib
+    import yaml
+
+    manifest = pathlib.Path(__file__).parents[1] / "k8s" / "deployment.yaml"
+    document = yaml.safe_load(manifest.read_text())
+    env = {
+        item["name"]: item.get("value")
+        for item in document["spec"]["template"]["spec"]["containers"][0]["env"]
+        if "name" in item
+    }
+    assert env["TUSKER_REDACTION_FORMAT_PRESERVING"] == "true"
