@@ -151,6 +151,8 @@ class CatalogEntry:
     # Optional pricing (filled by models.dev lookup)
     cost_input: float | None = None
     cost_output: float | None = None
+    # Published/advertised context window (tokens), when known.
+    context_window: int | None = None
     # Known input modalities. None means the catalog does not advertise them.
     input_modalities: frozenset[str] | None = None
     # Known output modalities. None means the catalog does not advertise them.
@@ -749,7 +751,12 @@ class CodexCatalog(CatalogClient):
             visibility = (m.get("visibility") or "").strip().lower()
             if visibility in {"hide", "hidden"}:
                 continue
-            out.append(CatalogEntry(provider="openai-codex", model=slug.strip(), raw=m))
+            out.append(CatalogEntry(
+                provider="openai-codex",
+                model=slug.strip(),
+                raw=m,
+                context_window=extract_published_context_window(m),
+            ))
         return out
 
 
@@ -833,7 +840,12 @@ class CopilotCatalog(CatalogClient):
             if not isinstance(slug, str) or not slug.strip():
                 continue
             slug = slug.strip()
-            out.append(CatalogEntry(provider=self.provider, model=slug, raw=m))
+            out.append(CatalogEntry(
+                provider=self.provider,
+                model=slug,
+                raw=m,
+                context_window=extract_published_context_window(m),
+            ))
         return out
 
 
@@ -874,6 +886,7 @@ class OpenRouterCatalog(CatalogClient):
                 raw=m,
                 cost_input=prompt_cost,
                 cost_output=completion_cost,
+                context_window=extract_published_context_window(m),
             ))
         return out
 
@@ -992,6 +1005,7 @@ class ProviderModelsCatalog(CatalogClient):
                 raw=raw,
                 cost_input=cost_input,
                 cost_output=cost_output,
+                context_window=extract_published_context_window(raw),
             )
             if (
                 entry.input_modalities is None
@@ -1031,7 +1045,18 @@ class OpenCodeGoCatalog(CatalogClient):
                 raise CatalogError(f"opencode {self.provider} HTTP {resp.status}")
             data = await resp.json()
         models = data.get("data", []) if isinstance(data, dict) else data
-        return [CatalogEntry(provider=self.provider, model=slug.strip(), raw=model) for model in models if isinstance(model, dict) for slug in [model.get("id") or model.get("name")] if isinstance(slug, str) and slug.strip()]
+        return [
+            CatalogEntry(
+                provider=self.provider,
+                model=slug.strip(),
+                raw=model,
+                context_window=extract_published_context_window(model),
+            )
+            for model in models
+            if isinstance(model, dict)
+            for slug in [model.get("id") or model.get("name")]
+            if isinstance(slug, str) and slug.strip()
+        ]
 
 # ---------------------------------------------------------------------------
 # OpenCode CLI (free models served through the local CLI adapter)
@@ -1100,11 +1125,13 @@ class OpenCodeCLICatalog(CatalogClient):
             model = name[len(self.NAMESPACE) :].strip()
             if not model:
                 continue
+            raw = {"source": "opencode models"}
             entries.append(
                 CatalogEntry(
                     provider=self.provider,
                     model=model,
-                    raw={"source": "opencode models"},
+                    raw=raw,
+                    context_window=extract_published_context_window(raw),
                     input_modalities=frozenset({"text", "image"}),
                     output_modalities=frozenset({"text"}),
                 )
@@ -1199,6 +1226,8 @@ class KiloCLICatalog(CatalogClient):
                 CatalogEntry(
                     provider=self.provider,
                     model=model,
+                    raw={"source": "kilo models"},
+                    context_window=None,
                     input_modalities=frozenset({"text", "image"}),
                     output_modalities=frozenset({"text"}),
                 )
@@ -1267,6 +1296,7 @@ class XiaomiCatalog(CatalogClient):
                 provider=self.provider,
                 model=model,
                 raw=row,
+                context_window=extract_published_context_window(row),
                 cost_input=metadata[1],
                 cost_output=metadata[2],
                 input_modalities=metadata[0],
@@ -1367,6 +1397,7 @@ class WorkersAICatalog(CatalogClient):
                 provider=self.provider,
                 model=model,
                 raw=raw,
+                context_window=extract_published_context_window(raw),
                 input_modalities=input_modalities,
             ))
         return out
@@ -1419,6 +1450,7 @@ class ModelsDevCatalog(CatalogClient):
                     raw=model_info,
                     cost_input=cost_input,
                     cost_output=cost_output,
+                    context_window=extract_published_context_window(model_info),
                 ))
         return out
 
@@ -1467,6 +1499,50 @@ def _extract_catalog_pricing(model_info: dict[str, Any]) -> tuple[float | None, 
         _parse_cost_field(cost.get("input", cost.get("prompt"))),
         _parse_cost_field(cost.get("output", cost.get("completion"))),
     )
+
+
+def _to_positive_int(value: Any) -> int | None:
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return None
+    return n if n > 0 else None
+
+
+def extract_published_context_window(model_info: dict[str, Any]) -> int | None:
+    """Return a published context window from common catalog/model shapes."""
+    if not isinstance(model_info, dict):
+        return None
+    for key in (
+        "context_length",
+        "context_window",
+        "max_context_length",
+        "max_model_len",
+        "max_input_tokens",
+        "inputTokenLimit",
+    ):
+        value = _to_positive_int(model_info.get(key))
+        if value is not None:
+            return value
+    top = model_info.get("top_provider")
+    if isinstance(top, dict):
+        for key in ("context_length", "max_completion_tokens"):
+            value = _to_positive_int(top.get(key))
+            if value is not None:
+                return value
+    limit = model_info.get("limit")
+    if isinstance(limit, dict):
+        for key in ("context", "input"):
+            value = _to_positive_int(limit.get(key))
+            if value is not None:
+                return value
+    info = model_info.get("info")
+    if isinstance(info, dict):
+        for key in ("context_length", "context_window", "max_context_length"):
+            value = _to_positive_int(info.get(key))
+            if value is not None:
+                return value
+    return None
 
 def is_free_openrouter_model(model_info: dict[str, Any]) -> bool:
     """Return whether OpenRouter explicitly prices both token directions at zero."""
@@ -1599,6 +1675,25 @@ class CatalogRegistry:
         """Enrich and persist a completed catalog snapshot off-loop."""
         self._enrich_pricing()
         self._record_catalog_capabilities()
+        self._publish_context_windows()
+
+    def _publish_context_windows(self) -> None:
+        """Publish catalog-advertised context windows for routing/clamping."""
+        try:
+            from tusker_gateway import context_limits
+        except Exception:
+            logger.debug("context window publish unavailable", exc_info=True)
+            return
+        windows: dict[tuple[str, str], int] = {}
+        for client in self._clients.values():
+            for entry in getattr(client, "_entries", []) or []:
+                window = getattr(entry, "context_window", None)
+                if window is None and isinstance(getattr(entry, "raw", None), dict):
+                    window = extract_published_context_window(entry.raw)
+                if isinstance(window, int) and window > 0:
+                    windows[(entry.provider, entry.model)] = window
+        if windows:
+            context_limits.update_published_context_windows(windows)
 
     def get_client(self, provider: str) -> CatalogClient | None:
         return self._clients.get(provider)

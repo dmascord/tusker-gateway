@@ -6,13 +6,27 @@ import json
 
 import pytest
 
+from tusker_gateway import context_limits
 from tusker_gateway.context_limits import (
     declared_context_window,
     estimate_prompt_tokens,
     fit_output_budget,
     min_output_tokens,
+    record_learned_context_window,
     required_context_tokens,
+    set_published_context_windows,
 )
+
+
+@pytest.fixture(autouse=True)
+def _clear_context_window_state(monkeypatch):
+    set_published_context_windows({})
+    context_limits._learned_context_windows.clear()
+    monkeypatch.delenv("TUSKER_CONTEXT_WINDOW_OVERRIDES_JSON", raising=False)
+    monkeypatch.delenv("TUSKER_MIN_OUTPUT_TOKENS", raising=False)
+    yield
+    set_published_context_windows({})
+    context_limits._learned_context_windows.clear()
 from tusker_gateway.errors import UnusableToolResponseError
 
 
@@ -31,6 +45,28 @@ def test_model_key_wins_over_provider_key(windows):
     # large prompts are not forwarded past a route's real upstream window.
     assert declared_context_window("openai-codex", "gpt-5.6-luna") == 128_000
     assert declared_context_window("openai-codex", "some-unknown-model") == 128_000
+
+
+def test_published_and_learned_windows_take_precedence_over_override(monkeypatch):
+    monkeypatch.setenv(
+        "TUSKER_CONTEXT_WINDOW_OVERRIDES_JSON",
+        json.dumps({"openai-codex/gpt-5.6-luna": 64000, "openai-codex": 32000}),
+    )
+    # Override is backup when nothing is known.
+    assert declared_context_window("openai-codex", "gpt-5.6-luna") == 64000
+
+    # Published/catalog window wins over override.
+    set_published_context_windows({("openai-codex", "gpt-5.6-luna"): 200000})
+    assert declared_context_window("openai-codex", "gpt-5.6-luna") == 200000
+
+    # Learned (observed) window also takes precedence.
+    record_learned_context_window("openai-codex", "gpt-5.6-luna", 272000, source="header")
+    assert declared_context_window("openai-codex", "gpt-5.6-luna") == 272000
+
+    # Without known info, override remains the backup.
+    set_published_context_windows({})
+    context_limits._learned_context_windows.clear()
+    assert declared_context_window("openai-codex", "other-model") == 32000
 
 
 def test_latest_tag_is_optional_on_either_side(monkeypatch):
@@ -105,6 +141,16 @@ def test_builtin_defaults_clamp_oversized_cloud_prompts(windows):
     assert budget.window == 128_000
     assert budget.clamped
     assert body["max_tokens"] == max(1, 128_000 - 166646 - 256)
+
+    # A published window (preferred over override/builtin) prevents premature
+    # restriction when the model is known to support more.
+    set_published_context_windows({("github-copilot", "gpt-5.6-luna"): 272000})
+    body, budget = fit_output_budget(
+        {"max_tokens": 16384}, "github-copilot", "gpt-5.6-luna", 166646
+    )
+    assert budget.window == 272000
+    assert not budget.clamped
+    assert body["max_tokens"] == 16384
 
     body, budget = fit_output_budget(
         {"max_tokens": 16384}, "opencode-go", "glm-5.3-flash", 9451

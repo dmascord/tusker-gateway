@@ -140,6 +140,154 @@ _BUILTIN_MODEL_CONTEXT_WINDOWS: tuple[tuple[str, int], ...] = (
     ("qwen", 131_072),
 )
 
+# Published windows come from provider catalogs/model metadata; learned
+# windows come from observed runtime signals (e.g. response headers or
+# context-limit errors). Both are preferred over operator overrides, which
+# act as a backup when the upstream/model does not tell us its window.
+_published_context_windows: dict[str, int] = {}
+_learned_context_windows: dict[str, int] = {}
+
+
+def _route_model_key(provider: str, model: str) -> str:
+    return _route_key(f"{provider}/{model}")
+
+
+def set_published_context_windows(windows: dict[tuple[str, str], int] | None) -> None:
+    """Replace the published context-window registry (catalog-sourced)."""
+    global _published_context_windows
+    parsed: dict[str, int] = {}
+    for (provider, model), value in (windows or {}).items():
+        try:
+            n = int(value)
+        except (TypeError, ValueError):
+            continue
+        if n > 0:
+            parsed[_route_model_key(str(provider), str(model))] = n
+    _published_context_windows = parsed
+
+
+def update_published_context_windows(windows: dict[tuple[str, str], int] | None) -> None:
+    """Merge published context windows into the registry."""
+    for (provider, model), value in (windows or {}).items():
+        try:
+            n = int(value)
+        except (TypeError, ValueError):
+            continue
+        if n > 0:
+            _published_context_windows[_route_model_key(str(provider), str(model))] = n
+
+
+def record_learned_context_window(provider: str, model: str, window: int, *, source: str = "unknown") -> None:
+    """Record an observed context window for a route."""
+    try:
+        n = int(window)
+    except (TypeError, ValueError):
+        return
+    if n <= 0:
+        return
+    key = _route_model_key(provider, model)
+    current = _learned_context_windows.get(key)
+    # Prefer larger learned values (a header/error usually states the true
+    # limit); if equal, keep existing.
+    if current is None or n >= current:
+        _learned_context_windows[key] = n
+        logger.info(
+            "learned context window provider=%s model=%s window=%d source=%s",
+            provider,
+            model,
+            n,
+            source,
+        )
+
+
+def _lookup_known_window(mapping: dict[str, int], provider: str, model: str) -> int | None:
+    provider_key = _route_key(provider)
+    model_key = _route_key(model)
+    exact = mapping.get(_route_model_key(provider, model))
+    if exact is not None:
+        return exact
+    # Accept lookups where either side stored/queried an implicit :latest tag.
+    prefix = provider_key + "/"
+    for key, value in mapping.items():
+        if not key.startswith(prefix):
+            continue
+        key_model = key[len(prefix):]
+        if key_model == model_key or key_model.removesuffix(":latest") == model_key.removesuffix(":latest"):
+            return value
+    return None
+
+
+_CONTEXT_HEADER_KEYS = (
+    "x-context-length",
+    "x-context-window",
+    "x-max-context-length",
+    "x-model-context-length",
+    "x-model-max-context",
+    "x-model-max-tokens",
+    "openai-model-context-length",
+)
+
+
+def learn_from_response_headers(provider: str, model: str, headers: Any) -> int | None:
+    """Record context window hints from upstream response headers, if present."""
+    if not headers:
+        return None
+    try:
+        items = headers.items() if hasattr(headers, "items") else []
+    except Exception:
+        return None
+    for key, value in items:
+        k = str(key).strip().lower()
+        if k in _CONTEXT_HEADER_KEYS or ("context" in k and ("length" in k or "window" in k or "token" in k)):
+            # Ignore obvious rate-limit headers.
+            if "ratelimit" in k or "remaining" in k or "reset" in k:
+                continue
+            try:
+                n = int(str(value).strip())
+            except (TypeError, ValueError):
+                continue
+            if n >= 1024:
+                record_learned_context_window(provider, model, n, source=f"header:{k}")
+                return n
+    return None
+
+
+import re as _re
+
+_CONTEXT_ERROR_RE = _re.compile(
+    r"(?i)(?:maximum|max(?:imum)?)?\s*context(?:\s+length|\s+window|\s+size)?(?:\s+is|\s+of|[:=])\s*(\d[\d,]{3,})"
+    r"|context(?:\s+length|\s+window)\s*(?:exceeded|too\s+(?:large|long)).{0,80}?(\d[\d,]{3,})"
+)
+
+
+def learn_from_error(provider: str, model: str, message: Any) -> int | None:
+    """Record context window hints from provider error text, if present."""
+    text = str(message or "")
+    if not text:
+        return None
+    for m in _CONTEXT_ERROR_RE.finditer(text):
+        raw = m.group(1) or m.group(2)
+        if not raw:
+            continue
+        try:
+            n = int(raw.replace(",", ""))
+        except (TypeError, ValueError):
+            continue
+        # Heuristic: context limits are typically >= 4096 tokens.
+        if n >= 4096:
+            record_learned_context_window(provider, model, n, source="error")
+            return n
+    return None
+
+
+def known_context_window(provider: str, model: str) -> int | None:
+    """Published or learned window for a route, if known."""
+    learned = _lookup_known_window(_learned_context_windows, provider, model)
+    published = _lookup_known_window(_published_context_windows, provider, model)
+    if learned is not None and published is not None:
+        return max(learned, published)
+    return learned if learned is not None else published
+
 
 def _builtin_context_window(provider: str, model: str) -> int | None:
     pkey = _route_key(provider)
@@ -155,13 +303,17 @@ def _builtin_context_window(provider: str, model: str) -> int | None:
 
 
 def declared_context_window(provider: str, model: str) -> int | None:
-    """Return the effective declared window for a route.
+    """Return the effective context window for a route.
 
-    Operator overrides (``TUSKER_CONTEXT_WINDOW_OVERRIDES_JSON``) take
-    precedence. Conservative built-in defaults apply when no override exists
-    so routes are filtered/clamped instead of forwarding prompts that exceed
-    the real upstream window.
+    Resolution order:
+    1. Published/catalog or learned (observed) window, when known.
+    2. Operator override (``TUSKER_CONTEXT_WINDOW_OVERRIDES_JSON``) as a
+       backup when the upstream/model does not tell us its window.
+    3. Conservative built-in default.
     """
+    known = known_context_window(provider, model)
+    if known is not None:
+        return known
     overrides = _context_window_overrides()
     provider_key = _route_key(provider)
     exact = overrides.get(_route_key(f"{provider}/{model}"))

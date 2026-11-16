@@ -3517,9 +3517,23 @@ class PassthroughClient:
         pool: str | None = None,
         request_payload: bytes | None = None,
     ) -> None:
+        if provider and model:
+            try:
+                from tusker_gateway import context_limits
+
+                context_limits.learn_from_response_headers(provider, model, resp.headers)
+            except Exception:
+                logger.debug("context window header learning failed", exc_info=True)
         if resp.status == 200:
             return
         body = await resp.text()
+        if provider and model:
+            try:
+                from tusker_gateway import context_limits
+
+                context_limits.learn_from_error(provider, model, body)
+            except Exception:
+                logger.debug("context window error learning failed", exc_info=True)
         logger.warning(
             "provider response error provider=%s model=%s status=%d body=%s",
             provider or "unknown",
