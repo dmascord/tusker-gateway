@@ -4765,8 +4765,6 @@ _STREAM_RECOVERY_CODES = frozenset({
     "cli_failed",
     "claude_code_cli_failed",
     "claude_code_cli_quota",
-    "kilo_cli_failed",
-    "kilo_worker_unavailable",
     "opencode_cli_failed",
     # A provider 429 carries no assistant-visible output, so one alternative
     # candidate can still absorb the turn. Without this code the pre-visible
@@ -6985,7 +6983,6 @@ _DIRECT_TEXT_ONLY_IMAGE_MODELS = frozenset({
 _DIRECT_CLI_INPUT_MODALITIES = {
     "claude-code-cli": frozenset({"text", "image"}),
     "opencode-cli": frozenset({"text", "image"}),
-    "kilo-cli": frozenset({"text", "image"}),
 }
 
 

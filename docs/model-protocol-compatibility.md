@@ -318,7 +318,7 @@ log record and therefore the request's span context:
 |`protocol_confidence`|`provider`, `heuristic`, or `unknown`|
 |`endpoint_id`|Opaque fingerprint of the configured endpoint that served the attempt (hashes `base_url`/`chat_path`/`chat_api`; credentials excluded)|
 |`evidence_version`|Probe-evidence contract label the resolver consulted (`protocol-contract-v1`)|
-|`selected_adapter`|Transport that served the attempt: `http`, `OpenCodeCLIAdapter`, `ClaudeCodeCLIAdapter`, or `KiloCLIAdapter`|
+|`selected_adapter`|Transport that served the attempt: `http`, `OpenCodeCLIAdapter`, or `ClaudeCodeCLIAdapter`|
 |`fallback_reason`|`previous_attempt:<ExcType>` when the router moved on|
 
 The fields are emitted on **both** dispatch shapes — a pooled attempt
@@ -373,7 +373,7 @@ failure classes decompose as follows and none are protocol regressions:
 |`provider_route_disabled`|1|github-copilot `gpt-5.6-luna` route disabled in config|
 
 Working end-to-end on the day: minimax (8/8), zai (2/2), xiaomi mimo-v2.5,
-kilo-cli free tier, claude-code-cli sonnet, apim gpt-5.6-luna,
+Kilo Gateway free tier, claude-code-cli sonnet, apim gpt-5.6-luna,
 mlx-mac qwen3.8-27b (privacy + swarm per-model), google gemini-3.5-flash,
 groq gpt-oss-20b, synthetic (all 4 variants at 64 tokens), plus the
 operator-authorized billable probes above.

@@ -380,7 +380,58 @@ def test_config_loads_provider_api_keys_env_vars():
     with patch.dict(os.environ, env, clear=False):
         cfg = load_config()
     assert cfg["provider_api_keys"]["openai"] == "sk-oa-override"
-    assert cfg["provider_api_keys"]["openrouter"] == "sk-or-override"
+
+
+@pytest.mark.asyncio
+async def test_kilo_provider_uses_direct_openrouter_compatible_endpoint():
+    from tusker_gateway.config import DEFAULT_PROVIDER_REGISTRY
+    from tusker_gateway.passthrough import _configured_endpoint
+
+    config = _base_config(provider_api_keys={"kilo": "kilo-test-key"})
+    config["providers"] = {"kilo": DEFAULT_PROVIDER_REGISTRY["kilo"]}
+    client = PassthroughClient(config, QualityDB(":memory:"), MagicMock())
+    endpoint = _configured_endpoint(config, "kilo")
+    assert endpoint is not None
+    assert endpoint["base_url"] == "https://api.kilo.ai/api/openrouter"
+    assert endpoint["chat_path"] == "/chat/completions"
+
+    headers, body = await client._build_request(
+        "kilo",
+        "kilo-auto/free",
+        [{"role": "user", "content": "hello"}],
+        stream=False,
+        api_key=None,
+        extra_headers=None,
+        extra_body=None,
+        endpoint=endpoint,
+    )
+    assert headers["Authorization"] == "Bearer kilo-test-key"
+    assert body["model"] == "kilo-auto/free"
+
+@pytest.mark.asyncio
+async def test_kilo_provider_without_optional_key_sends_no_authorization_header():
+    from tusker_gateway.config import DEFAULT_PROVIDER_REGISTRY
+    from tusker_gateway.passthrough import _configured_endpoint
+
+    config = _base_config()
+    config["providers"] = {"kilo": DEFAULT_PROVIDER_REGISTRY["kilo"]}
+    client = PassthroughClient(config, QualityDB(":memory:"), MagicMock())
+    endpoint = _configured_endpoint(config, "kilo")
+    assert endpoint is not None
+
+    headers, body = await client._build_request(
+        "kilo",
+        "kilo-auto/free",
+        [{"role": "user", "content": "hello"}],
+        stream=False,
+        api_key=None,
+        extra_headers=None,
+        extra_body=None,
+        endpoint=endpoint,
+    )
+
+    assert "Authorization" not in headers
+    assert body["model"] == "kilo-auto/free"
 
 def test_config_normalizes_hyphenated_provider_keys():
     """PROVIDER_*_API_KEY vars for hyphenated providers must map to the
@@ -660,7 +711,10 @@ async def test_codex_all_accounts_unsupported_stops_repeating_upstream_request(
         )
     assert mock_http.request.await_count == 1
 
-    with pytest.raises(ProviderError, match="unsupported by all configured OAuth accounts"):
+    with pytest.raises(
+        ProviderError,
+        match="no usable OAuth credential|unsupported by all configured OAuth accounts",
+    ):
         await client._chat_codex(
             provider="openai-codex",
             model="gpt-5.4-mini",

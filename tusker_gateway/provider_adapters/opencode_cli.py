@@ -39,7 +39,7 @@ from tusker_gateway.provider_adapters.claude_code import (
 )
 from tusker_gateway.provider_adapters.claude_code import ClaudeCodeCLIAdapter
 
-from tusker_gateway.provider_adapters.kilo_cli import _clear_broker, _point_broker
+from tusker_gateway.provider_adapters.mcp_broker import _clear_broker, _point_broker
 from tusker_gateway.sse import format_openai_chunk, sse_done, sse_frame
 
 logger = logging.getLogger(__name__)

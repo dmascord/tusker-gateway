@@ -18,7 +18,7 @@ SCRIPT = ROOT / "k8s" / "check_cli_version_drift.py"
 MANIFEST = ROOT / "k8s" / "cli-drift-cronjob.yaml"
 DOCKERFILE = ROOT / "Dockerfile"
 
-PINS = ("CLAUDE_CODE_CLI_VERSION", "OPENCODE_CLI_VERSION", "KILO_CLI_VERSION")
+PINS = ("CLAUDE_CODE_CLI_VERSION", "OPENCODE_CLI_VERSION")
 
 
 def _docs() -> tuple[dict, dict]:

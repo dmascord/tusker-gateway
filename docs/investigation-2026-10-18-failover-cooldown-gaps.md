@@ -62,11 +62,11 @@ In production, `TUSKER_REQUEST_TIMEOUT_MS=240000` (4 minutes) is set, so the
 hard outer bound is the request deadline. Per-attempt overrides
 (`TUSKER_PROVIDER_ATTEMPT_TIMEOUT_OVERRIDES_JSON`) raise the per-candidate
 budget to 240s for `local-llm`/`mlx-mac`, 180s for `ollama-cloud` and
-`synthetic`, 120s for `kilo-cli` and `alibaba/qwen3.8-max`, and 90s for
-`zai` and `opencode-go`. A request whose first candidate is an `ollama-cloud`
-stall has up to 180s to fail before the next candidate starts, so a couple of
-slow overrides plus one stalling upstream can absorb the whole request
-deadline before the loop reaches its remaining candidates.
+`synthetic`, 120s for `alibaba/qwen3.8-max`, and 90s for `zai` and
+`opencode-go`. A request whose first candidate is an `ollama-cloud` stall has
+up to 180s to fail before the next candidate starts, so a couple of slow
+overrides plus one stalling upstream can absorb the whole request deadline
+before the loop reaches its remaining candidates.
 
 The per-candidate budget is the only knob. There is no aggregate
 "attempts must finish within N seconds" setting, so the number of candidates

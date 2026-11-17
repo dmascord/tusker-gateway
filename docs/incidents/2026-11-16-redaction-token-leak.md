@@ -51,8 +51,8 @@ reinforced the wrong pattern by telling the model to pass `[TUSKER:…]` values
   `registry.tusker.net.au:5000/tusker-gateway@sha256:479cce1bf0308e154ec27e0325c6f987c30f2e0b0dbf97c545f94794977e2e9e`.
   Branch `fix/redaction-token-leak-20261116`, manifest pin commit `bd844b0a`.
 - `k8s/verify-provenance.sh` on visor: tracked manifest, live Deployment,
-  gateway pod imageID, kilo-worker imageID, registry tag, `/health` and the
-  Deployment annotation all agree.
+  gateway pod imageID, registry tag, `/health` and the Deployment annotation
+  all agree.
 - `k8s/smoke_production.sh`: `{"ok": true, "reason": "ok", "http_status": 200}`.
 - Runtime config DB re-synced with
   `python -m tusker_gateway.tools.migrate_config_to_db --update`: 53 rows

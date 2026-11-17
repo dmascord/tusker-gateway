@@ -78,8 +78,7 @@ def capacity_group_for_route(
     Process-backed providers (``opencode-cli``, ``claude-code-cli``) share one
     budget because each in-flight request runs a CLI child process inside the
     gateway container: an uncapped burst exhausts the pod memory limit and the
-    kernel OOM-kills the gateway. ``kilo-cli`` only counts when it is not
-    proxied to the dedicated worker, which bounds its own subprocesses.
+    kernel OOM-kills the gateway.
     """
     provider_name = str(provider or "").strip().lower()
     model_name = str(model or "").strip().lower()
@@ -93,11 +92,6 @@ def capacity_group_for_route(
     if provider_name == SYNTHETIC_CAPACITY_GROUP:
         return SYNTHETIC_CAPACITY_GROUP
     if provider_name in ("opencode-cli", "claude-code-cli"):
-        return CLI_CAPACITY_GROUP
-    if (
-        provider_name == "kilo-cli"
-        and not os.environ.get("TUSKER_KILO_WORKER_URL", "").strip()
-    ):
         return CLI_CAPACITY_GROUP
     if (
         provider_name == NVIDIA_CAPACITY_GROUP

@@ -12,7 +12,6 @@ Architecture:
         ├── OpenRouterCatalog (openrouter.ai/api/v1/models)
         ├── ProviderModelsCatalog (provider-native OpenAI-compatible /models)
         ├── OpenCodeCLICatalog (opencode models subprocess, CLI free set)
-        ├── KiloCLICatalog     (kilo models --refresh subprocess, free set)
         ├── XiaomiCatalog      (token-plan-sgp.xiaomimimo.com/v1/models)
         └── ModelsDevCatalog   (models.dev/api.json, pricing DB)
 
@@ -77,7 +76,7 @@ DEFAULT_TTLS: dict[str, float] = {
     "openrouter": 3600.0,          # OpenRouter: 60 min
     "opencode-go": 3600.0,
     "opencode-cli": 3600.0,      # CLI free set: 60 min
-    "kilo-cli": 3600.0,          # CLI account set: 60 min
+    "kilo": 3600.0,              # Kilo auto catalog: 60 min
     "models.dev": 3600.0,        # models.dev: 60 min
     "xiaomi": 3600.0,             # Xiaomi Token Plan: 60 min
 }
@@ -910,6 +909,7 @@ class ProviderModelsCatalog(CatalogClient):
         default_output_modalities: frozenset[str] | None = None,
         pricing_overrides: dict[str, tuple[float, float]] | None = None,
         model_allowlist: Iterable[str] | None = None,
+        free_only: bool = False,
     ) -> None:
         super().__init__()
         self.provider = provider
@@ -924,6 +924,11 @@ class ProviderModelsCatalog(CatalogClient):
         # model list carries no pricing (e.g. Ollama Cloud). Only fills
         # entries the payload itself doesn't price.
         self.pricing_overrides = pricing_overrides
+        # Keep only zero-priced rows when set. Kilo's gateway lists paid
+        # routers alongside free models and marks its sign-in-only routers
+        # with pricing "-1", so a plain falsy cost check would admit routes
+        # an anonymous request cannot serve.
+        self.free_only = bool(free_only)
 
     async def fetch(self, session: aiohttp.ClientSession) -> list[CatalogEntry]:
         headers = {
@@ -999,6 +1004,8 @@ class ProviderModelsCatalog(CatalogClient):
                 pricing = self.pricing_overrides.get(slug)
                 if pricing is not None:
                     cost_input, cost_output = pricing
+            if self.free_only and (cost_input != 0.0 or cost_output != 0.0):
+                continue
             entry = CatalogEntry(
                 provider=self.provider,
                 model=slug,
@@ -1140,101 +1147,6 @@ class OpenCodeCLICatalog(CatalogClient):
             raise CatalogError("'opencode models' listed no opencode/ models")
         return entries
 
-
-# ---------------------------------------------------------------------------
-# Kilo CLI (models.dev-backed account catalog)
-# ---------------------------------------------------------------------------
-
-
-class KiloCLICatalog(CatalogClient):
-    """Models currently advertised by the local Kilo CLI.
-
-    ``kilo models --refresh --pure`` refreshes Kilo's own models.dev-backed
-    cache before listing available routes. The command emits ``kilo/...`` for
-    Kilo-hosted routes and provider-qualified IDs for direct providers; the
-    adapter accepts both forms after the outer ``kilo/`` namespace is removed.
-    A failed or empty listing is an error so ``CatalogClient`` retains the
-    last-good snapshot instead of treating a CLI glitch as mass retirement.
-    """
-
-    provider = "kilo-cli"
-    ttl_secs = DEFAULT_TTLS["kilo-cli"]
-    timeout_secs = 30.0
-
-    @staticmethod
-    def _model_id(line: str) -> str | None:
-        value = line.strip()
-        if not value:
-            return None
-        # Kilo prints the exact provider/model identifier accepted by
-        # ``kilo run --model``. Only free routes and Kilo's free auto-router
-        # belong in the gateway's cheap code pool; paid account models remain
-        # explicit operator configuration.
-        if not (value.endswith(":free") or value.startswith("kilo/kilo-auto/")):
-            return None
-        parts = value.split("/")
-        if len(parts) < 2 or any(not part for part in parts):
-            return None
-        if any(
-            part in {".", ".."}
-            or part.startswith("-")
-            or any(
-                ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-~:"
-                for ch in part
-            )
-            for part in parts
-        ):
-            return None
-        return value
-
-    async def fetch(self, session: aiohttp.ClientSession) -> list[CatalogEntry]:
-        del session  # subprocess-backed catalog; no HTTP involved
-        executable = shutil.which(os.environ.get("TUSKER_KILO_CLI_PATH") or "kilo")
-        if not executable:
-            raise CatalogError("kilo CLI is not installed in this runtime")
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                executable,
-                "models",
-                "--refresh",
-                "--pure",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-        except OSError as exc:
-            raise CatalogError(f"could not run '{executable} models': {exc}") from exc
-        try:
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=self.timeout_secs)
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-            raise CatalogError(
-                f"'{executable} models --refresh' timed out after {self.timeout_secs:.0f}s"
-            ) from None
-        if proc.returncode != 0:
-            raise CatalogError(
-                f"'{executable} models --refresh' exited with code {proc.returncode}"
-            )
-        entries: list[CatalogEntry] = []
-        seen: set[str] = set()
-        for line in stdout.decode("utf-8", errors="replace").splitlines():
-            model = self._model_id(line)
-            if model is None or model in seen:
-                continue
-            seen.add(model)
-            entries.append(
-                CatalogEntry(
-                    provider=self.provider,
-                    model=model,
-                    raw={"source": "kilo models"},
-                    context_window=None,
-                    input_modalities=frozenset({"text", "image"}),
-                    output_modalities=frozenset({"text"}),
-                )
-            )
-        if not entries:
-            raise CatalogError("'kilo models --refresh' listed no models")
-        return entries
 
 
 # ---------------------------------------------------------------------------
@@ -1806,12 +1718,26 @@ class CatalogRegistry:
             in {"1", "on", "yes", "true"}
         ):
             reg.register("opencode-cli", OpenCodeCLICatalog())
-        if (
-            "kilo-cli" in provider_registry
-            and os.environ.get("TUSKER_KILO_CLI_ENABLED", "").strip().lower()
-            in {"1", "on", "yes", "true"}
-        ):
-            reg.register("kilo-cli", KiloCLICatalog())
+        if "kilo" in provider_registry:
+            kilo_config = provider_registry["kilo"]
+            if isinstance(kilo_config, dict):
+                kilo_base_url = str(kilo_config.get("base_url", "")).strip()
+                kilo_models_path = str(kilo_config.get("models_path", "/models")).strip()
+            else:
+                kilo_base_url = str(getattr(kilo_config, "base_url", "")).strip()
+                kilo_models_path = str(getattr(kilo_config, "models_path", "/models")).strip()
+            kilo_endpoint = kilo_models_path
+            if not kilo_endpoint.startswith(("http://", "https://")):
+                kilo_endpoint = f"{kilo_base_url.rstrip('/')}/{kilo_endpoint.lstrip('/')}"
+            reg.register(
+                "kilo",
+                ProviderModelsCatalog(
+                    provider="kilo",
+                    endpoint=kilo_endpoint,
+                    ttl_secs=DEFAULT_TTLS["kilo"],
+                    free_only=True,
+                ),
+            )
         if "xiaomi" in provider_registry:
             reg.register("xiaomi", XiaomiCatalog())
         if "workers-ai" in provider_registry:
@@ -1824,7 +1750,7 @@ class CatalogRegistry:
             "openrouter",
             "opencode-go",
             "opencode-cli",
-            "kilo-cli",
+            "kilo",
             "xiaomi",
             "workers-ai",
             "models.dev",

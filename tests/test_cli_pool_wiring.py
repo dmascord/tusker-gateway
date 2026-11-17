@@ -34,18 +34,14 @@ def test_opencode_and_kilo_routes_are_code_only_and_explicitly_enabled():
         "step-5-preview-free",
     }
     assert {("opencode-cli", m) for m in free_models} <= code_routes
-    assert ("kilo-cli", "kilo/kilo-auto/free") in code_routes
+    assert ("kilo", "kilo-auto/free") in code_routes
     assert ("claude-code-cli", "sonnet") in code_routes
-    assert not ({"claude-code-cli", "opencode-cli", "kilo-cli"} & privacy_providers)
+    assert not ({"claude-code-cli", "opencode-cli", "kilo"} & privacy_providers)
     assert env["TUSKER_CLAUDE_CODE_ENABLED"]["value"] == "true"
     assert env["TUSKER_OPENCODE_CLI_ENABLED"]["value"] == "true"
     assert env["TUSKER_OPENCODE_CLI_API_KEY"]["valueFrom"]["secretKeyRef"]["key"] == (
         "OPENCODE_ZEN_API_KEY"
     )
-    attempt_timeouts = json.loads(
-        env["TUSKER_PROVIDER_ATTEMPT_TIMEOUT_OVERRIDES_JSON"]["value"]
-    )
-    assert attempt_timeouts["kilo-cli"] == 120
 
 
 def test_code_pool_opts_into_opencode_cli_auto_catalog():

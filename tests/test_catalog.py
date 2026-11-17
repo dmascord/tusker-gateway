@@ -24,7 +24,6 @@ from tusker_gateway.catalog import (
     ModelsDevCatalog,
     OpenCodeCLICatalog,
     OpenCodeGoCatalog,
-    KiloCLICatalog,
     OpenRouterCatalog,
     ProviderModelsCatalog,
     WorkersAICatalog,
@@ -383,6 +382,27 @@ async def test_provider_models_catalog_applies_pricing_overrides():
     # Payload-provided pricing wins; unknown slugs stay unpriced.
     assert entries["priced-in-payload"].cost_input == 0.0
     assert entries["priced-in-payload"].cost_output == 0.0
+
+
+@pytest.mark.asyncio
+async def test_provider_models_catalog_free_only_keeps_zero_priced_rows():
+    session = _CapturingSession(FakeResponse(200, {
+        "data": [
+            {"id": "kilo-auto/free", "pricing": {"prompt": "0", "completion": "0"}},
+            {"id": "kilo-auto/efficient", "pricing": {"prompt": "-1", "completion": "-1"}},
+            {"id": "paid/model", "pricing": {"prompt": "0.000001", "completion": "0.000002"}},
+        ],
+    }))
+    catalog = ProviderModelsCatalog(
+        provider="kilo",
+        endpoint="https://api.example.test/api/openrouter/models",
+        free_only=True,
+    )
+
+    entries = await catalog.fetch(session)
+
+    assert [entry.model for entry in entries] == ["kilo-auto/free"]
+
 
 
 @pytest.mark.asyncio
@@ -846,56 +866,6 @@ async def test_opencode_cli_catalog_empty_free_list_is_error(monkeypatch):
         await OpenCodeCLICatalog().fetch(None)
 
 @pytest.mark.asyncio
-async def test_kilo_cli_catalog_refreshes_and_parses_provider_models(monkeypatch):
-    stdout = (
-        b"kilo/kilo-auto/free\n"
-        b"kilo/openai/gpt-sol\n"
-        b"openrouter/google/gemma-4-31b-it:free\n"
-        b"not-a-model\n"
-    )
-    calls = []
-
-    async def _exec(*args, **kwargs):
-        calls.append(args)
-        return _FakeCLIProc(stdout)
-
-    monkeypatch.setattr("tusker_gateway.catalog.shutil.which", lambda name: "/usr/bin/kilo")
-    monkeypatch.setattr("tusker_gateway.catalog.asyncio.create_subprocess_exec", _exec)
-    entries = await KiloCLICatalog().fetch(None)
-    assert calls == [("/usr/bin/kilo", "models", "--refresh", "--pure")]
-    assert [entry.model for entry in entries] == [
-        "kilo/kilo-auto/free",
-        "openrouter/google/gemma-4-31b-it:free",
-    ]
-    assert all(entry.provider == "kilo-cli" for entry in entries)
-
-
-def test_kilo_cli_catalog_advertises_images():
-    entry = CatalogEntry(
-        provider="kilo-cli",
-        model="kilo/kilo-auto/free",
-        input_modalities=frozenset({"text", "image"}),
-        output_modalities=frozenset({"text"}),
-    )
-    assert advertised_input_modalities(entry) == frozenset({"text", "image"})
-    assert advertised_output_modalities(entry) == frozenset({"text"})
-
-
-@pytest.mark.asyncio
-async def test_kilo_cli_catalog_empty_listing_keeps_last_good(monkeypatch):
-    state = {"stdout": b"kilo/kilo-auto/free\n", "returncode": 0}
-
-    async def _exec(*args, **kwargs):
-        return _FakeCLIProc(state["stdout"], state["returncode"])
-
-    monkeypatch.setattr("tusker_gateway.catalog.shutil.which", lambda name: "/usr/bin/kilo")
-    monkeypatch.setattr("tusker_gateway.catalog.asyncio.create_subprocess_exec", _exec)
-    client = KiloCLICatalog()
-    await client.refresh(None)
-    state["stdout"] = b""
-    await client.refresh(None)
-    assert [entry.model for entry in client._entries] == ["kilo/kilo-auto/free"]
-    assert client._last_error is not None
 
 
 @pytest.mark.asyncio
@@ -1284,17 +1254,26 @@ def test_registry_registers_opencode_cli_only_when_enabled(monkeypatch):
     monkeypatch.setenv("TUSKER_OPENCODE_CLI_ENABLED", "true")
     registry = CatalogRegistry.default({"opencode-cli": {}})
     assert isinstance(registry.get_client("opencode-cli"), OpenCodeCLICatalog)
-    monkeypatch.setenv("TUSKER_KILO_CLI_ENABLED", "true")
-    registry = CatalogRegistry.default({"kilo-cli": {}})
-    assert isinstance(registry.get_client("kilo-cli"), KiloCLICatalog)
-
-    monkeypatch.setenv("TUSKER_KILO_CLI_ENABLED", "false")
-    registry = CatalogRegistry.default({"kilo-cli": {}})
-    assert registry.get_client("kilo-cli") is None
 
     monkeypatch.setenv("TUSKER_OPENCODE_CLI_ENABLED", "false")
     registry = CatalogRegistry.default({"opencode-cli": {}})
     assert registry.get_client("opencode-cli") is None
+
+
+def test_registry_registers_kilo_free_catalog(monkeypatch):
+    """Kilo registers its OpenRouter-compatible HTTP catalog unconditionally."""
+    from tusker_gateway.config import DEFAULT_PROVIDER_REGISTRY
+
+    registry = CatalogRegistry.default(dict(DEFAULT_PROVIDER_REGISTRY))
+    client = registry.get_client("kilo")
+    assert isinstance(client, ProviderModelsCatalog)
+    assert client.free_only is True
+    assert client.endpoint == "https://api.kilo.ai/api/openrouter/models"
+
+    registry = CatalogRegistry.default({"kilo": {}})
+    client = registry.get_client("kilo")
+    assert isinstance(client, ProviderModelsCatalog)
+    assert client.endpoint == "/models"
 
 
 def test_poolmanager_auto_catalog_adds_opted_in_opencode_cli_models():
@@ -1356,7 +1335,7 @@ def test_poolmanager_auto_catalog_prunes_removed_kilo_models():
                 name="code",
                 models=[],
                 auto_catalog=True,
-                auto_catalog_providers=["kilo-cli"],
+                auto_catalog_providers=["kilo"],
             ),
         },
         "excluded_providers": [],
@@ -1365,18 +1344,22 @@ def test_poolmanager_auto_catalog_prunes_removed_kilo_models():
     }
     pm = PoolManager(cfg)
     registry = CatalogRegistry()
-    client = KiloCLICatalog()
-    client._entries = [CatalogEntry(provider="kilo-cli", model="kilo/kilo-auto/free")]
-    registry.register("kilo-cli", client)
+    client = ProviderModelsCatalog(
+        provider="kilo",
+        endpoint="https://api.example.test/api/openrouter/models",
+        free_only=True,
+    )
+    client._entries = [CatalogEntry(provider="kilo", model="kilo-auto/free")]
+    registry.register("kilo", client)
     pm.catalog_registry = registry
     pm.extend_pools_with_auto_catalog()
-    assert ("kilo-cli", "kilo/kilo-auto/free") in {
+    assert ("kilo", "kilo-auto/free") in {
         (item["provider"], item["model"]) for item in pm.pools["code"].models
     }
 
-    client._entries = [CatalogEntry(provider="kilo-cli", model="openrouter/x:free")]
+    client._entries = [CatalogEntry(provider="kilo", model="openrouter/x:free")]
     pm.extend_pools_with_auto_catalog()
-    assert ("kilo-cli", "kilo/kilo-auto/free") not in {
+    assert ("kilo", "kilo-auto/free") not in {
         (item["provider"], item["model"]) for item in pm.pools["code"].models
     }
 

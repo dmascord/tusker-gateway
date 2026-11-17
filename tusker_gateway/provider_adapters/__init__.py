@@ -45,12 +45,11 @@ provider_adapters = ProviderAdapterRegistry()
 
 def _register_builtins() -> None:
     from tusker_gateway.provider_adapters.claude_code import ClaudeCodeCLIAdapter
-    from tusker_gateway.provider_adapters.kilo_cli import KiloCLIAdapter
     from tusker_gateway.provider_adapters.opencode_cli import OpenCodeCLIAdapter
 
     provider_adapters.register("claude-code-cli", ClaudeCodeCLIAdapter())
     provider_adapters.register("opencode-cli", OpenCodeCLIAdapter())
-    provider_adapters.register("kilo-cli", KiloCLIAdapter())
+
 
 
 _register_builtins()

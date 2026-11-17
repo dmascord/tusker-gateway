@@ -91,26 +91,24 @@ HEAD, or a recorded tag whose registry digest has moved. Run it after each deplo
 and whenever a pod is restarted out of band; `--allow-unresolved` downgrades
 unverifiable links (registry or `/health` unreachable) to warnings.
 As of 2026-10-15, production was observed at commit `c50c86f` - image
-`registry.tusker.net.au:5000/tusker-gateway@sha256:a52192b15ae8936b261d23321e1b1eaac4a94a14a72be4472eab3fdc75b9025a`,
-the digest the tracked manifest pins; the Kilo worker ran the same digest.
+`registry.tusker.net.au:5000/tusker-gateway@sha256:a52192b15ae8936b261d23321e1b1eaac4a94a14a72be4472eab3fdc75b9025a`.
 At that verification point, `k8s/verify-provenance.sh` reported all links
-(tracked manifest pin, live Deployment, pod imageIDs, registry tag, `/health`,
-git HEAD) in agreement.
+(tracked manifest pin, live Deployment, gateway pod imageID, registry tag,
+`/health`, and git HEAD) in agreement.
 
 
 
 ### Provider CLI pins and the weekly drift check
 
-The image pins three npm CLIs (`ARG CLAUDE_CODE_CLI_VERSION`,
-`ARG OPENCODE_CLI_VERSION`, `ARG KILO_CLI_VERSION` in the `Dockerfile`).
-The gateway catalog loop runs `opencode models` and, when Kilo is enabled,
-`kilo models --refresh --pure` every five minutes. OpenCode's `opencode/`
-free namespace and Kilo's `:free` plus `kilo/kilo-auto/*` routes are merged into
-the code pool as auto-discovered entries; a successful refresh prunes entries
-removed by the CLI. Empty or failed listings retain the last-good snapshot.
-Claude Code has no reliable model-list command, so its `sonnet`, `opus`, and
-`haiku` aliases remain a deliberate static contract; deterministic retirement
-errors are marked as permanently failed at request time.
+The image pins the Claude Code and OpenCode npm CLIs (`ARG
+CLAUDE_CODE_CLI_VERSION` and `ARG OPENCODE_CLI_VERSION` in the `Dockerfile`).
+The gateway catalog loop runs `opencode models` every five minutes. OpenCode's
+`opencode/` free namespace is merged into the code pool as auto-discovered
+entries; a successful refresh prunes entries removed by the CLI. Empty or
+failed listings retain the last-good snapshot. Claude Code has no reliable
+model-list command, so its `sonnet`, `opus`, and `haiku` aliases remain a
+deliberate static contract; deterministic retirement errors are marked as
+permanently failed at request time.
 
 
 `k8s/check_cli_version_drift.py` compares the pins against npm `latest`
@@ -120,48 +118,15 @@ and exits 1 on drift. `k8s/cli-drift-cronjob.yaml` runs it weekly in the
 repo checkout, so it mounts the checker from a ConfigMap and duplicates
 the pins in env - `tests/test_cli_drift_wiring.py` fails if either copy
 diverges from the `Dockerfile`/script.
-Dated assessment (2026-10-15): all three pins have drifted -
-`@anthropic-ai/claude-code` 2.1.281 to 2.1.300, `@opencode/cli` 2.0.15 to
-2.0.29, `@kilocode/cli` 7.7.9 to 7.8.8 (the first drift since the 2026-09-24
-pins). `opencode models` on the pinned 2.0.15 and on 2.0.29 returns the same
-26 models and the same ten `opencode/*` free entries, so there is no measured
-catalog-name delta for that comparison. The available post-deploy logs show 0
-retired-model / invalid-model-reference rejections, and include
-`catalog refresh provider=opencode-cli status=ok entries=10`; this is not a
-24-hour request count. The observed catalog refresh evidence covers
-`opencode-cli`; it does not establish that the other adapters cannot
-auto-catalog. No release-note, security, or broader bug-fix review was
-performed, so the model-list comparison alone is not a reason to treat an
-upgrade as having no benefit. Re-check the decision if the free set changes, a
-model is refused on the routing path, an upstream CLI bug is reported, or a
-release/security review identifies a reason to bump. The weekly
-`tusker-cli-drift-check` reporting drift remains an expected signal to review,
-not by itself an outage.
-
-Dated assessment (2026-10-16 - drift acted on): the pins moved to
-`@anthropic-ai/claude-code` 2.1.301, `@opencode/cli` 2.0.30 and
-`@kilocode/cli` 7.8.12, in both the `Dockerfile` ARGs and the CronJob env
-mirror. Offline re-verification before deploy:
-
-- Claude Code 2.1.301 still carries every flag the isolation path depends on
-  (`--restricted`, `--mcp-config`, `--strict-mcp-config`, `--allowedTools`,
-  `--permission-mode`, `--tools`, `--no-session-persistence`,
-  `--include-partial-messages`).
-- Kilo 7.8.12 keeps `run --pure --format json --attach ...`, unchanged from
-  7.7.9.
-- `opencode models --standalone` on 2.0.30 lists ten `opencode/*` free entries;
-  the pinned 2.0.15 lists none in a clean environment (production reaches
-  `entries=10` only because the mounted state lets its background service
-  start). Relative to the `TUSKER_POOL_CODE` seed, 2.0.30 adds
-  `deepseek-v4.1-flash-free`, `nemotron-3-ultra-free` and
-  `nemotron-3.5-super-vl-free`, and does not list `step-5-preview-free`. The
-  seed is not a contract - the `opencode-cli` auto-catalog adopts whatever the
-  pinned binary reports, so the live free set follows the binary.
+Dated assessment (2026-10-15): the Claude Code and OpenCode pins had drifted.
+The OpenCode comparison showed the same free model names on 2.0.15 and 2.0.29;
+the available post-deploy logs showed no retired-model or invalid-model-
+reference rejections. This was a freshness signal, not an outage verdict.
 
 Upgrades stay deliberate: bump the `Dockerfile` ARG (and the CronJob env
-mirror), rebuild through `k8s/deploy.sh`, and re-verify the CLI adapters
-(`tests/test_opencode_cli_adapter.py` plus a live tool-qualification
-probe) before trusting a new CLI on the routing path.
+mirror), rebuild through `k8s/deploy.sh`, and re-verify the CLI adapter
+(`tests/test_opencode_cli_adapter.py` plus a live tool-qualification probe)
+before trusting a new CLI on the routing path.
 
 ## 3. Smoke test
 
@@ -287,22 +252,15 @@ existing mode-0700/mode-0600 bounded directory store. Nothing is written for a
 turn that is served.
 
 
-Kilo Code CLI runs in a dedicated worker deployment scheduled on nodes labeled
-with AVX2 support, not inside the gateway pod. `k8s/kilo-worker.yaml` gives it
-bounded resources and allows ingress only from the gateway pod; it receives only
-`GROQ_API_KEY`. Its tracked image is a deploy-time `:latest` placeholder that
-`k8s/deploy.sh` replaces with the immutable build digest; do not apply that
-manifest directly.
-The `kilo/kilo-auto/free` route itself ran without API credentials in a clean
-worker-like environment. The normal deploy script builds one image and deploys the worker before
-rolling the gateway, which uses the internal ClusterIP service. The initial
-worker allowlist contains only routes that passed an actual MCP tool-call
-probe. Kilo routes are non-ZDR and are therefore never privacy-pool candidates.
-The code pool additionally includes `claude-code-cli/sonnet`,
-`opencode-cli/big-pickle` plus seven free Zen models served through the same
-CLI route, and `kilo-cli/kilo/kilo-auto/free`. OpenCode uses a
-dedicated `TUSKER_OPENCODE_CLI_API_KEY` secret mapping; Kilo runs on the
-worker. These CLI routes are not ZDR and do not belong in the privacy pool.
+Kilo Gateway is a direct OpenRouter-compatible HTTP provider. The gateway
+discovers its free routes from `GET /api/openrouter/models`, filters to rows
+whose prompt and completion prices are both zero, and calls
+`/api/openrouter/chat/completions` anonymously for free routes. If configured,
+`KILO_CODE_API_KEY` (or `KILO_API_KEY`) is sent as a bearer token for
+authenticated routes. It is non-ZDR and therefore never a privacy-pool
+candidate. The code pool contains the static `kilo/kilo-auto/free` seed plus
+any matching free models admitted by the provider catalog. No Kilo worker
+deployment, subprocess, image pin, or dedicated network policy is required.
 
 `POST /v1/rerank` is independent of chat-pool disablement. For example,
 Cohere may remain excluded from chat pool/catalog construction while its

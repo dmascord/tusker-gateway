@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Check pinned provider-CLI versions against the latest npm releases.
 
-The gateway's CLI routes (opencode-cli, claude-code-cli, kilo-cli) run
-binaries pinned in the Dockerfile. Upstream keeps deprecating models and
-shipping new free ones, so a stale pin means a stale model catalog:
-newer CLIs list new free models (the auto-catalog adopts them into the
-code pool automatically) and drop deprecated entries from ``opencode
-models``. Models that a newer CLI still lists but refuses to serve are
-handled at request time by the adapter's 410 retired-model mapping, so
-this check is about freshness, not correctness.
+The gateway's CLI routes (opencode-cli, claude-code-cli) run binaries pinned
+in the Dockerfile. Upstream keeps deprecating models and shipping new free
+ones, so a stale pin means a stale model catalog:
+newer CLIs list new free models (the auto-catalog adopts them into the code
+pool automatically) and drop deprecated entries from ``opencode models``.
+Models that a newer CLI still lists but refuses to serve are handled at
+request time by the adapter's 410 retired-model mapping, so this check is
+about freshness, not correctness.
 
 Pinned versions come from the Dockerfile when present; the weekly k8s
 CronJob has no repo checkout and passes ``*_CLI_VERSION`` environment
@@ -33,7 +33,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 PACKAGES = {
     "CLAUDE_CODE_CLI_VERSION": "@anthropic-ai/claude-code",
     "OPENCODE_CLI_VERSION": "@opencode/cli",
-    "KILO_CLI_VERSION": "@kilocode/cli",
 }
 
 

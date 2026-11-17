@@ -5,21 +5,17 @@ FROM node:22-bookworm-slim AS cli-tools
 
 ARG CLAUDE_CODE_CLI_VERSION=2.1.319
 ARG OPENCODE_CLI_VERSION=2.2.6
-ARG KILO_CLI_VERSION=7.8.27
 
 RUN npm install --global --no-audit --no-fund \
       "@anthropic-ai/claude-code@${CLAUDE_CODE_CLI_VERSION}" \
       "@opencode/cli@${OPENCODE_CLI_VERSION}" \
-      "@kilocode/cli@${KILO_CLI_VERSION}" \
  && cli_arch="$(node -p 'process.arch')" \
  && mkdir -p /opt/provider-cli \
  && cp "/usr/local/lib/node_modules/@anthropic-ai/claude-code/node_modules/@anthropic-ai/claude-code-linux-${cli_arch}/claude" /opt/provider-cli/claude \
  && cp "/usr/local/lib/node_modules/@opencode/cli/node_modules/@opencode/cli-linux-${cli_arch}/bin/opencode" /opt/provider-cli/opencode \
- && cp "/usr/local/lib/node_modules/@kilocode/cli/node_modules/@kilocode/cli-linux-${cli_arch}/bin/kilo" /opt/provider-cli/kilo \
  && chmod 0755 /opt/provider-cli/* \
  && /opt/provider-cli/claude --version \
- && /opt/provider-cli/opencode --version \
- && /opt/provider-cli/kilo --version
+ && /opt/provider-cli/opencode --version
 
 FROM python:3.11-slim
 
