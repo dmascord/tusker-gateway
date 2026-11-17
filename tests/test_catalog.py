@@ -1364,6 +1364,59 @@ def test_poolmanager_auto_catalog_prunes_removed_kilo_models():
     }
 
 
+def test_poolmanager_auto_catalog_demotes_routers_and_keeps_model_modalities():
+    """Auto-routers rank behind concrete free models; per-model modalities survive.
+
+    A router's quality/tool evidence describes whichever backend answered, so
+    it must only be tried after concrete routes. A concrete Kilo model must
+    carry its own advertised image input rather than a text-only seed.
+    """
+    from tusker_gateway.config import PoolConfig
+    from tusker_gateway.pools import PoolManager
+
+    cfg = {
+        "pools": {
+            "code": PoolConfig(
+                name="code",
+                models=[],
+                auto_catalog=True,
+                auto_catalog_providers=["kilo"],
+            ),
+        },
+        "excluded_providers": [],
+        "provider_api_keys": {},
+        "quality_db_path": "/tmp/_unused-kilo-router.db",
+    }
+    pm = PoolManager(cfg)
+    registry = CatalogRegistry()
+    client = ProviderModelsCatalog(
+        provider="kilo",
+        endpoint="https://api.example.test/api/openrouter/models",
+        free_only=True,
+    )
+    client._entries = [
+        CatalogEntry(provider="kilo", model="kilo-auto/free"),
+        CatalogEntry(provider="kilo", model="openrouter/free"),
+        CatalogEntry(
+            provider="kilo",
+            model="vendor/vision-model:free",
+            raw={"architecture": {"input_modalities": ["text", "image"]}},
+        ),
+        CatalogEntry(provider="kilo", model="vendor/text-model:free"),
+    ]
+    registry.register("kilo", client)
+    pm.catalog_registry = registry
+
+    pm.extend_pools_with_auto_catalog()
+
+    by_model = {item["model"]: item for item in pm.pools["code"].models}
+    assert by_model["kilo-auto/free"]["weight"] == 0.05
+    assert by_model["openrouter/free"]["weight"] == 0.05
+    assert by_model["vendor/text-model:free"]["weight"] == 1.0
+    assert by_model["vendor/vision-model:free"]["weight"] == 1.0
+    assert by_model["vendor/vision-model:free"]["input_modalities"] == ["image", "text"]
+
+
 def test_registry_known_models_returns_set_for_provider():
     reg = CatalogRegistry()
     cat = CodexCatalog()

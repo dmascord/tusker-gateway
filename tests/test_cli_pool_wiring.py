@@ -34,7 +34,11 @@ def test_opencode_and_kilo_routes_are_code_only_and_explicitly_enabled():
         "step-5-preview-free",
     }
     assert {("opencode-cli", m) for m in free_models} <= code_routes
-    assert ("kilo", "kilo-auto/free") in code_routes
+    # Kilo free models enter through the auto-catalog with their own advertised
+    # modalities; a static kilo-auto/free seed would mask image input and rank
+    # the router instead of the backend model that answered.
+    assert "kilo" not in {provider for provider, _ in code_routes}
+    assert "kilo" in code["auto_catalog_providers"]
     assert ("claude-code-cli", "sonnet") in code_routes
     assert not ({"claude-code-cli", "opencode-cli", "kilo"} & privacy_providers)
     assert env["TUSKER_CLAUDE_CODE_ENABLED"]["value"] == "true"

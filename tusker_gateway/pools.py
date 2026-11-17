@@ -84,6 +84,24 @@ _PROVIDER_ROUTER_MODELS: frozenset[tuple[str, str]] = frozenset({
     ("openrouter", "free"),
     ("openrouter", "auto"),
 })
+
+# Auto-routers pick an arbitrary backend per request, so quality, tool and
+# modality evidence recorded against them describes whichever model answered.
+# They stay available as last-resort fallbacks but must not rank alongside
+# concrete models.
+_ROUTER_MODEL_SLUGS: frozenset[str] = frozenset({
+    "openrouter/free",
+    "openrouter/auto",
+    "free",
+    "auto",
+})
+
+
+def is_router_model(model: str) -> bool:
+    """Return whether a catalog slug names a provider-side auto-router."""
+    slug = str(model).strip().lower()
+    return slug in _ROUTER_MODEL_SLUGS or slug.startswith("kilo-auto/")
+
 _LANGUAGE_RESTRICTED_MODELS: frozenset[tuple[str, str]] = frozenset({
     # allam-2-7b is an Arabic-first model from SDAIA. It serves Arabic
     # prompts well but returns empty content on English prompts (verified
@@ -92,7 +110,6 @@ _LANGUAGE_RESTRICTED_MODELS: frozenset[tuple[str, str]] = frozenset({
     # slug-matched because "allam" is not a modality keyword.
     ("groq", "allam-2-7b"),
 })
-
 
 def _provider_registry(config: dict[str, Any]) -> dict[str, Any]:
     """Return the runtime provider registry, with the legacy default fallback."""
@@ -740,7 +757,7 @@ class PoolManager:
                     # This prevents expensive catalog entries (e.g. claude-sonnet-4.6
                     # via copilot) from burning a limited budget alongside the
                     # static models before the quality DB has evidence.
-                    if heavyweight:
+                    if heavyweight or is_router_model(entry.model):
                         model_data["weight"] = AUTO_DISCOVERED_HEAVYWEIGHT_WEIGHT
                     else:
                         model_data["weight"] = 1.0
