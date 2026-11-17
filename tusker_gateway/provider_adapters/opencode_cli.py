@@ -41,6 +41,7 @@ from tusker_gateway.provider_adapters.claude_code import ClaudeCodeCLIAdapter
 
 from tusker_gateway.provider_adapters.mcp_broker import _clear_broker, _point_broker
 from tusker_gateway.sse import format_openai_chunk, sse_done, sse_frame
+from tusker_gateway.provider_adapters.cli_streaming import CLI_STREAM_READ_LIMIT
 
 logger = logging.getLogger(__name__)
 
@@ -364,6 +365,7 @@ async def _warm_events(
                 env=env,
                 cwd=request_dir,
                 start_new_session=True,
+                limit=CLI_STREAM_READ_LIMIT,
             )
             assert proc.stdin and proc.stdout and proc.stderr
             proc.stdin.write(prompt.encode())
@@ -661,6 +663,7 @@ class OpenCodeCLIAdapter:
                     env=env,
                     cwd=temp_dir,
                     start_new_session=True,
+                    limit=CLI_STREAM_READ_LIMIT,
                 )
                 communicate_task = asyncio.create_task(proc.communicate(prompt.encode()))
                 timeout = max(10.0, float(os.environ.get("TUSKER_OPENCODE_CLI_TIMEOUT_SECS", "600")))

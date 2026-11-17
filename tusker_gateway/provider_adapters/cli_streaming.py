@@ -16,6 +16,11 @@ from tusker_gateway.errors import ProviderError
 from tusker_gateway.sse import format_openai_chunk, sse_done, sse_frame
 
 logger = logging.getLogger(__name__)
+# JSONL events can contain a complete tool call or a large model text delta.
+# asyncio's default subprocess StreamReader limit is 64 KiB; ``readline()``
+# raises LimitOverrunError when a valid event exceeds it, even when the newline
+# is present. Keep a bounded, shared limit for the CLI streaming adapters.
+CLI_STREAM_READ_LIMIT = 4 * 1024 * 1024
 
 
 def text_from_event(event: dict[str, Any]) -> str | None:
@@ -71,6 +76,7 @@ def stream_cli_jsonl(
                 *command, stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                 env=env, cwd=cwd, start_new_session=True,
+                limit=CLI_STREAM_READ_LIMIT,
             )
             assert proc.stdin and proc.stdout and proc.stderr
             proc.stdin.write(prompt)
@@ -170,6 +176,20 @@ def stream_cli_jsonl(
                 from tusker_gateway.provider_adapters.claude_code import _stop_process
                 await _stop_process(proc)
             raise ProviderError(timeout_message, code="upstream_timeout") from exc
+        except asyncio.LimitOverrunError as exc:
+            # asyncio.LimitOverrunError is *not* a TimeoutError/OSError; it
+            # arrives on readline() when a single JSONL event exceeded the
+            # stream limit — even with the terminator present. Translate it
+            # so the outer pool-failover treats it as a CLI candidate
+            # failure instead of leaking raw parser internals.
+            logger.warning(
+                "CLI stream line exceeded the read limit (%d > %d)",
+                exc.consumed, CLI_STREAM_READ_LIMIT,
+            )
+            raise ProviderError(
+                "CLI emitted a stream event larger than the read limit",
+                code=error_code,
+            ) from exc
         except OSError as exc:
             raise ProviderError("Could not start CLI process", code=error_code) from exc
         finally:

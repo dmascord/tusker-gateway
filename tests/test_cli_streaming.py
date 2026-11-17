@@ -8,6 +8,7 @@ import pytest
 
 from tusker_gateway.errors import ProviderError
 from tusker_gateway.provider_adapters.cli_streaming import (
+    CLI_STREAM_READ_LIMIT,
     claude_text_from_event,
     stream_cli_jsonl,
     text_from_event,
@@ -158,3 +159,57 @@ async def test_stream_cli_jsonl_spawns_in_the_given_working_directory():
     ) as spawn:
         [item async for item in stream]
     assert spawn.await_args.kwargs["cwd"] == "/tmp/isolated-workspace"
+
+
+@pytest.mark.asyncio
+async def test_stream_cli_jsonl_sets_limit_for_large_json_events():
+    process = _Process([json.dumps({"type": "text", "part": {"text": "ok"}}).encode() + b"\n"])
+    stream = stream_cli_jsonl(
+        ["fake-cli"], env={}, prompt=b"prompt", model="opencode-cli/big-pickle",
+        timeout=1, text_extractor=text_from_event,
+    )
+    with patch(
+        "tusker_gateway.provider_adapters.cli_streaming.asyncio.create_subprocess_exec",
+        new=AsyncMock(return_value=process),
+    ) as spawn:
+        [item async for item in stream]
+
+
+    assert spawn.await_args.kwargs["limit"] == CLI_STREAM_READ_LIMIT
+
+
+@pytest.mark.asyncio
+async def test_stream_cli_jsonl_translates_limit_overrun():
+    """An oversized JSONL line must fail over as a CLI error, not crash.
+
+    asyncio.LimitOverrunError is not a TimeoutError/OSError subclass: without
+    this translation the raw parser message ('Separator is found, but chunk is
+    longer than limit') would escape as an opaque provider error. Production
+    evidence, req_a537986a832bcf98 (2026-11-17).
+    """
+    class _OverrunReader:
+        async def readline(self):
+            raise asyncio.LimitOverrunError(
+                "Separator is found, but chunk is longer than limit", 70000,
+            )
+
+        async def read(self):
+            return b""
+
+    process = _Process([])
+    process.stdout = _OverrunReader()
+    stream = stream_cli_jsonl(
+        ["fake-cli"], env={}, prompt=b"prompt", model="opencode-cli/big-pickle",
+        timeout=1, text_extractor=text_from_event,
+    )
+    with patch(
+        "tusker_gateway.provider_adapters.cli_streaming.asyncio.create_subprocess_exec",
+        new=AsyncMock(return_value=process),
+    ), patch("tusker_gateway.provider_adapters.cli_streaming.logger") as log:
+        with pytest.raises(ProviderError) as exc:
+            [item async for item in stream]
+
+    assert exc.value.code == "cli_failed"
+    (message, consumed, limit), _ = log.warning.call_args
+    assert "read limit" in message
+    assert (consumed, limit) == (70000, CLI_STREAM_READ_LIMIT)
