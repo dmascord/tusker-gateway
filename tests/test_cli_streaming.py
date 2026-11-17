@@ -77,7 +77,7 @@ async def test_jsonl_cli_stream_emits_text_delta_before_finish():
         json.dumps({"type": "text", "part": {"text": " second"}}).encode() + b"\n",
     ])
     stream = stream_cli_jsonl(
-        ["fake-cli"], env={}, prompt=b"prompt", model="kilo-cli/kilo/kilo-auto/free",
+        ["fake-cli"], env={}, prompt=b"prompt", model="opencode-cli/big-pickle",
         timeout=1, text_extractor=text_from_event,
     )
     with patch(
@@ -124,8 +124,8 @@ async def test_nonzero_cli_exit_logs_bounded_stderr_preview():
     process.returncode = 1
     process.stderr = _StderrReader(stderr)
     stream = stream_cli_jsonl(
-        ["fake-cli"], env={}, prompt=b"prompt", model="kilo-cli/kilo/kilo-auto/free",
-        timeout=1, text_extractor=text_from_event, error_code="kilo_cli_failed",
+        ["fake-cli"], env={}, prompt=b"prompt", model="opencode-cli/big-pickle",
+        timeout=1, text_extractor=text_from_event, error_code="cli_failed",
     )
     with patch(
         "tusker_gateway.provider_adapters.cli_streaming.asyncio.create_subprocess_exec",
@@ -134,7 +134,7 @@ async def test_nonzero_cli_exit_logs_bounded_stderr_preview():
         with pytest.raises(ProviderError) as exc:
             [item async for item in stream]
 
-    assert exc.value.code == "kilo_cli_failed"
+    assert exc.value.code == "cli_failed"
     (message, rc, size, preview), _ = log.warning.call_args
     assert message == "CLI stream exited rc=%s stderr_bytes=%d stderr=%r"
     assert (rc, size) == (1, len(stderr))
@@ -149,7 +149,7 @@ async def test_stream_cli_jsonl_spawns_in_the_given_working_directory():
     # the child process.
     process = _Process([json.dumps({"type": "text", "part": {"text": "x"}}).encode() + b"\n"])
     stream = stream_cli_jsonl(
-        ["fake-cli"], env={}, prompt=b"prompt", model="kilo-cli/kilo/kilo-auto/free",
+        ["fake-cli"], env={}, prompt=b"prompt", model="opencode-cli/big-pickle",
         timeout=1, text_extractor=text_from_event, cwd="/tmp/isolated-workspace",
     )
     with patch(

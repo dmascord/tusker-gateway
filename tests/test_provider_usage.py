@@ -172,16 +172,11 @@ def test_process_backed_providers_share_cli_capacity_group(monkeypatch):
     from tusker_gateway.provider_usage import CLI_CAPACITY_GROUP, capacity_limit
 
     monkeypatch.delenv("TUSKER_CLI_MAX_CONCURRENT", raising=False)
-    monkeypatch.delenv("TUSKER_KILO_WORKER_URL", raising=False)
     assert capacity_group_for_route("opencode-cli", "openai/gpt-5") == CLI_CAPACITY_GROUP
     assert capacity_group_for_route("claude-code-cli", "sonnet") == CLI_CAPACITY_GROUP
-    # Without the dedicated worker, kilo-cli runs its subprocess in-process.
-    assert capacity_group_for_route("kilo-cli", "kilo/kilo-auto/free") == CLI_CAPACITY_GROUP
-    # The worker pod bounds its own subprocesses, so proxied kilo requests
-    # must not consume a gateway-side CLI slot.
-    monkeypatch.setenv("TUSKER_KILO_WORKER_URL", "http://tusker-kilo-worker:8643")
-    assert capacity_group_for_route("kilo-cli", "kilo/kilo-auto/free") is None
-    # Streaming HTTP transports stay uncapped by the CLI budget.
+    # Streaming HTTP transports stay uncapped by the CLI budget. Kilo is a
+    # direct HTTP provider now, so it must not consume a CLI slot.
+    assert capacity_group_for_route("kilo", "kilo-auto/free") is None
     assert capacity_group_for_route("groq", "qwen/qwen3.8-27b") is None
     assert capacity_limit(CLI_CAPACITY_GROUP) == 1
 
@@ -196,7 +191,6 @@ async def test_process_backed_capacity_gate_rejects_fourth_concurrent_request(mo
 
     monkeypatch.setenv("TUSKER_CLI_MAX_CONCURRENT", "3")
     monkeypatch.delenv("TUSKER_CLI_QUEUE_DEPTH", raising=False)
-    monkeypatch.delenv("TUSKER_KILO_WORKER_URL", raising=False)
     controller = capacity_controller()
     controller.reset()
     config = {

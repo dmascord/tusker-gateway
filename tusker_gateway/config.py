@@ -361,6 +361,7 @@ def load_config() -> dict[str, Any]:
         "synthetic": ["SYNTHETIC_API_KEY"],
         "ollama-cloud": ["OLLAMA_API_KEY", "OLLAMA_MAC_API_KEY"],
         "opencode-go": ["OPENCODE_GO_API_KEY"],
+        "kilo": ["KILO_CODE_API_KEY", "KILO_API_KEY"],
         "workers-ai": ["CF_API_TOKEN"],
         "github-copilot": ["GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN"],
         "github-copilot-enterprise": ["GITHUB_COPILOT_ENTERPRISE_TOKEN"],
@@ -633,12 +634,17 @@ DEFAULT_PROVIDER_REGISTRY: dict[str, ProviderConfig] = {
         auth_type="local",
         zdr_ok=False,
     ),
-    "kilo-cli": ProviderConfig(
-        "kilo-cli",
+    # Kilo Gateway's OpenRouter-compatible API. Free-tier models are
+    # anonymously accessible; an optional KILO_CODE_API_KEY or KILO_API_KEY
+    # is still forwarded when configured for authenticated routes.
+    # The local kind keeps anonymous free routes eligible in pool construction;
+    # BearerAuthenticator still sends a configured key when one exists.
+    "kilo": ProviderConfig(
+        "kilo",
         "local",
-        "kilo://local",
+        "https://api.kilo.ai/api/openrouter",
         "/chat/completions",
-        auth_type="local",
+        models_path="/models",
         zdr_ok=False,
     ),
     "openai": ProviderConfig(

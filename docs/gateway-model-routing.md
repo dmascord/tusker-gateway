@@ -609,8 +609,7 @@ Ollama. Non-stream `local-llm`/`mlx-mac` now get the full `240s`.
 
 #### Process-backed CLI capacity gate
 
-`opencode-cli`, `claude-code-cli`, and `kilo-cli` (only when it is *not*
-proxied to the dedicated worker) each run a CLI child process inside the
+`opencode-cli` and `claude-code-cli` each run a CLI child process inside the
 gateway container for the whole request, so they share one `cli` capacity
 group at `TUSKER_CLI_MAX_CONCURRENT=1`. An uncapped burst of concurrent
 clients exhausted the 3 GiB pod limit and the kernel OOM-killed the gateway,
@@ -625,10 +624,11 @@ approach a GiB alongside the gateway process and its warm service.
 
 Because these CLIs treat their working directory as the project and load its
 file tree and instructions into the model context, every child process runs
-in a request-scoped empty directory with `KILO_DISABLE_PROJECT_CONFIG=true`.
+in a request-scoped empty directory with project configuration disabled.
 Inheriting the gateway's own source tree would leak it into third-party
-prompts and make the model's file tools (edit/find) target gateway code,
-auto-reject, and fail the request.
+prompts and make the model's file tools target gateway code, auto-reject, and
+fail.
+
 
 #### Declared context windows and max_tokens fitting
 

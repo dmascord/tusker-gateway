@@ -25,8 +25,8 @@
   },
   {
    "pool": "code",
-   "provider": "kilo-cli",
-   "model": "kilo/kilo-auto/free",
+   "provider": "kilo",
+   "model": "kilo-auto/free",
    "ok": true,
    "http": 200,
    "class": "",

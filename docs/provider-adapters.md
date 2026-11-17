@@ -11,18 +11,17 @@ cannot choose an executable or import arbitrary code.
 ### CLI version coupling, model refresh, and retirement
 
 The CLI binaries remain pinned in the image; catalog refresh never upgrades a
-binary. The gateway's 5-minute catalog loop runs the following commands:
+binary. The gateway's 5-minute catalog loop runs the following command:
 
 - OpenCode: `opencode models`; only the `opencode/` free namespace is exposed.
-- Kilo: `kilo models --refresh --pure`; only `:free` routes and Kilo's
-  `kilo/kilo-auto/*` routes enter the cheap code pool.
+- Kilo Gateway: `GET /api/openrouter/models`; only zero-priced routes enter the code pool.
+  The provider route is standard HTTP and carries no CLI subprocess.
 - Claude Code: no model-list API exists. Its stable `sonnet`, `opus`, and
   `haiku` aliases remain the supported contract; aliases rejected by Claude's
   CLI with deterministic retirement wording are marked permanently failed.
 
-OpenCode and Kilo catalog snapshots replace their previously auto-discovered
-entries on a successful refresh, so removed upstream models leave rotation.
-Failed or empty CLI listings retain the last-good snapshot. Static operator
+The Kilo Gateway catalog is refreshed from its HTTP `/models` endpoint. A
+failed or empty response retains the last-good snapshot. Static operator
 routes are not removed by catalog disappearance. A request-time deterministic
 retirement response is also persisted as a permanent failure and excluded
 from selection until the route is explicitly recovered.
@@ -30,9 +29,8 @@ from selection until the route is explicitly recovered.
 The CLI adapters classify some provider rejections from the executable's
 stdout, so their parsing contract is coupled to the installed CLI version.
 After any CLI bump, re-verify the adapters with
-`tests/test_opencode_cli_adapter.py` and a live tool-qualification probe;
-the adapter's rejection parsing must still match the CLI's output. Only
-OpenCode and Kilo feed the automatic model catalog; Claude Code remains
+`tests/test_opencode_cli_adapter.py` and a live tool-qualification probe.
+Only OpenCode feeds the automatic CLI model catalog; Claude Code remains
 alias-based because it exposes no reliable machine-readable model list.
 
 ## Claude Code CLI
@@ -193,11 +191,11 @@ pays that startup once (about 6 seconds).
 
 The server fixes its MCP configuration when it starts, so tool requests cannot
 use per-request inline config. The adapter publishes each request through the
-same broker pointer the Kilo warm path uses
-(`TUSKER_OPENCODE_WARM_BROKER_DIR/active.json`): the bridge that the server
-spawned resolves the manifest and call file per tool call. That pointer names
-exactly one request, so warm requests are serialized - a concurrent OpenCode
-request queues behind the in-flight one instead of sharing a bridge.
+`TUSKER_OPENCODE_WARM_BROKER_DIR/active.json` broker pointer: the bridge that
+the server spawned resolves the manifest and call file per tool call. That
+pointer names exactly one request, so warm requests are serialized - a
+concurrent OpenCode request queues behind the in-flight one instead of sharing
+a bridge.
 
 Request lifecycle:
 
@@ -218,12 +216,11 @@ The server is a child of the gateway and shares its cgroup: expect roughly
 it plus one transient `opencode run` client.
 
 The long-lived `opencode serve` is started by a control command whose working
-directory it inherits, so `service start` runs from the broker directory — not
+directory it inherits, so `service start` runs from the broker directory - not
 the gateway's source tree. OpenCode indexes its working directory as the
 project, so an inherited source tree would leak gateway code into every warm
-prompt. The same isolation applies to the Kilo warm text/tool servers and the
-Kilo worker's text server (`KILO_DISABLE_PROJECT_CONFIG=true`, empty request
-workspace).
+prompt. The same isolation applies to the OpenCode request workspace
+(`TUSKER_OPENCODE_WARM_BROKER_DIR`, empty request workspace).
 
 If the server cannot start, or a non-streaming request fails inside it, the
 adapter logs a warning and falls back to the isolated `--standalone` path. A
@@ -275,8 +272,7 @@ the pool failover treats as a provider error and retries on the next candidate.
 
 | Adapter | Warm path | Basis |
 |---|---|---|
-| `kilo_cli` | yes, in the worker pod | `kilo serve` publishes the HTTP API the broker pointer addresses |
-| `opencode_cli` | yes, child of the gateway | `opencode serve` plus the same broker pointer (above) |
+| `opencode_cli` | yes, child of the gateway | `opencode serve` plus the request broker |
 | `claude_code` | no | no request server exists to keep warm, and CLI start is not the cost |
 
 `claude_code` deliberately has no warm path. Evidence from the production
@@ -284,104 +280,40 @@ container (2026-09-28):
 
 - Claude Code 2.x is a native binary - the image copies
   `claude-code-linux-${arch}/claude`, not a Node entrypoint. `claude --version`
-  measured 0.01s and full CLI init (`claude --help`) 0.14-0.15s, against a
-  roughly 6s OpenCode server start and 1.3s for `kilo --help`. There is no
-  startup large enough for a warm server to remove. MCP configuration loading is
-  the largest CLI-side cost (`claude mcp list` measured 2.8s), but the adapter's
-  tool requests use request-scoped proxies that a shared process cannot carry.
-- The CLI exposes no `serve` or daemon subcommand. `claude --help` lists
-  `agents`, `attach`, `auth`, `auto-mode`, `doctor`, `gateway` (an enterprise
-  auth/telemetry gateway), `import`, `install`, `logs`, `mcp`, `plugin`,
-  `project`, `respawn`, `rm`, `setup-token`, `stop|kill`, `ultrareview`, and
-  `update`. `--bg` starts a *session* in the background addressed by a session
-  id (`claude attach`, `logs`, `stop`, `rm`) - a conversation handle, not a
-  request server with a stable endpoint.
-- Each Claude request needs its own MCP proxy and call file so the client's tool
-  call returns to that request (see "Claude Code CLI" above). A background
-  session cannot carry a per-request bridge, so reusing one would break the
-  tool-call contract that `kilo_cli` and `opencode_cli` satisfy through the
-  pointer file.
+  measured 0.01s and full CLI init (`claude --help`) 0.14-0.15s. MCP
+  configuration loading is the largest CLI-side cost (`claude mcp list`
+  measured 2.8s), but the adapter's tool requests use request-scoped proxies
+  that a shared process cannot carry.
+- The CLI exposes no `serve` or daemon subcommand. `--bg` starts a session in
+  the background addressed by a session id, not a request server with a stable
+  endpoint.
+- Each Claude request needs its own MCP proxy and call file so the client's
+  tool call returns to that request. A background session cannot carry a
+  per-request bridge, so reusing one would break the tool-call contract.
 
 If Claude Code latency ever needs work, the levers are session reuse
 (`--resume`) or provider selection, not a warm server.
 
-## Kilo Code CLI
+## Kilo Gateway HTTP API
 
-The `kilo-cli` adapter runs `kilo run --format json --model provider/model`.
-It accepts explicit Kilo model IDs, including nested upstream names (for
-example, `kilo-cli/anthropic/claude-sonnet-4.6` or
-`kilo-cli/groq/openai/gpt-oss-20b`), and is opt-in with
-`TUSKER_KILO_CLI_ENABLED=true`. `TUSKER_KILO_CLI_PATH` chooses the executable
-and `TUSKER_KILO_CLI_TIMEOUT_SECS` sets the request timeout (default 600
-seconds). The adapter uses Kilo's existing runtime auth; if `KILO_API_KEY` is
-set, it is passed only to the child process. For a direct provider/model ID,
-the gateway passes only that provider's configured API key under the provider's
-standard CLI variable (for example, the Groq key for `groq/...` models), never
-the full gateway key set.
+Kilo is an OpenRouter-compatible HTTP provider, not a local CLI transport.
+The gateway calls `https://api.kilo.ai/api/openrouter/chat/completions` for
+the free route, anonymously by default, and forwards the configured
+`KILO_CODE_API_KEY` (or `KILO_API_KEY`) as a bearer token when present. The
+free model catalog comes from `GET https://api.kilo.ai/api/openrouter/models`;
+only rows whose prompt and completion prices are both exactly zero enter the
+automatic code catalog. The direct route is `kilo/kilo-auto/free` in the
+code pool and is non-ZDR, so it remains excluded from the privacy pool.
 
-Each request receives high-priority inline `KILO_CONFIG_CONTENT`, disables
-project config, denies tools by default, and exposes only request-scoped MCP
-proxies for client-declared tools. The proxy returns an OpenAI tool call to
-the connected harness; it never executes that call. Like the other CLI
-adapters, Kilo is local/non-ZDR. Production explicitly includes
-`kilo-cli/kilo/kilo-auto/free` in the code pool. For streaming requests, the
-adapter reads JSON events as they arrive and forwards assistant text deltas
-as OpenAI SSE; lifecycle and diagnostic events are filtered out. Tool calls
-continue to be returned as normal OpenAI tool-call deltas. The gateway
-heartbeat stays active while waiting for the first CLI text event.
+The API accepts the standard OpenAI chat-completions request, including
+streaming and declared tools. No worker pod, subprocess, MCP broker, warm
+server, image materialization, or CLI-specific environment is involved.
+Kilo's anonymous/free service can retain prompts, so operators must not route
+confidential data to this provider.
 
-Kilo CLI models accept text and base64 image data URLs in the gateway contract.
-The adapter materializes each image into a request-scoped file and passes it
-with `kilo run --file`; remote image URLs, audio, and video remain rejected.
-Worker and warm-server paths are bypassed for image requests so the isolated
-CLI invocation owns the request-scoped attachments.
+The model catalog is cached for one hour and retains the last-good snapshot
+when Kilo's `/models` endpoint fails. Paid or sign-in-only rows are filtered
+before they can become pool candidates.
 
-### Warm worker servers
-
-The worker keeps two long-lived `kilo serve` processes so request handling does
-not pay Kilo's provider and session startup on every call:
-
-- a **text** server started without an MCP bridge, used for requests that carry
-  no tools;
-- a **tool** server started with one shared MCP bridge that resolves each
-  request's tools through a broker pointer file.
-
-Kilo lists MCP tools per session, but its MCP configuration is fixed at server
-startup, so the shared bridge reads `<broker>/active.json` for the in-flight
-request's manifest and call channel. Warm tool requests are therefore
-serialized, and each request enables its own tools through the session `tools`
-map using Kilo's fully-qualified tool ids (`gateway_<manifest mcp name>`).
-Request manifests beyond the pre-authorized id range (`_WARM_TOOL_INDEX_LIMIT`,
-128) skip the warm path. Sessions are aborted and deleted after every request,
-so the server's session store stays bounded.
-
-Every warm failure - a refused turn, an invalid session, a timeout, or a server
-startup error - degrades to the isolated per-request `kilo run` path, so tool
-correctness never depends on the warm path. `TUSKER_KILO_WARM_ENABLED=0`
-disables both servers, and the worker's `/healthz` reports `warm_text` and
-`warm_tools`.
-
-In Kubernetes, the gateway forwards Kilo requests to the dedicated
-`tusker-kilo-worker` service, pinned to node `visor` and isolated by a
-NetworkPolicy that permits ingress only from the gateway pod. The worker has
-bounded CPU/memory, receives only the Groq key, and currently allows
-`groq/openai/gpt-oss-20b`, `groq/qwen/qwen3.8-27b`, and
-`kilo/kilo-auto/free`. The free auto-router passed a live tool-call probe
-through the worker HTTP endpoint with a clean home directory and no API keys.
-Request-shaped worker failures (for example a 400 *unsupported_message_content*
-for an image payload) are relayed with their original status and OpenAI error
-code, so the modality probe records an authoritative `unsupported` verdict and
-clients see a clean 400 rather than a misleading 502. Worker-side outages and
-unparseable bodies still surface as 502 `kilo_worker_failed`. Streaming
-requests that reject before the first SSE byte get the same code/message via
-the SSE error frame. Kilo catalog entries advertise image input, and image
-requests use the isolated CLI path. Other environments can run the adapter
-locally by leaving `TUSKER_KILO_WORKER_URL` unset. The gateway image includes
-the pinned Kilo CLI (currently 7.8.12); set `TUSKER_KILO_CLI_PATH` to use an
-operator-managed installation instead.
-
-Kilo Auto Free may route to providers that retain or use prompts for
-improvement, so it must not receive confidential data or enter the privacy
-pool. Big Pickle is likewise not privacy eligible during its free period. The
-worker is deliberately not a general-purpose proxy: its model allowlist is
-separate from the main gateway's pool configuration.
+The direct HTTP transport participates in normal provider capacity, cooldown,
+stream validation, and fallback handling. It has no CLI capacity group.

@@ -116,12 +116,9 @@ if [[ -n "${live_tag}" ]]; then
 fi
 
 gateway_pods=$(pod_digests app=tusker-gateway)
-kilo_pods=$(pod_digests app=tusker-kilo-worker)
 gateway_digest=$(printf '%s\n' "${gateway_pods}" | awk 'NF{print $2; exit}')
-kilo_digest=$(printf '%s\n' "${kilo_pods}" | awk 'NF{print $2; exit}')
 gateway_pod_count=$(printf '%s\n' "${gateway_pods}" | grep -c 'sha256:' || true)
 gateway_distinct=$(printf '%s\n' "${gateway_pods}" | awk 'NF{print $2}' | sort -u | grep -c . || true)
-kilo_pod_count=$(printf '%s\n' "${kilo_pods}" | grep -c 'sha256:' || true)
 
 health_commit=$(curl -s -m 10 --retry 2 --retry-delay 1 --retry-all-errors "${HEALTH_URL}" 2>/dev/null \
     | python3 -c 'import json
@@ -155,7 +152,6 @@ say "$(printf '  %-28s %s' 'live Deployment digest' "${live_digest:-<none>}")"
 say "$(printf '  %-28s %s -> %s' 'recorded tag' "${live_tag:-<none>}" "${tag_digest:-<unresolved>}")"
 say "$(printf '  %-28s %s' 'Deployment digest annotation' "${live_annotated_digest:-<none>}")"
 say "$(printf '  %-28s %s (%s pod(s), %s distinct)' 'gateway pods' "$(printf '%s' "${gateway_pods}" | tr '\n' ' ')" "${gateway_pod_count}" "${gateway_distinct}")"
-say "$(printf '  %-28s %s (%s pod(s))' 'kilo-worker pods' "$(printf '%s' "${kilo_pods}" | tr '\n' ' ')" "${kilo_pod_count}")"
 say ""
 say "commit chain"
 say "$(printf '  %-28s %s' '/health' "${health_commit:-<unreachable>}")"
@@ -169,8 +165,7 @@ fi
 
 if [[ -n "${gateway_digest}" ]]; then
     for pair in "tracked manifest:${tracked_digest}" "live Deployment:${live_digest}" \
-                "recorded tag:${tag_digest}" "Deployment annotation:${live_annotated_digest}" \
-                "kilo-worker pod:${kilo_digest}"; do
+                "recorded tag:${tag_digest}" "Deployment annotation:${live_annotated_digest}"; do
         name=${pair%%:*}
         value=${pair#*:}
         if [[ -z "${value}" ]]; then

@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 
 def text_from_event(event: dict[str, Any]) -> str | None:
-    """Extract user-visible assistant text from Kilo/OpenCode JSON events."""
+    """Extract user-visible assistant text from OpenCode JSON events."""
     part = event.get("part")
     if event.get("type") == "text" and isinstance(part, dict):
         value = part.get("text")

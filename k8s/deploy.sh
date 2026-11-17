@@ -108,15 +108,6 @@ kubectl set image -f k8s/deployment.yaml \
     "${DEPLOY}=${IMAGE_REF}" \
     --local -o json > "${RENDERED}"
 
-# The Kilo CLI runs in a separate, resource-limited pod on wynk. Render the
-# exact same immutable-by-tag build into its manifest before applying it.
-KILO_WORKER_RENDERED="${WORK_DIR}/kilo-worker.yaml"
-sed "s|${REGISTRY}/tusker-gateway:latest|${IMAGE_REF}|g" \
-    k8s/kilo-worker.yaml > "${KILO_WORKER_RENDERED}"
-
-echo "--- Apply manifests ---"
-kubectl -n "${NAMESPACE}" apply -f "${KILO_WORKER_RENDERED}"
-kubectl -n "${NAMESPACE}" rollout status deployment/tusker-kilo-worker --timeout=300s
 kubectl -n "${NAMESPACE}" apply -f k8s/pvc-rwx.yaml
 kubectl -n "${NAMESPACE}" apply -f k8s/pvc.yaml
 kubectl -n "${NAMESPACE}" apply -f k8s/config.yaml
@@ -130,7 +121,7 @@ kubectl -n "${NAMESPACE}" rollout status deployment/"${DEPLOY}" --timeout=300s
 
 # Record the build identity on the live objects so a drift check can compare them
 # against git without guessing.
-for target in "${DEPLOY}" tusker-kilo-worker; do
+for target in "${DEPLOY}"; do
     kubectl -n "${NAMESPACE}" annotate deployment/"${target}" \
         "tusker.net.au/commit=${COMMIT}" \
         "tusker.net.au/image-tag=${IMAGE_TAG}" \
@@ -139,8 +130,7 @@ for target in "${DEPLOY}" tusker-kilo-worker; do
 done
 
 # Ignore terminating old pods left during rollout, but verify every Ready
-# replacement matching the intended image, not an arbitrary items[0] pod. The
-# same check runs for the kilo worker, which runs the same image.
+# replacement matching the intended image, not an arbitrary items[0] pod.
 verify_image_digest() {
     local selector=$1 container=$2
     kubectl -n "${NAMESPACE}" get pods -l "${selector}" -o json \
@@ -179,7 +169,6 @@ print("{}: IMAGE DIGEST OK ({} Ready pod(s), {})".format(container_name, verifie
 
 echo "--- Running image digest verification ---"
 verify_image_digest app=tusker-gateway "${DEPLOY}"
-verify_image_digest app=tusker-kilo-worker kilo-worker
 
 # /health must report the revision baked into the verified image.
 echo "--- Commit verification ---"
