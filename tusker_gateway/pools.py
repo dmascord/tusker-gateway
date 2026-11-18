@@ -33,6 +33,8 @@ from tusker_gateway.cooldown import CooldownTracker, global_tracker, is_permanen
 from tusker_gateway.heavyweight import is_heavyweight
 from tusker_gateway.model_capability import (
     INPUT_MODALITY_CAPABILITIES,
+    PRIVACY_ZDR_CAPABILITY,
+    PRIVACY_ZDR_PROBE_VERSION,
     STRUCTURED_OUTPUT_CAPABILITY,
     STRUCTURED_OUTPUT_PROBE_VERSION,
 )
@@ -956,6 +958,32 @@ class PoolManager:
                 return False
         return not spec.auto_discovered
 
+    def _privacy_evidence_allows(self, spec: ModelSpec, record: Any | None) -> bool:
+        """Return whether privacy-route evidence admits this ZDR candidate.
+
+        A provider marked ``zdr_ok`` is necessary but not sufficient: the
+        route must have answered a request that actually carried the pool's
+        privacy policy (for Command Code, ``x-cmd-zdr: 1``). Only a
+        *definitive* ``privacy_zdr`` probe verdict is evidence about that
+        contract:
+
+        * ``passed`` for the current probe version admits the route;
+        * ``unsupported``/``failed`` excludes it, curated and
+          auto-discovered routes alike;
+        * ``unavailable`` (timeout, 5xx, quota) and missing/stale evidence
+          say nothing about the contract, so they hold back only
+          auto-discovered routes; curated routes stay eligible, matching
+          the composite and behavioural tool gates.
+        """
+        if record is not None and record.probe_version == PRIVACY_ZDR_PROBE_VERSION:
+            status = str(record.status or "").strip().lower()
+            if status == "passed":
+                return True
+            if status in COMPOSITE_IMAGE_TOOLS_DEFINITIVE_FAILURES:
+                return False
+        return not spec.auto_discovered
+
+
     def _input_modalities_allowed(
         self,
         spec: ModelSpec,
@@ -1367,6 +1395,20 @@ class PoolManager:
             )
             for key, records in (model_capability_records or {}).items()
         }
+        # Privacy-route acceptance is likewise separate evidence: a ZDR
+        # provider marking alone does not prove the route answered a
+        # request that carried the pool's privacy policy.
+        privacy_records = {
+            key: next(
+                (
+                    record for record in records
+                    if record.capability == PRIVACY_ZDR_CAPABILITY
+                ),
+                None,
+            )
+            for key, records in (model_capability_records or {}).items()
+        }
+
 
         # Resolve heavyweight gate from pool tier if not explicitly set.
         if heavyweight_ok is None:
@@ -1441,6 +1483,12 @@ class PoolManager:
                             ):
                                 self._drop_stickiness(key)
                                 break
+                        if pool_config and pool_config.zdr:
+                            if not self._privacy_evidence_allows(
+                                s, privacy_records.get((s.provider, s.model))
+                            ):
+                                self._drop_stickiness(key)
+                                break
                         if (
                             requires_structured_output
                             and self._structured_output_status(
@@ -1502,6 +1550,7 @@ class PoolManager:
             "behavioral_tools": 0,
             "structured_output": 0,
             "image_tools": 0,
+            "privacy_evidence": 0,
             "cooldown": 0,
             "zdr_policy": 0,
             "llm_stats_rank": 0,
@@ -1538,6 +1587,13 @@ class PoolManager:
                 filter_counts["zdr_policy"] += 1
                 if len(filtered_zdr_models) < 12:
                     filtered_zdr_models.append(f"{s.provider}/{s.model}")
+                continue
+            if pool_config and pool_config.zdr and not self._privacy_evidence_allows(
+                s, privacy_records.get((s.provider, s.model))
+            ):
+                filter_counts["privacy_evidence"] += 1
+                if len(filtered_zdr_models) < 12:
+                    filtered_zdr_models.append(f"{s.provider}/{s.model}:privacy_evidence")
                 continue
             # Only operator-declared windows gate selection: the pool-wide
             # ``context_window`` is a 128k guess that would wrongly exclude
@@ -1673,6 +1729,13 @@ class PoolManager:
                 "pool '%s' privacy policy filter filtered=%d models=%s",
                 pool_name,
                 len(filtered_zdr_models),
+                ",".join(filtered_zdr_models[:12]),
+            )
+        if pool_config and pool_config.zdr and filter_counts["privacy_evidence"]:
+            logger.info(
+                "pool '%s' privacy evidence filter filtered=%d models=%s",
+                pool_name,
+                filter_counts["privacy_evidence"],
                 ",".join(filtered_zdr_models[:12]),
             )
         if required_modalities and filtered_modality_models:

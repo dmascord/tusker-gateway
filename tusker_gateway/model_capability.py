@@ -33,6 +33,12 @@ from tusker_gateway.storage import shared_database
 
 
 MODEL_CAPABILITY_PROBE_VERSION = "model-capability-v2"
+# A privacy qualification is separate from ordinary capability evidence: it
+# proves that the concrete route answered through the privacy pool, whose
+# provider-specific request policy (for example Command Code's x-cmd-zdr)
+# was applied by the gateway.
+PRIVACY_ZDR_CAPABILITY = "privacy_zdr"
+PRIVACY_ZDR_PROBE_VERSION = "privacy-zdr-v1"
 # Hindsight and other memory clients depend on a stricter contract than a
 # generic successful chat: the response must contain parseable JSON. Keep
 # this evidence in the same durable capability store so privacy-pool routing
@@ -391,11 +397,6 @@ __all__ = [
     "CAPABILITY_STATUSES",
     "ENDPOINT_CAPABILITIES",
     "INPUT_MODALITY_CAPABILITIES",
-    "KNOWN_CAPABILITIES",
-    "MODEL_CAPABILITY_PROBE_VERSION",
-    "ModelCapability",
-    "ModelCapabilityDB",
-    "OUTPUT_MODALITY_CAPABILITIES",
-    "default_model_capability_db_path",
-    "normalize_capability",
+    "PRIVACY_ZDR_CAPABILITY",
+    "PRIVACY_ZDR_PROBE_VERSION",
 ]

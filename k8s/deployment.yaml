@@ -583,6 +583,25 @@ spec:
         # produces no image-plus-tool evidence at all.
         - name: TUSKER_COMPOSITE_QUALIFICATION_INITIAL_DELAY_SECS
           value: '600'
+        # Privacy-route evidence: a ZDR provider marking alone does not prove
+        # the upstream accepted the pool's privacy request policy (for
+        # Command Code, x-cmd-zdr: 1). This bounded cycle sends one cheap
+        # non-streaming chat request per auto-discovered privacy candidate
+        # through the privacy request path and records the result as
+        # privacy_zdr capability evidence; selection holds auto-discovered
+        # ZDR routes until that evidence passes.
+        - name: TUSKER_PRIVACY_QUALIFICATION_ENABLED
+          value: 'true'
+        - name: TUSKER_PRIVACY_QUALIFICATION_LIMIT
+          value: '8'
+        - name: TUSKER_PRIVACY_QUALIFICATION_TIMEOUT_SECS
+          value: '45'
+        - name: TUSKER_PRIVACY_QUALIFICATION_MAX_AGE_SECS
+          value: '86400'
+        - name: TUSKER_PRIVACY_QUALIFICATION_INITIAL_DELAY_SECS
+          value: '600'
+        - name: TUSKER_PRIVACY_QUALIFICATION_INTERVAL_SECS
+          value: '43200'
         # Media routes are qualified out of band; no cold probe is added to
         # requests.
         # Quality warm-up: local providers (MLX Mac, local LLM) never appear
