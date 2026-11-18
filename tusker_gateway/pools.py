@@ -759,6 +759,17 @@ class PoolManager:
                     # static models before the quality DB has evidence.
                     if heavyweight or is_router_model(entry.model):
                         model_data["weight"] = AUTO_DISCOVERED_HEAVYWEIGHT_WEIGHT
+                    elif (
+                        entry.cost_input is None
+                        and entry.cost_output is None
+                        and not entry.model.endswith(":free")
+                    ):
+                        # Unknown pricing is not proof of free. Command Code's
+                        # catalog omits prices for expensive routes (e.g.
+                        # deepseek-v4.1-flash-ultrafast at $2.40/$9.60 per M),
+                        # so an unpriced entry must not enter a cheap pool at
+                        # full weight; deprioritise until pricing is published.
+                        model_data["weight"] = AUTO_DISCOVERED_HEAVYWEIGHT_WEIGHT
                     else:
                         model_data["weight"] = 1.0
                     modalities = advertised_input_modalities(entry)
