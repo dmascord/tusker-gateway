@@ -2552,7 +2552,14 @@ class PassthroughClient:
         #      path is /chat/completions; the catalog is the source of
         #      truth for which endpoint a model accepts.
         use_responses = endpoint.get("chat_path", "").endswith("/responses")
-        if not use_responses and self._catalog_registry is not None:
+        # Command Code lists /responses for most models, but its ZDR header is
+        # only applied on the chat-completions path (_build_request) and the
+        # Codex adapter mislabels responses; keep it on /chat/completions.
+        if (
+            not use_responses
+            and self._catalog_registry is not None
+            and provider.lower() != "commandcode"
+        ):
             entries = self._catalog_registry.entries_for(provider)
             if entries:
                 for entry in entries:
