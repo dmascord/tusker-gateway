@@ -2552,7 +2552,14 @@ class PassthroughClient:
         #      path is /chat/completions; the catalog is the source of
         #      truth for which endpoint a model accepts.
         use_responses = endpoint.get("chat_path", "").endswith("/responses")
-        if not use_responses and self._catalog_registry is not None:
+        # Command Code lists /responses for most models, but its ZDR header is
+        # only applied on the chat-completions path (_build_request) and the
+        # Codex adapter mislabels responses; keep it on /chat/completions.
+        if (
+            not use_responses
+            and self._catalog_registry is not None
+            and provider.lower() != "commandcode"
+        ):
             entries = self._catalog_registry.entries_for(provider)
             if entries:
                 for entry in entries:
@@ -2580,10 +2587,10 @@ class PassthroughClient:
                 tools=tools,
                 tool_choice=tool_choice,
                 extra_headers=extra_headers,
+                pool=pool,
                 extra_body=extra_body,
                 endpoint=endpoint,
                 request_id=request_id,
-                pool=pool,
             )
 
         base_url = endpoint["base_url"]
@@ -2607,6 +2614,7 @@ class PassthroughClient:
             extra_headers=extra_headers,
             extra_body=extra_body,
             conversation_id=conversation_id,
+            pool=pool,
             endpoint=endpoint,
         )
 
@@ -2917,6 +2925,7 @@ class PassthroughClient:
         extra_headers: dict[str, str] | None,
         extra_body: dict[str, Any] | None,
         conversation_id: str | None = None,
+        pool: str | None = None,
         endpoint: dict[str, Any],
     ) -> tuple[dict[str, str], dict[str, Any]]:
         from tusker_gateway.auth_strategies import get_auth_strategy
@@ -2935,6 +2944,8 @@ class PassthroughClient:
         headers.update(
             await strategy.headers(self._config, provider, model, api_key, endpoint_model)
         )
+        if provider.lower() == "commandcode" and pool == "privacy":
+            headers["x-cmd-zdr"] = "1"
         if provider.lower() in {
             "github-copilot",
             "github-copilot-enterprise",

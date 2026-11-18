@@ -47,6 +47,7 @@ def test_default_privacy_pool_has_no_manual_routes_and_requires_qualification(mo
         "github-copilot-enterprise",
         "ollama-cloud",
         "opencode-go",
+        "commandcode",
     )
 
 
