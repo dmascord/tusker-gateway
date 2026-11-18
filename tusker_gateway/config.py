@@ -362,6 +362,7 @@ def load_config() -> dict[str, Any]:
         "ollama-cloud": ["OLLAMA_API_KEY", "OLLAMA_MAC_API_KEY"],
         "opencode-go": ["OPENCODE_GO_API_KEY"],
         "kilo": ["KILO_CODE_API_KEY", "KILO_API_KEY"],
+        "commandcode": ["COMMAND_CODE_API_KEY"],
         "workers-ai": ["CF_API_TOKEN"],
         "github-copilot": ["GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN"],
         "github-copilot-enterprise": ["GITHUB_COPILOT_ENTERPRISE_TOKEN"],
@@ -791,6 +792,15 @@ DEFAULT_PROVIDER_REGISTRY: dict[str, ProviderConfig] = {
         auth_env="OPENCODE_GO_API_KEY",
         zdr_ok=True,
     ),
+    "commandcode": ProviderConfig(
+        "commandcode",
+        "bearer",
+        "https://api.commandcode.ai/provider/v1",
+        "/chat/completions",
+        auth_env="COMMAND_CODE_API_KEY",
+        models_path="/models",
+        zdr_ok=True,
+    ),
     "openai-codex": ProviderConfig(
         "openai-codex",
         "codex",
@@ -1027,6 +1037,7 @@ def _load_pools() -> dict[str, PoolConfig]:
                     "groq",
                     "google",
                     "cerebras",
+                    "commandcode",
                 )
             ),
         )
@@ -1042,6 +1053,7 @@ def _load_pools() -> dict[str, PoolConfig]:
                 "github-copilot-enterprise",
                 "ollama-cloud",
                 "opencode-go",
+                "commandcode",
             ),
             require_tool_qualification=True,
         )
