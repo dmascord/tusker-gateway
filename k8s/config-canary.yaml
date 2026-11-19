@@ -141,6 +141,8 @@ items:
             value: /home/tusker/.hermes/model_capability-recovered.db
           - name: TUSKER_CAPABILITY_PROBE_GENERATION
             value: 'false'
+          - name: TUSKER_PRIVACY_QUALIFICATION_ENABLED
+            value: 'false'
           - name: TUSKER_QUALIFICATION_MAINTENANCE_ENABLED
             value: 'true'
           - name: TUSKER_QUALIFICATION_MAINTENANCE_INITIAL_DELAY_SECS

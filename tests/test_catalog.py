@@ -1878,6 +1878,60 @@ def test_poolmanager_auto_catalog_marks_heavyweight_entries():
     assert manager.select("code") == ("zai", "glm-lite")
 
 
+def test_poolmanager_auto_catalog_deprioritises_unknown_pricing():
+    """Unpriced catalog entries must not enter cheap pools at full weight.
+
+    Command Code's authenticated catalog omits pricing for expensive routes
+    (deepseek-v4.1-flash-ultrafast bills $2.40/$9.60 per M upstream), so an
+    entry with no price data is not provably free and must sit behind priced
+    candidates until the catalog publishes real numbers.
+    """
+    from tusker_gateway.config import PoolConfig
+    from tusker_gateway.pools import PoolManager
+
+    cfg = {
+        "pools": {
+            "code": PoolConfig(
+                name="code",
+                models=[],
+                auto_catalog=True,
+                auto_catalog_providers=["commandcode"],
+            ),
+        },
+        "excluded_providers": [],
+        "provider_api_keys": {"commandcode": "k-cc"},
+        "quality_db_path": "/tmp/_unused-cc-pricing.db",
+    }
+    manager = PoolManager(cfg)
+    registry = CatalogRegistry()
+    client = ProviderModelsCatalog(
+        provider="commandcode",
+        endpoint="https://api.example.test/provider/v1/models",
+    )
+    client._entries = [
+        CatalogEntry(provider="commandcode", model="paid-but-unpriced"),
+        CatalogEntry(
+            provider="commandcode",
+            model="free-tagged-no-price:free",
+        ),
+        CatalogEntry(
+            provider="commandcode",
+            model="cheap-priced",
+            cost_input=0.15,
+            cost_output=0.5,
+        ),
+    ]
+    registry.register("commandcode", client)
+    manager.catalog_registry = registry
+
+    manager.extend_pools_with_auto_catalog()
+
+    by_model = {m["model"]: m for m in manager.pools["code"].models}
+    assert by_model["paid-but-unpriced"]["weight"] == 0.05
+    assert by_model["free-tagged-no-price:free"]["weight"] == 1.0
+    assert by_model["cheap-priced"]["weight"] == 1.0
+
+
 def test_poolmanager_auto_catalog_excludes_configured_provider():
     """An exhausted provider must not re-enter through dynamic discovery."""
     from tusker_gateway.config import PoolConfig

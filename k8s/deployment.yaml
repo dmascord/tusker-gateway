@@ -6,9 +6,9 @@ metadata:
   labels:
     app: tusker-gateway
   annotations:
-    tusker.net.au/commit: ad4e0641b8d596067d577972308b934ff83593d2
-    tusker.net.au/image-tag: swarm-alpine-ad4e0641b8d596067d577972308b934ff83593d2
-    tusker.net.au/image-digest: sha256:a9f10fda8f66b9c28ac59087f54cee3924e4b723399372d7d06e3503bd1f9a48
+    tusker.net.au/commit: 77bf6972941ea17c48d63664036cf5a3d1580aa9
+    tusker.net.au/image-tag: swarm-alpine-77bf6972941ea17c48d63664036cf5a3d1580aa9
+    tusker.net.au/image-digest: sha256:fdd054790994cbfd742e221c03bda6958c07fb4db42e844d82049501ee35b0ef
 spec:
   replicas: 1
   selector:
@@ -34,7 +34,7 @@ spec:
       terminationGracePeriodSeconds: 90
       containers:
       - name: tusker-gateway
-        image: registry.tusker.net.au:5000/tusker-gateway@sha256:a9f10fda8f66b9c28ac59087f54cee3924e4b723399372d7d06e3503bd1f9a48
+        image: registry.tusker.net.au:5000/tusker-gateway@sha256:fdd054790994cbfd742e221c03bda6958c07fb4db42e844d82049501ee35b0ef
         imagePullPolicy: Always
         envFrom:
         - secretRef:
@@ -583,6 +583,25 @@ spec:
         # produces no image-plus-tool evidence at all.
         - name: TUSKER_COMPOSITE_QUALIFICATION_INITIAL_DELAY_SECS
           value: '600'
+        # Privacy-route evidence: a ZDR provider marking alone does not prove
+        # the upstream accepted the pool's privacy request policy (for
+        # Command Code, x-cmd-zdr: 1). This bounded cycle sends one cheap
+        # non-streaming chat request per auto-discovered privacy candidate
+        # through the privacy request path and records the result as
+        # privacy_zdr capability evidence; selection holds auto-discovered
+        # ZDR routes until that evidence passes.
+        - name: TUSKER_PRIVACY_QUALIFICATION_ENABLED
+          value: 'true'
+        - name: TUSKER_PRIVACY_QUALIFICATION_LIMIT
+          value: '8'
+        - name: TUSKER_PRIVACY_QUALIFICATION_TIMEOUT_SECS
+          value: '45'
+        - name: TUSKER_PRIVACY_QUALIFICATION_MAX_AGE_SECS
+          value: '86400'
+        - name: TUSKER_PRIVACY_QUALIFICATION_INITIAL_DELAY_SECS
+          value: '600'
+        - name: TUSKER_PRIVACY_QUALIFICATION_INTERVAL_SECS
+          value: '43200'
         # Media routes are qualified out of band; no cold probe is added to
         # requests.
         # Quality warm-up: local providers (MLX Mac, local LLM) never appear

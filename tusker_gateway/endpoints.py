@@ -771,7 +771,7 @@ async def _normalize_stream_legacy(
             # below. Restore sealed values before emitting the recovered
             # arguments to OMP, just as we do for native tool-call deltas.
             if restorer is not None and hasattr(restorer, "restore_text"):
-                args = restorer.restore_text(args)
+                args = restorer.restore_text(args, json_escape=True)
             cid = call.get("id") or f"call_{index}_{hashlib.sha1(name.encode()).hexdigest()[:10]}"
             openai_calls.append(
                 {
@@ -888,6 +888,30 @@ async def _normalize_stream_legacy(
                 probe = reasoning_buf.feed("")
                 if probe:
                     delta["reasoning_content"] = probe
+            # Restore redaction aliases carried inside streamed tool-call
+            # arguments. Without this, format-preserving aliases survive to OMP
+            # verbatim (the legacy path previously restored only content and
+            # reasoning). Buffer per (choice, call index) so a token split
+            # across deltas is held and restored once complete.
+            if restorer is not None and isinstance(tc, list):
+                for call in tc:
+                    if not isinstance(call, dict):
+                        continue
+                    fn = call.get("function")
+                    if not isinstance(fn, dict):
+                        continue
+                    arg = fn.get("arguments")
+                    if not isinstance(arg, str) or not arg:
+                        continue
+                    key = (int(choice.get("index", 0) or 0), int(call.get("index", -1)))
+                    buf = _arg_restorers.get(key)
+                    if buf is None:
+                        buf = _BufferedRestorer(tokenizer=restorer, json_escape=True)
+                        _arg_restorers[key] = buf
+                    fn["arguments"] = buf.feed(arg)
+                if isinstance(delta.get("tool_calls"), list):
+                    delta["tool_calls"] = tc
+
             # Replace delta in choice and obj for downstream re-emission.
             new_choice = {**choice, "delta": delta}
             new_obj = {**obj, "choices": [new_choice, *choices[1:]]}

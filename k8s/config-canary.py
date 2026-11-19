@@ -84,6 +84,9 @@ SPEND_GUARD_ENV = (
     # rotating through the code/premium/swarm pools.
     ("TUSKER_MODALITY_QUALIFICATION_ENABLED", "false"),
     ("TUSKER_COMPOSITE_QUALIFICATION_ENABLED", "false"),
+    # Privacy/ZDR probes send one bounded chat request per discovered route;
+    # never inherit production's enabled state in the canary.
+    ("TUSKER_PRIVACY_QUALIFICATION_ENABLED", "false"),
     # Generates media against image/video providers.
     ("TUSKER_MEDIA_QUALIFICATION_ENABLED", "false"),
 )

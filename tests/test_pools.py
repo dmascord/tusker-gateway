@@ -9,7 +9,11 @@ import pytest
 
 from tusker_gateway.config import PoolConfig, _load_pools, load_config
 from tusker_gateway.cooldown import CooldownTracker, _cooldown_seconds_for_429
-from tusker_gateway.model_capability import STRUCTURED_OUTPUT_PROBE_VERSION
+from tusker_gateway.model_capability import (
+    PRIVACY_ZDR_CAPABILITY,
+    PRIVACY_ZDR_PROBE_VERSION,
+    STRUCTURED_OUTPUT_PROBE_VERSION,
+)
 from tusker_gateway.pools import ModelSpec, PoolManager, is_general_chat_model
 from tusker_gateway.quality import QualityDB
 from tusker_gateway.tool_capability import ToolCapabilityLevel
@@ -709,6 +713,154 @@ def test_privacy_structured_output_gate_fails_open_for_unknown_candidates(tmp_pa
     )
 
 
+@pytest.mark.parametrize(
+    "status,auto_discovered,expected",
+    [
+        (None, True, None),
+        ("passed", True, ("synthetic", "privacy-route")),
+        ("unsupported", True, None),
+        ("unavailable", True, None),
+        (None, False, ("synthetic", "privacy-route")),
+        ("unavailable", False, ("synthetic", "privacy-route")),
+    ],
+)
+def test_privacy_auto_discovered_routes_require_zdr_probe_evidence(
+    tmp_path, status, auto_discovered, expected
+):
+    """Provider ``zdr_ok`` alone must not admit an untested catalog route."""
+    manager = PoolManager(
+        {
+            "pools": {
+                "privacy": PoolConfig(
+                    name="privacy",
+                    zdr=True,
+                    models=[
+                        {
+                            "provider": "synthetic",
+                            "model": "privacy-route",
+                            "auto_discovered": auto_discovered,
+                        }
+                    ],
+                )
+            },
+            "quality_db_path": str(tmp_path / "quality.db"),
+            "model_capability_db_path": str(tmp_path / "model-capability.db"),
+            "excluded_providers": [],
+            "provider_api_keys": {"synthetic": "k-synthetic"},
+            "providers": {"synthetic": {"kind": "bearer", "zdr_ok": True}},
+        }
+    )
+    if status is not None:
+        manager._model_capability_db.record(
+            provider="synthetic",
+            model="privacy-route",
+            capability=PRIVACY_ZDR_CAPABILITY,
+            status=status,
+            source="privacy_probe",
+            probe_version=PRIVACY_ZDR_PROBE_VERSION,
+        )
+
+    assert manager.select("privacy") == expected
+
+
+@pytest.mark.asyncio
+async def test_privacy_probe_sends_zdr_flag_through_privacy_request_path():
+    """The probe must carry pool="privacy" policy upstream (x-cmd-zdr: 1).
+
+    Regression for the Command Code privacy qualification: the earlier
+    probes addressed provider::model passthrough routes, which never
+    exercised ``_build_request(pool="privacy")`` and so never proved the
+    zero-data-retention header reached Command Code.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    from tusker_gateway.config import DEFAULT_PROVIDER_REGISTRY
+    from tusker_gateway.privacy_qualification import probe_privacy_model
+
+    captured: dict[str, Any] = {}
+    response = MagicMock()
+    response.status = 200
+    response.json = AsyncMock(return_value={
+        "id": "privacy-probe",
+        "model": "deepseek/deepseek-v4-flash",
+        "choices": [{
+            "message": {"role": "assistant", "content": "acknowledged"},
+            "finish_reason": "stop",
+        }],
+    })
+    response.release = MagicMock()
+
+    class _Request:
+        async def __aenter__(self):
+            return response
+
+        async def __aexit__(self, *_args):
+            return None
+
+    http = MagicMock()
+
+    def _record_request(method, url, **kwargs):
+        captured["url"] = url
+        captured["headers"] = kwargs.get("headers") or {}
+        return _Request()
+
+    http.request = MagicMock(side_effect=_record_request)
+
+    config = {
+        "api_keys": ["gw-test-key"],
+        "provider_api_keys": {"commandcode": "cmd-key"},
+        "codex_credentials": [],
+        "quality_db_path": ":memory:",
+        "providers": {"commandcode": DEFAULT_PROVIDER_REGISTRY["commandcode"]},
+    }
+    result = await probe_privacy_model(
+        config,
+        http,
+        provider="commandcode",
+        model="deepseek/deepseek-v4-flash",
+    )
+
+    assert result["status"] == "passed"
+    assert captured["url"] == (
+        "https://api.commandcode.ai/provider/v1/chat/completions"
+    )
+    assert captured["headers"]["x-cmd-zdr"] == "1"
+    assert captured["headers"]["Authorization"] == "Bearer cmd-key"
+
+
+@pytest.mark.asyncio
+async def test_privacy_probe_reports_provider_failure_without_bodies(monkeypatch):
+    """A provider rejection records a safe class, not response content."""
+    from tusker_gateway.errors import ProviderError
+    from tusker_gateway.privacy_qualification import probe_privacy_model
+
+    class _Client:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def chat(self, *_args, **_kwargs):
+            exc = ProviderError("upstream rejected the request", code="provider_error")
+            exc.upstream_status = 400
+            raise exc
+
+    monkeypatch.setattr(
+        "tusker_gateway.passthrough.PassthroughClient",
+        _Client,
+    )
+    result = await probe_privacy_model(
+        {"quality_db_path": ":memory:"},
+        object(),
+        provider="commandcode",
+        model="deepseek/deepseek-v4-flash",
+    )
+
+    assert result["status"] == "unavailable"
+    assert result["failure_class"] == "provider_error"
+    assert result["http_status"] == 400
+
+
+
+
 def test_unrated_model_does_not_outrank_measured_model():
     """Pre-seeded static models outrank models with no pre-seed (unknown catalog entries).
 
@@ -1165,6 +1317,22 @@ def test_ollama_capability_shape_admits_image_tool_privacy_candidates():
         assert ("mlx-mac", "qwen3.8-27b:latest") in admitted
         # Text-only routes are still discovered, just not image-eligible.
         assert ("ollama-cloud", "glm-5.2") in admitted
+
+        # Auto-discovered privacy routes now require a successful privacy
+        # policy probe in addition to catalog modality evidence. This test
+        # models the post-probe state before checking image selection.
+        for provider, model in (
+            ("ollama-cloud", "kimi-k3"),
+            ("mlx-mac", "qwen3.8-27b:latest"),
+        ):
+            manager._model_capability_db.record(
+                provider=provider,
+                model=model,
+                capability=PRIVACY_ZDR_CAPABILITY,
+                status="passed",
+                source="privacy_probe",
+                probe_version=PRIVACY_ZDR_PROBE_VERSION,
+            )
 
         selected = manager.select(
             "privacy",

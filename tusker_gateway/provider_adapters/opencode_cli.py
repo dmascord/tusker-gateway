@@ -252,6 +252,12 @@ async def _ensure_warm_service(binary: str, env: dict[str, str]) -> str | None:
             return None
         service_env = dict(env)
         _write_project_config(broker_dir, _warm_bridge_config(broker_dir))
+        # The project-config flag (set in _child_env) would otherwise stop
+        # OpenCode from reading the broker's opencode.json, so the shared
+        # gateway MCP bridge would never load. Point OPENCODE_CONFIG at the
+        # file we just wrote instead of relying on project discovery.
+        service_env["OPENCODE_CONFIG"] = str(broker_dir / "opencode.json")
+        service_env.pop("OPENCODE_CONFIG_CONTENT", None)
         await _run_cli_tool(binary, ["service", "stop"], env, timeout=60)
         code, stdout, stderr = await _run_cli_tool(
             binary, ["service", "start"], service_env, timeout=180, cwd=broker_dir,
@@ -586,6 +592,11 @@ class OpenCodeCLIAdapter:
                     },
                 }
                 _write_project_config(temp_dir, config)
+                # Project config is disabled in _child_env() for isolation, so
+                # OpenCode would never read the file we just wrote. Load it
+                # explicitly so the request-scoped gateway MCP bridge is
+                # available to the model.
+                env["OPENCODE_CONFIG"] = str(temp_dir / "opencode.json")
                 env.pop("OPENCODE_CONFIG_CONTENT", None)
 
             def stream_error(event: dict[str, Any]) -> Exception | None:
@@ -644,6 +655,11 @@ class OpenCodeCLIAdapter:
                 # rules (403), while MCP-only config works and its run command
                 # auto-rejects permission prompts in non-interactive mode.
                 _write_project_config(temp_dir, config)
+                # Project config is disabled in _child_env() for isolation, so
+                # OpenCode would never read the file we just wrote. Load it
+                # explicitly so the request-scoped gateway MCP bridge is
+                # available to the model.
+                env["OPENCODE_CONFIG"] = str(temp_dir / "opencode.json")
                 env.pop("OPENCODE_CONFIG_CONTENT", None)
             # The model must not inherit the gateway's working tree as its
             # project. Keep its workspace request-scoped and empty.

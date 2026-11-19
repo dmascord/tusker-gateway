@@ -435,6 +435,15 @@ async def _call_with_pool_fallback_anthropic(
                     await asyncio.to_thread(breaker.record_success, prov, mdl)
                 if body.get("stream"):
                     if isinstance(result, dict):
+                        # Restore sealed secrets before re-encoding so tool-call
+                        # arguments reach the Anthropic client in plaintext.
+                        _tok = (
+                            request.app.get("redaction_tokenizer")
+                            if request is not None else None
+                        )
+                        if _tok is not None:
+                            from tusker_gateway.redaction import restore_response
+                            result = restore_response(result, _tok)
                         # Codex/Responses providers are parsed into a complete
                         # Chat result even when the caller requested a stream.
                         # Re-encode it before the Anthropic SSE adapter; a dict
@@ -453,6 +462,10 @@ async def _call_with_pool_fallback_anthropic(
                             result,
                             provider=prov,
                             model=mdl,
+                            restorer=(
+                                request.app.get("redaction_tokenizer")
+                                if request is not None else None
+                            ),
                         )
                     )
                     result = _AnthropicSSEStreamAdapter(
@@ -527,6 +540,10 @@ async def _call_with_pool_fallback_anthropic(
                         result,
                         provider=route.provider,
                         model=route.model,
+                        restorer=(
+                            request.app.get("redaction_tokenizer")
+                            if request is not None else None
+                        ),
                     )
                 )
                 result = _AnthropicSSEStreamAdapter(

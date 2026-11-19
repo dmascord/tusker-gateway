@@ -158,6 +158,19 @@ def _modality_qualification_enabled(config: dict[str, Any]) -> bool:
     pools = _modality_pool_order(config)
     return bool(pools)
 
+def _privacy_qualification_enabled(config: dict[str, Any]) -> bool:
+    """Return whether privacy policy probes are enabled.
+
+    Privacy evidence is required for auto-discovered ZDR routes. Enable it
+    by default whenever a privacy pool exists; operators can disable it
+    explicitly while investigating provider behavior.
+    """
+    raw = os.environ.get("TUSKER_PRIVACY_QUALIFICATION_ENABLED", "1")
+    if raw.strip().lower() in {"0", "false", "no", "off"}:
+        return False
+    pool = config.get("pools", {}).get("privacy")
+    return bool(pool is not None and getattr(pool, "zdr", False))
+
 
 def _modality_pool_order(config: dict[str, Any]) -> tuple[str, ...]:
     """Return the operator-overridable rotation order for modality probes.
@@ -397,6 +410,42 @@ async def run_composite_maintenance_cycle(
         "tested": len(results),
         "passed": passed,
         "failed": len(results) - passed,
+    }
+
+
+async def run_privacy_maintenance_cycle(
+    *,
+    base_url: str = "http://127.0.0.1:8642",
+    limit: int = 8,
+    timeout_secs: float = 45.0,
+    max_age_secs: float = 86_400.0,
+) -> dict[str, Any]:
+    """Refresh privacy-route evidence for auto-discovered ZDR candidates.
+
+    Each probe is one bounded non-streaming chat request through the
+    privacy request path (``PassthroughClient.chat(..., pool="privacy")``),
+    so a pass proves the route accepted the pool's privacy policy — for
+    Command Code, the ``x-cmd-zdr: 1`` header — rather than merely
+    advertising a capability.
+    """
+    from tusker_gateway.privacy_qualification import run_privacy_qualification
+
+    results = await run_privacy_qualification(
+        base_url=base_url,
+        max_concurrency=1,
+        timeout_secs=timeout_secs,
+        max_age_secs=max_age_secs,
+        limit=limit,
+    )
+    counts: dict[str, int] = {}
+    for result in results:
+        status = str(result.get("status", "unavailable"))
+        counts[status] = counts.get(status, 0) + 1
+    return {
+        "tested": len(results),
+        "passed": counts.get("passed", 0),
+        "unsupported": counts.get("unsupported", 0),
+        "unavailable": counts.get("unavailable", 0),
     }
 
 async def run_quality_warmup_cycle(
@@ -709,6 +758,32 @@ async def qualification_maintenance_loop(
         43_200.0,
         minimum=60.0,
     )
+    privacy_enabled = _privacy_qualification_enabled(config)
+    privacy_limit = _env_int(
+        "TUSKER_PRIVACY_QUALIFICATION_LIMIT",
+        8,
+        minimum=1,
+    )
+    privacy_timeout_secs = _env_float(
+        "TUSKER_PRIVACY_QUALIFICATION_TIMEOUT_SECS",
+        45.0,
+        minimum=5.0,
+    )
+    privacy_max_age_secs = _env_float(
+        "TUSKER_PRIVACY_QUALIFICATION_MAX_AGE_SECS",
+        86_400.0,
+        minimum=60.0,
+    )
+    privacy_initial_delay_secs = _env_float(
+        "TUSKER_PRIVACY_QUALIFICATION_INITIAL_DELAY_SECS",
+        600.0,
+        minimum=0.0,
+    )
+    privacy_interval_secs = _env_float(
+        "TUSKER_PRIVACY_QUALIFICATION_INTERVAL_SECS",
+        43_200.0,
+        minimum=60.0,
+    )
 
     logger.info(
         "qualification maintenance started interval=%.0fs initial_delay=%.0fs limit=%d pools=%s",
@@ -756,6 +831,11 @@ async def qualification_maintenance_loop(
     warmup_next_due_at = (
         time.monotonic() + warmup_initial_delay_secs if warmup_enabled else None
     )
+    # Privacy evidence gates auto-discovered ZDR routes, so it also needs its
+    # first run shortly after startup instead of one full interval later.
+    privacy_next_due_at = (
+        time.monotonic() + privacy_initial_delay_secs if privacy_enabled else None
+    )
     while not stop_event.is_set():
         # The tool/structured probes run on a coarse cadence (typically
         # every few hours) while the modality probe runs on its own
@@ -779,7 +859,11 @@ async def qualification_maintenance_loop(
             warmup_delay = max(0.0, warmup_next_due_at - time.monotonic())
         else:
             warmup_delay = float("inf")
-        delay = min(tool_delay, modality_delay, composite_delay, warmup_delay)
+        if privacy_enabled and privacy_next_due_at is not None:
+            privacy_delay = max(0.0, privacy_next_due_at - time.monotonic())
+        else:
+            privacy_delay = float("inf")
+        delay = min(tool_delay, modality_delay, composite_delay, warmup_delay, privacy_delay)
         first_cycle = False
         if await _wait_or_stop(stop_event, delay):
             return
@@ -904,3 +988,21 @@ async def qualification_maintenance_loop(
                 )
             finally:
                 warmup_next_due_at = time.monotonic() + warmup_interval_secs
+        if privacy_enabled and privacy_next_due_at is not None and now_mono >= privacy_next_due_at:
+            try:
+                privacy_summary = await run_privacy_maintenance_cycle(
+                    base_url=base_url,
+                    limit=privacy_limit,
+                    timeout_secs=privacy_timeout_secs,
+                    max_age_secs=privacy_max_age_secs,
+                )
+                logger.info("privacy qualification result=%s", privacy_summary)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "privacy qualification cycle failed error_class=%s",
+                    type(exc).__name__,
+                )
+            finally:
+                privacy_next_due_at = time.monotonic() + privacy_interval_secs
