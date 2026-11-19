@@ -84,6 +84,16 @@ _REASONING_RE = re.compile(
 # operators tune this without a code change.
 REASONING_FLOOR: int = int(os.environ.get("TUSKER_REASONING_MAX_TOKENS_FLOOR", "2000"))
 
+# Command Code routes run models with an internal thinking budget of 24576
+# tokens. The upstream rejects the request when the output cap is below it:
+# "max_completion_tokens [16384] must be greater than thinking_budget
+# [24576]". A client-supplied cap (the gateway default is 16384) therefore
+# fails every Command Code route, so this provider needs its own floor above
+# the budget. Env override for operators whose routes differ.
+COMMANDCODE_FLOOR: int = int(
+    os.environ.get("TUSKER_COMMANDCODE_MAX_TOKENS_FLOOR", "32768")
+)
+
 # Non-reasoning models use no floor (value 0 = no enforcement).
 # Upstream providers handle their own defaults when max_tokens is absent.
 DEFAULT_FLOOR: int = 0
@@ -99,12 +109,15 @@ def is_reasoning_model(model: str) -> bool:
     return bool(_REASONING_RE.search(model))
 
 
-def max_tokens_floor(model: str) -> int:
-    """Return the minimum ``max_tokens`` for *model*.
+def max_tokens_floor(provider: str, model: str) -> int:
+    """Return the minimum ``max_tokens`` for the route.
 
-    Returns ``REASONING_FLOOR`` for reasoning models and ``DEFAULT_FLOOR``
-    (0 — no enforcement) for everything else.
+    Command Code routes have the hard provider floor (above the upstream
+    thinking budget); reasoning models take the generic reasoning floor;
+    everything else is unenforced.
     """
+    if provider.strip().lower() == "commandcode":
+        return COMMANDCODE_FLOOR
     if is_reasoning_model(model):
         return REASONING_FLOOR
     return DEFAULT_FLOOR
@@ -132,7 +145,7 @@ def apply_max_tokens_floor(
     if extra_body is None:
         extra_body = {}
 
-    floor = max_tokens_floor(model)
+    floor = max_tokens_floor(provider, model)
     if floor <= 0:
         return extra_body
 
@@ -146,7 +159,7 @@ def apply_max_tokens_floor(
     import logging
 
     logging.getLogger(__name__).info(
-        "max_tokens floor: %s/%s %s → %d (reasoning model floor)",
+        "max_tokens floor: %s/%s %s → %d (provider/model floor)",
         provider,
         model,
         current,
