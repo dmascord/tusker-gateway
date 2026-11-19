@@ -430,8 +430,18 @@ def known_context_window(provider: str, model: str) -> int | None:
 
 def _builtin_context_window(provider: str, model: str) -> int | None:
     pkey = _route_key(provider)
-    mkey = _route_key(model)
+    # Command Code models have internal thinking_budgets that exceed typical
+    # context windows; a low fitted max_tokens causes 400s such as
+    # "max_completion_tokens [1024] must be greater than thinking_budget [24576]".
+    # Return a generous built-in value instead of falling back to a scarce one.
+    if pkey == "commandcode":
+        return (
+            int(os.environ.get("TUSKER_CONTEXT_WINDOW_COMMANDCODE", "65536"))
+            if _env_int("TUSKER_CONTEXT_WINDOW_COMMANDCODE", 0) != 0
+            else 65536
+        )
     value = _BUILTIN_PROVIDER_CONTEXT_WINDOWS.get(pkey)
+    mkey = _route_key(model)
     for prefix, window in _BUILTIN_MODEL_CONTEXT_WINDOWS:
         prefix_key = _route_key(prefix)
         if mkey == prefix_key or mkey.startswith(prefix_key + "-") or mkey.startswith(prefix_key + "."):
