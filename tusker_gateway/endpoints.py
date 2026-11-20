@@ -4300,10 +4300,10 @@ def _provider_attempt_timeout_secs(
     try:
         configured = max(
             0.1,
-            float(os.environ.get("TUSKER_PROVIDER_ATTEMPT_TIMEOUT_SECS", "45")),
+            float(os.environ.get("TUSKER_PROVIDER_ATTEMPT_TIMEOUT_SECS", "15")),
         )
     except (TypeError, ValueError):
-        configured = 45.0
+        configured = 15.0
     if provider:
         from tusker_gateway.passthrough import _attempt_idle_secs
 
