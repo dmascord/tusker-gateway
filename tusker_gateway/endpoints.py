@@ -3918,13 +3918,38 @@ def _estimated_tokens(messages: list[dict[str, Any]]) -> int:
     """
     chars = 0
     for m in messages:
+        if not isinstance(m, dict):
+            continue
         content = m.get("content", "")
         if isinstance(content, str):
             chars += len(content)
         elif isinstance(content, list):
             for part in content:
                 if isinstance(part, dict):
-                    chars += len(str(part.get("text", "")))
+                    for key in ("text", "thinking", "reasoning", "reasoning_content", "content"):
+                        value = part.get(key)
+                        if isinstance(value, str) and value:
+                            chars += len(value)
+                            break
+                    else:
+                        chars += len(str(part))
+                else:
+                    chars += len(str(part))
+        for field in ("reasoning_content", "reasoning", "reasoning_details", "thinking", "thinking_blocks"):
+            value = m.get(field)
+            if isinstance(value, str):
+                chars += len(value)
+            elif value is not None:
+                chars += len(json.dumps(value, default=str))
+        fc = m.get("function_call")
+        if isinstance(fc, dict):
+            chars += len(json.dumps(fc, default=str))
+        if m.get("tool_calls"):
+            chars += len(json.dumps(m["tool_calls"], default=str))
+        for field in ("name", "tool_call_id", "call_id"):
+            value = m.get(field)
+            if isinstance(value, str):
+                chars += len(value)
     return max(1, chars // 4)
 
 
