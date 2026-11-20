@@ -2068,6 +2068,56 @@ def test_status_reports_catalog_and_live_modality_evidence():
         assert candidate["model_capabilities"][0]["status"] == "passed"
 
 
+def test_status_caches_payload_and_reflects_new_evidence():
+    """Repeated /status polls must reuse the payload until evidence moves."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = PoolManager(
+            {
+                "pools": {
+                    "code": PoolConfig(
+                        name="code",
+                        models=[
+                            {"provider": "openrouter", "model": "vision-model"},
+                        ],
+                    ),
+                },
+                "quality_db_path": os.path.join(tmpdir, "quality.db"),
+                "model_capability_db_path": os.path.join(
+                    tmpdir, "model-capability.db"
+                ),
+                "excluded_providers": [],
+                "provider_api_keys": {"openrouter": "k-openrouter"},
+            }
+        )
+        calls = 0
+        original = manager._model_capability_db.records_for_pairs
+
+        def counted(pairs):
+            nonlocal calls
+            calls += 1
+            return original(pairs)
+
+        manager._model_capability_db.records_for_pairs = counted
+        first = manager.status()
+        assert calls == 1
+        assert manager.status() is first, "cached poll must return the same payload"
+        assert calls == 1
+
+        # A probe write bumps the store revision and must be reflected.
+        manager._model_capability_db.record(
+            provider="openrouter",
+            model="vision-model",
+            capability="input_image",
+            status="passed",
+            source="modality_probe",
+        )
+        second = manager.status()
+        assert second is not first
+        assert second["code"]["candidates"][0]["model_capabilities"][0][
+            "status"
+        ] == "passed"
+
+
 def test_xiaomi_catalog_auto_adds_only_nonheavy_chat_models_to_code():
     with tempfile.TemporaryDirectory() as tmpdir:
         manager = _xiaomi_pool_manager(

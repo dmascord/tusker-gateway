@@ -45,7 +45,11 @@ from tusker_gateway.tool_capability import (
     ToolCapabilityLevel,
     default_tool_capability_db_path,
 )
-from tusker_gateway.storage import state_key_revision
+from tusker_gateway.storage import (
+    shared_state_target,
+    state_key_revision,
+    state_revision,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -334,6 +338,9 @@ class PoolManager:
     )
     _tool_capability_records_cached_at: float = field(init=False, default=0.0)
     _tool_capability_records_revision: int = field(init=False, default=-1)
+    _status_cache: tuple[tuple[int, ...], float, dict[str, Any]] | None = field(
+        init=False, default=None
+    )
     _blacklist_config_signature: tuple[str, ...] = field(init=False, default=())
     _blacklist_exact: frozenset[str] = field(init=False, default_factory=frozenset)
     _blacklist_patterns: tuple[str, ...] = field(init=False, default=())
@@ -472,6 +479,14 @@ class PoolManager:
     def __post_init__(self):
         self.pools = dict(self.config.get("pools", {}))
         self._providers = _provider_registry(self.config)
+        # ``shared_state_target`` raises in PostgreSQL mode without a DSN;
+        # the sandboxed default keeps the manager constructible in tests.
+        try:
+            self._revision_target = shared_state_target(
+                self.config["quality_db_path"]
+            )
+        except Exception:
+            self._revision_target = os.fspath(self.config["quality_db_path"])
         self._disabled_providers = frozenset(
             str(provider).strip().lower().replace("_", "-")
             for provider in self.config.get("disabled_providers", ())
@@ -2177,8 +2192,30 @@ class PoolManager:
                 self._remember_stickiness(key, result)
         return result
 
+    _STATUS_CACHE_TTL_SECS = 10.0
+
     def status(self) -> dict[str, Any]:
-        """Return pool status for /status endpoint."""
+        """Return pool status for /status endpoint.
+
+        The payload walks every pool's candidates and embeds their probe
+        records, and callers poll it. A short cache keyed by the revision
+        of the underlying evidence stores keeps repeated polls cheap while
+        still reflecting a fresh probe or cooldown change within seconds.
+        """
+        now = time.monotonic()
+        revision = (
+            state_revision(*self._quality._revision_key),
+            state_revision(*self._model_capability_db._revision_key),
+            state_revision(*self._tool_capabilities._revision_key),
+            (
+                state_revision(*self._llm_stats._revision_key)
+                if getattr(self._llm_stats, "_revision_key", None)
+                else 0
+            ),
+        )
+        cached = self._status_cache
+        if cached is not None and cached[0] == revision and now - cached[1] < self._STATUS_CACHE_TTL_SECS:
+            return cached[2]
         result = {}
         capability_cache: dict[
             tuple[str, str], tuple[frozenset[str] | None, bool | None]
@@ -2233,6 +2270,7 @@ class PoolManager:
                     for s in valid
                 ],
             }
+        self._status_cache = (revision, now, result)
         return result
 
     def readiness_status(

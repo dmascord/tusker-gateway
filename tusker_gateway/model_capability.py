@@ -394,9 +394,14 @@ class ModelCapabilityDB:
 
         The capability table holds one row per model/capability pair and
         grows with every probe cycle, so reading it whole for a request
-        that inspects a few hundred routes is wasted work. The row-value
-        ``IN`` form lets PostgreSQL drive the composite primary key
-        instead of scanning and sorting the table.
+        that inspects a few hundred routes is wasted work.
+
+        On PostgreSQL the pair lists are passed as parallel arrays and
+        zip-joined with ``unnest``: measured live, it keeps the composite
+        primary key index scan as the pair count grows where the row-value
+        ``IN`` form degrades. SQLite takes the ``IN (VALUES ...)`` form,
+        chunked because each pair binds two parameters and SQLite caps the
+        parameters per statement.
         """
         if not pairs:
             return []
@@ -411,19 +416,35 @@ class ModelCapabilityDB:
         )
         rows: list[tuple[object, ...]] = []
         with self._connection() as connection:
-            for chunk in chunked_pairs(normalized):
-                placeholders = ", ".join(["(?, ?)"] * len(chunk))
-                parameters = [value for pair in chunk for value in pair]
+            if connection.is_postgres:
+                providers = [provider for provider, _ in normalized]
+                models = [model for _, model in normalized]
                 rows.extend(
                     connection.execute(
-                        "SELECT provider, model, capability, status, source, "
-                        "probe_version, http_status, latency_ms, failure_class, "
-                        "checked_at FROM model_capability "
-                        "WHERE (provider, model) IN (VALUES " + placeholders + ") "
-                        "ORDER BY provider, model, capability",
-                        parameters,
+                        "SELECT c.provider, c.model, c.capability, c.status, "
+                        "c.source, c.probe_version, c.http_status, c.latency_ms, "
+                        "c.failure_class, c.checked_at "
+                        "FROM model_capability c "
+                        "JOIN unnest(?::text[], ?::text[]) AS p(provider, model) "
+                        "ON c.provider = p.provider AND c.model = p.model "
+                        "ORDER BY c.provider, c.model, c.capability",
+                        (providers, models),
                     ).fetchall()
                 )
+            else:
+                for chunk in chunked_pairs(normalized):
+                    placeholders = ", ".join(["(?, ?)"] * len(chunk))
+                    parameters = [value for pair in chunk for value in pair]
+                    rows.extend(
+                        connection.execute(
+                            "SELECT provider, model, capability, status, source, "
+                            "probe_version, http_status, latency_ms, failure_class, "
+                            "checked_at FROM model_capability "
+                            "WHERE (provider, model) IN (VALUES " + placeholders + ") "
+                            "ORDER BY provider, model, capability",
+                            parameters,
+                        ).fetchall()
+                    )
         return [self._from_row(row) for row in rows]
 
     def status(self) -> dict[str, object]:

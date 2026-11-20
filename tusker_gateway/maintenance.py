@@ -784,6 +784,12 @@ async def qualification_maintenance_loop(
         43_200.0,
         minimum=60.0,
     )
+    prune_enabled = _env_float("TUSKER_QUALITY_EVENT_PRUNE_ENABLED", 1.0) > 0
+    prune_interval_secs = _env_float(
+        "TUSKER_QUALITY_EVENT_PRUNE_INTERVAL_SECS",
+        43_200.0,
+        minimum=60.0,
+    )
 
     logger.info(
         "qualification maintenance started interval=%.0fs initial_delay=%.0fs limit=%d pools=%s",
@@ -836,6 +842,9 @@ async def qualification_maintenance_loop(
     privacy_next_due_at = (
         time.monotonic() + privacy_initial_delay_secs if privacy_enabled else None
     )
+    # Event pruning runs shortly after startup so a fresh deploy trims the
+    # accumulated table instead of waiting a full interval.
+    prune_next_due_at = time.monotonic() + 300.0 if prune_enabled else None
     while not stop_event.is_set():
         # The tool/structured probes run on a coarse cadence (typically
         # every few hours) while the modality probe runs on its own
@@ -988,6 +997,22 @@ async def qualification_maintenance_loop(
                 )
             finally:
                 warmup_next_due_at = time.monotonic() + warmup_interval_secs
+        if prune_enabled and prune_next_due_at is not None and now_mono >= prune_next_due_at:
+            try:
+                from tusker_gateway.quality import QualityDB
+
+                quality_cfg = load_config()
+                removed = QualityDB(quality_cfg["quality_db_path"]).prune_events()
+                logger.info("quality event prune removed=%d", removed)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "quality event prune failed error_class=%s",
+                    type(exc).__name__,
+                )
+            finally:
+                prune_next_due_at = time.monotonic() + prune_interval_secs
         if privacy_enabled and privacy_next_due_at is not None and now_mono >= privacy_next_due_at:
             try:
                 privacy_summary = await run_privacy_maintenance_cycle(
