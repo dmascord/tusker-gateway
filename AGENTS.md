@@ -30,6 +30,7 @@ Read in order when picking up the repo:
 | `docs/incidents/2026-11-11-codex-refresh-cooldown-adoption-deadlock.md` | Codex OAuth refresh-failure cooldown blocked store adoption; the whole pool read as empty while the DB held live credentials. |
 | `docs/incidents/2026-11-11-mlx-mac-capacity-queue.md` | MLX Mac capacity rejections discarded servable work (77/80 privacy attempts locally rejected); bounded FIFO admission queue. |
 | `docs/incidents/2026-11-16-redaction-token-leak.md` | Opaque `[TUSKER:email:…]` ciphertext reaching OMP sessions; syntax-shaped redaction aliases enabled in production. |
+| `docs/incidents/2026-11-20-xhigh-reasoning-effort-downgrade.md` | `xhigh` reasoning level rejected by non-Codex upstreams; per-provider downgrade to `high` + manifest re-pin to the running digest. |
 | `TODO.md` | Active cross-session work items. |
 
 
