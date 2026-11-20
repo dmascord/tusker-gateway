@@ -6,6 +6,7 @@ import os
 import json
 import tempfile
 import pytest
+from typing import Any
 
 from tusker_gateway.config import PoolConfig, _load_pools, load_config
 from tusker_gateway.cooldown import CooldownTracker, _cooldown_seconds_for_429
