@@ -1293,11 +1293,16 @@ def test_ollama_capability_shape_admits_image_tool_privacy_candidates():
                 _CatalogEntry(
                     "ollama-cloud",
                     "kimi-k3",
+                    # Ollama Cloud publishes prices for every catalog row.
+                    cost_input=3.0,
+                    cost_output=15.0,
                     raw={"capabilities": ["completion", "thinking", "tools", "vision"]},
                 ),
                 _CatalogEntry(
                     "ollama-cloud",
                     "glm-5.2",
+                    cost_input=1.4,
+                    cost_output=4.4,
                     raw={"capabilities": ["completion", "thinking", "tools"]},
                 ),
             ],
@@ -2443,7 +2448,13 @@ def test_catalog_refresh_cannot_restore_permanently_failed_model(tmp_path):
             "provider_api_keys": {"google": "test-key"},
         }
     )
-    registry = _CatalogRegistry({"google": [_CatalogEntry(*route)]})
+    # Google publishes prices for most catalog rows (models/gemini-2.5-flash
+    # is $0.30/$2.50 per M upstream).
+    registry = _CatalogRegistry({
+        "google": [
+            _CatalogEntry(*route, cost_input=0.30, cost_output=2.50),
+        ]
+    })
     registry.providers = lambda: ("google",)
     manager.catalog_registry = registry
     manager.extend_pools_with_auto_catalog()

@@ -258,3 +258,23 @@ def test_tagged_variant_of_cheap_base_stays_light():
     assert is_heavyweight_slug("deepseek-v4-flash:0731") is False
     assert is_heavyweight_slug("glm-5.3-flash") is False
     assert is_heavyweight_slug("gemma4:31b") is False
+
+
+def test_qwen_max_family_is_heavyweight_slug():
+    """Command Code publishes no price for Qwen/Qwen4-Max and models.dev has no
+    commandcode entry, so the pricing gate cannot classify it. Other providers
+    bill the Max tier at $1.41-$4/M in, well above the cheap-tier thresholds."""
+    for slug in (
+        "Qwen/Qwen4-Max",
+        "Qwen/Qwen3.8-Max",
+        "Qwen/Qwen3.8-Max-0902",
+        "Qwen/Qwen3.8-Max-Prime",
+        "Qwen/Qwen3.7-Max",
+        "qwen4-max",
+    ):
+        assert is_heavyweight_slug(slug) is True, slug
+
+
+def test_qwen_flash_and_plus_stay_light():
+    for slug in ("Qwen/Qwen3.8-Flash", "Qwen/Qwen3.7-Flash", "Qwen/Qwen3.7-Plus"):
+        assert is_heavyweight_slug(slug) is False, slug
