@@ -98,10 +98,10 @@ _XHIGH_CAPABLE_PROVIDERS = frozenset({"opencode-go", "openai-codex"})
 def _normalize_reasoning_effort(value: Any, provider: str | None = None) -> Any:
     """Normalize client aliases accepted by OpenCode/Codex backends.
 
-    ``xhigh`` is an OpenAI/Codex-specific level that most other upstreams
-    (mlx-mac, apim, alibaba, ...) reject with ``invalid reasoning value``.
-    For those providers we downgrade to ``high`` so the request still carries
-    a strong reasoning budget instead of failing the whole turn.
+    ``xhigh`` is OpenAI/Codex-specific; most other upstreams reject it, and a
+    live ``gemini-3.5-flash`` probe returned HTTP 400 ``Thinking level XHIGH
+    is not supported for this model``. Downgrade those providers to ``high``
+    so the request keeps a strong reasoning budget instead of failing.
     """
     if not isinstance(value, str):
         return value

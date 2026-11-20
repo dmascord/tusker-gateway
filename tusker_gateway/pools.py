@@ -26,11 +26,12 @@ from tusker_gateway.catalog import (
 from tusker_gateway.config import (
     DEFAULT_PROVIDER_REGISTRY,
     PoolConfig,
-    model_is_blacklisted,
 )
 from tusker_gateway.context_limits import declared_context_window
 from tusker_gateway.cooldown import CooldownTracker, global_tracker, is_permanently_failed
 from tusker_gateway.heavyweight import is_heavyweight
+from tusker_gateway.model_rankings import normalize_slug
+from tusker_gateway.safety import is_runtime_blacklisted
 from tusker_gateway.model_capability import (
     INPUT_MODALITY_CAPABILITIES,
     PRIVACY_ZDR_CAPABILITY,
@@ -43,6 +44,11 @@ from tusker_gateway.tool_capability import (
     ToolCapabilityDB,
     ToolCapabilityLevel,
     default_tool_capability_db_path,
+)
+from tusker_gateway.storage import (
+    shared_state_target,
+    state_key_revision,
+    state_revision,
 )
 
 logger = logging.getLogger(__name__)
@@ -58,6 +64,20 @@ COMPOSITE_IMAGE_TOOLS_DEFINITIVE_FAILURES = frozenset({"unsupported", "failed"})
 def _normalise_input_modality(value: Any) -> str:
     """Normalize configured modality names to the catalog/DB spelling."""
     return str(value).strip().lower().replace("-", "_")
+
+
+def _capability_route_key(provider: str, model: str) -> tuple[str, str]:
+    """Return the normalized key used for capability evidence lookups.
+
+    Capability rows are stored with a normalized provider name, so the
+    lookup key must be normalized too. Pool configuration is not
+    guaranteed to use the same spelling, and an unnormalized lookup would
+    silently miss evidence.
+    """
+    return (
+        str(provider or "").strip().lower().replace("_", "-"),
+        str(model or "").strip(),
+    )
 
 
 # Pools that are considered "premium" tiers — heavyweight models are
@@ -295,6 +315,38 @@ class PoolManager:
     _quality: QualityDB | None = None
     _tool_capabilities: ToolCapabilityDB | None = None
     _model_capability_db: Any | None = None
+    # Selection runs in worker threads and may be called repeatedly while a
+    # request walks its fallback chain. Cache the evidence per route so
+    # each candidate change does not scan the shared database again, and so
+    # two pools that share a route reuse the same cached evidence.
+    _model_capability_records_cache: dict[tuple[str, str], tuple[Any, ...]] = field(
+        init=False, default_factory=dict
+    )
+    _model_capability_records_cached_at: dict[tuple[str, str], float] = field(
+        init=False, default_factory=dict
+    )
+    _model_capability_records_revisions: dict[tuple[str, str], int] = field(
+        init=False, default_factory=dict
+    )
+    _llm_stats_snapshot_cache: dict[str, tuple[str, int | None]] | None = field(
+        init=False, default=None
+    )
+    _llm_stats_snapshot_cached_at: float = field(init=False, default=0.0)
+    _llm_stats_snapshot_revision: int = field(init=False, default=-1)
+    _tool_capability_records_cache: dict[tuple[str, str], Any] | None = field(
+        init=False, default=None
+    )
+    _tool_capability_records_cached_at: float = field(init=False, default=0.0)
+    _tool_capability_records_revision: int = field(init=False, default=-1)
+    _status_cache: tuple[tuple[int, ...], float, dict[str, Any]] | None = field(
+        init=False, default=None
+    )
+    _blacklist_config_signature: tuple[str, ...] = field(init=False, default=())
+    _blacklist_exact: frozenset[str] = field(init=False, default_factory=frozenset)
+    _blacklist_patterns: tuple[str, ...] = field(init=False, default=())
+    _model_capability_cache_lock: threading.Lock = field(
+        init=False, default_factory=threading.Lock
+    )
     _llm_stats: Any | None = None
     _cooldowns: CooldownTracker | None = None
     # Optional catalog registry — when set, PoolManager.extend_pools_with_catalog()
@@ -380,22 +432,14 @@ class PoolManager:
         return str(provider).strip().lower().replace("_", "-") in self._disabled_providers
 
     def _model_is_blacklisted(self, provider: str, model: str) -> bool:
-        return model_is_blacklisted(self.config, provider, model)
+        return self._model_is_blacklisted_fast(provider, model)
 
     def _llm_stats_excludes(self, model: str) -> bool:
-        """Whether the LLM Stats ranking removes this model from selection.
-
-        Under ``prefer`` enforcement the ranking never removes a model: it
-        only orders candidates through ``_rank_boost``, so the strongest
-        model is used while it has quota/health and traffic falls through to
-        weaker ones (and back up again) as cooldowns, capacity gates, or
-        breakers move.
-        """
-        if self._llm_stats is None:
+        """Whether the cached LLM Stats snapshot excludes this model."""
+        if self._llm_stats is None or self._llm_stats_enforcement == "prefer":
             return False
-        if self._llm_stats_enforcement == "prefer":
-            return False
-        return self._llm_stats.excludes(model)
+        row = (self._llm_stats_snapshot() or {}).get(normalize_slug(model))
+        return row is not None and row[0] == "excluded"
 
     # LLM Stats rank boost defaults. Models with better (lower) ranks
     # receive a quality-score bonus so they climb into higher tiers where
@@ -407,10 +451,12 @@ class PoolManager:
     _RANK_BOOST_PER_RANK: float = 1.0
 
     def _llm_stats_rank(self, model: str) -> int | None:
-        """Return the effective LLM Stats rank for a gateway model name."""
+        """Return the effective LLM Stats rank from the cached snapshot."""
         if self._llm_stats is None:
             return None
-        return self._llm_stats.effective_rank(model)
+        row = (self._llm_stats_snapshot() or {}).get(normalize_slug(model))
+        value = row[1] if row is not None else None
+        return value if isinstance(value, int) and value > 0 else None
 
     def _rank_boost(self, rank: int) -> float:
         """Score bonus for one rank, from the configured cap/decay."""
@@ -433,6 +479,14 @@ class PoolManager:
     def __post_init__(self):
         self.pools = dict(self.config.get("pools", {}))
         self._providers = _provider_registry(self.config)
+        # ``shared_state_target`` raises in PostgreSQL mode without a DSN;
+        # the sandboxed default keeps the manager constructible in tests.
+        try:
+            self._revision_target = shared_state_target(
+                self.config["quality_db_path"]
+            )
+        except Exception:
+            self._revision_target = os.fspath(self.config["quality_db_path"])
         self._disabled_providers = frozenset(
             str(provider).strip().lower().replace("_", "-")
             for provider in self.config.get("disabled_providers", ())
@@ -923,7 +977,7 @@ class PoolManager:
         model_capability_records: dict[tuple[str, str], tuple[Any, ...]] | None = None,
     ) -> tuple[frozenset[str] | None, bool | None]:
         """Resolve effective input/tool capabilities for a pool candidate."""
-        key = (spec.provider, spec.model)
+        key = _capability_route_key(spec.provider, spec.model)
         cached = capability_cache.get(key)
         if cached is not None:
             return cached
@@ -1034,6 +1088,7 @@ class PoolManager:
         spec: ModelSpec,
         required_modalities: frozenset[str],
         advertised_modalities: frozenset[str] | None,
+        model_capability_records: dict[tuple[str, str], tuple[Any, ...]] | None = None,
     ) -> bool:
         """Apply verified modality evidence before catalog compatibility.
 
@@ -1042,12 +1097,30 @@ class PoolManager:
         exists. If neither is present for non-text input, the candidate is
         held back instead of turning missing metadata into a provider 400.
         """
+        records = (
+            model_capability_records.get(
+                _capability_route_key(spec.provider, spec.model), ()
+            )
+            if model_capability_records is not None
+            else None
+        )
         for modality in required_modalities:
             capability = f"input_{modality}"
             record = (
-                self._model_capability_db.get(spec.provider, spec.model, capability)
-                if self._model_capability_db is not None
-                else None
+                next(
+                    (
+                        item
+                        for item in records
+                        if item.capability == capability
+                    ),
+                    None,
+                )
+                if records is not None
+                else (
+                    self._model_capability_db.get(spec.provider, spec.model, capability)
+                    if self._model_capability_db is not None
+                    else None
+                )
             )
             # An explicit pool/catalog declaration is a hard negative. A
             # stale or overly broad successful probe must not turn a known
@@ -1095,7 +1168,9 @@ class PoolManager:
         when at least one recent pass exists, selection prefers those passes.
         """
         records = (
-            model_capability_records.get((spec.provider, spec.model), ())
+            model_capability_records.get(
+                _capability_route_key(spec.provider, spec.model), ()
+            )
             if model_capability_records is not None
             else ()
         )
@@ -1129,6 +1204,7 @@ class PoolManager:
         capability_cache: dict[
             tuple[str, str], tuple[frozenset[str] | None, bool | None]
         ],
+        model_capability_records: dict[tuple[str, str], tuple[Any, ...]] | None = None,
     ) -> tuple[frozenset[str] | None, frozenset[str] | None]:
         """Return current input/output modality evidence for diagnostics.
 
@@ -1137,12 +1213,20 @@ class PoolManager:
         catalog incorrectly advertised. ``None`` remains meaningful: it
         means the gateway has no current claim for that direction.
         """
-        input_modalities, _ = self._model_capabilities(spec, capability_cache)
+        input_modalities, _ = self._model_capabilities(
+            spec, capability_cache, model_capability_records
+        )
         output_modalities = advertised_output_modalities(self._catalog_entry_for(spec))
         records = (
-            self._model_capability_db.for_model(spec.provider, spec.model)
-            if self._model_capability_db is not None
-            else []
+            model_capability_records.get(
+                _capability_route_key(spec.provider, spec.model), ()
+            )
+            if model_capability_records is not None
+            else (
+                self._model_capability_db.for_model(spec.provider, spec.model)
+                if self._model_capability_db is not None
+                else []
+            )
         )
 
         def apply_evidence(
@@ -1259,6 +1343,151 @@ class PoolManager:
         if mode == "strict":
             return False
         return not spec.auto_discovered
+
+    _SELECTION_SNAPSHOT_TTL_SECS = 30.0
+
+    def _llm_stats_snapshot(self) -> dict[str, tuple[str, int | None]] | None:
+        """Load LLM Stats verdicts and ranks once per short selection window.
+
+        A sync or seed import must become visible immediately, so the cache
+        is invalidated when the store's revision changes.
+        """
+        if self._llm_stats is None:
+            return None
+        now = time.monotonic()
+        revision = getattr(self._llm_stats, "_revision", 0)
+        with self._model_capability_cache_lock:
+            if (
+                self._llm_stats_snapshot_cache is not None
+                and self._llm_stats_snapshot_revision == revision
+                and now - self._llm_stats_snapshot_cached_at < self._SELECTION_SNAPSHOT_TTL_SECS
+            ):
+                return self._llm_stats_snapshot_cache
+            snapshot = {
+                str(slug): (str(row.get("status", "")), row.get("category_rank"))
+                for slug, row in self._llm_stats.rows().items()
+            }
+            self._llm_stats_snapshot_cache = snapshot
+            self._llm_stats_snapshot_cached_at = now
+            self._llm_stats_snapshot_revision = revision
+            return snapshot
+
+    def _tool_capability_records(self) -> dict[tuple[str, str], Any] | None:
+        """Load behavioral qualification rows once per short selection window.
+
+        A new qualification record must become visible immediately, so the
+        cache is invalidated when the store's revision changes. The table
+        holds one row per probed route and stays small, so a full read is
+        cheaper than a query per candidate.
+        """
+        if self._tool_capabilities is None:
+            return None
+        now = time.monotonic()
+        revision = getattr(self._tool_capabilities, "_revision", 0)
+        with self._model_capability_cache_lock:
+            if (
+                self._tool_capability_records_cache is not None
+                and self._tool_capability_records_revision == revision
+                and now - self._tool_capability_records_cached_at
+                < self._SELECTION_SNAPSHOT_TTL_SECS
+            ):
+                return self._tool_capability_records_cache
+            cached = {
+                (record.provider, record.model): record
+                for record in self._tool_capabilities.records()
+            }
+            self._tool_capability_records_cache = cached
+            self._tool_capability_records_cached_at = now
+            self._tool_capability_records_revision = revision
+            return cached
+
+    def _blacklist_matchers(self) -> tuple[frozenset[str], tuple[str, ...]]:
+        """Normalize configured blacklist patterns once until config changes."""
+        configured = tuple(str(pattern).strip().lower() for pattern in self.config.get("blacklisted_models", ()))
+        if configured != self._blacklist_config_signature:
+            self._blacklist_config_signature = configured
+            self._blacklist_exact = frozenset(
+                pattern for pattern in configured if not any(char in pattern for char in "*?[")
+            )
+            self._blacklist_patterns = tuple(
+                pattern for pattern in configured if pattern not in self._blacklist_exact
+            )
+        return self._blacklist_exact, self._blacklist_patterns
+
+    def _model_is_blacklisted_fast(self, provider: str, model: str) -> bool:
+        """Apply static and runtime blacklist policy without repeated setup."""
+        normalized_provider = str(provider or "").strip().lower().replace("_", "-")
+        normalized_model = str(model or "").strip().lower()
+        candidate = f"{normalized_provider}/{normalized_model}"
+        if is_runtime_blacklisted(normalized_provider, normalized_model):
+            return True
+        exact, patterns = self._blacklist_matchers()
+        return candidate in exact or any(fnmatch.fnmatchcase(candidate, pattern) for pattern in patterns)
+    _MODEL_CAPABILITY_CACHE_TTL_SECS = 30.0
+
+    def _model_capability_records(
+        self,
+        pairs: list[tuple[str, str]],
+    ) -> dict[tuple[str, str], tuple[Any, ...]] | None:
+        """Return capability evidence for the given routes.
+
+        Evidence is cached per route. A route's cached entry is dropped as
+        soon as the store reports a write for that route, so a probe
+        result becomes visible immediately instead of after the TTL, and
+        two pools that share a route reuse the same cached entry.
+        """
+        if self._model_capability_db is None:
+            return None
+        now = time.monotonic()
+        wanted = list(dict.fromkeys(pairs))
+        with self._model_capability_cache_lock:
+            stale = [
+                key
+                for key in wanted
+                if key in self._model_capability_records_cache
+                and (
+                    now - self._model_capability_records_cached_at.get(key, 0.0)
+                    >= self._MODEL_CAPABILITY_CACHE_TTL_SECS
+                    or self._model_capability_records_revisions.get(key)
+                    != self._capability_key_revision(key)
+                )
+            ]
+            for key in stale:
+                self._model_capability_records_cache.pop(key, None)
+                self._model_capability_records_cached_at.pop(key, None)
+                self._model_capability_records_revisions.pop(key, None)
+            missing = [
+                key
+                for key in wanted
+                if key not in self._model_capability_records_cache
+            ]
+            if missing:
+                records = self._model_capability_db.records_for_pairs(missing)
+                grouped: dict[tuple[str, str], list[Any]] = {}
+                for record in records:
+                    grouped.setdefault(
+                        (record.provider, record.model), []
+                    ).append(record)
+                for key in missing:
+                    self._model_capability_records_cache[key] = tuple(
+                        grouped.get(key, ())
+                    )
+                    self._model_capability_records_cached_at[key] = now
+                    self._model_capability_records_revisions[key] = (
+                        self._capability_key_revision(key)
+                    )
+            return {
+                key: self._model_capability_records_cache[key]
+                for key in wanted
+                if key in self._model_capability_records_cache
+            }
+
+    def _capability_key_revision(self, key: tuple[str, str]) -> int:
+        """Return the store's write revision for one route's evidence."""
+        revision_key = getattr(self._model_capability_db, "_revision_key", None)
+        if revision_key is None:
+            return 0
+        return state_key_revision(revision_key[0], revision_key[1], key)
 
     def select(
         self,
@@ -1408,23 +1637,12 @@ class PoolManager:
         capability_cache: dict[
             tuple[str, str], tuple[frozenset[str] | None, bool | None]
         ] = {}
-        model_capability_records: dict[tuple[str, str], tuple[Any, ...]] | None = None
-        if self._model_capability_db is not None:
-            grouped_records: dict[tuple[str, str], list[Any]] = {}
-            for record in self._model_capability_db.records():
-                grouped_records.setdefault((record.provider, record.model), []).append(record)
-            model_capability_records = {
-                key: tuple(records) for key, records in grouped_records.items()
-            }
+        model_capability_records = self._model_capability_records(
+            [_capability_route_key(spec.provider, spec.model) for spec in specs]
+        )
         tool_capability_cache: dict[tuple[str, str], Any] | None = None
         if (requires_tools or qualification_required) and self._tool_capabilities is not None:
-            # Selection may inspect hundreds of candidates. Read the compact
-            # qualification table once instead of opening/reconfiguring a
-            # SQLite connection for every candidate on the RWX volume.
-            tool_capability_cache = {
-                (record.provider, record.model): record
-                for record in self._tool_capabilities.records()
-            }
+            tool_capability_cache = self._tool_capability_records()
 
         # Image-plus-tool support is a separate contract from ordinary image
         # input and ordinary tool calling. Read its latest probe once per
@@ -1515,13 +1733,16 @@ class PoolManager:
                             s, capability_cache, model_capability_records
                         )
                         if not self._input_modalities_allowed(
-                            s, required_modalities, modalities
+                            s,
+                            required_modalities,
+                            modalities,
+                            model_capability_records,
                         ):
                             self._drop_stickiness(key)
                             break
                         if requires_image_tools and "image" in required_modalities:
                             composite_record = composite_records.get(
-                                (s.provider, s.model)
+                                _capability_route_key(s.provider, s.model)
                             )
                             if not self._image_tools_evidence_allows(
                                 s, composite_record
@@ -1530,7 +1751,10 @@ class PoolManager:
                                 break
                         if pool_config and pool_config.zdr:
                             if not self._privacy_evidence_allows(
-                                s, privacy_records.get((s.provider, s.model))
+                                s,
+                                privacy_records.get(
+                                    _capability_route_key(s.provider, s.model)
+                                ),
                             ):
                                 self._drop_stickiness(key)
                                 break
@@ -1605,7 +1829,7 @@ class PoolManager:
         filtered_context_models: list[str] = []
         filtered_payload_models: list[str] = []
         for s in specs:
-            if self._model_is_blacklisted(s.provider, s.model):
+            if self._model_is_blacklisted_fast(s.provider, s.model):
                 filter_counts["blacklisted_model"] += 1
                 continue
             if self._llm_stats_excludes(s.model):
@@ -1634,7 +1858,8 @@ class PoolManager:
                     filtered_zdr_models.append(f"{s.provider}/{s.model}")
                 continue
             if pool_config and pool_config.zdr and not self._privacy_evidence_allows(
-                s, privacy_records.get((s.provider, s.model))
+                s,
+                privacy_records.get(_capability_route_key(s.provider, s.model)),
             ):
                 filter_counts["privacy_evidence"] += 1
                 if len(filtered_zdr_models) < 12:
@@ -1669,13 +1894,18 @@ class PoolManager:
                 s, capability_cache, model_capability_records
             )
             if not self._input_modalities_allowed(
-                s, required_modalities, modalities
+                s,
+                required_modalities,
+                modalities,
+                model_capability_records,
             ):
                 filter_counts["input_modalities"] += 1
                 filtered_modality_models.append(f"{s.provider}/{s.model}")
                 continue
             if requires_image_tools and "image" in required_modalities:
-                composite_record = composite_records.get((s.provider, s.model))
+                composite_record = composite_records.get(
+                    _capability_route_key(s.provider, s.model)
+                )
                 if not self._image_tools_evidence_allows(s, composite_record):
                     filter_counts["image_tools"] += 1
                     filtered_composite_models.append(f"{s.provider}/{s.model}")
@@ -1917,10 +2147,14 @@ class PoolManager:
 
         # Group candidates by quality tier (all with same score as the top)
         top_score = quality_list[0][2]  # third element is the score
-        tier_candidates = [c for c in candidates if next(
-            (q[2] for q in quality_list if q[0] == c.provider and q[1] == c.model),
-            -1
-        ) == top_score]
+        score_by_candidate = {
+            (provider, model): score
+            for provider, model, score in quality_list
+        }
+        tier_candidates = [
+            c for c in candidates
+            if score_by_candidate.get((c.provider, c.model), -1) == top_score
+        ]
 
         # Within the top tier, apply weighted selection.
         # Equal weights should distribute traffic, while retaining a
@@ -1958,12 +2192,42 @@ class PoolManager:
                 self._remember_stickiness(key, result)
         return result
 
+    _STATUS_CACHE_TTL_SECS = 10.0
+
     def status(self) -> dict[str, Any]:
-        """Return pool status for /status endpoint."""
+        """Return pool status for /status endpoint.
+
+        The payload walks every pool's candidates and embeds their probe
+        records, and callers poll it. A short cache keyed by the revision
+        of the underlying evidence stores keeps repeated polls cheap while
+        still reflecting a fresh probe or cooldown change within seconds.
+        """
+        now = time.monotonic()
+        revision = (
+            state_revision(*self._quality._revision_key),
+            state_revision(*self._model_capability_db._revision_key),
+            state_revision(*self._tool_capabilities._revision_key),
+            (
+                state_revision(*self._llm_stats._revision_key)
+                if getattr(self._llm_stats, "_revision_key", None)
+                else 0
+            ),
+        )
+        cached = self._status_cache
+        if cached is not None and cached[0] == revision and now - cached[1] < self._STATUS_CACHE_TTL_SECS:
+            return cached[2]
         result = {}
         capability_cache: dict[
             tuple[str, str], tuple[frozenset[str] | None, bool | None]
         ] = {}
+        model_capability_records = self._model_capability_records(
+            [
+                _capability_route_key(spec.provider, spec.model)
+                for specs in self.models.values()
+                for spec in specs
+            ]
+        )
+        tool_capability_records = self._tool_capability_records()
         for name, specs in self.models.items():
             catalog_unavailable = self._catalog_unavailable_routes(specs)
             valid = [
@@ -1997,10 +2261,16 @@ class PoolManager:
                     for s, reason in self.unkeyed.get(name, [])
                 ],
                 "candidates": [
-                    self._status_candidate(s, capability_cache)
+                    self._status_candidate(
+                        s,
+                        capability_cache,
+                        model_capability_records,
+                        tool_capability_records,
+                    )
                     for s in valid
                 ],
             }
+        self._status_cache = (revision, now, result)
         return result
 
     def readiness_status(
@@ -2025,14 +2295,7 @@ class PoolManager:
                 and getattr(pool, "require_tool_qualification", False)
             )
             if requires_qualification:
-                tool_capability_cache = (
-                    {
-                        (record.provider, record.model): record
-                        for record in self._tool_capabilities.records()
-                    }
-                    if self._tool_capabilities is not None
-                    else {}
-                )
+                tool_capability_cache = self._tool_capability_records() or {}
             eligible = [
                 spec
                 for spec in specs
@@ -2070,10 +2333,32 @@ class PoolManager:
         capability_cache: dict[
             tuple[str, str], tuple[frozenset[str] | None, bool | None]
         ],
+        model_capability_records: dict[tuple[str, str], tuple[Any, ...]] | None = None,
+        tool_capability_records: dict[tuple[str, str], Any] | None = None,
     ) -> dict[str, Any]:
         """Serialize one candidate with effective capability evidence."""
         input_modalities, output_modalities = self._effective_modalities_for_status(
-            spec, capability_cache
+            spec, capability_cache, model_capability_records
+        )
+        tool_record = (
+            tool_capability_records.get((spec.provider, spec.model))
+            if tool_capability_records is not None
+            else (
+                self._tool_capabilities.get(spec.provider, spec.model)
+                if self._tool_capabilities is not None
+                else None
+            )
+        )
+        capability_records = (
+            model_capability_records.get(
+                _capability_route_key(spec.provider, spec.model), ()
+            )
+            if model_capability_records is not None
+            else (
+                self._model_capability_db.for_model(spec.provider, spec.model)
+                if self._model_capability_db is not None
+                else []
+            )
         )
         return {
             "provider": spec.provider,
@@ -2088,19 +2373,9 @@ class PoolManager:
                 sorted(output_modalities) if output_modalities is not None else None
             ),
             "tool_capability": (
-                self._tool_capabilities.get(spec.provider, spec.model).to_dict()
-                if self._tool_capabilities is not None
-                and self._tool_capabilities.get(spec.provider, spec.model) is not None
-                else None
+                tool_record.to_dict() if tool_record is not None else None
             ),
-            "model_capabilities": (
-                [
-                    record.to_dict()
-                    for record in self._model_capability_db.for_model(
-                        spec.provider, spec.model
-                    )
-                ]
-                if self._model_capability_db is not None
-                else []
-            ),
+            "model_capabilities": [
+                record.to_dict() for record in capability_records
+            ],
         }

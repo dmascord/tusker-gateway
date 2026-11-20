@@ -48,7 +48,7 @@ import re
 import time
 from typing import Any
 
-from tusker_gateway.storage import shared_database
+from tusker_gateway.storage import bump_state_revision, shared_database, state_revision
 
 logger = logging.getLogger(__name__)
 
@@ -282,7 +282,17 @@ class ModelRankingsDB:
     def __init__(self, path: str):
         self._path = path
         self._db = shared_database(path)
+        # Selection caches the verdict table for a short window. The
+        # revision is shared per state target so a sync or seed import from
+        # any store handle is visible to the next selection instead of
+        # waiting for the TTL.
+        self._revision_key = (self._db.target, "llm_stats_verdicts")
         self._ensure_db()
+
+    @property
+    def _revision(self) -> int:
+        """Return the shared write revision for the verdict table."""
+        return state_revision(*self._revision_key)
 
     def _ensure_db(self) -> None:
         with self._db.connection() as conn:
@@ -387,6 +397,7 @@ class ModelRankingsDB:
                     """,
                     entry,
                 )
+        bump_state_revision(*self._revision_key)
 
     def apply_seed(
         self, rows: list[dict[str, Any]], synced_at: float
@@ -433,6 +444,7 @@ class ModelRankingsDB:
                     ),
                 )
                 written += 1
+        bump_state_revision(*self._revision_key)
         return {"written": written, "skipped_window": skipped}
 
     def apply_probe(
@@ -480,6 +492,7 @@ class ModelRankingsDB:
                     ),
                 )
                 written += 1
+        bump_state_revision(*self._revision_key)
         return {"written": written, "skipped_evidence": skipped}
 
     def expire_probe(self, max_age_secs: float, now: float) -> int:
@@ -495,7 +508,10 @@ class ModelRankingsDB:
                 "AND synced_at < ?",
                 (PROBE_EVIDENCE, now - max_age_secs),
             )
-            return int(cursor.rowcount or 0)
+            removed = int(cursor.rowcount or 0)
+        if removed:
+            bump_state_revision(*self._revision_key)
+        return removed
 
     def status(self) -> dict[str, Any]:
         """Summary for /status-style reporting."""

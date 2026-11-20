@@ -35,12 +35,12 @@ import sys
 # policing new growth. Reviewed growth: endpoints.py 9381 -> 9431 (reasoning /
 # tool content in the prompt estimate, 1cb7ef0, plus earlier post-baseline
 # work); passthrough.py 3771 -> 3819 (Command Code floor, per-provider xhigh
-# downgrade); pools.py 1934 -> 2106 (ZDR qualification gate, PR #67, and
-# unpriced-route weighting, 13a9112). Extraction stays a Priority 2 task.
+# downgrade); pools.py 1934 -> 2134 (cached model-capability snapshot for
+# selection hot path). Extraction stays a Priority 2 task.
 MAX_LINES = {
     "tusker_gateway/endpoints.py": 9_431,
     "tusker_gateway/passthrough.py": 3_819,
-    "tusker_gateway/pools.py": 2_106,
+    "tusker_gateway/pools.py": 2_134,
     "tusker_gateway/admin.py": 1_717,
     "tusker_gateway/config_store.py": 1_583,
 }
