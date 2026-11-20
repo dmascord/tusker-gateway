@@ -1,5 +1,20 @@
 # Project TODOs
 
+## Quality-ranking selection bottleneck (2026-11-20)
+
+Bounded local profiling found `QualityDB.rank()` dominates selection after the
+model-capability snapshot cache: with 361 eligible candidates, 40 plain selects
+had a 79.07 ms median and 86.48 ms p90. Replacing ranking with an in-memory
+constant-score stub reduced the same path to 3.88 ms median and 10.05 ms p90.
+The profiler attributed 1.587 s of 1.930 s total across 30 selects to
+`QualityDB.rank()`, including 6,000 `get_quality()` and 6,000
+`_recent_failure_count()` calls, each opening a database connection and issuing
+a query. Production uses PostgreSQL pooling rather than local SQLite, so these
+absolute timings are not production latency; the per-candidate query pattern is
+still the next measured bottleneck. Candidate fix: add one bulk ranking query
+for the selected candidate set, including recent failure counts, then preserve
+the existing score and tie-breaking semantics with regression coverage.
+
 ## Pool-selection latency and live provenance drift (2026-11-20)
 
 The live `2309478` image lowered the default candidate idle budget from 45s to
