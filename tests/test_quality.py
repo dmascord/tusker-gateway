@@ -104,6 +104,22 @@ def test_quality_rank_adaptive_floor_is_bounded():
             score for provider, model, score in ranked if provider == unknown[0]
         )
         assert unknown_score == 10.0
+
+def test_quality_rank_bulk_query_preserves_recent_failure_and_floor(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = QualityDB(os.path.join(tmpdir, "test.db"))
+        db.record("known", "model", True, 1_000.0)
+        db.record("recent", "model", True, 1_000.0)
+        monkeypatch.setattr("tusker_gateway.quality.time.time", lambda: 1_000.0)
+        db.record("recent", "model", False, 1_000.0)
+
+        ranked = db.rank(
+            [("known", "model"), ("recent", "model"), ("unknown", "model")]
+        )
+
+        scores = {(provider, model): score for provider, model, score in ranked}
+        assert scores[("unknown", "model")] == 50.0
+        assert scores[("recent", "model")] <= scores[("known", "model")] - 25.0
 def test_quality_windowed_recovery():
     """Old failures fall out of the window once enough new successes accumulate."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -218,3 +234,78 @@ def test_degraded_state_store_does_not_crash_quality_reads(monkeypatch):
 
     db.record("p1", "m1", True, 12.0)
     assert db.rank([("p1", "m1")]) == [("p1", "m1", 50.0)]
+
+
+def test_quality_creates_model_events_indexes():
+    """The ranking queries need indexes on ``model_events``.
+
+    Without them the recent-failure count and the windowed score
+    recomputation scan the whole event table, which grows with every
+    attempt and dominates selection latency.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = QualityDB(os.path.join(tmpdir, "test.db"))
+        with db._db.connection() as conn:
+            rows = conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'index' AND tbl_name = 'model_events'"
+            ).fetchall()
+        names = {str(row[0]) for row in rows}
+        assert "idx_model_events_provider_model_id" in names
+        assert "idx_model_events_recent_failures" in names
+
+
+def test_quality_rank_scales_with_one_query_per_table(monkeypatch):
+    """Ranking must not issue a query per candidate.
+
+    Selection can inspect hundreds of routes; a per-candidate query turns
+    ranking into an avoidable round-trip cost per request.
+    """
+    from tusker_gateway import storage
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = QualityDB(os.path.join(tmpdir, "test.db"))
+        for index in range(50):
+            db.record(f"p{index}", "m1", True, 100.0)
+        candidates = [(f"p{index}", "m1") for index in range(50)]
+
+        executed: list[str] = []
+        real_execute = storage.DatabaseConnection.execute
+
+        def counting_execute(self, sql, parameters=()):
+            executed.append(sql)
+            return real_execute(self, sql, parameters)
+
+        monkeypatch.setattr(storage.DatabaseConnection, "execute", counting_execute)
+        ranked = db.rank(candidates)
+
+        assert len(ranked) == 50
+        # One read per table per chunk, not one per candidate.
+        assert len(executed) <= 4, executed
+
+
+def test_quality_rank_chunks_large_candidate_lists(monkeypatch):
+    """A large candidate list must not exceed the parameter limit.
+
+    Each candidate pair binds two parameters, and the backend caps the
+    number of parameters in one statement, so the pair list is chunked.
+    """
+    from tusker_gateway import storage
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = QualityDB(os.path.join(tmpdir, "test.db"))
+        candidates = [(f"p{index}", "m1") for index in range(1200)]
+
+        bound_counts: list[int] = []
+        real_execute = storage.DatabaseConnection.execute
+
+        def counting_execute(self, sql, parameters=()):
+            bound_counts.append(len(parameters))
+            return real_execute(self, sql, parameters)
+
+        monkeypatch.setattr(storage.DatabaseConnection, "execute", counting_execute)
+        ranked = db.rank(candidates)
+
+        assert len(ranked) == 1200
+        assert bound_counts, "ranking must query the store"
+        assert max(bound_counts) <= storage.MAX_PAIR_CHUNK * 2 + 1, bound_counts

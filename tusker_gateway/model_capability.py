@@ -29,7 +29,14 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterator
 
-from tusker_gateway.storage import shared_database
+from tusker_gateway.storage import (
+    bump_state_key_revision,
+    bump_state_revision,
+    chunked_pairs,
+    shared_database,
+    state_key_revision,
+    state_revision,
+)
 
 
 MODEL_CAPABILITY_PROBE_VERSION = "model-capability-v2"
@@ -138,7 +145,17 @@ class ModelCapabilityDB:
         self._db = shared_database(self.path)
         if not self._db.is_postgres and self.path != ":memory:":
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+        # Selection caches the evidence table between requests. The
+        # revision is shared per state target so a write from any store
+        # handle (probe runner, catalog refresh, admin endpoint) is visible
+        # immediately instead of waiting for the cache TTL.
+        self._revision_key = (self._db.target, "model_capability")
         self._ensure_db()
+
+    @property
+    def _revision(self) -> int:
+        """Return the shared write revision for the capability table."""
+        return state_revision(*self._revision_key)
 
     @contextmanager
     def _connection(self) -> Iterator[object]:
@@ -290,6 +307,12 @@ class ModelCapabilityDB:
                 ),
             )
             connection.commit()
+        bump_state_revision(*self._revision_key)
+        bump_state_key_revision(
+            self._revision_key[0],
+            self._revision_key[1],
+            (result.provider, result.model),
+        )
         return result
 
     @staticmethod
@@ -362,6 +385,45 @@ class ModelCapabilityDB:
                 ORDER BY provider, model, capability
                 """
             ).fetchall()
+        return [self._from_row(row) for row in rows]
+
+    def records_for_pairs(
+        self, pairs: list[tuple[str, str]]
+    ) -> list[ModelCapability]:
+        """Return records for the given provider/model pairs only.
+
+        The capability table holds one row per model/capability pair and
+        grows with every probe cycle, so reading it whole for a request
+        that inspects a few hundred routes is wasted work. The row-value
+        ``IN`` form lets PostgreSQL drive the composite primary key
+        instead of scanning and sorting the table.
+        """
+        if not pairs:
+            return []
+        normalized = list(
+            dict.fromkeys(
+                (
+                    str(provider).strip().lower().replace("_", "-"),
+                    str(model).strip(),
+                )
+                for provider, model in pairs
+            )
+        )
+        rows: list[tuple[object, ...]] = []
+        with self._connection() as connection:
+            for chunk in chunked_pairs(normalized):
+                placeholders = ", ".join(["(?, ?)"] * len(chunk))
+                parameters = [value for pair in chunk for value in pair]
+                rows.extend(
+                    connection.execute(
+                        "SELECT provider, model, capability, status, source, "
+                        "probe_version, http_status, latency_ms, failure_class, "
+                        "checked_at FROM model_capability "
+                        "WHERE (provider, model) IN (VALUES " + placeholders + ") "
+                        "ORDER BY provider, model, capability",
+                        parameters,
+                    ).fetchall()
+                )
         return [self._from_row(row) for row in rows]
 
     def status(self) -> dict[str, object]:

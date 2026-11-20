@@ -11,6 +11,7 @@ from typing import Any
 from tusker_gateway.config import PoolConfig, _load_pools, load_config
 from tusker_gateway.cooldown import CooldownTracker, _cooldown_seconds_for_429
 from tusker_gateway.model_capability import (
+    ModelCapabilityDB,
     PRIVACY_ZDR_CAPABILITY,
     PRIVACY_ZDR_PROBE_VERSION,
     STRUCTURED_OUTPUT_PROBE_VERSION,
@@ -241,6 +242,7 @@ def test_pool_selection_reuses_model_capability_snapshot(monkeypatch):
             }
         )
         records = manager._model_capability_db.records
+        records_for_pairs = manager._model_capability_db.records_for_pairs
         calls = 0
 
         def counted_records():
@@ -248,10 +250,192 @@ def test_pool_selection_reuses_model_capability_snapshot(monkeypatch):
             calls += 1
             return records()
 
+        def counted_records_for_pairs(pairs):
+            nonlocal calls
+            calls += 1
+            return records_for_pairs(pairs)
+
         monkeypatch.setattr(manager._model_capability_db, "records", counted_records)
+        monkeypatch.setattr(
+            manager._model_capability_db,
+            "records_for_pairs",
+            counted_records_for_pairs,
+        )
         assert manager.select("test") == ("groq", "m1")
         assert manager.select("test", excluded={("groq", "m1")}) is None
         assert calls == 1
+
+
+def test_pool_selection_caches_tool_capabilities_and_uses_score_map(tmp_path, monkeypatch):
+    manager = PoolManager(
+        {
+            "pools": {
+                "test": PoolConfig(
+                    name="test",
+                    models=[
+                        {"provider": "groq", "model": "m1"},
+                        {"provider": "openai", "model": "m2"},
+                    ],
+                )
+            },
+            "quality_db_path": str(tmp_path / "quality.db"),
+            "provider_api_keys": {"groq": "k-groq", "openai": "k-openai"},
+        }
+    )
+    records = manager._tool_capabilities.records
+    calls = 0
+
+    def counted_records():
+        nonlocal calls
+        calls += 1
+        return records()
+
+    monkeypatch.setattr(manager._tool_capabilities, "records", counted_records)
+    manager.select("test", requires_tools=True)
+    manager.select("test", requires_tools=True)
+    assert calls == 1
+
+    class Ranked:
+        def rank(self, candidates):
+            return [(provider, model, 10.0) for provider, model in candidates]
+
+    manager._quality = Ranked()
+    assert manager.select("test") in {("groq", "m1"), ("openai", "m2")}
+
+
+def test_pool_selection_reads_capability_evidence_only_for_pool_routes(tmp_path):
+    """Selection must not read the whole capability table for one pool."""
+    manager = PoolManager(
+        {
+            "pools": {
+                "test": PoolConfig(
+                    name="test",
+                    models=[{"provider": "groq", "model": "m1"}],
+                )
+            },
+            "quality_db_path": str(tmp_path / "quality.db"),
+            "provider_api_keys": {"groq": "k-groq"},
+        }
+    )
+    requested: list[list[tuple[str, str]]] = []
+    original = manager._model_capability_db.records_for_pairs
+
+    def spy(pairs):
+        requested.append(list(pairs))
+        return original(pairs)
+
+    manager._model_capability_db.records_for_pairs = spy
+    manager.select("test")
+
+    assert requested, "selection must read capability evidence"
+    for pairs in requested:
+        assert ("groq", "m1") in pairs
+        assert len(pairs) < 100
+
+
+def test_pool_selection_shares_cached_evidence_between_pools(tmp_path):
+    """Two pools that share a route must not each re-read its evidence."""
+    manager = PoolManager(
+        {
+            "pools": {
+                "one": PoolConfig(
+                    name="one", models=[{"provider": "groq", "model": "m1"}]
+                ),
+                "two": PoolConfig(
+                    name="two", models=[{"provider": "groq", "model": "m1"}]
+                ),
+            },
+            "quality_db_path": str(tmp_path / "quality.db"),
+            "provider_api_keys": {"groq": "k-groq"},
+        }
+    )
+    calls = 0
+    original = manager._model_capability_db.records_for_pairs
+
+    def counted(pairs):
+        nonlocal calls
+        calls += 1
+        return original(pairs)
+
+    manager._model_capability_db.records_for_pairs = counted
+    manager.select("one")
+    manager.select("two")
+    assert calls == 1
+
+
+def test_pool_selection_sees_capability_probe_written_by_another_store(tmp_path):
+    """A probe result from another store handle must be visible at once."""
+    manager = PoolManager(
+        {
+            "pools": {
+                "test": PoolConfig(
+                    name="test", models=[{"provider": "groq", "model": "m1"}]
+                )
+            },
+            "quality_db_path": str(tmp_path / "quality.db"),
+            "provider_api_keys": {"groq": "k-groq"},
+        }
+    )
+    assert manager.select("test") == ("groq", "m1")
+
+    writer = ModelCapabilityDB(manager._model_capability_db.path)
+    writer.record(
+        provider="groq",
+        model="m1",
+        capability="input_image",
+        status="passed",
+        source="probe",
+    )
+
+    records = manager._model_capability_records([("groq", "m1")])
+    assert records is not None
+    assert any(r.capability == "input_image" for r in records[("groq", "m1")])
+
+
+def test_pool_capability_cache_invalidates_only_the_written_route(tmp_path):
+    """A write to one route must not invalidate another route's evidence."""
+    manager = PoolManager(
+        {
+            "pools": {
+                "test": PoolConfig(
+                    name="test",
+                    models=[
+                        {"provider": "groq", "model": "m1"},
+                        {"provider": "openai", "model": "m2"},
+                    ],
+                )
+            },
+            "quality_db_path": str(tmp_path / "quality.db"),
+            "provider_api_keys": {"groq": "k-groq", "openai": "k-openai"},
+        }
+    )
+    writer = ModelCapabilityDB(manager._model_capability_db.path)
+    writer.record(
+        provider="groq",
+        model="m1",
+        capability="input_image",
+        status="passed",
+        source="probe",
+    )
+
+    records = manager._model_capability_records([("groq", "m1"), ("openai", "m2")])
+    assert records is not None
+    assert records[("groq", "m1")]
+    assert records[("openai", "m2")] == ()
+
+    # A write to one route leaves the other route's cached entry in place.
+    writer.record(
+        provider="groq",
+        model="m1",
+        capability="input_image_tools",
+        status="passed",
+        source="probe",
+    )
+    updated = manager._model_capability_records([("groq", "m1"), ("openai", "m2")])
+    assert updated is not None
+    capabilities = {record.capability for record in updated[("groq", "m1")]}
+    assert "input_image_tools" in capabilities
+
 
 def test_stickiness_expires_and_is_cardinality_bounded():
     with tempfile.TemporaryDirectory() as tmpdir:

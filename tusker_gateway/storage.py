@@ -37,6 +37,9 @@ _STORAGE_STATUS: dict[str, Any] = {
     "last_error_at": None,
     "recovery_count": 0,
 }
+_REVISION_LOCK = threading.Lock()
+_REVISIONS: dict[tuple[str, str], int] = {}
+_KEY_REVISIONS: dict[tuple[str, str, Any], int] = {}
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -219,6 +222,65 @@ def shared_state_target(path: str | os.PathLike[str]) -> str:
             "(or TUSKER_DATABASE_URL)"
         )
     return dsn
+
+def state_revision(target: str | os.PathLike[str], namespace: str = "") -> int:
+    """Return the current write revision for a state target.
+
+    Several store objects may address the same target in one process (the
+    pool manager, the qualification runner and the catalog refresh each
+    open their own handle). A revision shared per target lets a write from
+    any of them invalidate a cache held by another. The namespace keeps
+    unrelated tables that share one database from invalidating each other.
+    """
+    key = (os.fspath(target), namespace)
+    with _REVISION_LOCK:
+        return _REVISIONS.get(key, 0)
+
+
+def bump_state_revision(target: str | os.PathLike[str], namespace: str = "") -> int:
+    """Record a write against a state target and return the new revision."""
+    key = (os.fspath(target), namespace)
+    with _REVISION_LOCK:
+        revision = _REVISIONS.get(key, 0) + 1
+        _REVISIONS[key] = revision
+        return revision
+
+
+def state_key_revision(
+    target: str | os.PathLike[str], namespace: str, key: Any
+) -> int:
+    """Return the write revision for one row key of a state table."""
+    lookup = (os.fspath(target), namespace, key)
+    with _REVISION_LOCK:
+        return _KEY_REVISIONS.get(lookup, 0)
+
+
+def bump_state_key_revision(
+    target: str | os.PathLike[str], namespace: str, key: Any
+) -> int:
+    """Record a write to one row key of a state table."""
+    lookup = (os.fspath(target), namespace, key)
+    with _REVISION_LOCK:
+        revision = _KEY_REVISIONS.get(lookup, 0) + 1
+        _KEY_REVISIONS[lookup] = revision
+        return revision
+
+
+
+# Bound the number of bound parameters in one statement. A candidate pair
+# binds two parameters, so a chunk of pairs must stay well under the
+# lowest backend limit: SQLite builds before 3.32 allow 999 parameters
+# per statement and PostgreSQL allows 65535.
+MAX_PAIR_CHUNK = 400
+
+
+def chunked_pairs(
+    pairs: list[tuple[str, str]], size: int = MAX_PAIR_CHUNK
+) -> Iterator[list[tuple[str, str]]]:
+    """Yield the given pairs in chunks of at most ``size`` entries."""
+    for start in range(0, len(pairs), size):
+        yield pairs[start : start + size]
+
 
 
 def _pool_for(dsn: str) -> Any:
@@ -583,7 +645,11 @@ def close_shared_pools() -> None:
 __all__ = [
     "Database",
     "DatabaseConnection",
+    "MAX_PAIR_CHUNK",
     "StorageModeError",
+    "bump_state_key_revision",
+    "bump_state_revision",
+    "chunked_pairs",
     "close_shared_pools",
     "is_postgres_target",
     "postgres_storage_enabled",
@@ -593,6 +659,8 @@ __all__ = [
     "sqlite_storage_enabled",
     "state_database_url",
     "state_degraded_mode",
+    "state_key_revision",
+    "state_revision",
     "storage_mode",
     "storage_status",
     "storage_error_types",

@@ -14,7 +14,7 @@ from enum import IntEnum
 from pathlib import Path
 from typing import Iterator
 
-from tusker_gateway.storage import shared_database
+from tusker_gateway.storage import bump_state_revision, shared_database, state_revision
 
 
 TOOL_CAPABILITY_PROBE_VERSION = "stream-tool-contract-v1"
@@ -119,7 +119,17 @@ class ToolCapabilityDB:
         self._db = shared_database(path)
         if not self._db.is_postgres and path != ":memory:":
             Path(path).parent.mkdir(parents=True, exist_ok=True)
+        # Selection caches the compact record table between requests. The
+        # revision is shared per state target so a write from any store
+        # handle (a probe finishing, an operator recording a result) is
+        # visible immediately instead of waiting for the cache TTL.
+        self._revision_key = (self._db.target, "model_tool_capability")
         self._ensure_db()
+
+    @property
+    def _revision(self) -> int:
+        """Return the shared write revision for the tool capability table."""
+        return state_revision(*self._revision_key)
 
     @contextmanager
     def _connection(self) -> Iterator[object]:
@@ -245,6 +255,7 @@ class ToolCapabilityDB:
                 ),
             )
             connection.commit()
+        bump_state_revision(*self._revision_key)
         return result
 
     @staticmethod
