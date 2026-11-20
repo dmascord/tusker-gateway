@@ -226,6 +226,32 @@ def test_pool_selection_logic():
         sel3 = mgr.select("test", session_id="s1")
         assert sel2 == sel3, f"stickiness broken: {sel2} vs {sel3}"
 
+def test_pool_selection_reuses_model_capability_snapshot(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = PoolManager(
+            {
+                "pools": {
+                    "test": PoolConfig(
+                        name="test",
+                        models=[{"provider": "groq", "model": "m1"}],
+                    )
+                },
+                "quality_db_path": os.path.join(tmpdir, "quality.db"),
+                "provider_api_keys": {"groq": "k-groq"},
+            }
+        )
+        records = manager._model_capability_db.records
+        calls = 0
+
+        def counted_records():
+            nonlocal calls
+            calls += 1
+            return records()
+
+        monkeypatch.setattr(manager._model_capability_db, "records", counted_records)
+        assert manager.select("test") == ("groq", "m1")
+        assert manager.select("test", excluded={("groq", "m1")}) is None
+        assert calls == 1
 
 def test_stickiness_expires_and_is_cardinality_bounded():
     with tempfile.TemporaryDirectory() as tmpdir:

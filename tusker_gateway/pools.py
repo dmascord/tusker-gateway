@@ -295,6 +295,16 @@ class PoolManager:
     _quality: QualityDB | None = None
     _tool_capabilities: ToolCapabilityDB | None = None
     _model_capability_db: Any | None = None
+    # Selection runs in worker threads and may be called repeatedly while a
+    # request walks its fallback chain. Cache the large evidence snapshot so
+    # each candidate change does not scan the shared database again.
+    _model_capability_records_cache: dict[tuple[str, str], tuple[Any, ...]] | None = field(
+        init=False, default=None
+    )
+    _model_capability_records_cached_at: float = field(init=False, default=0.0)
+    _model_capability_cache_lock: threading.Lock = field(
+        init=False, default_factory=threading.Lock
+    )
     _llm_stats: Any | None = None
     _cooldowns: CooldownTracker | None = None
     # Optional catalog registry — when set, PoolManager.extend_pools_with_catalog()
@@ -1260,6 +1270,31 @@ class PoolManager:
             return False
         return not spec.auto_discovered
 
+    _MODEL_CAPABILITY_CACHE_TTL_SECS = 30.0
+
+    def _model_capability_records(
+        self,
+    ) -> dict[tuple[str, str], tuple[Any, ...]] | None:
+        """Return capability evidence without re-reading it per candidate."""
+        if self._model_capability_db is None:
+            return None
+        now = time.monotonic()
+        with self._model_capability_cache_lock:
+            cached = self._model_capability_records_cache
+            if (
+                cached is not None
+                and now - self._model_capability_records_cached_at
+                < self._MODEL_CAPABILITY_CACHE_TTL_SECS
+            ):
+                return cached
+            grouped: dict[tuple[str, str], list[Any]] = {}
+            for record in self._model_capability_db.records():
+                grouped.setdefault((record.provider, record.model), []).append(record)
+            cached = {key: tuple(records) for key, records in grouped.items()}
+            self._model_capability_records_cache = cached
+            self._model_capability_records_cached_at = now
+            return cached
+
     def select(
         self,
         pool_name: str,
@@ -1408,14 +1443,7 @@ class PoolManager:
         capability_cache: dict[
             tuple[str, str], tuple[frozenset[str] | None, bool | None]
         ] = {}
-        model_capability_records: dict[tuple[str, str], tuple[Any, ...]] | None = None
-        if self._model_capability_db is not None:
-            grouped_records: dict[tuple[str, str], list[Any]] = {}
-            for record in self._model_capability_db.records():
-                grouped_records.setdefault((record.provider, record.model), []).append(record)
-            model_capability_records = {
-                key: tuple(records) for key, records in grouped_records.items()
-            }
+        model_capability_records = self._model_capability_records()
         tool_capability_cache: dict[tuple[str, str], Any] | None = None
         if (requires_tools or qualification_required) and self._tool_capabilities is not None:
             # Selection may inspect hundreds of candidates. Read the compact

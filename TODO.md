@@ -1,5 +1,28 @@
 # Project TODOs
 
+## Pool-selection latency and live provenance drift (2026-11-20)
+
+The live `2309478` image lowered the default candidate idle budget from 45s to
+15s without a regression test or deploy record. Two real candidates were then
+killed at exactly 15s before their first byte: `minimax/MiniMax-M3` on a
+199,814-token prompt and Workers AI on a 22,309-token prompt. A direct
+MiniMax probe with the same ~200k prompt returned its first stream bytes in
+5.1s, so the 15s default was too aggressive rather than evidence of an
+upstream outage. Restore the documented 45s default; retain explicit longer
+overrides for cold local routes.
+
+The gateway also spent about 1.2s between candidate attempts because every
+`PoolManager.select()` re-read and materialized 33,262 model-capability rows
+from the shared database. Selection now keeps a 30-second app-scoped snapshot;
+qualification writes become visible when the snapshot expires or the manager
+is rebuilt. This removes the repeated full-table scan while preserving the
+fallback filters.
+
+The running pod serves commit `2309478b0c6972bcbfb2d88ef829317c57ca1d5d`, but
+`k8s/deployment.yaml` still pins `4c9ed1326226b27d6998dbde6ad943c80e91399e`.
+Merge the live branch and re-pin the manifest before the next deployment; do
+not treat the current cluster state as reproducible source provenance.
+
 
 ## Reasoning-only `length` turns (2026-11-07, 2026-11-08)
 

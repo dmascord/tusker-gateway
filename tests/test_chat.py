@@ -3466,6 +3466,17 @@ async def test_provider_attempt_timeout_helper_uses_per_provider_override():
         os.environ.pop("TUSKER_PROVIDER_ATTEMPT_TIMEOUT_SECS", None)
         os.environ.pop("TUSKER_PROVIDER_ATTEMPT_TIMEOUT_OVERRIDES_JSON", None)
 
+
+@pytest.mark.asyncio
+async def test_provider_attempt_timeout_helper_defaults_to_45_seconds(monkeypatch):
+    from tusker_gateway.endpoints import _provider_attempt_timeout_secs
+
+    monkeypatch.delenv("TUSKER_PROVIDER_ATTEMPT_TIMEOUT_SECS", raising=False)
+    monkeypatch.delenv("TUSKER_PROVIDER_ATTEMPT_TIMEOUT_OVERRIDES_JSON", raising=False)
+    request = SimpleNamespace(get=lambda key, default=None: None)
+
+    assert _provider_attempt_timeout_secs(request, provider="minimax") == 45.0
+
 @pytest.mark.asyncio
 async def test_provider_attempt_timeout_helper_supports_model_override(monkeypatch):
     from tusker_gateway.endpoints import _provider_attempt_timeout_secs
