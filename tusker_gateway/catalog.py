@@ -41,6 +41,7 @@ import logging
 import os
 import re
 import shutil
+import statistics
 import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Iterable
@@ -1526,8 +1527,45 @@ class CatalogRegistry:
         """Return registered provider keys in stable insertion order."""
         return tuple(self._clients)
 
+    def _bare_name_price_index(self) -> dict[str, tuple[float, float]]:
+        """Median models.dev price per bare model name across all providers.
+
+        Keyed by the lowercased final path segment so ``Qwen/Qwen4-Max`` and
+        ``qwen/qwen4-max`` collide. The median is used deliberately: a
+        single reseller listing a model at 10x the going rate must not
+        classify a cheap model as heavyweight (the maximum over-classified
+        63 model names, including ``gpt-5.6-luna`` at $1/$6 against a
+        $0.2/$1.2 median), while a model priced consistently at the top of
+        the range still resolves as heavyweight.
+        """
+        samples: dict[str, list[tuple[float, float]]] = {}
+        if self._models_dev is None:
+            return {}
+        for entry in self._models_dev._entries:
+            if entry.cost_input is None or entry.cost_output is None:
+                continue
+            key = entry.model.rsplit("/", 1)[-1].strip().lower()
+            if not key:
+                continue
+            samples.setdefault(key, []).append(
+                (entry.cost_input, entry.cost_output)
+            )
+        index: dict[str, tuple[float, float]] = {}
+        for key, values in samples.items():
+            index[key] = (
+                statistics.median([v[0] for v in values]),
+                statistics.median([v[1] for v in values]),
+            )
+        return index
+
     def _enrich_pricing(self) -> None:
-        """Fill provider catalog prices from models.dev when available."""
+        """Fill provider catalog prices from models.dev when available.
+
+        An exact (provider, model) match wins. Otherwise the bare model name
+        is matched across providers so routes a gateway catalog leaves
+        unpriced (Command Code omits several) are still classified.
+        """
+        bare_index: dict[str, tuple[float, float]] | None = None
         for client in self._clients.values():
             if isinstance(client, ModelsDevCatalog):
                 continue
@@ -1537,6 +1575,17 @@ class CatalogRegistry:
                 cost_input, cost_output = self._pricing_lookup(
                     entry.provider, entry.model
                 )
+                if cost_input is None or cost_output is None:
+                    if bare_index is None:
+                        bare_index = self._bare_name_price_index()
+                    fallback = bare_index.get(
+                        entry.model.rsplit("/", 1)[-1].strip().lower()
+                    )
+                    if fallback is not None:
+                        if cost_input is None:
+                            cost_input = fallback[0]
+                        if cost_output is None:
+                            cost_output = fallback[1]
                 if entry.cost_input is None:
                     entry.cost_input = cost_input
                 if entry.cost_output is None:

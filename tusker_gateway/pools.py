@@ -65,6 +65,12 @@ def _normalise_input_modality(value: Any) -> str:
 # Cheap-tier pools (`hermes-code`, `hermes-privacy`) drop heavyweights.
 PREMIUM_POOLS: frozenset[str] = frozenset({"premium", "swarm"})
 
+# The weight an ordinary pool entry carries. Auto-discovered heavyweights,
+# routers and unpriced routes are demoted below it (see
+# ``AUTO_DISCOVERED_HEAVYWEIGHT_WEIGHT``) so they are only used after the
+# ordinary candidates are exhausted.
+_DEFAULT_POOL_WEIGHT: float = 1.0
+
 # Provider catalogs also expose models that are not response-generating chat
 # models. Sending those through a general chat pool can return classifier prose
 # (for example, "User Safety: safe") or route a request nondeterministically.
@@ -361,6 +367,14 @@ class PoolManager:
             getattr(endpoint, "kind", getattr(endpoint, "auth_type", "bearer"))
         ).lower()
 
+    def _provider_is_local(self, provider: str) -> bool:
+        """Return whether the provider is a local hardware route.
+
+        Local routes have no per-token price by nature, so the unpriced-entry
+        gate must not remove them from a pool.
+        """
+        return self._provider_kind(provider) == "local"
+
     def _provider_is_disabled(self, provider: str) -> bool:
         """Return whether operator policy disables this provider for pools."""
         return str(provider).strip().lower().replace("_", "-") in self._disabled_providers
@@ -653,6 +667,7 @@ class PoolManager:
             static_pairs = set(self._original_static.get(pool_name, frozenset()))
             eligible: dict[tuple[str, str], dict[str, Any]] = {}
             excluded_special_models: list[str] = []
+            excluded_unpriced_models: list[str] = []
 
             providers = getattr(self.catalog_registry, "providers", None)
             catalog_providers = (
@@ -739,6 +754,29 @@ class PoolManager:
                         cost_input=entry.cost_input,
                         cost_output=entry.cost_output,
                     )
+                    if (
+                        mode == "catalog"
+                        and not self.pool_keeps_heavyweight(pool_name)
+                        and not self._provider_is_local(entry.provider)
+                        and entry.cost_input is None
+                        and entry.cost_output is None
+                        and not entry.model.endswith(":free")
+                    ):
+                        # Unknown pricing is not proof of free, and a cheap
+                        # pool must not carry a route whose cost cannot be
+                        # established. A 0.05 weight is not enough on its
+                        # own: weights only break ties inside the top
+                        # selection tier, so an expensive-but-unpriced
+                        # route could still win a request outright
+                        # (commandcode/Qwen/Qwen4-Max served 9 requests on
+                        # 2026-11-20 with a 0.05 weight). Local hardware
+                        # routes are exempt: they have no per-token price by
+                        # nature, and an explicit ":free" marker is a
+                        # published price of zero.
+                        excluded_unpriced_models.append(
+                            f"{entry.provider}/{entry.model}"
+                        )
+                        continue
                     if mode == "xiaomi" and heavyweight:
                         continue
                     if pool.heavyweight_only and not heavyweight:
@@ -805,6 +843,13 @@ class PoolManager:
                     pool_name,
                     len(excluded_special_models),
                     ",".join(sorted(excluded_special_models)[:12]),
+                )
+            if excluded_unpriced_models:
+                logger.info(
+                    "auto_catalog pool '%s': excluded %d unpriced models=%s",
+                    pool_name,
+                    len(excluded_unpriced_models),
+                    ",".join(sorted(excluded_unpriced_models)[:12]),
                 )
             self.auto_added[pool_name] = desired_auto
 
@@ -1828,7 +1873,21 @@ class PoolManager:
             ]
             quality_ceiling = max(known_scores) if known_scores else None
             boosted: list[tuple[str, str, float]] = []
+            demoted_weight = {
+                (c.provider, c.model)
+                for c in candidates
+                if c.weight < _DEFAULT_POOL_WEIGHT
+            }
             for provider, model, score in quality_list:
+                if (provider, model) in demoted_weight:
+                    # A demoted entry (auto-discovered heavyweight, router,
+                    # or unpriced route) carries a reduced weight so it is
+                    # only used after the weight-1.0 candidates are
+                    # exhausted. An additive rank bonus would lift it into
+                    # the top tier and let it win outright, defeating the
+                    # demotion — so the boost is skipped for it.
+                    boosted.append((provider, model, float(score)))
+                    continue
                 rank = self._llm_stats_rank(model)
                 bonus = (
                     self._rank_boost(rank) if rank is not None else 0.0

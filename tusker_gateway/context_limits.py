@@ -430,8 +430,18 @@ def known_context_window(provider: str, model: str) -> int | None:
 
 def _builtin_context_window(provider: str, model: str) -> int | None:
     pkey = _route_key(provider)
-    mkey = _route_key(model)
+    # Command Code models have internal thinking_budgets that exceed typical
+    # context windows; a low fitted max_tokens causes 400s such as
+    # "max_completion_tokens [1024] must be greater than thinking_budget [24576]".
+    # Return a generous built-in value instead of falling back to a scarce one.
+    if pkey == "commandcode":
+        return (
+            int(os.environ.get("TUSKER_CONTEXT_WINDOW_COMMANDCODE", "65536"))
+            if _env_int("TUSKER_CONTEXT_WINDOW_COMMANDCODE", 0) != 0
+            else 65536
+        )
     value = _BUILTIN_PROVIDER_CONTEXT_WINDOWS.get(pkey)
+    mkey = _route_key(model)
     for prefix, window in _BUILTIN_MODEL_CONTEXT_WINDOWS:
         prefix_key = _route_key(prefix)
         if mkey == prefix_key or mkey.startswith(prefix_key + "-") or mkey.startswith(prefix_key + "."):
@@ -464,6 +474,16 @@ def declared_context_window(provider: str, model: str) -> int | None:
     return _builtin_context_window(provider, model)
 
 
+# Fields that carry text on an OpenAI-format message beyond ``content``.
+# Reasoning / thinking channels are replayed on subsequent turns by harnesses
+# (OMP in particular) and consume real context window, so they must be counted
+# in the prompt estimate; otherwise the gateway under-estimates the prompt and
+# routes to a candidate whose window cannot actually fit, silently truncating
+# earlier messages upstream.
+_REASONING_FIELDS = ("reasoning_content", "reasoning", "reasoning_details", "thinking", "thinking_blocks")
+_TEXT_PART_KEYS = ("text", "thinking", "reasoning", "reasoning_content", "content")
+
+
 def _content_size(content: Any) -> tuple[int, int]:
     """Return (chars, images) for OpenAI-format message content."""
     if isinstance(content, str):
@@ -474,11 +494,23 @@ def _content_size(content: Any) -> tuple[int, int]:
     images = 0
     for part in content:
         if not isinstance(part, dict):
+            chars += len(str(part))
             continue
         if part.get("type") in {"image_url", "input_image", "image"}:
             images += 1
+            continue
+        # Count text from any plausible text-bearing key, including reasoning /
+        # thinking parts that some providers embed inside the content array.
+        for key in _TEXT_PART_KEYS:
+            value = part.get(key)
+            if isinstance(value, str) and value:
+                chars += len(value)
+                break
         else:
-            chars += len(str(part.get("text", "")))
+            # Fallback: stringify the part so opaque structured content is not
+            # silently dropped from the estimate.
+            if part.get("type") not in {"text", "input_text", "output_text"}:
+                chars += len(json.dumps(part, default=str))
     return chars, images
 
 
@@ -497,8 +529,25 @@ def estimate_prompt_tokens(
         message_chars, message_images = _content_size(message.get("content"))
         chars += message_chars
         images += message_images
+        # Reasoning / thinking channels replayed from prior turns.
+        for field in _REASONING_FIELDS:
+            value = message.get(field)
+            if isinstance(value, str):
+                chars += len(value)
+            elif value is not None:
+                chars += len(json.dumps(value, default=str))
+        # Legacy function_call shape.
+        fc = message.get("function_call")
+        if isinstance(fc, dict):
+            chars += len(json.dumps(fc, default=str))
+        # Native tool calls carry arguments that consume context.
         if message.get("tool_calls"):
             chars += len(json.dumps(message["tool_calls"], default=str))
+        # Tool result identifiers and other small fields.
+        for field in ("name", "tool_call_id", "call_id"):
+            value = message.get(field)
+            if isinstance(value, str):
+                chars += len(value)
     if tools:
         chars += len(json.dumps(tools, default=str))
     image_tokens = _env_int("TUSKER_IMAGE_TOKEN_ESTIMATE", _DEFAULT_IMAGE_TOKENS)

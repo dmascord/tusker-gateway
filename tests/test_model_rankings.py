@@ -1257,3 +1257,48 @@ def test_rank_boost_clamps_to_top_known_quality(tmp_path):
         ("ollama-cloud", "glm-5.3-flash"),
         ("local-llm", "qwen3.8-27b"),
     ]
+
+
+def test_rank_boost_does_not_lift_a_demoted_weight_entry_into_the_top_tier(
+    tmp_path,
+):
+    """A demoted entry must not win the tier on rank alone.
+
+    Auto-discovered heavyweights and unpriced routes carry weight 0.05 so
+    they are only used after the weight-1.0 candidates are exhausted. The
+    LLM Stats rank bonus is additive, so a rank-1 entry with a marginally
+    lower learned quality could be lifted past the healthy candidate and
+    then win the tier outright — defeating the demotion. The boost must be
+    skipped for demoted entries so their weight keeps them behind.
+    """
+    quality_path = os.path.join(str(tmp_path), "quality.db")
+    quality = QualityDB(quality_path)
+    # Gap must stay inside the rank-boost cap (25 points): the healthy
+    # candidate is faster, the demoted entry only escapes via the bonus.
+    for _ in range(10):
+        quality.record("ollama-cloud", "glm-5.3-flash", True, 900.0)
+    for _ in range(10):
+        quality.record("ollama-cloud", "claude-sonnet-5", True, 4000.0)
+
+    db = ModelRankingsDB(str(tmp_path / "llm_stats.db"))
+    db.replace_all(
+        [
+            _verdict("claude-sonnet-5", "pass", category_rank=1, category_name="general"),
+            _verdict("glm-5.3-flash", "pass", category_rank=100, category_name="general"),
+        ],
+        time.time(),
+    )
+    manager = _pool_manager(
+        str(tmp_path),
+        [
+            {"provider": "ollama-cloud", "model": "glm-5.3-flash", "weight": 1.0},
+            {"provider": "ollama-cloud", "model": "claude-sonnet-5", "weight": 0.05},
+        ],
+    )
+    manager._quality = quality
+
+    selected = [manager.select("code") for _ in range(20)]
+
+    # The demoted entry never wins: without the boost its learned quality
+    # is below the healthy candidate, so it stays out of the top tier.
+    assert selected == [("ollama-cloud", "glm-5.3-flash")] * 20

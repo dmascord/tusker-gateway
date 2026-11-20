@@ -91,6 +91,7 @@ build of a heavy model cannot slip past the gate. Cheap bases stay cheap:
 | Other | `mistral-large-3:675b`, `deepseek-v4-pro` |
 | Synthetic.new (usage-heavy) | `Kimi-K3`, `syn:large:vision` |
 | Ollama Cloud (usage-heavy) | `kimi-k2.6`, `kimi-k2.7-code`, `kimi-k3` |
+| Qwen Max tier | `Qwen/Qwen4-Max`, `Qwen/Qwen3.8-Max`, `Qwen/Qwen3.8-Max-0902`, `Qwen/Qwen3.8-Max-Prime`, `Qwen/Qwen3.7-Max` |
 
 **Ollama Cloud pricing overlay.** Neither ollama's `/v1/models` payload nor
 models.dev carries cost data for ollama-cloud, so pricing-based detection
@@ -287,6 +288,13 @@ Consequences of the bounded default:
 - Auto-catalog candidates participate too: they share the same
   `llm_stats.db`, so discovered models with good ranks rise inside their
   pool without operator action.
+- **Demoted entries never receive the bonus.** An auto-discovered
+  heavyweight, router, or unpriced route carries a reduced weight (0.05)
+  so it is only used after the weight-1.0 candidates are exhausted. The
+  bonus is additive, so without this rule a rank-1 demoted entry could be
+  lifted into the top tier and win outright, defeating the demotion
+  (2026-11-20). Learned quality still orders demoted entries among
+  themselves.
 
 Set `TUSKER_LLM_STATS_RANK_BOOST_PER_RANK=0` to restore pure
 quality-score ordering in either mode.
@@ -420,6 +428,51 @@ as the account's allowlist rather than the zero-price test. This is the
 explicit path for Codex, Copilot, OpenCode Go, Z.AI, Synthetic, MiniMax,
 Ollama Cloud, Groq, Google, or Cerebras when their credentials provide model
 access.
+
+
+**Bare-name price fallback.** A provider catalog that omits prices for a
+route can still be classified: when neither price resolves from the provider
+overlay or an exact models.dev `(provider, model)` match, the model is matched
+by its **bare name** (the final path segment, lowercased) across every
+models.dev provider and priced at the **median** of those listings. The
+median is deliberate: a single reseller listing a model at 10x the going rate
+must not classify a cheap model as heavyweight (the maximum over-classified
+63 model names, including `gpt-5.6-luna` at $1/$6 against a $0.2/$1.2
+median), while a model priced consistently at the top of the range still
+resolves as heavyweight.
+
+### Unpriced entries in cheap pools
+
+An auto-discovered entry whose cost cannot be established is **excluded from
+cheap-tier pools** (`code`, `privacy`). An unknown price is not proof of free:
+Command Code publishes no price for `deepseek/deepseek-v4.1-flash-ultrafast`,
+which bills $2.40/$9.60 per 1M upstream. A `0.05` weight is not a sufficient
+guard — weights only break ties inside the top selection tier, so an
+expensive-but-unpriced route could still win a request outright.
+
+The gate applies when:
+
+- the provider was opted in through `auto_catalog_providers` (an
+  authenticated account catalog), **and**
+- the pool is cheap-tier (premium/swarm keep heavyweight routes), **and**
+- neither `cost_input` nor `cost_output` resolves, from the provider's own
+  catalog, the provider pricing overlay, models.dev, or the bare-name
+  models.dev median, **and**
+- the model slug does not end in `:free` — an explicit free marker is a
+  published price of zero, **and**
+- the provider is not a local hardware route.
+
+Local providers (`kind: "local"` — `mlx-mac`, `local-llm`) are exempt: their
+cost is the operator's own hardware, not a per-token charge, so they have no
+price by nature. Excluding them would delete the privacy pool's only
+self-hosted candidates.
+
+Curated static entries in `TUSKER_POOL_*` are unaffected — they are
+operator-chosen and sit outside the discovery loop.
+
+On 2026-11-20 the gate removed 26 entries from the `code` pool and 8 from
+`privacy` against the live catalog, mostly retired OpenAI/Copilot preview
+models and embedding-only rows that carried no price.
 
 `opencode-cli` is registered only when `TUSKER_OPENCODE_CLI_ENABLED` is set;
 the code pool opts in through `auto_catalog_providers`, so new free CLI
@@ -1072,3 +1125,14 @@ candidate's stored records.
   output (input remains `$1/M`). Added static slug overrides for
   `kimi-k2.6` and `kimi-k2.7-code`; code/privacy pools now classify all
   catalog models at or above either boundary as heavyweight.
+
+- **2026-11-20**: Cheap-tier pools exclude auto-discovered entries whose
+  cost cannot be established (see *Unpriced entries in cheap pools*).
+  Local hardware providers are exempt. Added the Qwen Max tier
+  (`Qwen/Qwen4-Max`, `Qwen/Qwen3.8-Max*`, `Qwen/Qwen3.7-Max`) to
+  `HEAVYWEIGHT_SLUG_OVERRIDES` — Command Code publishes no price for those
+  routes, so the slug set was the only gate keeping them out of the cheap
+  rotation. Added the bare-name models.dev median price fallback so an
+  unpriced catalog row can still be classified. The LLM Stats rank bonus
+  is now skipped for entries carrying a reduced pool weight so the bonus
+  cannot lift a demoted route into the top selection tier.

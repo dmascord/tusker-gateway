@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from tusker_gateway.max_tokens import (
+    COMMANDCODE_FLOOR,
     DEFAULT_FLOOR,
     REASONING_FLOOR,
     apply_max_tokens_floor,
@@ -104,14 +105,21 @@ class TestIsReasoningModel:
 
 class TestMaxTokensFloor:
     def test_reasoning_returns_floor(self):
-        assert max_tokens_floor("qwen3-8b") == REASONING_FLOOR
+        assert max_tokens_floor("openrouter", "qwen3-8b") == REASONING_FLOOR
         assert REASONING_FLOOR == 2000
 
     def test_non_reasoning_returns_zero(self):
-        assert max_tokens_floor("gpt-4o") == 0
-        assert max_tokens_floor("llama3.2:3b") == 0
-        assert max_tokens_floor("") == DEFAULT_FLOOR
+        assert max_tokens_floor("openrouter", "gpt-4o") == 0
+        assert max_tokens_floor("openrouter", "llama3.2:3b") == 0
+        assert max_tokens_floor("openrouter", "") == DEFAULT_FLOOR
         assert DEFAULT_FLOOR == 0
+
+    def test_commandcode_returns_provider_floor(self):
+        assert max_tokens_floor("commandcode", "gpt-4o") == COMMANDCODE_FLOOR
+        assert COMMANDCODE_FLOOR == 32768
+
+    def test_commandcode_floor_is_case_insensitive(self):
+        assert max_tokens_floor("CommandCode", "gpt-4o") == COMMANDCODE_FLOOR
 
 
 class TestApplyMaxTokensFloor:
@@ -164,3 +172,34 @@ class TestApplyMaxTokensFloor:
         a = apply_max_tokens_floor({"max_tokens": 20}, "mlx-mac", "qwen3-8b")
         b = apply_max_tokens_floor({"max_tokens": 20}, "openai-codex", "qwen3-8b")
         assert a["max_tokens"] == b["max_tokens"] == REASONING_FLOOR
+
+    def test_commandcode_bumps_client_cap_above_thinking_budget(self):
+        # Production failure (req_9ab50f394c513ab2): the gateway default cap
+        # of 16384 rode below Command Code's internal thinking budget of
+        # 24576, and the upstream rejected every dispatch with
+        # "max_completion_tokens [16384] must be greater than thinking_budget
+        # [24576]". The provider floor must lift the cap above the budget.
+        extra = {"max_tokens": 16384}
+        out = apply_max_tokens_floor(extra, "commandcode", "Qwen/Qwen4-Max")
+        assert out is not extra
+        assert out["max_tokens"] == COMMANDCODE_FLOOR == 32768 > 24576
+
+    def test_commandcode_cap_above_floor_unchanged(self):
+        extra = {"max_tokens": COMMANDCODE_FLOOR + 1024}
+        out = apply_max_tokens_floor(extra, "commandcode", "Qwen/Qwen4-Max")
+        assert out is extra
+
+    def test_commandcode_window_floor_interaction(self):
+        # The floored cap must survive fit_output_budget on the 65536
+        # commandcode built-in window (regression for the paired
+        # context_limits fix): window - prompt - safety must not cut the
+        # floor back below the thinking budget.
+        from tusker_gateway.context_limits import fit_output_budget
+
+        floored = apply_max_tokens_floor(
+            {"max_tokens": 16384}, "commandcode", "Qwen/Qwen4-Max"
+        )
+        fitted, budget = fit_output_budget(
+            floored, "commandcode", "Qwen/Qwen4-Max", prompt_estimate=161
+        )
+        assert budget.effective_max_tokens == 32768 > 24576

@@ -73,6 +73,18 @@ HEAVYWEIGHT_SLUG_OVERRIDES: frozenset[str] = frozenset({
     # Synthetic.new large-vision route — backed by Kimi-K3 under the hood
     # ($3/M in, $15/M out). Expensive; keep it out of cheap pools.
     "syn:large:vision",
+    # Qwen Max tier ($1.4-$4/M in, $4-$12/M out at every priced provider).
+    # Command Code publishes no price for Qwen/Qwen4-Max and models.dev has
+    # no commandcode entry, so pricing cannot classify it; the slug set is
+    # the only gate keeping it out of the cheap rotation.
+    "Qwen/Qwen4-Max",
+    "Qwen/Qwen3.8-Max",
+    "Qwen/Qwen3.8-Max-0902",
+    "Qwen/Qwen3.8-Max-Prime",
+    "Qwen/Qwen3.7-Max",
+    "qwen4-max",
+    "qwen3.8-max",
+    "qwen3.7-max",
 })
 
 

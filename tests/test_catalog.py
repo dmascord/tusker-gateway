@@ -35,6 +35,7 @@ from tusker_gateway.catalog import (
     catalog_refresh_loop,
     researched_input_modalities,
 )
+from tusker_gateway.heavyweight import is_heavyweight
 from tusker_gateway.model_capability import ModelCapabilityDB
 
 
@@ -1445,6 +1446,68 @@ def test_registry_pricing_lookup_via_models_dev():
     assert reg._pricing_lookup("unknown-provider", "claude-sonnet-4.6") == (None, None)
 
 
+def test_enrich_pricing_falls_back_to_bare_model_name_across_providers():
+    """Command Code omits prices for some routes and models.dev has no
+    commandcode entry for them, but other providers price the same model.
+    The bare model name must classify it rather than leaving it unpriced.
+    """
+    reg = CatalogRegistry()
+    md = ModelsDevCatalog()
+    md._entries = [
+        CatalogEntry(provider="deepinfra", model="Qwen/Qwen4-Max", cost_input=1.413, cost_output=4.24),
+        CatalogEntry(provider="novita-ai", model="qwen/qwen4-max", cost_input=2.0, cost_output=6.0),
+        CatalogEntry(provider="reseller-ai", model="Qwen/Qwen4-Max", cost_input=20.0, cost_output=50.0),
+        CatalogEntry(provider="commandcode", model="deepseek/deepseek-v4-flash", cost_input=0.15, cost_output=0.6),
+        CatalogEntry(provider="other", model="deepseek-v4-flash", cost_input=9.0, cost_output=9.0),
+    ]
+    reg.register("models.dev", md)
+    cc = ProviderModelsCatalog(provider="commandcode", endpoint="https://api.example.test/models")
+    cc._entries = [
+        CatalogEntry(provider="commandcode", model="Qwen/Qwen4-Max"),
+        CatalogEntry(provider="commandcode", model="deepseek/deepseek-v4-flash"),
+        CatalogEntry(provider="commandcode", model="never-priced-anywhere"),
+    ]
+    reg.register("commandcode", cc)
+
+    reg._enrich_pricing()
+
+    by_model = {e.model: e for e in cc._entries}
+    # Median across providers: the $20/$50 reseller listing must not drag the
+    # classification up, and $1.413/$4.24 and $2/$6 both say heavyweight.
+    assert (by_model["Qwen/Qwen4-Max"].cost_input, by_model["Qwen/Qwen4-Max"].cost_output) == (2.0, 6.0)
+    # An exact provider match wins over the cross-provider fallback.
+    assert (by_model["deepseek/deepseek-v4-flash"].cost_input, by_model["deepseek/deepseek-v4-flash"].cost_output) == (0.15, 0.6)
+    assert by_model["never-priced-anywhere"].cost_input is None
+    assert by_model["never-priced-anywhere"].cost_output is None
+
+
+def test_enrich_pricing_bare_name_fallback_does_not_over_classify():
+    """One expensive reseller listing must not make a cheap model heavy.
+
+    The maximum across providers classified 63 model names as heavyweight
+    that their median price puts in the cheap tier, including the curated
+    privacy-pool route gpt-5.6-luna ($1/$6 listed vs $0.2/$1.2 median).
+    """
+    reg = CatalogRegistry()
+    md = ModelsDevCatalog()
+    md._entries = [
+        CatalogEntry(provider="p1", model="gpt-5.6-luna", cost_input=0.2, cost_output=1.2),
+        CatalogEntry(provider="p2", model="gpt-5.6-luna", cost_input=0.2, cost_output=1.2),
+        CatalogEntry(provider="p3", model="gpt-5.6-luna", cost_input=0.2, cost_output=1.2),
+        CatalogEntry(provider="reseller", model="gpt-5.6-luna", cost_input=1.0, cost_output=6.0),
+    ]
+    reg.register("models.dev", md)
+    cc = ProviderModelsCatalog(provider="commandcode", endpoint="https://api.example.test/models")
+    cc._entries = [CatalogEntry(provider="commandcode", model="gpt-5.6-luna")]
+    reg.register("commandcode", cc)
+
+    reg._enrich_pricing()
+
+    entry = cc._entries[0]
+    assert (entry.cost_input, entry.cost_output) == (0.2, 1.2)
+    assert is_heavyweight("gpt-5.6-luna", cost_input=entry.cost_input, cost_output=entry.cost_output) is False
+
+
 @pytest.mark.asyncio
 async def test_registry_refresh_all_calls_every_client():
     fetch_count = 0
@@ -1798,7 +1861,12 @@ def test_poolmanager_auto_catalog_adds_opted_in_authenticated_models():
         endpoint="https://api.example.test/v4/models",
     )
     zai._entries = [
-        CatalogEntry(provider="zai", model="glm-5.2"),
+        CatalogEntry(
+            provider="zai",
+            model="glm-5.2",
+            cost_input=1.4,
+            cost_output=4.4,
+        ),
         CatalogEntry(
             provider="zai",
             model="glm-4.7",
@@ -1858,7 +1926,12 @@ def test_poolmanager_auto_catalog_marks_heavyweight_entries():
             cost_input=2.0,
             cost_output=10.0,
         ),
-        CatalogEntry(provider="zai", model="glm-lite"),
+        CatalogEntry(
+            provider="zai",
+            model="glm-lite",
+            cost_input=0.15,
+            cost_output=0.5,
+        ),
     ]
     registry.register("zai", zai)
     manager.catalog_registry = registry
@@ -1883,8 +1956,8 @@ def test_poolmanager_auto_catalog_deprioritises_unknown_pricing():
 
     Command Code's authenticated catalog omits pricing for expensive routes
     (deepseek-v4.1-flash-ultrafast bills $2.40/$9.60 per M upstream), so an
-    entry with no price data is not provably free and must sit behind priced
-    candidates until the catalog publishes real numbers.
+    entry with no price data is not provably free. A cheap pool excludes such
+    entries outright; a heavyweight pool keeps them behind the cheap ones.
     """
     from tusker_gateway.config import PoolConfig
     from tusker_gateway.pools import PoolManager
@@ -1893,6 +1966,12 @@ def test_poolmanager_auto_catalog_deprioritises_unknown_pricing():
         "pools": {
             "code": PoolConfig(
                 name="code",
+                models=[],
+                auto_catalog=True,
+                auto_catalog_providers=["commandcode"],
+            ),
+            "premium": PoolConfig(
+                name="premium",
                 models=[],
                 auto_catalog=True,
                 auto_catalog_providers=["commandcode"],
@@ -1927,9 +2006,125 @@ def test_poolmanager_auto_catalog_deprioritises_unknown_pricing():
     manager.extend_pools_with_auto_catalog()
 
     by_model = {m["model"]: m for m in manager.pools["code"].models}
-    assert by_model["paid-but-unpriced"]["weight"] == 0.05
+    assert "paid-but-unpriced" not in by_model
     assert by_model["free-tagged-no-price:free"]["weight"] == 1.0
     assert by_model["cheap-priced"]["weight"] == 1.0
+
+    # The heavyweight pool still admits the unpriced entry, deprioritised
+    # behind priced candidates.
+    premium = {m["model"]: m for m in manager.pools["premium"].models}
+    assert premium["paid-but-unpriced"]["weight"] == 0.05
+
+
+
+def test_poolmanager_auto_catalog_excludes_unpriced_entries_from_cheap_pools():
+    """An unpriced auto-discovered entry must not sit in a cheap pool at all.
+
+    A 0.05 weight only breaks ties inside the top selection tier, so an
+    expensive-but-unpriced route could still win a request outright. Cheap
+    pools now hold back entries that no price source can price.
+    """
+    from tusker_gateway.config import PoolConfig
+    from tusker_gateway.pools import PoolManager
+
+    cfg = {
+        "pools": {
+            "code": PoolConfig(
+                name="code",
+                models=[],
+                auto_catalog=True,
+                auto_catalog_providers=["commandcode"],
+            ),
+            "premium": PoolConfig(
+                name="premium",
+                models=[],
+                auto_catalog=True,
+                auto_catalog_providers=["commandcode"],
+            ),
+        },
+        "excluded_providers": [],
+        "provider_api_keys": {"commandcode": "k-cc"},
+        "quality_db_path": "/tmp/_unused-cc-unpriced.db",
+    }
+    manager = PoolManager(cfg)
+    registry = CatalogRegistry()
+    client = ProviderModelsCatalog(
+        provider="commandcode",
+        endpoint="https://api.example.test/provider/v1/models",
+    )
+    client._entries = [
+        CatalogEntry(provider="commandcode", model="paid-but-unpriced"),
+        CatalogEntry(provider="commandcode", model="free-tagged-no-price:free"),
+        CatalogEntry(
+            provider="commandcode",
+            model="cheap-priced",
+            cost_input=0.15,
+            cost_output=0.5,
+        ),
+    ]
+    registry.register("commandcode", client)
+    manager.catalog_registry = registry
+
+    manager.extend_pools_with_auto_catalog()
+
+    cheap = {m["model"] for m in manager.pools["code"].models}
+    assert "paid-but-unpriced" not in cheap
+    # An explicit free marker still qualifies.
+    assert "free-tagged-no-price:free" in cheap
+    assert "cheap-priced" in cheap
+    # A premium pool keeps heavyweight routes, so the price gate stays off.
+    premium = {m["model"] for m in manager.pools["premium"].models}
+    assert "paid-but-unpriced" in premium
+
+
+def test_poolmanager_auto_catalog_keeps_unpriced_local_entries():
+    """Local hardware routes stay in cheap pools despite having no price.
+
+    An mlx-mac or local-llm model has no per-token price by nature — the
+    operator's own hardware is the cost. Excluding unpriced entries from a
+    cheap pool must not delete real local routes, including the privacy
+    pool's only self-hosted candidates.
+    """
+    from tusker_gateway.config import PoolConfig
+    from tusker_gateway.pools import PoolManager
+
+    cfg = {
+        "pools": {
+            "code": PoolConfig(
+                name="code",
+                models=[],
+                auto_catalog=True,
+                auto_catalog_providers=["mlx-mac"],
+            ),
+        },
+        "excluded_providers": [],
+        "provider_api_keys": {},
+        "quality_db_path": "/tmp/_unused-local-unpriced.db",
+        "providers": {
+            "mlx-mac": {
+                "kind": "local",
+                "base_url": "http://10.0.0.141:11434",
+                "chat_path": "/v1/chat/completions",
+                "models_path": "/api/tags",
+            },
+        },
+    }
+    manager = PoolManager(cfg)
+    registry = CatalogRegistry()
+    client = ProviderModelsCatalog(
+        provider="mlx-mac",
+        endpoint="http://10.0.0.141:11434/api/tags",
+    )
+    client._entries = [
+        CatalogEntry(provider="mlx-mac", model="qwen3.8-27b:latest"),
+    ]
+    registry.register("mlx-mac", client)
+    manager.catalog_registry = registry
+
+    manager.extend_pools_with_auto_catalog()
+
+    cheap = {m["model"] for m in manager.pools["code"].models}
+    assert "qwen3.8-27b:latest" in cheap
 
 
 def test_poolmanager_auto_catalog_excludes_configured_provider():
