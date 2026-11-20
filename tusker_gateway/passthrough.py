@@ -91,15 +91,24 @@ _OPENCODE_REASONING_EFFORT_ALIASES = {
     "maximal": "max",
 }
 
+# Providers whose backends accept the `xhigh` reasoning level natively.
+_XHIGH_CAPABLE_PROVIDERS = frozenset({"opencode-go", "openai-codex"})
 
-def _normalize_reasoning_effort(value: Any) -> Any:
-    """Normalize client aliases accepted by OpenCode/Codex backends."""
+
+def _normalize_reasoning_effort(value: Any, provider: str | None = None) -> Any:
+    """Normalize client aliases accepted by OpenCode/Codex backends.
+
+    ``xhigh`` is an OpenAI/Codex-specific level that most other upstreams
+    (mlx-mac, apim, alibaba, ...) reject with ``invalid reasoning value``.
+    For those providers we downgrade to ``high`` so the request still carries
+    a strong reasoning budget instead of failing the whole turn.
+    """
     if not isinstance(value, str):
         return value
-    return _OPENCODE_REASONING_EFFORT_ALIASES.get(
-        value.strip().lower(),
-        value,
-    )
+    key = value.strip().lower()
+    if key == "xhigh" and (provider or "").strip().lower() not in _XHIGH_CAPABLE_PROVIDERS:
+        return "high"
+    return _OPENCODE_REASONING_EFFORT_ALIASES.get(key, value)
 
 
 # Providers whose reasoning-model deployments reject the legacy
@@ -2993,10 +3002,13 @@ class PassthroughClient:
             # Re-inject thought_signatures clients stripped from assistant
             # tool_calls. Gemini requires them on follow-up turns.
             _gemini_cache().inject_into_messages(body.get("messages") or [])
-        if provider.lower() == _OPENCODE_GO_PROVIDER:
-            effort = body.get("reasoning_effort")
-            if isinstance(effort, str):
-                body["reasoning_effort"] = _normalize_reasoning_effort(effort)
+        # Normalize reasoning_effort for every provider: map aliases and
+        # downgrade `xhigh` for backends that do not accept it (mlx-mac,
+        # apim, alibaba, ...), which otherwise reject the request with
+        # "invalid reasoning value: 'xhigh'".
+        effort = body.get("reasoning_effort")
+        if isinstance(effort, str):
+            body["reasoning_effort"] = _normalize_reasoning_effort(effort, provider)
         from tusker_gateway.protocol_compat import adapt_upstream_chat
         from tusker_gateway.protocol_runtime import verified_features_for_endpoint
         adapt_upstream_chat(
@@ -3151,7 +3163,7 @@ class PassthroughClient:
             if reffort is not None:
                 if not isinstance(body.get("reasoning"), dict):
                     body["reasoning"] = {}
-                body["reasoning"]["effort"] = _normalize_reasoning_effort(reffort)
+                body["reasoning"]["effort"] = _normalize_reasoning_effort(reffort, provider)
             reasoning_override = mapped.pop("reasoning", None)
             if isinstance(reasoning_override, dict):
                 if not isinstance(body.get("reasoning"), dict):
@@ -3167,7 +3179,7 @@ class PassthroughClient:
             if isinstance(reasoning, dict):
                 reasoning.setdefault("summary", "auto")
                 if "effort" in reasoning:
-                    reasoning["effort"] = _normalize_reasoning_effort(reasoning["effort"])
+                    reasoning["effort"] = _normalize_reasoning_effort(reasoning["effort"], provider)
         url = f"{endpoint_raw['base_url']}{endpoint_raw['chat_path']}"
         # Exactly what aiohttp serializes for ``json=body``; held only until the
         # turn resolves so a rejected turn can be audited byte-for-byte. The
