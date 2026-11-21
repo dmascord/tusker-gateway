@@ -44,11 +44,22 @@ provider_adapters = ProviderAdapterRegistry()
 
 
 def _register_builtins() -> None:
-    from tusker_gateway.provider_adapters.claude_code import ClaudeCodeCLIAdapter
-    from tusker_gateway.provider_adapters.opencode_cli import OpenCodeCLIAdapter
+    import os
 
-    provider_adapters.register("claude-code-cli", ClaudeCodeCLIAdapter())
-    provider_adapters.register("opencode-cli", OpenCodeCLIAdapter())
+    worker_url = (os.environ.get("TUSKER_CLI_WORKER_URL") or "").strip()
+    if worker_url:
+        # Delegate process-backed CLI providers to a worker pod so their memory
+        # does not land in the gateway container.
+        from tusker_gateway.provider_adapters.remote_cli import RemoteCLIAdapter
+
+        provider_adapters.register("claude-code-cli", RemoteCLIAdapter("claude-code-cli"))
+        provider_adapters.register("opencode-cli", RemoteCLIAdapter("opencode-cli"))
+    else:
+        from tusker_gateway.provider_adapters.claude_code import ClaudeCodeCLIAdapter
+        from tusker_gateway.provider_adapters.opencode_cli import OpenCodeCLIAdapter
+
+        provider_adapters.register("claude-code-cli", ClaudeCodeCLIAdapter())
+        provider_adapters.register("opencode-cli", OpenCodeCLIAdapter())
 
 
 

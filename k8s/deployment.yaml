@@ -52,6 +52,10 @@ spec:
           value: 'true'
         - name: TUSKER_OPENCODE_CLI_ENABLED
           value: 'true'
+        # Delegate process-backed CLI providers to the worker pod so their
+        # memory (up to ~1 GiB per invocation) cannot OOM the gateway.
+        - name: TUSKER_CLI_WORKER_URL
+          value: 'http://tusker-gateway-worker.hermes.svc.cluster.local:8643'
         # Keep one OpenCode server alive so requests do not each pay a private
         # server start (~6s). The server is released after the idle window, so a
         # long window is the point: it costs ~160MiB resident while warm, and a
