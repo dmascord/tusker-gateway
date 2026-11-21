@@ -77,6 +77,13 @@ class RemoteCLIAdapter:
                     async for line in resp.content:
                         if line:
                             yield line.decode("utf-8", errors="replace")
+                except Exception as exc:  # noqa: BLE001
+                    # Worker connection dropped mid-stream; surface as a
+                    # ProviderError so the gateway can render a verdict.
+                    raise ProviderError(
+                        f"worker stream interrupted: {exc}",
+                        code="worker_stream_interrupted",
+                    )
                 finally:
                     await resp.release()
                     await session.close()

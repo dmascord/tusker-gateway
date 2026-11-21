@@ -70,9 +70,18 @@ async def chat(request: web.Request) -> web.Response:
             headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"},
         )
         await resp.prepare(request)
-        async for chunk in result:
-            data = chunk.encode("utf-8") if isinstance(chunk, str) else bytes(chunk)
-            await resp.write(data)
+        try:
+            async for chunk in result:
+                data = chunk.encode("utf-8") if isinstance(chunk, str) else bytes(chunk)
+                await resp.write(data)
+        except Exception as exc:  # noqa: BLE001 - convert to SSE error frame
+            import json as _json
+
+            err = _json.dumps(
+                {"error": {"message": str(exc), "code": getattr(exc, "code", None)}}
+            )
+            await resp.write(f"data: {err}\\n\\n".encode("utf-8"))
+            await resp.write(b"data: [DONE]\\n\\n")
         await resp.write_eof()
         return resp
 
