@@ -18,15 +18,27 @@ import aiohttp
 from tusker_gateway.errors import ProviderError, ProviderRouteDisabledError
 
 
-def _worker_url() -> str:
-    return (os.environ.get("TUSKER_CLI_WORKER_URL") or "").strip().rstrip("/")
-
-
 class RemoteCLIAdapter:
     """Adapter proxying CLI chat completions to a worker service."""
 
-    def __init__(self, provider: str) -> None:
+    def __init__(self, provider: str, worker_url: str | None = None) -> None:
         self._provider = provider
+        self._worker_url = (worker_url or "").strip().rstrip("/")
+
+    def _url(self) -> str:
+        if self._worker_url:
+            return self._worker_url
+        import os
+
+        # Backwards-compatible fallbacks for a single shared worker.
+        for env in (
+            "TUSKER_OPENCODE_WORKER_URL" if self._provider == "opencode-cli" else "TUSKER_CLAUDE_WORKER_URL",
+            "TUSKER_CLI_WORKER_URL",
+        ):
+            value = (os.environ.get(env) or "").strip().rstrip("/")
+            if value:
+                return value
+        return ""
 
     async def chat(
         self,
@@ -38,7 +50,7 @@ class RemoteCLIAdapter:
         tools: list[dict[str, Any]] | None = None,
         tool_choice: Any = None,
     ) -> dict[str, Any] | AsyncIterator[str]:
-        url = _worker_url()
+        url = self._url()
         if not url:
             raise ProviderRouteDisabledError(provider)
 
