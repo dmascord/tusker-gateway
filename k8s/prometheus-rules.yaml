@@ -139,3 +139,21 @@ spec:
           for: 5m
           labels:
             severity: warning
+
+        - alert: PrometheusStorageAlmostFull
+          annotations:
+            description: Prometheus TSDB PVC has less than 15% free space; ingestion may stop before retention compaction catches up.
+            summary: Prometheus storage almost full
+          expr: kubelet_volume_stats_available_bytes{namespace="monitoring",persistentvolumeclaim=~"prometheus.*"} / kubelet_volume_stats_capacity_bytes{namespace="monitoring",persistentvolumeclaim=~"prometheus.*"} < 0.15
+          for: 15m
+          labels:
+            severity: critical
+
+        - alert: PrometheusIngestionStalled
+          annotations:
+            description: Prometheus has healthy scrape targets but appended no samples for 10 minutes; investigate TSDB/PVC pressure.
+            summary: Prometheus ingestion stalled
+          expr: sum(up{job=~"kubelet|kube-state-metrics|tusker-gateway"}) > 0 and increase(prometheus_tsdb_head_samples_appended_total[10m]) == 0
+          for: 10m
+          labels:
+            severity: critical
