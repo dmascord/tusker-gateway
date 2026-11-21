@@ -22,7 +22,7 @@ spec:
         fsGroupChangePolicy: OnRootMismatch
       containers:
       - name: tusker-claude-worker
-        image: registry.tusker.net.au:5000/tusker-gateway@sha256:8722ff56f03b7b66b65d1f25ced757d7a03c57c6a38a89f80ce19adb2f8fc65e
+        image: registry.tusker.net.au:5000/tusker-gateway@sha256:800cd56fd2326384889e014d6fa4eca2ff99b934956d328bfbfca9c3f971b9af
         imagePullPolicy: Always
         command: ["tini", "--", "python", "-m", "tusker_gateway.worker"]
         envFrom:
