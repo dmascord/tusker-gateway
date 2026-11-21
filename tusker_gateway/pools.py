@@ -726,6 +726,7 @@ class PoolManager:
                 if catalog_models is not None and self._outbound_model(provider, model) in catalog_models:
                     count += 1
             confirmed[pool_name] = count
+        self._value_cost_model._cached_at = 0.0
         logger.info("catalog confirmed %s pool entries", confirmed)
         return confirmed
     def extend_pools_with_auto_catalog(self) -> dict[str, list[str]]:
