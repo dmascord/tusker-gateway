@@ -814,18 +814,6 @@ DEFAULT_PROVIDER_REGISTRY: dict[str, ProviderConfig] = {
         models_path="/models",
         zdr_ok=True,
     ),
-    # Windsurf (Codeium) chat API — OpenAI-compatible chat/completions with a
-    # Windsurf API key (`apk_user_...`). The consumer free tier is not a ZDR
-    # boundary, so this route must stay out of the privacy pool.
-    "windsurf": ProviderConfig(
-        "windsurf",
-        "bearer",
-        "https://api.windsurf.com",
-        "/v1/chat/completions",
-        auth_env="WINDSURF_API_KEY",
-        zdr_ok=False,
-        models_path="/v1/models",
-    ),
     "openai-codex": ProviderConfig(
         "openai-codex",
         "codex",
