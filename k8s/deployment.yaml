@@ -98,6 +98,13 @@ spec:
         # rate limits, budgets, and idempotency fail explicitly with 503.
         - name: TUSKER_STATE_DATABASE_CONNECT_TIMEOUT
           value: '2'
+        # Value routing is observable but non-disruptive until explicitly enabled.
+        - name: TUSKER_VALUE_ROUTING
+          value: 'shadow'
+        - name: TUSKER_PROVIDER_PLANS
+          value: '{}'
+        - name: TUSKER_BUDGET_PACING_THRESHOLD
+          value: '0.8'
         - name: TUSKER_STATE_DEGRADED_MODE
           value: advisory
         # The response cache is disposable; keep it off the shared RWX volume

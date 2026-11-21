@@ -11,7 +11,7 @@ Read in order when picking up the repo:
 |---|---|
 | `README.md` | Architecture overview (config, auth, pools, routing, app). |
 | `docs/solution.md` | Why this exists, scope boundaries. |
-| `docs/gateway-model-routing.md` | Pool tiers, heavyweight gate, role aliases, auto_free opt-in. |
+| `docs/gateway-model-routing.md` | Pool tiers, heavyweight gate, role aliases, auto_free opt-in, and shadow-first value routing. |
 | `docs/deployment-k8s.md` | Cluster topology, source paths, image registry, deploy procedure. |
 | `docs/capability-catalog.md` | v0.1.0 capability list (shipped surface). |
 | `docs/feature-matrix-and-plan.md` | Roadmap vs. peer gateways. |

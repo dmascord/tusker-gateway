@@ -321,6 +321,19 @@ def load_config() -> dict[str, Any]:
     ]
 
     # Normalized provider registry and API-key map.
+    raw_provider_plans = os.environ.get("TUSKER_PROVIDER_PLANS", "").strip()
+    try:
+        config["provider_plans"] = json.loads(raw_provider_plans) if raw_provider_plans else {}
+    except (TypeError, ValueError):
+        logger.warning("invalid TUSKER_PROVIDER_PLANS JSON; ignoring")
+        config["provider_plans"] = {}
+    try:
+        config["budget_pacing_threshold"] = float(
+            os.environ.get("TUSKER_BUDGET_PACING_THRESHOLD", "0.8")
+        )
+    except (TypeError, ValueError):
+        config["budget_pacing_threshold"] = 0.8
+
     config["providers"] = _load_providers()
     raw_providers: dict[str, str] = {}
     json_raw = os.environ.get("PROVIDER_API_KEYS", "").strip()
@@ -801,6 +814,7 @@ DEFAULT_PROVIDER_REGISTRY: dict[str, ProviderConfig] = {
         models_path="/models",
         zdr_ok=True,
     ),
+        models_path="/v1/models",
     "openai-codex": ProviderConfig(
         "openai-codex",
         "codex",

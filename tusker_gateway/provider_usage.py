@@ -528,6 +528,32 @@ class ProviderUsageDB:
             )
         }
         return {"usage_day": day, "groups": groups, "totals": totals}
+    def window_spend_rows(self) -> list[tuple[str, str, str, int, int]]:
+        """Return token rows needed for provider budget-window calculations.
+
+        The value router uses the existing daily ledger rather than creating
+        a second spend store. Rows are bounded to the retention horizon by
+        the caller, and this method returns no request content or credentials.
+        """
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT provider, model, usage_day, prompt_tokens,
+                       completion_tokens
+                FROM provider_usage_daily
+                """
+            ).fetchall()
+        return [
+            (
+                str(row[0]),
+                str(row[1]),
+                str(row[2]),
+                int(row[3] or 0),
+                int(row[4] or 0),
+            )
+            for row in rows
+        ]
+
 
 
 __all__ = [

@@ -3,6 +3,41 @@
 How the gateway picks a (provider, model) pair when a client sends a virtual
 alias like `hermes-code`, `hermes-privacy`, `hermes-premium`, or `hermes-swarm`.
 
+
+## Value-weighted routing (shadow-first)
+
+Eligible routes can be ranked using reliability, model strength, latency, and
+effective cost under the provider's subscription plan. Configure plan economics
+under `provider_plans` in runtime config:
+
+```json
+{
+  "provider_plans": {
+    "commandcode": {
+      "multiplier": 0.143,
+      "window_5h_usd": 14,
+      "window_week_usd": 35,
+      "trains_on_data": false,
+      "retention_days": 0
+    }
+  }
+}
+```
+
+`TUSKER_VALUE_ROUTING` is read per request and defaults to `shadow`:
+
+- `shadow`: compute value ranking and record actual→value divergences, while
+  preserving existing quality-ranked selection.
+- `actual`: use value-adjusted ranking after eligibility and privacy filters.
+- `off`: skip value scoring.
+
+Unknown catalog prices receive no value credit and cannot win solely because
+their price is missing. Subscription-window spend comes from the provider
+usage ledger at list price. Pacing decays only the value term and withholds a
+route after a configured window is exhausted.
+
+`trains_on_data: true` is a hard privacy exclusion for ZDR pools. It does not
+affect non-private pools. Provider `zdr_ok` remains a separate required gate.
 ## Pool tiers
 
 The gateway has four pools, each with a different tier of models:
