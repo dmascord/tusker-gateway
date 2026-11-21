@@ -1,7 +1,7 @@
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: allow-tusker-gateway-to-cli-worker
+  name: allow-tusker-gateway-to-opencode-worker
   namespace: hermes
 spec:
   ingress:
@@ -14,6 +14,6 @@ spec:
       protocol: TCP
   podSelector:
     matchLabels:
-      app: tusker-gateway-worker
+      app: tusker-opencode-worker
   policyTypes:
   - Ingress

@@ -1,0 +1,19 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-tusker-gateway-to-claude-worker
+  namespace: hermes
+spec:
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: tusker-gateway
+    ports:
+    - port: 8643
+      protocol: TCP
+  podSelector:
+    matchLabels:
+      app: tusker-claude-worker
+  policyTypes:
+  - Ingress
