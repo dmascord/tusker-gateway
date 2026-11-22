@@ -832,6 +832,7 @@ def _record_durable_auth_failure(
 def _interleave_probe_candidates(
     pairs: list[tuple[str, str]],
     capability_db: ModelCapabilityDB,
+    capability: str = COMPOSITE_CAPABILITY,
 ) -> list[tuple[str, str]]:
     """Order due routes so one provider cannot consume the whole bounded batch.
 
@@ -848,11 +849,14 @@ def _interleave_probe_candidates(
     within its provider. Both tiers are interleaved provider by provider, so
     a bounded batch still spans every provider instead of spending itself on
     the provider with the most stale records.
+
+    ``capability`` selects which evidence column is consulted, so the same
+    starvation guard applies to privacy-policy probes as to composite ones.
     """
     unprobed: dict[str, list[tuple[str, str]]] = {}
     stale: dict[str, list[tuple[float, tuple[str, str]]]] = {}
     for pair in pairs:
-        record = capability_db.get(*pair, COMPOSITE_CAPABILITY)
+        record = capability_db.get(*pair, capability)
         if record is None:
             unprobed.setdefault(pair[0], []).append(pair)
         else:

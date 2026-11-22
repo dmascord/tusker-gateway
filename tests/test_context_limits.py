@@ -48,6 +48,28 @@ def test_model_key_wins_over_provider_key(windows):
     assert declared_context_window("openai-codex", "some-unknown-model") == 128_000
 
 
+def test_apim_luna_context_window_is_the_total_window_not_the_output_cap(monkeypatch):
+    """APIM gpt-5.6-luna: 1,050,000 total context, 128,000 max OUTPUT.
+
+    The upstream /models row carries no context field, so without the
+    model-scoped override the built-in apim 128,000 fallback filtered a
+    212K-token privacy request out entirely (req_4ae4a2134158c498, 2026-11-22).
+    The 128,000 figure is the output cap, not the prompt window.
+    """
+    monkeypatch.setenv(
+        "TUSKER_CONTEXT_WINDOW_OVERRIDES_JSON",
+        json.dumps({"apim/gpt-5.6-luna": 1050000}),
+    )
+    assert declared_context_window("apim", "gpt-5.6-luna") == 1_050_000
+    # Other APIM models keep the conservative built-in; the override is model-scoped.
+    assert declared_context_window("apim", "gpt-6-luna") == 128_000
+
+    body, budget = fit_output_budget({"max_tokens": 16384}, "apim", "gpt-5.6-luna", 208379)
+    assert body["max_tokens"] == 16384
+    assert budget.window == 1_050_000
+    assert not budget.clamped
+
+
 def test_published_and_learned_windows_take_precedence_over_override(monkeypatch):
     monkeypatch.setenv(
         "TUSKER_CONTEXT_WINDOW_OVERRIDES_JSON",

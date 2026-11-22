@@ -165,15 +165,29 @@ async def run_privacy_qualification(
                 if spec.auto_discovered
             }
         )
+    from tusker_gateway.tool_qualification import _interleave_probe_candidates
+
     if not force:
+        # A bounded batch must not be spent re-probing the same alphabetically
+        # first routes when their provider is quota-blocked: on 2026-11-22 the
+        # eight ``commandcode/Qwen/*`` routes were re-probed every cycle and
+        # returned ``unavailable`` each time, so the other ~180 auto-discovered
+        # privacy routes were never examined. Treat transient ``unavailable``
+        # evidence as due, matching behavioural/composite qualification.
+        now = time.time()
         pairs = [
             pair
             for pair in pairs
-            if _needs_probe(
-                capability_db.get(pair[0], pair[1], PRIVACY_ZDR_CAPABILITY),
-                max_age_secs=max_age_secs,
+            if (
+                (record := capability_db.get(*pair, PRIVACY_ZDR_CAPABILITY)) is None
+                or record.probe_version != PRIVACY_ZDR_PROBE_VERSION
+                or now - record.checked_at >= max_age_secs
+                or str(record.status or "").lower() == "unavailable"
             )
         ]
+    # Interleave even for explicit force runs: a bounded --limit must span
+    # providers rather than draining the first one alphabetically.
+    pairs = _interleave_probe_candidates(pairs, capability_db, PRIVACY_ZDR_CAPABILITY)
     if limit is not None:
         pairs = pairs[: max(0, limit)]
     logger.info(
@@ -208,14 +222,6 @@ async def run_privacy_qualification(
             return result
 
     return await asyncio.gather(*(one(pair) for pair in pairs))
-
-
-def _needs_probe(record: Any, *, max_age_secs: float) -> bool:
-    if record is None:
-        return True
-    if record.probe_version != PRIVACY_ZDR_PROBE_VERSION:
-        return True
-    return (time.time() - record.checked_at) >= max_age_secs
 
 
 def main(argv: list[str] | None = None) -> int:

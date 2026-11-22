@@ -689,8 +689,15 @@ spec:
         # silently assumed to support it. Jetson has only 8 GiB RAM, so do
         # not declare a blanket context override there; the coder model's
         # Modelfile explicitly sets 8192.
+        # APIM serves gpt-5.6-luna from Azure OpenAI / Microsoft Foundry with a
+        # 1,050,000-token TOTAL context window; the 128,000-token figure is the
+        # per-response OUTPUT limit, not the prompt window. The upstream /models
+        # row carries no context field, so without this override the built-in
+        # apim 128,000 fallback filtered long-context privacy requests out
+        # (2026-11-22, req_4ae4a2134158c498). Keep this model-scoped: other APIM
+        # models may have different windows.
         - name: TUSKER_CONTEXT_WINDOW_OVERRIDES_JSON
-          value: '{"mlx-mac/ornith-1.5:35b": 262144, "mlx-mac/qwen3.8-27b": 262144, "mlx-mac/shirdel-coder-9b-claude-fable-5": 262144, "local-llm/qwopus-9b-coder-mtp": 8192}'
+          value: '{"apim/gpt-5.6-luna": 1050000, "mlx-mac/ornith-1.5:35b": 262144, "mlx-mac/qwen3.8-27b": 262144, "mlx-mac/shirdel-coder-9b-claude-fable-5": 262144, "local-llm/qwopus-9b-coder-mtp": 8192}'
         # Per-provider streaming per-chunk idle budget overrides (seconds).
         # xiaomi/mimo large contexts regularly exceed the default 120s wall
         # clock — extend the per-chunk budget so streaming generation completes
