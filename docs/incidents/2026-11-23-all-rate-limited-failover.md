@@ -60,8 +60,23 @@ healthy candidate still reach the third dispatch.
 
 ### Deployed
 
-Final source `2a2d41aa9532fdc1596f95610015ae24aa63fc79`, image
-`sha256:5af85cdc00ea896afed9169af61ecc7e82c66ce0f6644b7abe1f415011281864`;
+Final source `f65cf8fd7f1cc53fdc3cbcd59a24e52f3cf3888c`, image
+`sha256:bc807cf71ee200979f28715b0d0f093c3c917988de3d71c3de9e2c30087dfcfa`;
 provenance OK, smoke 200/200. The original request ID was not present in
 current pod logs (pods had rotated), so the fix is based on the error shape,
 sibling request traces, and current provider state.
+
+### Post-deploy measurement and final correction
+
+Over 168 chat requests after the first deploy: 164 × 200, 4 × 502 (97.6%
+success). 429s now surfaced as actionable 429s ("retry in about 60s", 3600s,
+etc.). However the cap extension never engaged: every remaining
+`all_candidates_failed` chain contained 11 429s **plus one non-429 failure**
+(e.g. `req_53e75b4f75fe429e`: 11 Google quota 429s + one synthetic
+provider_error), so the "all failures were 429" precondition was false.
+
+Final correction: refund the attempt slot on **every** 429 regardless of the
+other failure classes; only the 3× hard dispatch ceiling bounds total work.
+Regression test updated to the mixed case (429 + provider_error + healthy
+candidate with `TUSKER_MAX_PROVIDER_ATTEMPTS=2`). Suite 2219 passed; deployed
+and confirmed live.
