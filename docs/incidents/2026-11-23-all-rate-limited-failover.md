@@ -37,10 +37,31 @@ be all rate-limited.
 
 Full offline suite: 2218 passed, 8 skipped.
 
+### Follow-up: the 12-attempt cap itself
+
+Log forensics on sibling requests showed the deeper cause: 10 of 12 attempts
+were spent on quota-exhausted `google` routes, and healthy providers
+(`synthetic`, `openrouter`, `opencode-cli`, `openai-codex`) further down the
+ranking were never reached. Two ideas were rejected:
+- recording 429s as permanent quality failures — a 429 is transient capacity
+  and must not demote a route after its quota window resets;
+- excluding a provider after its first 429 — `google` quotas are model-scoped,
+  and cycling through every model is intentional.
+
+Instead, rate-limit failures no longer consume the bounded **viable-attempt**
+budget: while every failure in the chain is a 429, the failover keeps walking
+the ranked list. A hard ceiling of 3× the configured attempts bounds total
+upstream dispatches. Quality scores and cooldown behavior are untouched —
+cooldown routes are still filtered out before ranking and re-enter when their
+window expires.
+
+Regression test: with `TUSKER_MAX_PROVIDER_ATTEMPTS=2`, two 429s followed by a
+healthy candidate still reach the third dispatch.
+
 ### Deployed
 
-Source `87444f933c0ebcd31d602bd9daa3240e6de73d78`, image
-`sha256:93f6da6ee7a4f9bc8c8f455964415bfba3691ec92154344a9ff0fcf06c7d3d0b`;
-provenance OK, smoke 200/200, rate-limit branch confirmed live in the deployed
-module. The original request ID was not present in current pod logs (pods had
-rotated), so the fix is based on the error shape and current provider state.
+Final source `2a2d41aa9532fdc1596f95610015ae24aa63fc79`, image
+`sha256:5af85cdc00ea896afed9169af61ecc7e82c66ce0f6644b7abe1f415011281864`;
+provenance OK, smoke 200/200. The original request ID was not present in
+current pod logs (pods had rotated), so the fix is based on the error shape,
+sibling request traces, and current provider state.
