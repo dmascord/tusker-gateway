@@ -585,8 +585,11 @@ spec:
           value: 'true'
         - name: TUSKER_COMPOSITE_QUALIFICATION_LIMIT
           value: '16'
+        # Reasoning models can take 60-100s to finish a composite probe once
+        # they have a 16k output budget; the old 45s cap re-flipped passing
+        # synthetic routes to "unavailable" on the next periodic cycle.
         - name: TUSKER_COMPOSITE_QUALIFICATION_TIMEOUT_SECS
-          value: '45'
+          value: '120'
         - name: TUSKER_COMPOSITE_QUALIFICATION_MAX_AGE_SECS
           value: '86400'
         - name: TUSKER_COMPOSITE_QUALIFICATION_INTERVAL_SECS
