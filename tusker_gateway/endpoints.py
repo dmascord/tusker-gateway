@@ -46,6 +46,7 @@ from tusker_gateway.errors import (
     ProviderCapacityError,
     ProviderEmptyStreamError,
     ProviderError,
+    ProviderFailoverError,
     ProviderRouteDisabledError,
     ProviderStreamClosedError,
     ProviderStreamLoopError,
@@ -5382,6 +5383,32 @@ async def _call_with_pool_fallback(
 
     excluded: set[tuple[str, str]] = set(excluded_candidates or ())
     last_error: Exception | None = None
+    # Every candidate that failed in this request, in dispatch order. When the
+    # pool is exhausted the terminal error must describe the whole failover,
+    # not just the last candidate (which is usually a timeout after earlier
+    # resets/capacity rejections). Labels are gateway-authored codes or class
+    # names - never raw upstream bodies - so the summary is client-safe.
+    candidate_failures: list[dict[str, str]] = []
+
+    def _record_failure(exc: BaseException) -> None:
+        candidate_failures.append(
+            {
+                "provider": provider,
+                "model": model,
+                "class": str(getattr(exc, "code", None) or type(exc).__name__),
+            }
+        )
+
+    def _terminal_error() -> Exception:
+        """Aggregate the failover, falling back to the last single error."""
+        distinct_candidates = {
+            (item["provider"], item["model"])
+            for item in candidate_failures
+        }
+        if len(distinct_candidates) < 2 or last_error is None:
+            return last_error or NoHealthyModelsError(pool=pool_name)
+        return ProviderFailoverError(candidate_failures)
+
     # Prefer the app-level PoolManager (so catalog refresh + session
     # stickiness are shared); fall back to a per-request instance.
     if request is not None:
@@ -5431,9 +5458,7 @@ async def _call_with_pool_fallback(
                 attempts,
                 _pool_failure_summary(last_error) if last_error is not None else "none",
             )
-            if last_error is not None:
-                raise last_error
-            raise NoHealthyModelsError(pool=pool_name)
+            raise _terminal_error()
         # A semantic-cache lookup resolves a concrete candidate first so the
         # cached response cannot be returned for a different provider/model.
         if pending_selection is not None:
@@ -5554,9 +5579,7 @@ async def _call_with_pool_fallback(
                         else "no eligible candidate"
                     ),
                 )
-            if last_error is not None:
-                raise last_error
-            raise NoHealthyModelsError(pool=pool_name)
+            raise _terminal_error()
         decision = BreakerDecision(allowed=True, state=None)
         if breaker is not None:
             decision = await asyncio.to_thread(
@@ -5747,6 +5770,7 @@ async def _call_with_pool_fallback(
                 )
             _mark_permanently_failed(timeout_exc, provider, model)
             last_error = timeout_exc
+            _record_failure(timeout_exc)
             excluded.add(selected)
             if request is not None:
                 set_access_log_context(
@@ -5789,6 +5813,7 @@ async def _call_with_pool_fallback(
                 )
             internal_failure = _internalize_github_copilot_rate_limit(provider, exc)
             last_error = internal_failure or exc
+            _record_failure(last_error)
             excluded.add(selected)
             if request is not None:
                 set_access_log_context(
@@ -5818,6 +5843,7 @@ async def _call_with_pool_fallback(
             # Try another pool candidate if one exists, but keep this local
             # credential problem out of breaker/quarantine health signals.
             last_error = exc
+            _record_failure(exc)
             excluded.add(selected)
             if request is not None:
                 set_access_log_context(
@@ -5840,6 +5866,7 @@ async def _call_with_pool_fallback(
             # A denied candidate never gets another tool attempt in this request.
             # Exclude it immediately and let the pool select a different model.
             last_error = exc
+            _record_failure(exc)
             excluded.add(selected)
             if request is not None:
                 set_access_log_context(
@@ -5887,6 +5914,7 @@ async def _call_with_pool_fallback(
                     )
             _mark_permanently_failed(exc, provider, model)
             last_error = exc
+            _record_failure(exc)
             excluded.add(selected)
             if request is not None:
                 set_access_log_context(

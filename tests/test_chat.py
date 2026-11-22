@@ -23,6 +23,7 @@ from tusker_gateway.errors import (
     ProviderCapacityError,
     ProviderEmptyStreamError,
     ProviderError,
+    ProviderFailoverError,
     ProviderRouteDisabledError,
     RateLimitError,
     ToolCallContractError,
@@ -866,6 +867,81 @@ async def test_pool_fallback_bounded_per_attempt_timeout():
     # The silent candidate was excluded from the second selection.
     second_call_excluded = pool_manager.select.call_args_list[1].kwargs["excluded"]
     assert ("ollama-cloud", "minimax-m3") in second_call_excluded
+
+
+@pytest.mark.asyncio
+async def test_pool_exhaustion_reports_all_candidate_failures():
+    """The terminal error must not blame only the last candidate.
+
+    Regression for req_4ae4a2134158c498 (2026-11-22): four privacy candidates
+    failed with two connection resets, a capacity rejection and a final idle
+    timeout, but the client was told only "Provider candidate exceeded its
+    per-attempt timeout". The failover verdict must describe every failure.
+    """
+    pool_manager = MagicMock()
+    pool_manager.fallback_pools.return_value = ()
+    candidates = iter(
+        [
+            ("openai-codex", "gpt-5.6-luna"),
+            ("mlx-mac", "qwen3.8-27b"),
+            ("opencode-go", "gpt-6-luna"),
+        ]
+    )
+    # None after the three candidates: the recovery and tool-compatibility
+    # probe passes find nothing else and the loop terminates.
+    pool_manager.select.side_effect = lambda *_a, **_k: next(candidates, None)
+
+    reset = aiohttp.ClientOSError(104, "Connection reset by peer")
+    capacity = ProviderCapacityError(group="mlx-mac")
+    timeout = ProviderError(
+        "Provider candidate exceeded its per-attempt timeout", code="provider_timeout"
+    )
+    timeout.upstream_status = 504
+    upstream = MagicMock()
+    upstream.chat = AsyncMock(side_effect=[reset, capacity, timeout])
+
+    with pytest.raises(ProviderFailoverError) as excinfo:
+        await _call_with_pool_fallback(
+            {"pools": {}},
+            {"model": "hermes-privacy", "messages": [{"role": "user", "content": "hello"}]},
+            upstream,
+            request=SimpleNamespace(app={"pool_manager": pool_manager}),
+        )
+
+    exc = excinfo.value
+    assert exc.code == "all_candidates_failed"
+    assert len(exc.failures) == 3
+    message = str(exc)
+    assert "All 3 eligible provider candidates failed" in message
+    assert "connection reset" in message
+    assert "capacity unavailable" in message
+    assert "timeout" in message
+    # The misleading single-candidate wording must not survive.
+    assert "per-attempt timeout" not in message
+    # Every raw upstream body stays out of the client-safe message.
+    assert "Connection reset by peer" not in message
+
+
+@pytest.mark.asyncio
+async def test_single_candidate_failure_keeps_its_original_error():
+    """A lone failure must still surface the provider's own error verbatim."""
+    pool_manager = MagicMock()
+    pool_manager.fallback_pools.return_value = ()
+    pool_manager.select.side_effect = [("openai", "gpt-5"), None, None]
+    upstream = MagicMock()
+    upstream.chat = AsyncMock(
+        side_effect=ProviderError("upstream said no", code="provider_error")
+    )
+
+    with pytest.raises(ProviderError) as excinfo:
+        await _call_with_pool_fallback(
+            {"pools": {}},
+            {"model": "hermes-code", "messages": [{"role": "user", "content": "hi"}]},
+            upstream,
+            request=SimpleNamespace(app={"pool_manager": pool_manager}),
+        )
+    assert excinfo.value.code == "provider_error"
+    assert not isinstance(excinfo.value, ProviderFailoverError)
 
 
 @pytest.mark.asyncio
