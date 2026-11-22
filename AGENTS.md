@@ -35,6 +35,7 @@ Read in order when picking up the repo:
 | `docs/incidents/2026-11-22-privacy-probe-starvation.md` | Privacy probe re-tested the same quota-blocked prefix forever; interleave due routes across providers. Includes context-window evidence check. |
 | `docs/incidents/2026-11-22-synthetic-image-tools-qualification.md` | Four gates for synthetic image+tools routing; composite probe output cap and 120s timeout. |
 | `docs/incidents/2026-11-23-privacy-pool-full-audit.md` | All 200 privacy routes audited against four gates; 8 eligible for image+tools+212K. |
+| `docs/incidents/2026-11-23-code-pool-audit.md` | 355 code routes audited; 24 eligible for image+tools+212K, google modality probes added three. |
 | `TODO.md` | Active cross-session work items. |
 
 
