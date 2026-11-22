@@ -201,7 +201,7 @@ class ProviderFailoverError(ProviderError):
         "ClientPayloadError": "connection reset",
     }
 
-    def __init__(self, failures: list[dict[str, str]]) -> None:
+    def __init__(self, failures: list[dict[str, Any]]) -> None:
         self.failures = list(failures)
         counts: dict[str, int] = {}
         for item in self.failures:

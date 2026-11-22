@@ -4600,6 +4600,10 @@ def _internalize_github_copilot_rate_limit(
     )
 
 
+# Failure labels recorded by _record_failure that mean "upstream 429".
+_RATE_LIMIT_FAILURE_CLASSES = frozenset({"rate_limit_exceeded", "RateLimitError"})
+
+
 def _provider_rate_limit_is_external(exc: BaseException) -> bool:
     """Whether a provider 429 may be reported to the client as a 429."""
     provider = str(getattr(exc, "provider", "") or "").strip().lower()
@@ -5389,15 +5393,20 @@ async def _call_with_pool_fallback(
     # not just the last candidate (which is usually a timeout after earlier
     # resets/capacity rejections). Labels are gateway-authored codes or class
     # names - never raw upstream bodies - so the summary is client-safe.
-    candidate_failures: list[dict[str, str]] = []
+    candidate_failures: list[dict[str, Any]] = []
     context_failures: list[dict[str, int]] = []
 
     def _record_failure(exc: BaseException) -> None:
+        label = str(getattr(exc, "code", None) or type(exc).__name__)
+        retry_after = (
+            _retry_after_seconds_for_exc(exc) if isinstance(exc, RateLimitError) else None
+        )
         candidate_failures.append(
             {
                 "provider": provider,
                 "model": model,
-                "class": str(getattr(exc, "code", None) or type(exc).__name__),
+                "class": label,
+                "retry_after": retry_after,
             }
         )
 
@@ -5419,6 +5428,25 @@ async def _call_with_pool_fallback(
         }
         if len(distinct_candidates) < 2 or last_error is None:
             return last_error or NoHealthyModelsError(pool=pool_name)
+        # A uniform rate-limit exhaustion is a capacity signal, not a generic
+        # provider failure. Render it as a 429 with a concrete Retry-After so
+        # the client can back off instead of retrying into the same exhausted
+        # pool (req_1be799418c9eae87, 2026-11-23).
+        if all(item["class"] in _RATE_LIMIT_FAILURE_CLASSES for item in candidate_failures):
+            windows = [
+                int(item["retry_after"])
+                for item in candidate_failures
+                if item.get("retry_after")
+            ]
+            retry_after = (
+                min(windows) if windows else _retry_after_seconds_for_exc(RateLimitError())
+            )
+            return RateLimitError(
+                "All eligible provider candidates are rate limited; retry after "
+                f"the shortest upstream window ({retry_after}s).",
+                code="rate_limit_exceeded",
+                headers={"Retry-After": str(retry_after)},
+            )
         return ProviderFailoverError(candidate_failures)
 
     # Prefer the app-level PoolManager (so catalog refresh + session

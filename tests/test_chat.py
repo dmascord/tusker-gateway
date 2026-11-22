@@ -923,6 +923,40 @@ async def test_pool_exhaustion_reports_all_candidate_failures():
 
 
 @pytest.mark.asyncio
+async def test_uniform_rate_limit_exhaustion_is_a_429_with_retry_after():
+    """All-rate-limit failover must be actionable, not a generic 502.
+
+    Regression for req_1be799418c9eae87 (2026-11-23): twelve candidates all
+    returned 429, but the client saw "All 12 eligible provider candidates
+    failed: rate limited x12" as a provider_error with no Retry-After.
+    """
+    pool_manager = MagicMock()
+    pool_manager.fallback_pools.return_value = ()
+    candidates = iter([("provider-a", "model-a"), ("provider-b", "model-b")])
+    pool_manager.select.side_effect = lambda *_a, **_k: next(candidates, None)
+    upstream = MagicMock()
+    upstream.chat = AsyncMock(
+        side_effect=[
+            RateLimitError(body='{"error":{"message":"rate limited"}}', headers={"Retry-After": "90"}),
+            RateLimitError(body='{"error":{"message":"rate limited"}}', headers={"Retry-After": "30"}),
+        ]
+    )
+
+    with pytest.raises(RateLimitError) as excinfo:
+        await _call_with_pool_fallback(
+            {"pools": {}},
+            {"model": "hermes-code", "messages": [{"role": "user", "content": "hi"}]},
+            upstream,
+            request=SimpleNamespace(app={"pool_manager": pool_manager}),
+        )
+    exc = excinfo.value
+    assert exc.code == "rate_limit_exceeded"
+    assert exc.headers["Retry-After"] == "30"  # shortest upstream window
+    assert exc.status == 429
+    assert not isinstance(exc, ProviderFailoverError)
+
+
+@pytest.mark.asyncio
 async def test_single_candidate_failure_keeps_its_original_error():
     """A lone failure must still surface the provider's own error verbatim."""
     pool_manager = MagicMock()
