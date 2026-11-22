@@ -16,6 +16,7 @@ from tusker_gateway.context_limits import (
     required_context_tokens,
     set_published_context_windows,
 )
+from tusker_gateway.errors import ContextWindowExceededError, openai_error
 
 
 @pytest.fixture(autouse=True)
@@ -197,6 +198,20 @@ def test_pool_skips_candidate_whose_declared_window_cannot_fit(monkeypatch, tmp_
     assert big in candidates(required_context_tokens(30000))
     assert local in candidates(required_context_tokens(2000))
 
+    # When context size is the only reason an otherwise eligible route was
+    # filtered, expose the largest available window for the client retry path.
+    context_failure: dict[str, int] = {}
+    assert manager.select(
+        "code",
+        context_tokens=required_context_tokens(30000),
+        allowed_models=(local[1],),
+        context_failure=context_failure,
+    ) is None
+    assert context_failure == {
+        "required_context_tokens": required_context_tokens(30000),
+        "max_context_window": 32768,
+    }
+
 
 def test_builtin_defaults_filter_candidates_that_cannot_fit(monkeypatch, tmp_path):
     from tusker_gateway.config import PoolConfig
@@ -224,6 +239,20 @@ def test_builtin_defaults_filter_candidates_that_cannot_fit(monkeypatch, tmp_pat
 def test_min_output_reserve_is_configurable(monkeypatch):
     monkeypatch.setenv("TUSKER_MIN_OUTPUT_TOKENS", "1000")
     assert min_output_tokens() == 1000
+
+
+def test_context_overflow_error_uses_omp_recognized_openai_code():
+    exc = ContextWindowExceededError(
+        pool="privacy",
+        required_context_tokens=210_000,
+        max_context_window=128_000,
+    )
+
+    payload = openai_error(exc.message, code=exc.code, error_type=exc.error_type)
+    assert exc.status == 400
+    assert payload["error"]["code"] == "context_length_exceeded"
+    assert "context_length_exceeded" in payload["error"]["message"]
+    assert "128000 tokens" in payload["error"]["message"]
 
 
 def test_output_budget_exhaustion_is_not_quarantined(monkeypatch):

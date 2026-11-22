@@ -14,7 +14,7 @@ import re
 import time
 import fnmatch
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, MutableMapping
 
 from tusker_gateway.catalog import (
     AUTO_DISCOVERED_HEAVYWEIGHT_WEIGHT,
@@ -1555,6 +1555,7 @@ class PoolManager:
         selection_context: str | None = None,
         payload_bytes: int = 0,
         payload_ceiling_of: Callable[[str, str], int | None] | None = None,
+        context_failure: MutableMapping[str, int] | None = None,
     ) -> tuple[str, str] | None:
         """Select the best (provider, model) from a pool.
 
@@ -1879,6 +1880,7 @@ class PoolManager:
         }
         filtered_zdr_models: list[str] = []
         filtered_context_models: list[str] = []
+        context_only_windows: list[int] = []
         filtered_payload_models: list[str] = []
         for s in specs:
             if self._model_is_blacklisted_fast(s.provider, s.model):
@@ -1928,16 +1930,6 @@ class PoolManager:
                         filtered_zdr_models.append(
                             f"{s.provider}/{s.model}:trains_on_data"
                         )
-                    continue
-            # Only operator-declared windows gate selection: the pool-wide
-            # ``context_window`` is a 128k guess that would wrongly exclude
-            # long-context routes.
-            if context_tokens > 0:
-                window = declared_context_window(s.provider, s.model)
-                if window is not None and window < context_tokens:
-                    filter_counts["context_window"] += 1
-                    if len(filtered_context_models) < 12:
-                        filtered_context_models.append(f"{s.provider}/{s.model}:{window}")
                     continue
             # Learned payload ceiling: skip a route we have positive
             # evidence cannot accept this body. ``None`` (no evidence yet)
@@ -2017,6 +2009,18 @@ class PoolManager:
                     if len(filtered_zdr_models) < 12:
                         filtered_zdr_models.append(f"{s.provider}/{s.model}")
                     continue
+            # Apply context after every other route eligibility check. This
+            # lets callers distinguish a genuinely-too-large request from a
+            # pool that is empty for privacy, capability, cooldown, or policy
+            # reasons. The pool-wide window is only a default; route-specific
+            # declarations preserve long-context candidates.
+            window = declared_context_window(s.provider, s.model)
+            if context_tokens > 0 and window is not None and window < context_tokens:
+                filter_counts["context_window"] += 1
+                context_only_windows.append(window)
+                if len(filtered_context_models) < 12:
+                    filtered_context_models.append(f"{s.provider}/{s.model}:{window}")
+                continue
             candidates.append(s)
 
         if requires_tools and filtered_tool_models:
@@ -2118,6 +2122,9 @@ class PoolManager:
                 )
 
         if not candidates:
+            if context_failure is not None and context_only_windows:
+                context_failure["required_context_tokens"] = int(context_tokens)
+                context_failure["max_context_window"] = max(context_only_windows)
             filters = ",".join(
                 f"{name}={count}"
                 for name, count in filter_counts.items()

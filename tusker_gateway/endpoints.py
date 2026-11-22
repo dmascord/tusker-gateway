@@ -37,6 +37,7 @@ from tusker_gateway.config import (
 from tusker_gateway.errors import (
     BadRequestError,
     ClaudeAuthRequiredError,
+    ContextWindowExceededError,
     GatewayError,
     HighImpactApprovalRequiredError,
     InvalidToolCallArgumentsError,
@@ -5389,6 +5390,7 @@ async def _call_with_pool_fallback(
     # resets/capacity rejections). Labels are gateway-authored codes or class
     # names - never raw upstream bodies - so the summary is client-safe.
     candidate_failures: list[dict[str, str]] = []
+    context_failures: list[dict[str, int]] = []
 
     def _record_failure(exc: BaseException) -> None:
         candidate_failures.append(
@@ -5401,6 +5403,16 @@ async def _call_with_pool_fallback(
 
     def _terminal_error() -> Exception:
         """Aggregate the failover, falling back to the last single error."""
+        # A size rejection is authoritative only when no upstream candidate
+        # was actually attempted. If an attempted route failed, preserve that
+        # provider failure rather than asking the client to compact needlessly.
+        if not candidate_failures and context_failures:
+            best = max(context_failures, key=lambda item: item["max_context_window"])
+            return ContextWindowExceededError(
+                pool=pool_name,
+                required_context_tokens=best["required_context_tokens"],
+                max_context_window=best["max_context_window"],
+            )
         distinct_candidates = {
             (item["provider"], item["model"])
             for item in candidate_failures
@@ -5498,7 +5510,12 @@ async def _call_with_pool_fallback(
                     select_kwargs["allow_structured_tool_fallback"] = True
                     if tool_compatibility_probe:
                         select_kwargs["allow_tool_compatibility_fallback"] = True
+            context_failure: dict[str, int] = {}
+            if isinstance(pool_mgr, PoolManager):
+                select_kwargs["context_failure"] = context_failure
             selected = await asyncio.to_thread(pool_mgr.select, active_pool, **select_kwargs)
+            if context_failure:
+                context_failures.append(context_failure)
         if not selected:
             if pool_index + 1 < len(pool_names):
                 previous_pool = active_pool

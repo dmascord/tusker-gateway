@@ -116,6 +116,36 @@ class NoHealthyModelsError(BadRequestError):
         self.headers = {"Retry-After": str(max(1, int(retry_after_secs)))}
 
 
+class ContextWindowExceededError(BadRequestError):
+    """No otherwise-eligible pool route can fit the estimated request context.
+
+    The stable OpenAI-compatible error code is also recognized by agent
+    clients such as OMP as a context overflow, triggering their normal
+    session compaction and retry flow.
+    """
+
+    status = 400
+    error_type = "invalid_request_error"
+
+    def __init__(
+        self,
+        *,
+        pool: str,
+        required_context_tokens: int,
+        max_context_window: int,
+    ) -> None:
+        self.pool = pool
+        self.required_context_tokens = max(0, int(required_context_tokens))
+        self.max_context_window = max(0, int(max_context_window))
+        super().__init__(
+            "context_length_exceeded: estimated request context requires "
+            f"{self.required_context_tokens} tokens, but the largest currently "
+            f"eligible upstream context window in pool '{pool}' is "
+            f"{self.max_context_window} tokens. Compact the conversation and retry.",
+            code="context_length_exceeded",
+        )
+
+
 class ProviderRouteDisabledError(BadRequestError):
     """An explicitly requested provider route is disabled by operator policy."""
 

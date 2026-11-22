@@ -756,6 +756,17 @@ the Qwen tokenizer: code ~3.3, schema JSON ~3.4, prose ~5.1), plus
 `context budget rid=... window=... prompt_estimate=... requested_max_tokens=...
 effective_max_tokens=... clamped=...`.
 
+If every route that otherwise satisfies the request's pool, privacy,
+capability, and availability requirements is filtered only because its
+declared context window is too small, the gateway returns HTTP 400 with
+`error.code=context_length_exceeded`. The message includes the gateway's
+estimated required context (including its output reserve) and the largest
+currently eligible route window. Agent clients can compact their durable
+conversation and retry; ordinary provider outages and capability mismatches
+continue to use their existing availability errors. The largest window is
+request-specific and may change as provider health and route eligibility
+change.
+
 
 A tool turn whose provider output is unusable is rejected by stream validation. This
 includes a complete turn with no answer and no tool call
