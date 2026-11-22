@@ -80,8 +80,8 @@ async def chat(request: web.Request) -> web.Response:
             err = _json.dumps(
                 {"error": {"message": str(exc), "code": getattr(exc, "code", None)}}
             )
-            await resp.write(f"data: {err}\\n\\n".encode("utf-8"))
-            await resp.write(b"data: [DONE]\\n\\n")
+            await resp.write(f"data: {err}\n\n".encode("utf-8"))
+            await resp.write(b"data: [DONE]\n\n")
         await resp.write_eof()
         return resp
 
