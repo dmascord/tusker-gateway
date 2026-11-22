@@ -5395,11 +5395,6 @@ async def _call_with_pool_fallback(
     # names - never raw upstream bodies - so the summary is client-safe.
     candidate_failures: list[dict[str, Any]] = []
     context_failures: list[dict[str, int]] = []
-    # Providers that returned a 429 during this request. A 429 is a
-    # provider-wide quota signal; excluding the provider from subsequent
-    # selections stops one heavily-ranked provider from consuming the whole
-    # failover chain while healthy providers go untried.
-    rate_limited_providers: set[str] = set()
 
     def _record_failure(exc: BaseException) -> None:
         label = str(getattr(exc, "code", None) or type(exc).__name__)
@@ -5517,8 +5512,6 @@ async def _call_with_pool_fallback(
                 "required_input_modalities": required_input_modalities,
                 "context_tokens": required_context_tokens(prompt_estimate),
             }
-            if rate_limited_providers:
-                select_kwargs["excluded_providers"] = frozenset(rate_limited_providers)
             if requires_image_tools:
                 select_kwargs["requires_image_tools"] = True
             if payload_ceiling_of is not None and payload_bytes > 0:
@@ -5866,7 +5859,6 @@ async def _call_with_pool_fallback(
             internal_failure = _internalize_github_copilot_rate_limit(provider, exc)
             last_error = internal_failure or exc
             _record_failure(last_error)
-            rate_limited_providers.add(provider)
             excluded.add(selected)
             if request is not None:
                 set_access_log_context(

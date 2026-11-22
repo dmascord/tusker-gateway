@@ -10,7 +10,6 @@ import re
 
 import tempfile
 from types import SimpleNamespace
-from typing import Any
 from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 
 import pytest
@@ -921,44 +920,6 @@ async def test_pool_exhaustion_reports_all_candidate_failures():
     assert "per-attempt timeout" not in message
     # Every raw upstream body stays out of the client-safe message.
     assert "Connection reset by peer" not in message
-
-
-@pytest.mark.asyncio
-async def test_rate_limited_provider_is_excluded_from_later_attempts():
-    """A provider-wide 429 must not consume the rest of the failover chain.
-
-    Regression for 2026-11-23: twelve attempts were spent almost entirely on
-    google's quota-exhausted routes while healthy synthetic/openrouter/
-    opencode-cli/openai-codex routes were never reached.
-    """
-    pool_manager = MagicMock()
-    pool_manager.fallback_pools.return_value = ()
-    picks = iter([("provider-a", "m1"), ("provider-b", "m2")])
-    calls: list[dict[str, Any]] = []
-
-    def _select(*args, **kwargs):
-        calls.append(kwargs)
-        return next(picks, None)
-
-    pool_manager.select.side_effect = _select
-    upstream = MagicMock()
-    upstream.chat = AsyncMock(
-        side_effect=[
-            RateLimitError(body='{"error":{"message":"quota"}}', headers={"Retry-After": "60"}),
-            {"choices": [{"message": {"role": "assistant", "content": "ok"}}]},
-        ]
-    )
-
-    provider, model, result = await _call_with_pool_fallback(
-        {"pools": {}},
-        {"model": "hermes-code", "messages": [{"role": "user", "content": "hi"}]},
-        upstream,
-        request=SimpleNamespace(app={"pool_manager": pool_manager}),
-    )
-    assert (provider, model) == ("provider-b", "m2")
-    assert result["choices"][0]["message"]["content"] == "ok"
-    assert len(calls) >= 2
-    assert "provider-a" in calls[1]["excluded_providers"]
 
 
 @pytest.mark.asyncio
