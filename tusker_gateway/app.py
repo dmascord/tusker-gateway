@@ -34,6 +34,7 @@ from tusker_gateway.endpoints import (
     embeddings_handler,
     responses_handler,
     tts_handler,
+    transcription_handler,
     video_handler,
  )
 from tusker_gateway.anthropic_adapter import anthropic_messages_handler
@@ -286,10 +287,14 @@ def create_app() -> web.Application:
     app["image_handler"] = ImageGenerationHandler(
         app["config"], capability_registry=capability_registry
     )
-    # TTS and video handlers (Phase: TTS/video support).
+    # TTS, transcription and video handlers (OpenAI-compatible media endpoints).
+    from tusker_gateway.providers.stt import STTHandler
     from tusker_gateway.providers.tts import TTSHandler
     from tusker_gateway.providers.video import VideoHandler
     app["tts_handler"] = TTSHandler(
+        app["config"], capability_registry=capability_registry
+    )
+    app["stt_handler"] = STTHandler(
         app["config"], capability_registry=capability_registry
     )
     app["video_handler"] = VideoHandler(
@@ -674,6 +679,8 @@ def create_app() -> web.Application:
     app.router.add_post("/v1/rerank", rerank_handler)
     app.router.add_post("/v1/embeddings", embeddings_handler)
     app.router.add_post("/v1/videos", video_handler)
+    app.router.add_post("/v1/audio/speech", tts_handler)
+    app.router.add_post("/v1/audio/transcriptions", transcription_handler)
     app.router.add_get("/v1/models", models_handler)
     app.router.add_post("/v1/chat/completions", chat_completions_handler)
     app.router.add_post("/v1/responses", responses_handler)

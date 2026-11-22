@@ -488,6 +488,7 @@ class ConfigRuntime:
         if fingerprint == self._last_media_providers:
             return
         from tusker_gateway.providers.image_generation import ImageGenerationHandler
+        from tusker_gateway.providers.stt import STTHandler
         from tusker_gateway.providers.tts import TTSHandler
         from tusker_gateway.providers.video import VideoHandler
         from tusker_gateway.providers.embed import EmbedHandler
@@ -495,6 +496,7 @@ class ConfigRuntime:
         reg = self._app.get("capability_registry")
         image_handler = ImageGenerationHandler(config, capability_registry=reg)
         tts_handler = TTSHandler(config, capability_registry=reg)
+        stt_handler = STTHandler(config, capability_registry=reg)
         video_handler = VideoHandler(config, capability_registry=reg)
         rerank_handler = RerankHandler(
             config, capability_db=self._app.get("model_capabilities")
@@ -504,6 +506,7 @@ class ConfigRuntime:
         )
         self._app["image_handler"] = image_handler
         self._app["tts_handler"] = tts_handler
+        self._app["stt_handler"] = stt_handler
         self._app["video_handler"] = video_handler
         self._app["rerank_handler"] = rerank_handler
         self._app["embed_handler"] = embed_handler

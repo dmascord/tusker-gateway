@@ -40,6 +40,7 @@ class Capability(str, enum.Enum):
     IMAGE_EDITS = "image_edits"
     IMAGE_VARIATIONS = "image_variations"
     TTS_SPEECH = "tts_speech"
+    SPEECH_TRANSCRIPTION = "speech_transcription"
     VIDEO_GENERATIONS = "video_generations"
 
 
@@ -149,7 +150,7 @@ class CapabilitiesRegistry:
                 ("openai", _discover_openai_via_probe(session, self.provider_keys.get("openai"))),
                 ("codex", _discover_codex_capability(self.codex_rotator)),
                 ("zai", _discover_zai(self.provider_keys.get("zai") or self.provider_keys.get("glm"), session)),
-                ("groq", _discover_groq_tts(self.provider_keys.get("groq"), session)),
+                ("groq", _discover_groq_audio(self.provider_keys.get("groq"), session)),
                 ("minimax", _discover_minimax(self.provider_keys.get("minimax"))),
                 ("google", _discover_google(self.provider_keys.get("google") or self.provider_keys.get("gemini"), session)),
             ]
@@ -329,6 +330,11 @@ _OPENAI_STATIC_MODELS: dict[Capability, list[CapabilityEntry]] = {
         CapabilityEntry(provider="openai", model="tts-1", capability=Capability.TTS_SPEECH),
         CapabilityEntry(provider="openai", model="tts-1-hd", capability=Capability.TTS_SPEECH),
         CapabilityEntry(provider="openai", model="gpt-4o-mini-tts", capability=Capability.TTS_SPEECH),
+    ],
+    Capability.SPEECH_TRANSCRIPTION: [
+        CapabilityEntry(provider="openai", model="whisper-1", capability=Capability.SPEECH_TRANSCRIPTION),
+        CapabilityEntry(provider="openai", model="gpt-4o-mini-transcribe", capability=Capability.SPEECH_TRANSCRIPTION),
+        CapabilityEntry(provider="openai", model="gpt-4o-transcribe", capability=Capability.SPEECH_TRANSCRIPTION),
     ],
     Capability.VIDEO_GENERATIONS: [
         CapabilityEntry(provider="openai", model="sora-2", capability=Capability.VIDEO_GENERATIONS),
@@ -568,21 +574,22 @@ async def _discover_google(
     return out
 
 
-# Groq TTS
+# Groq audio (TTS + transcription)
 # ---------------------------------------------------------------------------
 
 
-async def _discover_groq_tts(
+async def _discover_groq_audio(
     api_key: str | None,
     session: aiohttp.ClientSession,
 ) -> list[CapabilityEntry]:
-    """Discover Groq's speech-output models for /v1/audio/speech dispatch.
+    """Discover Groq's speech-output and transcription models.
 
-    Groq exposes an OpenAI-compatible ``/v1/audio/speech`` endpoint and
-    marks speech models in its model catalog via
-    ``output_modalities == ["speech"]`` (e.g. ``canopylabs/orpheus-*``).
-    Terms acceptance is enforced per-org upstream on first use; discovery
-    itself stays read-only against the model list.
+    Groq exposes OpenAI-compatible ``/v1/audio/speech`` and
+    ``/v1/audio/transcriptions`` endpoints. Speech models are marked in its
+    model catalog via ``output_modalities == ["speech"]`` (e.g.
+    ``canopylabs/orpheus-*``); transcription models carry ``whisper`` in the
+    slug. Terms acceptance is enforced per-org upstream on first use;
+    discovery itself stays read-only against the model list.
     """
     if not api_key:
         return []
@@ -624,7 +631,21 @@ async def _discover_groq_tts(
                     capability=Capability.TTS_SPEECH,
                 )
             )
+        if "whisper" in slug.lower():
+            out.append(
+                CapabilityEntry(
+                    provider="groq",
+                    model=slug,
+                    capability=Capability.SPEECH_TRANSCRIPTION,
+                )
+            )
     return out
+
+
+async def _discover_groq_tts(api_key, session):
+    """Backwards-compatible TTS-only wrapper (STT is discovered alongside it)."""
+    entries = await _discover_groq_audio(api_key, session)
+    return [e for e in entries if e.capability == Capability.TTS_SPEECH]
 
 
 # Xiaomi MiMo TTS

@@ -9182,6 +9182,88 @@ async def tts_handler(request: web.Request) -> web.Response:
         )
 
 
+async def transcription_handler(request: web.Request) -> web.Response:
+    """POST /v1/audio/transcriptions — OpenAI-compatible speech-to-text.
+
+    Accepts multipart/form-data with a required ``file`` and ``model`` plus the
+    optional ``language``, ``prompt``, ``response_format`` and ``temperature``
+    fields, and returns the upstream transcript JSON (``{"text": ...}``).
+    """
+    set_access_log_context(request, pool="media")
+    try:
+        started = time.monotonic()
+        form = await request.post()
+        file_field = form.get("file")
+        if file_field is None or not hasattr(file_field, "file"):
+            return web.json_response(
+                openai_error(
+                    "multipart field 'file' is required",
+                    code="invalid_request",
+                    error_type="invalid_request_error",
+                ),
+                status=400,
+            )
+        model = str(form.get("model") or "whisper-1").strip()
+        body: dict[str, Any] = {"model": model}
+        for key in ("language", "prompt", "response_format", "temperature"):
+            value = form.get(key)
+            if value is not None:
+                body[key] = value
+        budget_units = 4096
+        blocked = await _media_preflight(request, body, budget_units=budget_units)
+        if blocked is not None:
+            return blocked
+        stt = request.app.get("stt_handler")
+        if stt is None:
+            return web.json_response(
+                openai_error(
+                    "transcription handler not initialised",
+                    code="internal_error",
+                    error_type="internal",
+                ),
+                status=503,
+            )
+        provider = stt.get_provider_for_stt_request(model)
+        set_access_log_context(request, pool="media", provider=provider, model=model)
+        api_key = request.app["config"].get("provider_api_keys", {}).get(provider)
+        audio_bytes = file_field.file.read(stt.MAX_STT_AUDIO_BYTES + 1)
+        result = await stt.handle_request(
+            model=model,
+            form_fields={key: value for key, value in body.items() if key != "model"},
+            audio_bytes=audio_bytes,
+            filename=getattr(file_field, "filename", None) or "audio.wav",
+            content_type=getattr(file_field, "content_type", None)
+            or "application/octet-stream",
+            api_key=api_key,
+        )
+        _record_media_capabilities(
+            request,
+            provider=provider,
+            model=model,
+            capabilities=("input_audio", "speech_transcription"),
+            started=started,
+        )
+        await _record_media_budget(request, budget_units=budget_units)
+        return web.json_response(result)
+    except GatewayError as exc:
+        logger.warning("transcription request failed: %s", exc)
+        return web.json_response(
+            openai_error(exc.message, code=exc.code, error_type=exc.error_type),
+            status=_media_error_status(exc),
+        )
+    except Exception as exc:
+        logger.warning("transcription request failed: %s", exc)
+        return web.json_response(
+            openai_error(
+                "Upstream speech-to-text failed; retry shortly or contact the "
+                "gateway operator with the request_id for triage.",
+                code="transcription_error",
+                error_type="provider_error",
+            ),
+            status=502,
+        )
+
+
 async def video_handler(request: web.Request) -> web.Response:
     """POST /v1/videos.
 
