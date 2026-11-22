@@ -110,3 +110,17 @@ Regression test in `tests/test_context_limits.py` pins the 1,050,000 window and
 asserts a 16,384-token cap is not clamped for a 208K prompt (the original
 filtered request). Because this setting is an env var read per call, the change
 takes effect on pod restart, not via the DB config store.
+
+### Verification (deployed)
+
+- Source commit `e1c0a2bdd6ab161a898612c72012010bd9d5e810`, image digest
+  `sha256:4db8c554b74dd4c64d6c988d22d688a4b1c9b0f9a0b4bf56c41195b12b322662`;
+  `k8s/verify-provenance.sh` reports tracked manifest, live Deployment, running
+  pod imageID and `/health` commit all agree.
+- In-pod check: override present, `declared_context_window("apim","gpt-5.6-luna")
+  == 1050000`, and `fit_output_budget` leaves a 16,384 cap unclamped for a
+  208,379-token prompt.
+- In-pod check: deployed `privacy_qualification.run_privacy_qualification` uses
+  the interleave guard and the dead `_needs_probe` is gone.
+- Deploy smoke: `/health` 200, `/ready` 200, `{"ok": true, "reason": "ok"}`.
+- Full offline suite: 2205 passed, 8 skipped.
