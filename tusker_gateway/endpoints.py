@@ -5484,18 +5484,7 @@ async def _call_with_pool_fallback(
         else None
     )
     while True:
-        if attempts >= max_attempts:
-            # Rate-limit failures are transient capacity misses, not attempts
-            # at viable candidates. Keep walking the ranked list while every
-            # failure so far is a 429 so healthy entries further down still get
-            # a chance; the hard dispatch ceiling bounds total work.
-            all_rate_limited = bool(candidate_failures) and all(
-                item["class"] in _RATE_LIMIT_FAILURE_CLASSES
-                for item in candidate_failures
-            )
-            if all_rate_limited and dispatch_count < max_dispatches:
-                attempts = max_attempts - 1  # one more viable slot
-                continue
+        if attempts >= max_attempts or dispatch_count >= max_dispatches:
             if request is not None:
                 set_access_log_context(
                     request,
@@ -5879,6 +5868,10 @@ async def _call_with_pool_fallback(
             internal_failure = _internalize_github_copilot_rate_limit(provider, exc)
             last_error = internal_failure or exc
             _record_failure(last_error)
+            # A 429 is transient capacity, not an attempt at a viable candidate.
+            # Refund the slot so quota-exhausted routes cannot burn the whole
+            # budget before healthy providers further down are reached.
+            attempts -= 1
             excluded.add(selected)
             if request is not None:
                 set_access_log_context(

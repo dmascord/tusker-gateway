@@ -939,7 +939,9 @@ async def test_rate_limited_candidates_do_not_consume_fallback_budget(monkeypatc
     upstream.chat = AsyncMock(
         side_effect=[
             RateLimitError(body='{"error":{"message":"quota"}}'),
-            RateLimitError(body='{"error":{"message":"quota"}}'),
+            # A non-429 failure mixed in must not retroactively make the 429
+            # count toward the budget.
+            ProviderError("transient reset", code="provider_error"),
             {"choices": [{"message": {"role": "assistant", "content": "ok"}}]},
         ]
     )
