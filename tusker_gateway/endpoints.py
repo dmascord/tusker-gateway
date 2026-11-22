@@ -5395,6 +5395,13 @@ async def _call_with_pool_fallback(
     # names - never raw upstream bodies - so the summary is client-safe.
     candidate_failures: list[dict[str, Any]] = []
     context_failures: list[dict[str, int]] = []
+    # A 429 is a transient capacity miss, not an attempt at a viable candidate:
+    # it must not consume the bounded fallback budget, or a run of quota-
+    # limited top-ranked routes cuts off the chain before healthy entries
+    # further down the pool are ever tried. A separate hard ceiling bounds
+    # total upstream dispatches so the loop cannot run away.
+    dispatch_count = 0
+    max_dispatches = 0  # set once max_attempts is resolved below
 
     def _record_failure(exc: BaseException) -> None:
         label = str(getattr(exc, "code", None) or type(exc).__name__)
@@ -5468,6 +5475,7 @@ async def _call_with_pool_fallback(
     attempts = max(0, attempt_offset)
     first_provider: str | None = None
     max_attempts = _max_pool_provider_attempts()
+    max_dispatches = max_attempts * 3
     recovery_probe = False
     tool_compatibility_probe = False
     attempts_started_at = (
@@ -5477,6 +5485,17 @@ async def _call_with_pool_fallback(
     )
     while True:
         if attempts >= max_attempts:
+            # Rate-limit failures are transient capacity misses, not attempts
+            # at viable candidates. Keep walking the ranked list while every
+            # failure so far is a 429 so healthy entries further down still get
+            # a chance; the hard dispatch ceiling bounds total work.
+            all_rate_limited = bool(candidate_failures) and all(
+                item["class"] in _RATE_LIMIT_FAILURE_CLASSES
+                for item in candidate_failures
+            )
+            if all_rate_limited and dispatch_count < max_dispatches:
+                attempts = max_attempts - 1  # one more viable slot
+                continue
             if request is not None:
                 set_access_log_context(
                     request,
@@ -5640,6 +5659,7 @@ async def _call_with_pool_fallback(
         if first_provider is None:
             first_provider = provider
         attempts += 1
+        dispatch_count += 1
         # Per-attempt operator diagnostics (runbook 1.6): resolver verdict,
         # endpoint fingerprint, evidence version and selected transport.
         # ``fallback_reason`` below records why the previous attempt was

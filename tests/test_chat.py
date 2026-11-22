@@ -923,6 +923,39 @@ async def test_pool_exhaustion_reports_all_candidate_failures():
 
 
 @pytest.mark.asyncio
+async def test_rate_limited_candidates_do_not_consume_fallback_budget(monkeypatch):
+    """A 429 is transient capacity, not a viable attempt.
+
+    A run of quota-limited top-ranked routes must not exhaust the bounded
+    fallback budget before healthy entries further down the pool are tried.
+    The hard dispatch ceiling still bounds total upstream work.
+    """
+    monkeypatch.setenv("TUSKER_MAX_PROVIDER_ATTEMPTS", "2")
+    pool_manager = MagicMock()
+    pool_manager.fallback_pools.return_value = ()
+    candidates = iter([("p1", "m1"), ("p2", "m2"), ("p3", "m3")])
+    pool_manager.select.side_effect = lambda *_a, **_k: next(candidates, None)
+    upstream = MagicMock()
+    upstream.chat = AsyncMock(
+        side_effect=[
+            RateLimitError(body='{"error":{"message":"quota"}}'),
+            RateLimitError(body='{"error":{"message":"quota"}}'),
+            {"choices": [{"message": {"role": "assistant", "content": "ok"}}]},
+        ]
+    )
+
+    provider, model, result = await _call_with_pool_fallback(
+        {"pools": {}},
+        {"model": "hermes-code", "messages": [{"role": "user", "content": "hi"}]},
+        upstream,
+        request=SimpleNamespace(app={"pool_manager": pool_manager}),
+    )
+    assert (provider, model) == ("p3", "m3")
+    assert result["choices"][0]["message"]["content"] == "ok"
+    assert upstream.chat.await_count == 3
+
+
+@pytest.mark.asyncio
 async def test_uniform_rate_limit_exhaustion_is_a_429_with_retry_after():
     """All-rate-limit failover must be actionable, not a generic 502.
 
