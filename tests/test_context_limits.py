@@ -263,7 +263,7 @@ def test_min_output_reserve_is_configurable(monkeypatch):
     assert min_output_tokens() == 1000
 
 
-def test_context_overflow_error_uses_omp_recognized_openai_code():
+def test_context_overflow_error_uses_omp_recovery_trigger():
     exc = ContextWindowExceededError(
         pool="privacy",
         required_context_tokens=210_000,

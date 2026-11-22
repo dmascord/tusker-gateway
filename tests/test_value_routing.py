@@ -425,6 +425,32 @@ def test_trains_on_data_provider_stays_available_in_non_private_pools(tmp_path):
     assert "alpha" in selected
 
 
+def test_privacy_context_limit_ignores_larger_non_zdr_routes(tmp_path, monkeypatch):
+    """A privacy overflow must describe only routes privacy traffic may use."""
+    from tusker_gateway.context_limits import required_context_tokens
+
+    monkeypatch.setenv(
+        "TUSKER_CONTEXT_WINDOW_OVERRIDES_JSON",
+        '{"alpha/m1": 1000000, "beta/m2": 32768}',
+    )
+    manager = _manager(
+        tmp_path,
+        plans={"alpha": {"trains_on_data": True}},
+        zdr=True,
+    )
+    context_failure: dict[str, int] = {}
+
+    assert manager.select(
+        "privacy",
+        context_tokens=required_context_tokens(40000),
+        context_failure=context_failure,
+    ) is None
+    assert context_failure == {
+        "required_context_tokens": required_context_tokens(40000),
+        "max_context_window": 32768,
+    }
+
+
 
 def test_shadow_mode_leaves_selection_unchanged(tmp_path, monkeypatch):
     monkeypatch.setenv("TUSKER_VALUE_ROUTING", "shadow")
