@@ -1541,6 +1541,7 @@ class PoolManager:
         preferred: str | None = None,
         heavyweight_ok: bool | None = None,
         excluded: set[tuple[str, str]] | None = None,
+        excluded_providers: frozenset[str] | set[str] | None = None,
         required_input_modalities: set[str] | frozenset[str] | None = None,
         requires_tools: bool = False,
         requires_image_tools: bool = False,
@@ -1892,6 +1893,14 @@ class PoolManager:
                     filtered_rank_models.append(f"{s.provider}/{s.model}")
                 continue
             if (s.provider, s.model) in excluded:
+                filter_counts["request_excluded"] += 1
+                continue
+            # A provider that rate-limited this request is quarantined for the
+            # rest of the failover chain. 429s are provider-wide quota signals
+            # (the gateway applies provider-level cooldowns for them); without
+            # this, a provider with many cheap top-ranked routes can consume
+            # every attempt while healthy providers are never reached.
+            if excluded_providers and s.provider in excluded_providers:
                 filter_counts["request_excluded"] += 1
                 continue
             # Skip providers that are not in the registry — avoids ProviderError cascade
