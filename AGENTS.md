@@ -41,6 +41,7 @@ Read in order when picking up the repo:
 | `docs/audio-routing.md` | OpenAI-compatible audio endpoints, provider selection, chat audio input and capability evidence. |
 | `docs/incidents/2026-11-23-audio-routing.md` | Restored accidentally-removed TTS route; added STT and audio token accounting; verified live. |
 | `docs/incidents/2026-11-23-all-rate-limited-failover.md` | Uniform rate-limit exhaustion now returns 429 with Retry-After instead of a generic 502. |
+| `docs/incidents/2026-11-23-claude-code-cli-sse-escape.md` | Worker error frames used literal backslash-n; claude-code-cli failures surfaced as a TypeError. |
 | `TODO.md` | Active cross-session work items. |
 
 
