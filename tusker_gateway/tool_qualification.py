@@ -85,6 +85,25 @@ PROBE_TOOL_NAME = "tusker_capability_probe"
 PROBE_PATH = "/tmp/tusker-tool-capability-probe"
 IMAGE_PROBE_COLOR = "green"
 
+
+def _composite_probe_max_tokens() -> int:
+    """Output budget for one composite image+tools probe.
+
+    Reasoning models can spend several thousand tokens on chain-of-thought
+    before emitting the required tool call. A 2,048-token cap made
+    ``synthetic/hf:Qwen/Qwen3.8-27B`` end with ``output_budget_exhausted``
+    after 9,004 reasoning characters (req_918ddeb1f2b61523, 2026-11-22), so
+    the probe recorded a false ``unavailable`` and held the route out of the
+    privacy pool. The same probe passes at 8,192 and 16,384. Keep the default
+    generous; operators can lower it with the env var if a provider bills
+    heavily for qualification traffic.
+    """
+    try:
+        value = int(float(os.environ.get("TUSKER_COMPOSITE_QUALIFICATION_MAX_TOKENS", "16384")))
+    except (TypeError, ValueError):
+        return 16384
+    return max(1024, value)
+
 PROBE_TOOL: dict[str, Any] = {
     "type": "function",
     "function": {
@@ -514,7 +533,7 @@ async def probe_image_tool_model(
         "tool_choice": "required",
         "stream": True,
         "temperature": 0,
-        "max_tokens": 2048,
+        "max_tokens": _composite_probe_max_tokens(),
     }
     result: dict[str, Any] = {
         "provider": provider,

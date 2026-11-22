@@ -596,6 +596,13 @@ spec:
         # produces no image-plus-tool evidence at all.
         - name: TUSKER_COMPOSITE_QUALIFICATION_INITIAL_DELAY_SECS
           value: '600'
+        # Output budget for one composite probe. Reasoning models can spend
+        # thousands of tokens thinking before emitting the required tool call;
+        # the old hard-coded 2048 made synthetic/hf:Qwen/Qwen3.8-27B end with
+        # output_budget_exhausted and a false "unavailable" verdict. Verified
+        # passing at 8192 and 16384 (2026-11-22, req_918ddeb1f2b61523).
+        - name: TUSKER_COMPOSITE_QUALIFICATION_MAX_TOKENS
+          value: '16384'
         # Privacy-route evidence: a ZDR provider marking alone does not prove
         # the upstream accepted the pool's privacy request policy (for
         # Command Code, x-cmd-zdr: 1). This bounded cycle sends one cheap
