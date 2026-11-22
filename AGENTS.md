@@ -37,6 +37,7 @@ Read in order when picking up the repo:
 | `docs/incidents/2026-11-23-privacy-pool-full-audit.md` | All 200 privacy routes audited against four gates; 8 eligible for image+tools+212K. |
 | `docs/incidents/2026-11-23-code-pool-audit.md` | 355 code routes audited; 24 eligible for image+tools+212K, google modality probes added three. |
 | `docs/incidents/2026-11-23-worker-pod-verification.md` | opencode worker verified end-to-end; kilo worker stale/unused, kilo models work over direct HTTP. |
+| `docs/incidents/2026-11-23-kilo-qualification.md` | 15/17 kilo models in code pool; 10 tool-qualified, 5 genuine upstream failures; 2 audio models correctly excluded. |
 | `TODO.md` | Active cross-session work items. |
 
 
