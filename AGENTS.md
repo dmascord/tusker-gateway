@@ -40,6 +40,7 @@ Read in order when picking up the repo:
 | `docs/incidents/2026-11-23-kilo-qualification.md` | 15/17 kilo models in code pool; 10 tool-qualified, 5 genuine upstream failures; 2 audio models correctly excluded. |
 | `docs/audio-routing.md` | OpenAI-compatible audio endpoints, provider selection, chat audio input and capability evidence. |
 | `docs/incidents/2026-11-23-audio-routing.md` | Restored accidentally-removed TTS route; added STT and audio token accounting; verified live. |
+| `docs/incidents/2026-11-23-all-rate-limited-failover.md` | Uniform rate-limit exhaustion now returns 429 with Retry-After instead of a generic 502. |
 | `TODO.md` | Active cross-session work items. |
 
 
