@@ -70,6 +70,10 @@ def main():
     parser.add_argument(
         "--write", action="store_true", help="rewrite the file instead of printing a diff"
     )
+    parser.add_argument(
+        "--render", action="store_true",
+        help="print the fully pinned manifest to stdout (for deploy.sh to apply)",
+    )
     args = parser.parse_args()
 
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", args.digest):
@@ -81,6 +85,10 @@ def main():
         original = handle.read()
 
     pinned = pin(original, args.digest, args.commit, args.tag)
+
+    if args.render:
+        sys.stdout.write(pinned)
+        return 0
 
     if pinned == original:
         print("{} already pinned to {}; nothing to commit".format(args.manifest, args.digest))

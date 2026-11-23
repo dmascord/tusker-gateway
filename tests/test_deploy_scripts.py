@@ -50,6 +50,19 @@ def _pin_module():
     return module
 
 
+def test_deploy_renders_multi_document_worker_manifests():
+    """Worker files contain a Service as well as a Deployment.
+
+    `kubectl set image --local` rejects the Service document, so deploy.sh must
+    render through pin-manifest.py --render, which preserves all documents.
+    """
+    deploy = _script("deploy.sh")
+    assert "pin-manifest.py" in deploy and "--render" in deploy
+    helper = _script("pin-manifest.py")
+    assert '"--render"' in helper
+    assert "sys.stdout.write(pinned)" in helper
+
+
 def test_pin_manifest_handles_worker_app_labels(tmp_path):
     module = _pin_module()
     for app in ("tusker-gateway", "tusker-opencode-worker", "tusker-claude-worker"):

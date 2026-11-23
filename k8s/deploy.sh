@@ -112,17 +112,18 @@ for old_image in "${OLD_IMAGES[@]}"; do
     fi
 done
 
-# Render the manifest locally without connecting to the cluster (--local).
-# The spec is pinned to the immutable digest, so a re-push of a tag can never
-# change what a restarted pod runs. Local rendering never mutates the tracked
-# manifest; k8s/pin-manifest.py prints the pin for the operator to commit.
+# Render each tracked manifest into the temporary workload with the digest we
+# just pushed. pin-manifest.py --render handles multi-document manifests (the
+# worker files also contain a Service), which `kubectl set image --local`
+# cannot: it rejects a document with no pod template. This never mutates the
+# tracked files; the operator commits the printed pins afterwards.
+RENDER_ARGS=(--digest "${IMAGE_DIGEST}" --commit "${COMMIT}" --tag "${IMAGE_TAG}")
 declare -A RENDERED_BY_TARGET
 for target in "${TARGETS[@]}"; do
     manifest=$(manifest_for "${target}")
-    rendered="${WORK_DIR}/${target}.json"
-    kubectl set image -f "${manifest}" \
-        "${target}=${IMAGE_REF}" \
-        --local -o json > "${rendered}"
+    rendered="${WORK_DIR}/${target}.yaml"
+    python3 "${SCRIPT_DIR}/pin-manifest.py" "${manifest}" "${RENDER_ARGS[@]}" \
+        --render > "${rendered}"
     RENDERED_BY_TARGET["${target}"]="${rendered}"
 done
 
