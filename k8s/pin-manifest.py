@@ -23,7 +23,7 @@ IMAGE_RE = re.compile(
     re.MULTILINE,
 )
 
-LABELS_BLOCK = "  labels:\n    app: tusker-gateway\nspec:\n"
+APP_RE = re.compile(r"^    app: ([A-Za-z0-9._-]+)$", re.MULTILINE)
 
 ANNOTATIONS_RE = re.compile(
     r"^  annotations:\n(?:    tusker\.net\.au/[^\n]*\n)+", re.MULTILINE
@@ -39,6 +39,11 @@ def pin(text, digest, commit, tag):
             "'image: registry.tusker.net.au:5000/tusker-gateway@sha256:<64 hex>' line"
         )
 
+    app_match = APP_RE.search(text)
+    if app_match is None:
+        raise SystemExit("ERROR: cannot locate the Deployment metadata app label")
+    app = app_match.group(1)
+
     annotations = (
         "  annotations:\n"
         "    tusker.net.au/commit: {commit}\n"
@@ -48,10 +53,11 @@ def pin(text, digest, commit, tag):
 
     if ANNOTATIONS_RE.search(text):
         return ANNOTATIONS_RE.sub(annotations, text, count=1)
-    if LABELS_BLOCK not in text:
+    labels_block = "  labels:\n    app: {}\nspec:\n".format(app)
+    if labels_block not in text:
         raise SystemExit("ERROR: cannot locate the Deployment metadata labels block")
     return text.replace(
-        LABELS_BLOCK, "  labels:\n    app: tusker-gateway\n" + annotations + "spec:\n", 1
+        labels_block, "  labels:\n    app: {}\n".format(app) + annotations + "spec:\n", 1
     )
 
 

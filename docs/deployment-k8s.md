@@ -33,10 +33,16 @@ The commands below use the `visor` alias for brevity when direct access works. O
 
 ## 2. Build and deploy
 
-The convenience script builds and pushes the image, renders the intended image
-into a temporary deployment manifest, applies it once, and verifies the rollout.
+The convenience script builds and pushes the image, renders the intended digest
+into temporary manifests for **all three workloads that run this image** —
+`tusker-gateway`, `tusker-opencode-worker` and `tusker-claude-worker` — applies
+them, waits for all three rollouts, verifies each running pod's imageID, and
+annotates each Deployment with the build identity. It also prints (or, with
+`TUSKER_PIN_MANIFEST=1`, writes) the pin for all three tracked manifests.
+Workers were previously left on stale digests by gateway-only deploys.
+
 `TUSKER_COMMIT` must be the explicit full source SHA. The image embeds it;
-the deployment does not override it with an environment value.
+the deployments do not override it with an environment value.
 
 ```bash
 if ssh -o BatchMode=yes visor true 2>/dev/null; then

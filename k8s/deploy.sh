@@ -22,7 +22,20 @@ set -euo pipefail
 
 NAMESPACE=hermes
 DEPLOY=tusker-gateway
+# One image is built here, and the gateway plus both CLI workers run that same
+# image with different entrypoints. All three must move together: a gateway-only
+# deploy leaves workers pinned to an old digest running stale code.
+TARGETS=(tusker-gateway tusker-opencode-worker tusker-claude-worker)
 REGISTRY=registry.tusker.net.au:5000
+
+manifest_for() {
+    case "$1" in
+        tusker-gateway) echo k8s/deployment.yaml ;;
+        tusker-opencode-worker) echo k8s/worker-opencode.yaml ;;
+        tusker-claude-worker) echo k8s/worker-claude.yaml ;;
+        *) echo "ERROR: no manifest for target $1" >&2; return 1 ;;
+    esac
+}
 
 # Default to the script's parent directory (the repository root).  An explicit
 # SRC_DIR env override is respected so callers can point at a revision-specific
@@ -103,25 +116,34 @@ done
 # The spec is pinned to the immutable digest, so a re-push of a tag can never
 # change what a restarted pod runs. Local rendering never mutates the tracked
 # manifest; k8s/pin-manifest.py prints the pin for the operator to commit.
-RENDERED="${WORK_DIR}/deployment.json"
-kubectl set image -f k8s/deployment.yaml \
-    "${DEPLOY}=${IMAGE_REF}" \
-    --local -o json > "${RENDERED}"
+declare -A RENDERED_BY_TARGET
+for target in "${TARGETS[@]}"; do
+    manifest=$(manifest_for "${target}")
+    rendered="${WORK_DIR}/${target}.json"
+    kubectl set image -f "${manifest}" \
+        "${target}=${IMAGE_REF}" \
+        --local -o json > "${rendered}"
+    RENDERED_BY_TARGET["${target}"]="${rendered}"
+done
 
 kubectl -n "${NAMESPACE}" apply -f k8s/pvc-rwx.yaml
 kubectl -n "${NAMESPACE}" apply -f k8s/pvc.yaml
 kubectl -n "${NAMESPACE}" apply -f k8s/config.yaml
-kubectl -n "${NAMESPACE}" apply -f "${RENDERED}"
+for target in "${TARGETS[@]}"; do
+    kubectl -n "${NAMESPACE}" apply -f "${RENDERED_BY_TARGET[${target}]}"
+done
 kubectl -n "${NAMESPACE}" apply -f k8s/service.yaml
 kubectl -n "${NAMESPACE}" apply -f k8s/ingressroute.yaml
 
 # --- Rollout ---
 echo "--- Rollout ---"
-kubectl -n "${NAMESPACE}" rollout status deployment/"${DEPLOY}" --timeout=300s
+for target in "${TARGETS[@]}"; do
+    kubectl -n "${NAMESPACE}" rollout status deployment/"${target}" --timeout=300s
+done
 
-# Record the build identity on the live objects so a drift check can compare them
-# against git without guessing.
-for target in "${DEPLOY}"; do
+# Record the build identity on every live object so a drift check can compare
+# them against git without guessing.
+for target in "${TARGETS[@]}"; do
     kubectl -n "${NAMESPACE}" annotate deployment/"${target}" \
         "tusker.net.au/commit=${COMMIT}" \
         "tusker.net.au/image-tag=${IMAGE_TAG}" \
@@ -168,7 +190,9 @@ print("{}: IMAGE DIGEST OK ({} Ready pod(s), {})".format(container_name, verifie
 }
 
 echo "--- Running image digest verification ---"
-verify_image_digest app=tusker-gateway "${DEPLOY}"
+for target in "${TARGETS[@]}"; do
+    verify_image_digest "app=${target}" "${target}"
+done
 
 # /health must report the revision baked into the verified image.
 echo "--- Commit verification ---"
@@ -239,12 +263,20 @@ SMOKE_API_KEY="${chat_key}" python3 "${SMOKE_HELPER}" \
 # apply it in place when TUSKER_PIN_MANIFEST=1.
 echo "--- Manifest pin ---"
 PIN_ARGS=(--digest "${IMAGE_DIGEST}" --commit "${COMMIT}" --tag "${IMAGE_TAG}")
+PINS=()
+for target in "${TARGETS[@]}"; do
+    PINS+=("$(manifest_for "${target}")")
+done
 if [[ "${TUSKER_PIN_MANIFEST:-0}" == "1" ]]; then
-    python3 "${SCRIPT_DIR}/pin-manifest.py" k8s/deployment.yaml "${PIN_ARGS[@]}" --write
-    [[ -d .git ]] && git diff --stat -- k8s/deployment.yaml || true
+    for manifest in "${PINS[@]}"; do
+        python3 "${SCRIPT_DIR}/pin-manifest.py" "${manifest}" "${PIN_ARGS[@]}" --write
+    done
+    [[ -d .git ]] && git diff --stat -- "${PINS[@]}" || true
 else
-    python3 "${SCRIPT_DIR}/pin-manifest.py" k8s/deployment.yaml "${PIN_ARGS[@]}"
-    echo "Commit k8s/deployment.yaml from the workstation so git records what runs,"
+    for manifest in "${PINS[@]}"; do
+        python3 "${SCRIPT_DIR}/pin-manifest.py" "${manifest}" "${PIN_ARGS[@]}"
+    done
+    echo "Commit ${PINS[*]} from the workstation so git records what runs,"
     echo "then run k8s/verify-provenance.sh."
 fi
 

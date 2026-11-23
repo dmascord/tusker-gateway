@@ -2,9 +2,9 @@
 # Provenance drift check: does the tracked source match what the cluster runs?
 #
 # Compares the links that can drift apart:
-#   1. tracked manifest   k8s/deployment.yaml image (repo@sha256:<digest>)
-#   2. live Deployment    spec.template.spec.containers[0].image (digest or tag)
-#   3. running pod        status.containerStatuses[].imageID
+#   1. tracked manifests  k8s/{deployment,worker-opencode,worker-claude}.yaml images
+#   2. live Deployments   spec.template.spec.containers[0].image (digest or tag)
+#   3. running pods       status.containerStatuses[].imageID
 #   4. serving process    /health "commit"
 # plus the Deployment's tusker.net.au/{commit,image-tag,image-digest} annotations,
 # git HEAD, and the registry's current digest for the recorded tag - which is what
@@ -87,38 +87,62 @@ for pod in json.load(sys.stdin)["items"]:
 ' 2>/dev/null
 }
 
-tracked_image=$(field "${MANIFEST}" 'registry\.tusker\.net\.au:5000/tusker-gateway(@sha256:[0-9a-f]{64}|:[A-Za-z0-9._-]+)') || true
-tracked_commit=$(field "${MANIFEST}" 'tusker\.net\.au/commit: [0-9a-f]{40}') || true
-tracked_commit=${tracked_commit##*: }
-tracked_digest=""
-if [[ -n "${tracked_image}" ]]; then
-    tracked_digest=$(prov_image_digest "${tracked_image}") || true
-fi
+# The gateway and both CLI workers run the same image with different entrypoints.
+# A deploy that moves only one of them leaves the others on a stale digest, so
+# every workload gets the same tracked/live/pod comparison.
+WORKLOADS=(
+    "tusker-gateway|${MANIFEST}"
+    "tusker-opencode-worker|${REPO_ROOT}/k8s/worker-opencode.yaml"
+    "tusker-claude-worker|${REPO_ROOT}/k8s/worker-claude.yaml"
+)
 
-deployment=$(${KUBECTL} -n "${NAMESPACE}" get deployment tusker-gateway -o json 2>/dev/null) || true
-live_image=""; live_commit=""; live_tag=""; live_annotated_digest=""
-if [[ -n "${deployment}" ]]; then
-    live_image=$(printf '%s' "${deployment}" | json_field 't["image"]') || true
-    live_commit=$(printf '%s' "${deployment}" | json_field 'a.get("tusker.net.au/commit", "")') || true
-    live_tag=$(printf '%s' "${deployment}" | json_field 'a.get("tusker.net.au/image-tag", "")') || true
-    live_annotated_digest=$(printf '%s' "${deployment}" | json_field 'a.get("tusker.net.au/image-digest", "")') || true
-fi
-if [[ -z "${deployment}" ]]; then
-    note_problem "cannot read Deployment ${NAMESPACE}/tusker-gateway (context $(kubectl config current-context 2>/dev/null || echo '<unknown>'))"
-fi
-live_digest=""
-if [[ -n "${live_image}" ]]; then
-    live_digest=$(prov_image_digest "${live_image}") || true
-fi
-tag_digest=""
-if [[ -n "${live_tag}" ]]; then
-    tag_digest=$(prov_registry_digest "${live_tag}") || true
-fi
+# Parallel indexed arrays (bash 3.2 compatible: no associative arrays here).
+W_NAMES=(); W_MANIFESTS=(); W_TRACKED_IMAGE=(); W_TRACKED_COMMIT=()
+W_TRACKED_DIGEST=(); W_LIVE_IMAGE=(); W_LIVE_COMMIT=(); W_LIVE_TAG=()
+W_LIVE_ANNOTATED_DIGEST=(); W_LIVE_DIGEST=(); W_TAG_DIGEST=()
+W_POD_LIST=(); W_POD_DIGEST=(); W_POD_COUNT=(); W_POD_DISTINCT=()
 
-gateway_pods=$(pod_digests app=tusker-gateway)
-gateway_digest=$(printf '%s\n' "${gateway_pods}" | awk 'NF{print $2; exit}')
-gateway_pod_count=$(printf '%s\n' "${gateway_pods}" | grep -c 'sha256:' || true)
-gateway_distinct=$(printf '%s\n' "${gateway_pods}" | awk 'NF{print $2}' | sort -u | grep -c . || true)
+for entry in "${WORKLOADS[@]}"; do
+    name=${entry%%|*}
+    manifest=${entry#*|}
+    W_NAMES+=("${name}"); W_MANIFESTS+=("${manifest}")
+    image=$(field "${manifest}" 'registry\.tusker\.net\.au:5000/tusker-gateway(@sha256:[0-9a-f]{64}|:[A-Za-z0-9._-]+)') || true
+    commit=$(field "${manifest}" 'tusker\.net\.au/commit: [0-9a-f]{40}') || true
+    commit=${commit##*: }
+    W_TRACKED_IMAGE+=("${image}"); W_TRACKED_COMMIT+=("${commit}")
+    td=""
+    if [[ -n "${image}" ]]; then td=$(prov_image_digest "${image}") || true; fi
+    W_TRACKED_DIGEST+=("${td}")
+
+    deployment=$(${KUBECTL} -n "${NAMESPACE}" get deployment "${name}" -o json 2>/dev/null) || true
+    li=""; lc=""; lt=""; lad=""
+    if [[ -n "${deployment}" ]]; then
+        li=$(printf '%s' "${deployment}" | json_field 't["image"]') || true
+        lc=$(printf '%s' "${deployment}" | json_field 'a.get("tusker.net.au/commit", "")') || true
+        lt=$(printf '%s' "${deployment}" | json_field 'a.get("tusker.net.au/image-tag", "")') || true
+        lad=$(printf '%s' "${deployment}" | json_field 'a.get("tusker.net.au/image-digest", "")') || true
+    else
+        note_problem "cannot read Deployment ${NAMESPACE}/${name} (context $(kubectl config current-context 2>/dev/null || echo '<unknown>'))"
+    fi
+    W_LIVE_IMAGE+=("${li}"); W_LIVE_COMMIT+=("${lc}")
+    W_LIVE_TAG+=("${lt}"); W_LIVE_ANNOTATED_DIGEST+=("${lad}")
+    ld=""; if [[ -n "${li}" ]]; then ld=$(prov_image_digest "${li}") || true; fi
+    W_LIVE_DIGEST+=("${ld}")
+    rd=""; if [[ -n "${lt}" ]]; then rd=$(prov_registry_digest "${lt}") || true; fi
+    W_TAG_DIGEST+=("${rd}")
+
+    pods=$(pod_digests "app=${name}")
+    W_POD_LIST+=("${pods}")
+    W_POD_DIGEST+=("$(printf '%s\n' "${pods}" | awk 'NF{print $2; exit}')")
+    W_POD_COUNT+=("$(printf '%s\n' "${pods}" | grep -c 'sha256:' || true)")
+    W_POD_DISTINCT+=("$(printf '%s\n' "${pods}" | awk 'NF{print $2}' | sort -u | grep -c . || true)")
+done
+
+# Anchors retained for the commit chain and final summary.
+gateway_digest=${W_POD_DIGEST[0]}
+tracked_image=${W_TRACKED_IMAGE[0]}
+tracked_commit=${W_TRACKED_COMMIT[0]}
+live_commit=${W_LIVE_COMMIT[0]}
 
 health_commit=$(curl -s -m 10 --retry 2 --retry-delay 1 --retry-all-errors "${HEALTH_URL}" 2>/dev/null \
     | python3 -c 'import json
@@ -141,55 +165,67 @@ if [[ -n "${git_head}" && -n "${health_commit}" ]]; then
     ahead_of_deployed=$(git -C "${REPO_ROOT}" rev-list --count "${health_commit}..${git_head}" 2>/dev/null) || ahead_of_deployed=""
 fi
 
-say "=== Provenance: ${MANIFEST} vs ${NAMESPACE}/tusker-gateway ==="
+say "=== Provenance: tracked manifests vs ${NAMESPACE} deployments ==="
 say "$(printf '  %-28s %s' 'kubectl context' "${KUBECTL_CONTEXT:-$(kubectl config current-context 2>/dev/null || echo '<none>')}")"
-say ""
-say "image digest chain"
-say "$(printf '  %-28s %s' 'tracked manifest' "${tracked_image:-<none>}")"
-say "$(printf '  %-28s %s' 'tracked digest' "${tracked_digest:-<none>}")"
-say "$(printf '  %-28s %s' 'live Deployment image' "${live_image:-<none>}")"
-say "$(printf '  %-28s %s' 'live Deployment digest' "${live_digest:-<none>}")"
-say "$(printf '  %-28s %s -> %s' 'recorded tag' "${live_tag:-<none>}" "${tag_digest:-<unresolved>}")"
-say "$(printf '  %-28s %s' 'Deployment digest annotation' "${live_annotated_digest:-<none>}")"
-say "$(printf '  %-28s %s (%s pod(s), %s distinct)' 'gateway pods' "$(printf '%s' "${gateway_pods}" | tr '\n' ' ')" "${gateway_pod_count}" "${gateway_distinct}")"
+
+for i in "${!W_NAMES[@]}"; do
+    name=${W_NAMES[$i]}
+    say ""
+    say "--- ${name} ---"
+    say "$(printf '  %-28s %s' 'tracked manifest' "${W_TRACKED_IMAGE[$i]:-<none>}")"
+    say "$(printf '  %-28s %s' 'tracked digest' "${W_TRACKED_DIGEST[$i]:-<none>}")"
+    say "$(printf '  %-28s %s' 'live Deployment image' "${W_LIVE_IMAGE[$i]:-<none>}")"
+    say "$(printf '  %-28s %s' 'live Deployment digest' "${W_LIVE_DIGEST[$i]:-<none>}")"
+    say "$(printf '  %-28s %s -> %s' 'recorded tag' "${W_LIVE_TAG[$i]:-<none>}" "${W_TAG_DIGEST[$i]:-<unresolved>}")"
+    say "$(printf '  %-28s %s' 'Deployment digest annotation' "${W_LIVE_ANNOTATED_DIGEST[$i]:-<none>}")"
+    say "$(printf '  %-28s %s (%s pod(s), %s distinct)' 'pods' "$(printf '%s' "${W_POD_LIST[$i]}" | tr '\n' ' ')" "${W_POD_COUNT[$i]}" "${W_POD_DISTINCT[$i]}")"
+
+    ti=${W_TRACKED_IMAGE[$i]}
+    if [[ -n "${ti}" && "${ti}" != *@sha256:* ]]; then
+        note_problem "${name}: tracked manifest pins the tag ${ti}, not a digest (run k8s/pin-manifest.py)"
+    fi
+    pd=${W_POD_DIGEST[$i]}
+    if [[ -n "${pd}" ]]; then
+        for pair in "tracked manifest:${W_TRACKED_DIGEST[$i]}" "live Deployment:${W_LIVE_DIGEST[$i]}" \
+                    "recorded tag:${W_TAG_DIGEST[$i]}" "Deployment annotation:${W_LIVE_ANNOTATED_DIGEST[$i]}"; do
+            label=${pair%%:*}
+            value=${pair#*:}
+            if [[ -z "${value}" ]]; then
+                note_warning "${name} ${label}: digest unknown"
+            elif [[ "${value}" != "${pd}" ]]; then
+                note_problem "${name} ${label} digest ${value} != running ${pd}"
+            fi
+        done
+        if [[ "${W_POD_DISTINCT[$i]}" != "1" ]]; then
+            note_warning "${name}: ${W_POD_DISTINCT[$i]} distinct pod digests (mid-rollout?)"
+        fi
+    else
+        note_problem "${name}: no pod imageID to anchor the digest chain"
+    fi
+done
+
 say ""
 say "commit chain"
 say "$(printf '  %-28s %s' '/health' "${health_commit:-<unreachable>}")"
 say "$(printf '  %-28s %s' 'git HEAD' "${git_head:-<no .git>}${ahead_of_deployed:+ (${ahead_of_deployed} commit(s) ahead of the running revision)}")"
-say "$(printf '  %-28s %s' 'Deployment annotation' "${live_commit:-<none>}")"
-say "$(printf '  %-28s %s' 'manifest annotation' "${tracked_commit:-<none>}")"
-
-if [[ -n "${tracked_image}" && "${tracked_image}" != *@sha256:* ]]; then
-    note_problem "tracked manifest pins the tag ${tracked_image}, not a digest (run k8s/pin-manifest.py)"
-fi
-
-if [[ -n "${gateway_digest}" ]]; then
-    for pair in "tracked manifest:${tracked_digest}" "live Deployment:${live_digest}" \
-                "recorded tag:${tag_digest}" "Deployment annotation:${live_annotated_digest}"; do
-        name=${pair%%:*}
-        value=${pair#*:}
-        if [[ -z "${value}" ]]; then
-            note_warning "${name}: digest unknown"
-        elif [[ "${value}" != "${gateway_digest}" ]]; then
-            note_problem "${name} digest ${value} != running gateway ${gateway_digest}"
-        fi
-    done
-    if [[ "${gateway_distinct}" != "1" ]]; then
-        note_warning "${gateway_distinct} distinct gateway pod digests (mid-rollout?)"
-    fi
-else
-    note_problem "no gateway pod imageID to anchor the digest chain"
-fi
+for i in "${!W_NAMES[@]}"; do
+    name=${W_NAMES[$i]}
+    say "$(printf '  %-24s %s' "${name} Deployment" "${W_LIVE_COMMIT[$i]:-<none>}")"
+    say "$(printf '  %-24s %s' "${name} manifest" "${W_TRACKED_COMMIT[$i]:-<none>}")"
+done
 
 if [[ -n "${health_commit}" ]]; then
-    for pair in "Deployment annotation:${live_commit}" "manifest annotation:${tracked_commit}"; do
-        name=${pair%%:*}
-        value=${pair#*:}
-        if [[ -z "${value}" ]]; then
-            note_warning "${name}: no commit recorded"
-        elif [[ "${value}" != "${health_commit}" ]]; then
-            note_problem "${name} ${value} != /health ${health_commit}"
-        fi
+    for i in "${!W_NAMES[@]}"; do
+        name=${W_NAMES[$i]}
+        for pair in "Deployment annotation:${W_LIVE_COMMIT[$i]}" "manifest annotation:${W_TRACKED_COMMIT[$i]}"; do
+            label=${pair%%:*}
+            value=${pair#*:}
+            if [[ -z "${value}" ]]; then
+                note_warning "${name} ${label}: no commit recorded"
+            elif [[ "${value}" != "${health_commit}" ]]; then
+                note_problem "${name} ${label} ${value} != /health ${health_commit}"
+            fi
+        done
     done
 else
     note_problem "/health at ${HEALTH_URL} reported no commit"
@@ -221,5 +257,5 @@ if [[ -n "${problems}" ]]; then
 fi
 
 say ""
-say "OK: tracked manifest, live Deployment, running pods and /health all agree"
+say "OK: all tracked manifests, live Deployments, running pods and /health agree"
 exit 0
