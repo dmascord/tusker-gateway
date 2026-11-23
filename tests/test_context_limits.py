@@ -16,6 +16,7 @@ from tusker_gateway.context_limits import (
     required_context_tokens,
     set_published_context_windows,
 )
+from tusker_gateway.errors import ContextWindowExceededError, openai_error
 
 
 @pytest.fixture(autouse=True)
@@ -45,6 +46,28 @@ def test_model_key_wins_over_provider_key(windows):
     # large prompts are not forwarded past a route's real upstream window.
     assert declared_context_window("openai-codex", "gpt-5.6-luna") == 128_000
     assert declared_context_window("openai-codex", "some-unknown-model") == 128_000
+
+
+def test_apim_luna_context_window_is_the_total_window_not_the_output_cap(monkeypatch):
+    """APIM gpt-5.6-luna: 1,050,000 total context, 128,000 max OUTPUT.
+
+    The upstream /models row carries no context field, so without the
+    model-scoped override the built-in apim 128,000 fallback filtered a
+    212K-token privacy request out entirely (req_4ae4a2134158c498, 2026-11-22).
+    The 128,000 figure is the output cap, not the prompt window.
+    """
+    monkeypatch.setenv(
+        "TUSKER_CONTEXT_WINDOW_OVERRIDES_JSON",
+        json.dumps({"apim/gpt-5.6-luna": 1050000}),
+    )
+    assert declared_context_window("apim", "gpt-5.6-luna") == 1_050_000
+    # Other APIM models keep the conservative built-in; the override is model-scoped.
+    assert declared_context_window("apim", "gpt-6-luna") == 128_000
+
+    body, budget = fit_output_budget({"max_tokens": 16384}, "apim", "gpt-5.6-luna", 208379)
+    assert body["max_tokens"] == 16384
+    assert budget.window == 1_050_000
+    assert not budget.clamped
 
 
 def test_published_and_learned_windows_take_precedence_over_override(monkeypatch):
@@ -197,6 +220,20 @@ def test_pool_skips_candidate_whose_declared_window_cannot_fit(monkeypatch, tmp_
     assert big in candidates(required_context_tokens(30000))
     assert local in candidates(required_context_tokens(2000))
 
+    # When context size is the only reason an otherwise eligible route was
+    # filtered, expose the largest available window for the client retry path.
+    context_failure: dict[str, int] = {}
+    assert manager.select(
+        "code",
+        context_tokens=required_context_tokens(30000),
+        allowed_models=(local[1],),
+        context_failure=context_failure,
+    ) is None
+    assert context_failure == {
+        "required_context_tokens": required_context_tokens(30000),
+        "max_context_window": 32768,
+    }
+
 
 def test_builtin_defaults_filter_candidates_that_cannot_fit(monkeypatch, tmp_path):
     from tusker_gateway.config import PoolConfig
@@ -224,6 +261,20 @@ def test_builtin_defaults_filter_candidates_that_cannot_fit(monkeypatch, tmp_pat
 def test_min_output_reserve_is_configurable(monkeypatch):
     monkeypatch.setenv("TUSKER_MIN_OUTPUT_TOKENS", "1000")
     assert min_output_tokens() == 1000
+
+
+def test_context_overflow_error_uses_omp_recovery_trigger():
+    exc = ContextWindowExceededError(
+        pool="privacy",
+        required_context_tokens=210_000,
+        max_context_window=128_000,
+    )
+
+    payload = openai_error(exc.message, code=exc.code, error_type=exc.error_type)
+    assert exc.status == 400
+    assert payload["error"]["code"] == "context_length_exceeded"
+    assert "context_length_exceeded" in payload["error"]["message"]
+    assert "128000 tokens" in payload["error"]["message"]
 
 
 def test_output_budget_exhaustion_is_not_quarantined(monkeypatch):

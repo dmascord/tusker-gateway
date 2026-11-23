@@ -116,6 +116,36 @@ class NoHealthyModelsError(BadRequestError):
         self.headers = {"Retry-After": str(max(1, int(retry_after_secs)))}
 
 
+class ContextWindowExceededError(BadRequestError):
+    """No otherwise-eligible pool route can fit the estimated request context.
+
+    The stable OpenAI-compatible error code is also recognized by agent
+    clients such as OMP as a context overflow, triggering their normal
+    session compaction and retry flow.
+    """
+
+    status = 400
+    error_type = "invalid_request_error"
+
+    def __init__(
+        self,
+        *,
+        pool: str,
+        required_context_tokens: int,
+        max_context_window: int,
+    ) -> None:
+        self.pool = pool
+        self.required_context_tokens = max(0, int(required_context_tokens))
+        self.max_context_window = max(0, int(max_context_window))
+        super().__init__(
+            "context_length_exceeded: estimated request context requires "
+            f"{self.required_context_tokens} tokens, but the largest currently "
+            f"eligible upstream context window in pool '{pool}' is "
+            f"{self.max_context_window} tokens. Compact the conversation and retry.",
+            code="context_length_exceeded",
+        )
+
+
 class ProviderRouteDisabledError(BadRequestError):
     """An explicitly requested provider route is disabled by operator policy."""
 
@@ -138,6 +168,56 @@ class ProviderError(GatewayError):
 
     status = 502
     error_type = "provider_error"
+
+
+class ProviderFailoverError(ProviderError):
+    """Every eligible pool candidate failed during one request.
+
+    A failover can burn through several candidates for different reasons
+    (upstream resets, capacity, quota, idle timeouts). Raising only the last
+    candidate's error is misleading: a client that saw two connection resets
+    and a capacity rejection is told the request "exceeded its per-attempt
+    timeout". This error carries a compact, client-safe summary of every
+    candidate failure so the terminal verdict reflects the whole failover.
+
+    ``failures`` is a list of ``{"provider", "model", "class"}`` dicts where
+    ``class`` is a gateway-authored code or exception class name - never a
+    raw upstream body, so the rendered message is safe to relay to clients.
+    """
+
+    _FRIENDLY_LABELS = {
+        "provider_timeout": "timeout",
+        "TimeoutError": "timeout",
+        "asyncio.TimeoutError": "timeout",
+        "provider_capacity": "capacity unavailable",
+        "ProviderCapacityError": "capacity unavailable",
+        "rate_limit_exceeded": "rate limited",
+        "RateLimitError": "rate limited",
+        "ClientOSError": "connection reset",
+        "ClientConnectionError": "connection reset",
+        "ClientConnectorError": "connection reset",
+        "ServerDisconnectedError": "connection reset",
+        "ConnectionResetError": "connection reset",
+        "ClientPayloadError": "connection reset",
+    }
+
+    def __init__(self, failures: list[dict[str, Any]]) -> None:
+        self.failures = list(failures)
+        counts: dict[str, int] = {}
+        for item in self.failures:
+            raw = str(item.get("class") or "provider_error")
+            label = self._FRIENDLY_LABELS.get(raw, raw)
+            counts[label] = counts.get(label, 0) + 1
+        summary = ", ".join(
+            f"{label} x{count}" if count > 1 else label
+            for label, count in counts.items()
+        )
+        message = f"All {len(self.failures)} eligible provider candidates failed: {summary}"
+        super().__init__(message, code="all_candidates_failed")
+        # Gateway-authored, so safe to render in the stream error frame; the
+        # operator-facing log and access log both carry this same summary.
+        self.upstream_status = 502
+        self.upstream_body = message
 
 
 class ProviderModelRetiredError(ProviderError):

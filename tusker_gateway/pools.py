@@ -14,7 +14,7 @@ import re
 import time
 import fnmatch
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, MutableMapping
 
 from tusker_gateway.catalog import (
     AUTO_DISCOVERED_HEAVYWEIGHT_WEIGHT,
@@ -32,6 +32,16 @@ from tusker_gateway.cooldown import CooldownTracker, global_tracker, is_permanen
 from tusker_gateway.heavyweight import is_heavyweight
 from tusker_gateway.model_rankings import normalize_slug
 from tusker_gateway.safety import is_runtime_blacklisted
+from tusker_gateway.value import (
+    BudgetPacer,
+    IntelPrior,
+    ProviderPlan,
+    RouteCostModel,
+    UsageMix,
+    load_provider_plans,
+    score_candidates,
+    value_routing_mode,
+)
 from tusker_gateway.model_capability import (
     INPUT_MODALITY_CAPABILITIES,
     PRIVACY_ZDR_CAPABILITY,
@@ -349,6 +359,14 @@ class PoolManager:
     )
     _llm_stats: Any | None = None
     _cooldowns: CooldownTracker | None = None
+    # Value-routing state: subscription economics, the catalog cost model,
+    # the observed token mix, and the budget pacer that decays a plan's
+    # value term as its subscription window fills.
+    _value_plans: dict[str, ProviderPlan] = field(default_factory=dict)
+    _value_intel: IntelPrior = field(default_factory=IntelPrior)
+    _value_cost_model: RouteCostModel = field(default_factory=RouteCostModel)
+    _value_usage_mix: UsageMix = field(default_factory=lambda: UsageMix(None))
+    _value_pacer: BudgetPacer | None = None
     # Optional catalog registry — when set, PoolManager.extend_pools_with_catalog()
     # merges catalog-known models into the allowlist. See catalog.py.
     catalog_registry: object | None = None
@@ -522,6 +540,30 @@ class PoolManager:
         llm_stats_path = self.config.get("llm_stats_db_path")
         if llm_stats_path:
             self._llm_stats = ModelRankingsDB(llm_stats_path)
+        # Value routing (shadow by default): plan economics from config,
+        # list prices from the catalog registry, spend pacing from the
+        # provider usage ledger.
+        self._value_plans = load_provider_plans(self.config)
+        self._value_cost_model = RouteCostModel(
+            getattr(self, "catalog_registry", None)
+        )
+        try:
+            from tusker_gateway.provider_usage import (
+                ProviderUsageDB,
+                default_provider_usage_db_path,
+            )
+
+            self._value_usage_db = ProviderUsageDB(
+                default_provider_usage_db_path(self.config["quality_db_path"])
+            )
+            self._value_usage_mix = UsageMix(self._value_usage_db)
+            self._value_pacer = BudgetPacer(
+                self._value_usage_db,
+                self._value_cost_model,
+                threshold=float(self.config.get("budget_pacing_threshold", 0.8)),
+            )
+        except Exception as exc:
+            logger.warning("value routing: usage ledger unavailable (%s)", exc)
         self._cooldowns = global_tracker()
         quality_path = self.config["quality_db_path"]
         if quality_path != ":memory:":
@@ -684,6 +726,7 @@ class PoolManager:
                 if catalog_models is not None and self._outbound_model(provider, model) in catalog_models:
                     count += 1
             confirmed[pool_name] = count
+        self._value_cost_model._cached_at = 0.0
         logger.info("catalog confirmed %s pool entries", confirmed)
         return confirmed
     def extend_pools_with_auto_catalog(self) -> dict[str, list[str]]:
@@ -1512,6 +1555,7 @@ class PoolManager:
         selection_context: str | None = None,
         payload_bytes: int = 0,
         payload_ceiling_of: Callable[[str, str], int | None] | None = None,
+        context_failure: MutableMapping[str, int] | None = None,
     ) -> tuple[str, str] | None:
         """Select the best (provider, model) from a pool.
 
@@ -1709,6 +1753,15 @@ class PoolManager:
                         if pool_config and pool_config.zdr and not s.zdr_ok:
                             self._drop_stickiness(key)
                             break
+                        _sticky_plan = self._value_plans.get(s.provider)
+                        if (
+                            pool_config
+                            and pool_config.zdr
+                            and _sticky_plan is not None
+                            and _sticky_plan.trains_on_data
+                        ):
+                            self._drop_stickiness(key)
+                            break
                         declared = (
                             declared_context_window(s.provider, s.model)
                             if context_tokens > 0
@@ -1827,6 +1880,7 @@ class PoolManager:
         }
         filtered_zdr_models: list[str] = []
         filtered_context_models: list[str] = []
+        context_only_windows: list[int] = []
         filtered_payload_models: list[str] = []
         for s in specs:
             if self._model_is_blacklisted_fast(s.provider, s.model):
@@ -1865,15 +1919,17 @@ class PoolManager:
                 if len(filtered_zdr_models) < 12:
                     filtered_zdr_models.append(f"{s.provider}/{s.model}:privacy_evidence")
                 continue
-            # Only operator-declared windows gate selection: the pool-wide
-            # ``context_window`` is a 128k guess that would wrongly exclude
-            # long-context routes.
-            if context_tokens > 0:
-                window = declared_context_window(s.provider, s.model)
-                if window is not None and window < context_tokens:
-                    filter_counts["context_window"] += 1
-                    if len(filtered_context_models) < 12:
-                        filtered_context_models.append(f"{s.provider}/{s.model}:{window}")
+            # Privacy: a provider that trains on request data is hard-masked
+            # from ZDR pools even when its registry entry sets zdr_ok — the
+            # score can never soften this (see tusker_gateway/value.py).
+            if pool_config and pool_config.zdr:
+                _plan = self._value_plans.get(s.provider)
+                if _plan is not None and _plan.trains_on_data:
+                    filter_counts["zdr_policy"] += 1
+                    if len(filtered_zdr_models) < 12:
+                        filtered_zdr_models.append(
+                            f"{s.provider}/{s.model}:trains_on_data"
+                        )
                     continue
             # Learned payload ceiling: skip a route we have positive
             # evidence cannot accept this body. ``None`` (no evidence yet)
@@ -1953,6 +2009,18 @@ class PoolManager:
                     if len(filtered_zdr_models) < 12:
                         filtered_zdr_models.append(f"{s.provider}/{s.model}")
                     continue
+            # Apply context after every other route eligibility check. This
+            # lets callers distinguish a genuinely-too-large request from a
+            # pool that is empty for privacy, capability, cooldown, or policy
+            # reasons. The pool-wide window is only a default; route-specific
+            # declarations preserve long-context candidates.
+            window = declared_context_window(s.provider, s.model)
+            if context_tokens > 0 and window is not None and window < context_tokens:
+                filter_counts["context_window"] += 1
+                context_only_windows.append(window)
+                if len(filtered_context_models) < 12:
+                    filtered_context_models.append(f"{s.provider}/{s.model}:{window}")
+                continue
             candidates.append(s)
 
         if requires_tools and filtered_tool_models:
@@ -2054,6 +2122,9 @@ class PoolManager:
                 )
 
         if not candidates:
+            if context_failure is not None and context_only_windows:
+                context_failure["required_context_tokens"] = int(context_tokens)
+                context_failure["max_context_window"] = max(context_only_windows)
             filters = ",".join(
                 f"{name}={count}"
                 for name, count in filter_counts.items()
@@ -2137,6 +2208,44 @@ class PoolManager:
                 boosted.append((provider, model, score))
             boosted.sort(key=lambda entry: (-entry[2], entry[0], entry[1]))
             quality_list = boosted
+        # 2b. Value routing: shadow mode records what the value-adjusted
+        # score would pick without changing selection; actual mode replaces
+        # the ranking entirely. Never applies on recovery paths (cooldown
+        # probe), where the bounded probe sequence owns ordering.
+        if candidates and value_routing_mode() != "off" and not allow_cooldown_probe:
+            quality_by_pair = {
+                (provider, model): float(score)
+                for provider, model, score in quality_list
+            }
+            value_scores = score_candidates(
+                pool_name=pool_name,
+                candidates=[(c.provider, c.model) for c in candidates],
+                quality_scores=quality_by_pair,
+                latency_ms={},
+                plans=self._value_plans,
+                intel=self._value_intel,
+                ranks_by_slug={
+                    slug: row[1]
+                    for slug, row in (self._llm_stats_snapshot() or {}).items()
+                },
+                cost_model=self._value_cost_model,
+                input_fraction=self._value_usage_mix.input_fraction(pool_name),
+                pacer=self._value_pacer,
+            )
+            value_ranked = sorted(
+                value_scores, key=lambda s: s.final, reverse=True
+            )
+            value_pick = (value_ranked[0].provider, value_ranked[0].model)
+            if value_routing_mode() == "actual":
+                quality_list = [
+                    (s.provider, s.model, s.final) for s in value_ranked
+                ]
+            else:
+                actual_pick = (quality_list[0][0], quality_list[0][1])
+                if value_pick != actual_pick:
+                    from tusker_gateway.value import record_shadow_comparison
+
+                    record_shadow_comparison(pool_name, actual_pick, value_pick)
         if not quality_list:
             # Fallback: pick first candidate
             result = (candidates[0].provider, candidates[0].model)

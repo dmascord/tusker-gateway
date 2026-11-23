@@ -3,6 +3,41 @@
 How the gateway picks a (provider, model) pair when a client sends a virtual
 alias like `hermes-code`, `hermes-privacy`, `hermes-premium`, or `hermes-swarm`.
 
+
+## Value-weighted routing (shadow-first)
+
+Eligible routes can be ranked using reliability, model strength, latency, and
+effective cost under the provider's subscription plan. Configure plan economics
+under `provider_plans` in runtime config:
+
+```json
+{
+  "provider_plans": {
+    "commandcode": {
+      "multiplier": 0.143,
+      "window_5h_usd": 14,
+      "window_week_usd": 35,
+      "trains_on_data": false,
+      "retention_days": 0
+    }
+  }
+}
+```
+
+`TUSKER_VALUE_ROUTING` is read per request and defaults to `shadow`:
+
+- `shadow`: compute value ranking and record actual→value divergences, while
+  preserving existing quality-ranked selection.
+- `actual`: use value-adjusted ranking after eligibility and privacy filters.
+- `off`: skip value scoring.
+
+Unknown catalog prices receive no value credit and cannot win solely because
+their price is missing. Subscription-window spend comes from the provider
+usage ledger at list price. Pacing decays only the value term and withholds a
+route after a configured window is exhausted.
+
+`trains_on_data: true` is a hard privacy exclusion for ZDR pools. It does not
+affect non-private pools. Provider `zdr_ok` remains a separate required gate.
 ## Pool tiers
 
 The gateway has four pools, each with a different tier of models:
@@ -720,6 +755,17 @@ the Qwen tokenizer: code ~3.3, schema JSON ~3.4, prose ~5.1), plus
 `TUSKER_IMAGE_TOKEN_ESTIMATE` (default 1600) per image. Every attempt logs
 `context budget rid=... window=... prompt_estimate=... requested_max_tokens=...
 effective_max_tokens=... clamped=...`.
+
+If every route that otherwise satisfies the request's pool, privacy,
+capability, and availability requirements is filtered only because its
+declared context window is too small, the gateway returns HTTP 400 with
+`error.code=context_length_exceeded`. The message includes the gateway's
+estimated required context (including its output reserve) and the largest
+currently eligible route window. Agent clients can compact their durable
+conversation and retry; ordinary provider outages and capability mismatches
+continue to use their existing availability errors. The largest window is
+request-specific and may change as provider health and route eligibility
+change.
 
 
 A tool turn whose provider output is unusable is rejected by stream validation. This

@@ -33,6 +33,7 @@ _ROUTE_SCOPES = {
     ("POST", "/v1/images/edits"): "inference:images",
     ("POST", "/v1/images/variations"): "inference:images",
     ("POST", "/v1/audio/speech"): "inference:audio",
+    ("POST", "/v1/audio/transcriptions"): "inference:audio",
     ("POST", "/v1/videos"): "inference:video",
     ("POST", "/v1/embeddings"): "inference:embeddings",
     ("POST", "/v1/rerank"): "inference:rerank",

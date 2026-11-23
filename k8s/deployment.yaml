@@ -6,9 +6,9 @@ metadata:
   labels:
     app: tusker-gateway
   annotations:
-    tusker.net.au/commit: 65c2c20cab542ba2efc70cd9e4ae747c41419f99
-    tusker.net.au/image-tag: swarm-alpine-65c2c20
-    tusker.net.au/image-digest: sha256:b2bc3b194b0551bc94eb986b742951e17eec216a48e5338c3f5a357cb26fdba1
+    tusker.net.au/commit: ad206c37a59595d94fbdd9755a2adc41bebd842a
+    tusker.net.au/image-tag: swarm-alpine-ad206c37a59595d94fbdd9755a2adc41bebd842a
+    tusker.net.au/image-digest: sha256:9cc86b5d1454489db54c0bf694d732a0dc8877a397e7df89ca003b6ceed7dbe3
 spec:
   replicas: 1
   selector:
@@ -34,7 +34,7 @@ spec:
       terminationGracePeriodSeconds: 90
       containers:
       - name: tusker-gateway
-        image: registry.tusker.net.au:5000/tusker-gateway@sha256:b2bc3b194b0551bc94eb986b742951e17eec216a48e5338c3f5a357cb26fdba1
+        image: registry.tusker.net.au:5000/tusker-gateway@sha256:9cc86b5d1454489db54c0bf694d732a0dc8877a397e7df89ca003b6ceed7dbe3
         imagePullPolicy: Always
         envFrom:
         - secretRef:
@@ -52,6 +52,12 @@ spec:
           value: 'true'
         - name: TUSKER_OPENCODE_CLI_ENABLED
           value: 'true'
+        # Delegate process-backed CLI providers to dedicated worker pods so
+        # their memory (up to ~1 GiB per invocation) cannot OOM the gateway.
+        - name: TUSKER_OPENCODE_WORKER_URL
+          value: 'http://tusker-opencode-worker.hermes.svc.cluster.local:8643'
+        - name: TUSKER_CLAUDE_WORKER_URL
+          value: 'http://tusker-claude-worker.hermes.svc.cluster.local:8643'
         # Keep one OpenCode server alive so requests do not each pay a private
         # server start (~6s). The server is released after the idle window, so a
         # long window is the point: it costs ~160MiB resident while warm, and a
@@ -92,6 +98,13 @@ spec:
         # rate limits, budgets, and idempotency fail explicitly with 503.
         - name: TUSKER_STATE_DATABASE_CONNECT_TIMEOUT
           value: '2'
+        # Value routing is observable but non-disruptive until explicitly enabled.
+        - name: TUSKER_VALUE_ROUTING
+          value: 'shadow'
+        - name: TUSKER_PROVIDER_PLANS
+          value: '{}'
+        - name: TUSKER_BUDGET_PACING_THRESHOLD
+          value: '0.8'
         - name: TUSKER_STATE_DEGRADED_MODE
           value: advisory
         # The response cache is disposable; keep it off the shared RWX volume
@@ -572,8 +585,11 @@ spec:
           value: 'true'
         - name: TUSKER_COMPOSITE_QUALIFICATION_LIMIT
           value: '16'
+        # Reasoning models can take 60-100s to finish a composite probe once
+        # they have a 16k output budget; the old 45s cap re-flipped passing
+        # synthetic routes to "unavailable" on the next periodic cycle.
         - name: TUSKER_COMPOSITE_QUALIFICATION_TIMEOUT_SECS
-          value: '45'
+          value: '120'
         - name: TUSKER_COMPOSITE_QUALIFICATION_MAX_AGE_SECS
           value: '86400'
         - name: TUSKER_COMPOSITE_QUALIFICATION_INTERVAL_SECS
@@ -583,6 +599,13 @@ spec:
         # produces no image-plus-tool evidence at all.
         - name: TUSKER_COMPOSITE_QUALIFICATION_INITIAL_DELAY_SECS
           value: '600'
+        # Output budget for one composite probe. Reasoning models can spend
+        # thousands of tokens thinking before emitting the required tool call;
+        # the old hard-coded 2048 made synthetic/hf:Qwen/Qwen3.8-27B end with
+        # output_budget_exhausted and a false "unavailable" verdict. Verified
+        # passing at 8192 and 16384 (2026-11-22, req_918ddeb1f2b61523).
+        - name: TUSKER_COMPOSITE_QUALIFICATION_MAX_TOKENS
+          value: '16384'
         # Privacy-route evidence: a ZDR provider marking alone does not prove
         # the upstream accepted the pool's privacy request policy (for
         # Command Code, x-cmd-zdr: 1). This bounded cycle sends one cheap
@@ -676,8 +699,15 @@ spec:
         # silently assumed to support it. Jetson has only 8 GiB RAM, so do
         # not declare a blanket context override there; the coder model's
         # Modelfile explicitly sets 8192.
+        # APIM serves gpt-5.6-luna from Azure OpenAI / Microsoft Foundry with a
+        # 1,050,000-token TOTAL context window; the 128,000-token figure is the
+        # per-response OUTPUT limit, not the prompt window. The upstream /models
+        # row carries no context field, so without this override the built-in
+        # apim 128,000 fallback filtered long-context privacy requests out
+        # (2026-11-22, req_4ae4a2134158c498). Keep this model-scoped: other APIM
+        # models may have different windows.
         - name: TUSKER_CONTEXT_WINDOW_OVERRIDES_JSON
-          value: '{"mlx-mac/ornith-1.5:35b": 262144, "mlx-mac/qwen3.8-27b": 262144, "mlx-mac/shirdel-coder-9b-claude-fable-5": 262144, "local-llm/qwopus-9b-coder-mtp": 8192}'
+          value: '{"apim/gpt-5.6-luna": 1050000, "mlx-mac/ornith-1.5:35b": 262144, "mlx-mac/qwen3.8-27b": 262144, "mlx-mac/shirdel-coder-9b-claude-fable-5": 262144, "local-llm/qwopus-9b-coder-mtp": 8192}'
         # Per-provider streaming per-chunk idle budget overrides (seconds).
         # xiaomi/mimo large contexts regularly exceed the default 120s wall
         # clock — extend the per-chunk budget so streaming generation completes

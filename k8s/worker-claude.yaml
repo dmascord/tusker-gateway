@@ -1,0 +1,101 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tusker-claude-worker
+  namespace: hermes
+  labels:
+    app: tusker-claude-worker
+  annotations:
+    tusker.net.au/commit: ad206c37a59595d94fbdd9755a2adc41bebd842a
+    tusker.net.au/image-tag: swarm-alpine-ad206c37a59595d94fbdd9755a2adc41bebd842a
+    tusker.net.au/image-digest: sha256:9cc86b5d1454489db54c0bf694d732a0dc8877a397e7df89ca003b6ceed7dbe3
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tusker-claude-worker
+  template:
+    metadata:
+      labels:
+        app: tusker-claude-worker
+    spec:
+      nodeSelector:
+        feature.node.kubernetes.io/cpu-cpuid.AVX2: "true"
+      securityContext:
+        fsGroup: 65534
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+      - name: tusker-claude-worker
+        image: registry.tusker.net.au:5000/tusker-gateway@sha256:9cc86b5d1454489db54c0bf694d732a0dc8877a397e7df89ca003b6ceed7dbe3
+        imagePullPolicy: Always
+        command: ["tini", "--", "python", "-m", "tusker_gateway.worker"]
+        envFrom:
+        - secretRef:
+            name: tusker-env-vault
+        env:
+        - name: MODEL_NAME
+          value: tusker-claude-worker
+        - name: HOME
+          value: /home/tusker
+        - name: PYTHONUNBUFFERED
+          value: '1'
+        - name: PYTHONDONTWRITEBYTECODE
+          value: '1'
+        - name: TUSKER_WORKER_MODE
+          value: '1'
+        - name: TUSKER_WORKER_PORT
+          value: '8643'
+        - name: TUSKER_OPENCODE_CLI_ENABLED
+          value: 'false'
+        - name: TUSKER_CLAUDE_CODE_ENABLED
+          value: 'true'
+        - name: TUSKER_LOG_LEVEL
+          value: 'INFO'
+        ports:
+        - containerPort: 8643
+          name: http
+          protocol: TCP
+        volumeMounts:
+        - mountPath: /home/tusker/.hermes
+          name: tusker-home
+        - mountPath: /home/tusker/.claude
+          name: tusker-home
+        resources:
+          requests:
+            memory: 1Gi
+            cpu: 500m
+          limits:
+            memory: 3Gi
+            ephemeral-storage: 4Gi
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8643
+          periodSeconds: 30
+          timeoutSeconds: 3
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8643
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 6
+      volumes:
+      - name: tusker-home
+        persistentVolumeClaim:
+          claimName: tusker-home-rwx
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tusker-claude-worker
+  namespace: hermes
+spec:
+  selector:
+    app: tusker-claude-worker
+  ports:
+  - name: http
+    port: 8643
+    targetPort: 8643
+    protocol: TCP

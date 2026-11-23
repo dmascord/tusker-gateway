@@ -89,13 +89,16 @@ prometheusOperator:
 
 prometheus:
   prometheusSpec:
-    retention: 15d
+    retention: 7d
+    retentionSize: 16GB
     resources:
       requests:
         cpu: 200m
         memory: 512Mi
       limits:
         memory: 1Gi
+    # Raw samples are intentionally short-lived and size-bounded. Recording
+    # rules or external summaries provide longer-term history.
     storageSpec:
       volumeClaimTemplate:
         spec:

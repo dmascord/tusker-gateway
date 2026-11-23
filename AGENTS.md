@@ -11,7 +11,7 @@ Read in order when picking up the repo:
 |---|---|
 | `README.md` | Architecture overview (config, auth, pools, routing, app). |
 | `docs/solution.md` | Why this exists, scope boundaries. |
-| `docs/gateway-model-routing.md` | Pool tiers, heavyweight gate, role aliases, auto_free opt-in. |
+| `docs/gateway-model-routing.md` | Pool tiers, heavyweight gate, role aliases, auto_free opt-in, and shadow-first value routing. |
 | `docs/deployment-k8s.md` | Cluster topology, source paths, image registry, deploy procedure. |
 | `docs/capability-catalog.md` | v0.1.0 capability list (shipped surface). |
 | `docs/feature-matrix-and-plan.md` | Roadmap vs. peer gateways. |
@@ -31,6 +31,17 @@ Read in order when picking up the repo:
 | `docs/incidents/2026-11-11-mlx-mac-capacity-queue.md` | MLX Mac capacity rejections discarded servable work (77/80 privacy attempts locally rejected); bounded FIFO admission queue. |
 | `docs/incidents/2026-11-16-redaction-token-leak.md` | Opaque `[TUSKER:email:…]` ciphertext reaching OMP sessions; syntax-shaped redaction aliases enabled in production. |
 | `docs/incidents/2026-11-20-xhigh-reasoning-effort-downgrade.md` | `xhigh` reasoning level rejected by non-Codex upstreams; per-provider downgrade to `high` + manifest re-pin to the running digest. |
+| `docs/incidents/2026-11-22-failover-terminal-error.md` | Exhausted pool failover reported only the last candidate's timeout; aggregate all candidate failures in the terminal error. |
+| `docs/incidents/2026-11-22-privacy-probe-starvation.md` | Privacy probe re-tested the same quota-blocked prefix forever; interleave due routes across providers. Includes context-window evidence check. |
+| `docs/incidents/2026-11-22-synthetic-image-tools-qualification.md` | Four gates for synthetic image+tools routing; composite probe output cap and 120s timeout. |
+| `docs/incidents/2026-11-23-privacy-pool-full-audit.md` | All 200 privacy routes audited against four gates; 8 eligible for image+tools+212K. |
+| `docs/incidents/2026-11-23-code-pool-audit.md` | 355 code routes audited; 24 eligible for image+tools+212K, google modality probes added three. |
+| `docs/incidents/2026-11-23-worker-pod-verification.md` | opencode worker verified end-to-end; kilo worker stale/unused, kilo models work over direct HTTP. |
+| `docs/incidents/2026-11-23-kilo-qualification.md` | 15/17 kilo models in code pool; 10 tool-qualified, 5 genuine upstream failures; 2 audio models correctly excluded. |
+| `docs/audio-routing.md` | OpenAI-compatible audio endpoints, provider selection, chat audio input and capability evidence. |
+| `docs/incidents/2026-11-23-audio-routing.md` | Restored accidentally-removed TTS route; added STT and audio token accounting; verified live. |
+| `docs/incidents/2026-11-23-all-rate-limited-failover.md` | Uniform rate-limit exhaustion now returns 429 with Retry-After instead of a generic 502. |
+| `docs/incidents/2026-11-23-claude-code-cli-sse-escape.md` | Worker error frames used literal backslash-n; claude-code-cli failures surfaced as a TypeError. |
 | `TODO.md` | Active cross-session work items. |
 
 

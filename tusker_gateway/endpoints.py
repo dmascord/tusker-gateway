@@ -37,6 +37,7 @@ from tusker_gateway.config import (
 from tusker_gateway.errors import (
     BadRequestError,
     ClaudeAuthRequiredError,
+    ContextWindowExceededError,
     GatewayError,
     HighImpactApprovalRequiredError,
     InvalidToolCallArgumentsError,
@@ -46,6 +47,7 @@ from tusker_gateway.errors import (
     ProviderCapacityError,
     ProviderEmptyStreamError,
     ProviderError,
+    ProviderFailoverError,
     ProviderRouteDisabledError,
     ProviderStreamClosedError,
     ProviderStreamLoopError,
@@ -4598,6 +4600,10 @@ def _internalize_github_copilot_rate_limit(
     )
 
 
+# Failure labels recorded by _record_failure that mean "upstream 429".
+_RATE_LIMIT_FAILURE_CLASSES = frozenset({"rate_limit_exceeded", "RateLimitError"})
+
+
 def _provider_rate_limit_is_external(exc: BaseException) -> bool:
     """Whether a provider 429 may be reported to the client as a 429."""
     provider = str(getattr(exc, "provider", "") or "").strip().lower()
@@ -5382,6 +5388,74 @@ async def _call_with_pool_fallback(
 
     excluded: set[tuple[str, str]] = set(excluded_candidates or ())
     last_error: Exception | None = None
+    # Every candidate that failed in this request, in dispatch order. When the
+    # pool is exhausted the terminal error must describe the whole failover,
+    # not just the last candidate (which is usually a timeout after earlier
+    # resets/capacity rejections). Labels are gateway-authored codes or class
+    # names - never raw upstream bodies - so the summary is client-safe.
+    candidate_failures: list[dict[str, Any]] = []
+    context_failures: list[dict[str, int]] = []
+    # A 429 is a transient capacity miss, not an attempt at a viable candidate:
+    # it must not consume the bounded fallback budget, or a run of quota-
+    # limited top-ranked routes cuts off the chain before healthy entries
+    # further down the pool are ever tried. A separate hard ceiling bounds
+    # total upstream dispatches so the loop cannot run away.
+    dispatch_count = 0
+    max_dispatches = 0  # set once max_attempts is resolved below
+
+    def _record_failure(exc: BaseException) -> None:
+        label = str(getattr(exc, "code", None) or type(exc).__name__)
+        retry_after = (
+            _retry_after_seconds_for_exc(exc) if isinstance(exc, RateLimitError) else None
+        )
+        candidate_failures.append(
+            {
+                "provider": provider,
+                "model": model,
+                "class": label,
+                "retry_after": retry_after,
+            }
+        )
+
+    def _terminal_error() -> Exception:
+        """Aggregate the failover, falling back to the last single error."""
+        # A size rejection is authoritative only when no upstream candidate
+        # was actually attempted. If an attempted route failed, preserve that
+        # provider failure rather than asking the client to compact needlessly.
+        if not candidate_failures and context_failures:
+            best = max(context_failures, key=lambda item: item["max_context_window"])
+            return ContextWindowExceededError(
+                pool=pool_name,
+                required_context_tokens=best["required_context_tokens"],
+                max_context_window=best["max_context_window"],
+            )
+        distinct_candidates = {
+            (item["provider"], item["model"])
+            for item in candidate_failures
+        }
+        if len(distinct_candidates) < 2 or last_error is None:
+            return last_error or NoHealthyModelsError(pool=pool_name)
+        # A uniform rate-limit exhaustion is a capacity signal, not a generic
+        # provider failure. Render it as a 429 with a concrete Retry-After so
+        # the client can back off instead of retrying into the same exhausted
+        # pool (req_1be799418c9eae87, 2026-11-23).
+        if all(item["class"] in _RATE_LIMIT_FAILURE_CLASSES for item in candidate_failures):
+            windows = [
+                int(item["retry_after"])
+                for item in candidate_failures
+                if item.get("retry_after")
+            ]
+            retry_after = (
+                min(windows) if windows else _retry_after_seconds_for_exc(RateLimitError())
+            )
+            return RateLimitError(
+                "All eligible provider candidates are rate limited; retry after "
+                f"the shortest upstream window ({retry_after}s).",
+                code="rate_limit_exceeded",
+                headers={"Retry-After": str(retry_after)},
+            )
+        return ProviderFailoverError(candidate_failures)
+
     # Prefer the app-level PoolManager (so catalog refresh + session
     # stickiness are shared); fall back to a per-request instance.
     if request is not None:
@@ -5401,6 +5475,7 @@ async def _call_with_pool_fallback(
     attempts = max(0, attempt_offset)
     first_provider: str | None = None
     max_attempts = _max_pool_provider_attempts()
+    max_dispatches = max_attempts * 3
     recovery_probe = False
     tool_compatibility_probe = False
     attempts_started_at = (
@@ -5409,7 +5484,7 @@ async def _call_with_pool_fallback(
         else None
     )
     while True:
-        if attempts >= max_attempts:
+        if attempts >= max_attempts or dispatch_count >= max_dispatches:
             if request is not None:
                 set_access_log_context(
                     request,
@@ -5431,9 +5506,7 @@ async def _call_with_pool_fallback(
                 attempts,
                 _pool_failure_summary(last_error) if last_error is not None else "none",
             )
-            if last_error is not None:
-                raise last_error
-            raise NoHealthyModelsError(pool=pool_name)
+            raise _terminal_error()
         # A semantic-cache lookup resolves a concrete candidate first so the
         # cached response cannot be returned for a different provider/model.
         if pending_selection is not None:
@@ -5473,7 +5546,12 @@ async def _call_with_pool_fallback(
                     select_kwargs["allow_structured_tool_fallback"] = True
                     if tool_compatibility_probe:
                         select_kwargs["allow_tool_compatibility_fallback"] = True
+            context_failure: dict[str, int] = {}
+            if isinstance(pool_mgr, PoolManager):
+                select_kwargs["context_failure"] = context_failure
             selected = await asyncio.to_thread(pool_mgr.select, active_pool, **select_kwargs)
+            if context_failure:
+                context_failures.append(context_failure)
         if not selected:
             if pool_index + 1 < len(pool_names):
                 previous_pool = active_pool
@@ -5554,9 +5632,7 @@ async def _call_with_pool_fallback(
                         else "no eligible candidate"
                     ),
                 )
-            if last_error is not None:
-                raise last_error
-            raise NoHealthyModelsError(pool=pool_name)
+            raise _terminal_error()
         decision = BreakerDecision(allowed=True, state=None)
         if breaker is not None:
             decision = await asyncio.to_thread(
@@ -5572,6 +5648,7 @@ async def _call_with_pool_fallback(
         if first_provider is None:
             first_provider = provider
         attempts += 1
+        dispatch_count += 1
         # Per-attempt operator diagnostics (runbook 1.6): resolver verdict,
         # endpoint fingerprint, evidence version and selected transport.
         # ``fallback_reason`` below records why the previous attempt was
@@ -5747,6 +5824,7 @@ async def _call_with_pool_fallback(
                 )
             _mark_permanently_failed(timeout_exc, provider, model)
             last_error = timeout_exc
+            _record_failure(timeout_exc)
             excluded.add(selected)
             if request is not None:
                 set_access_log_context(
@@ -5789,6 +5867,11 @@ async def _call_with_pool_fallback(
                 )
             internal_failure = _internalize_github_copilot_rate_limit(provider, exc)
             last_error = internal_failure or exc
+            _record_failure(last_error)
+            # A 429 is transient capacity, not an attempt at a viable candidate.
+            # Refund the slot so quota-exhausted routes cannot burn the whole
+            # budget before healthy providers further down are reached.
+            attempts -= 1
             excluded.add(selected)
             if request is not None:
                 set_access_log_context(
@@ -5818,6 +5901,7 @@ async def _call_with_pool_fallback(
             # Try another pool candidate if one exists, but keep this local
             # credential problem out of breaker/quarantine health signals.
             last_error = exc
+            _record_failure(exc)
             excluded.add(selected)
             if request is not None:
                 set_access_log_context(
@@ -5840,6 +5924,7 @@ async def _call_with_pool_fallback(
             # A denied candidate never gets another tool attempt in this request.
             # Exclude it immediately and let the pool select a different model.
             last_error = exc
+            _record_failure(exc)
             excluded.add(selected)
             if request is not None:
                 set_access_log_context(
@@ -5887,6 +5972,7 @@ async def _call_with_pool_fallback(
                     )
             _mark_permanently_failed(exc, provider, model)
             last_error = exc
+            _record_failure(exc)
             excluded.add(selected)
             if request is not None:
                 set_access_log_context(
@@ -9131,6 +9217,88 @@ async def tts_handler(request: web.Request) -> web.Response:
                 "Upstream text-to-speech failed; retry shortly or contact the "
                 "gateway operator with the request_id for triage.",
                 code="tts_error",
+                error_type="provider_error",
+            ),
+            status=502,
+        )
+
+
+async def transcription_handler(request: web.Request) -> web.Response:
+    """POST /v1/audio/transcriptions — OpenAI-compatible speech-to-text.
+
+    Accepts multipart/form-data with a required ``file`` and ``model`` plus the
+    optional ``language``, ``prompt``, ``response_format`` and ``temperature``
+    fields, and returns the upstream transcript JSON (``{"text": ...}``).
+    """
+    set_access_log_context(request, pool="media")
+    try:
+        started = time.monotonic()
+        form = await request.post()
+        file_field = form.get("file")
+        if file_field is None or not hasattr(file_field, "file"):
+            return web.json_response(
+                openai_error(
+                    "multipart field 'file' is required",
+                    code="invalid_request",
+                    error_type="invalid_request_error",
+                ),
+                status=400,
+            )
+        model = str(form.get("model") or "whisper-1").strip()
+        body: dict[str, Any] = {"model": model}
+        for key in ("language", "prompt", "response_format", "temperature"):
+            value = form.get(key)
+            if value is not None:
+                body[key] = value
+        budget_units = 4096
+        blocked = await _media_preflight(request, body, budget_units=budget_units)
+        if blocked is not None:
+            return blocked
+        stt = request.app.get("stt_handler")
+        if stt is None:
+            return web.json_response(
+                openai_error(
+                    "transcription handler not initialised",
+                    code="internal_error",
+                    error_type="internal",
+                ),
+                status=503,
+            )
+        provider = stt.get_provider_for_stt_request(model)
+        set_access_log_context(request, pool="media", provider=provider, model=model)
+        api_key = request.app["config"].get("provider_api_keys", {}).get(provider)
+        audio_bytes = file_field.file.read(stt.MAX_STT_AUDIO_BYTES + 1)
+        result = await stt.handle_request(
+            model=model,
+            form_fields={key: value for key, value in body.items() if key != "model"},
+            audio_bytes=audio_bytes,
+            filename=getattr(file_field, "filename", None) or "audio.wav",
+            content_type=getattr(file_field, "content_type", None)
+            or "application/octet-stream",
+            api_key=api_key,
+        )
+        _record_media_capabilities(
+            request,
+            provider=provider,
+            model=model,
+            capabilities=("input_audio", "speech_transcription"),
+            started=started,
+        )
+        await _record_media_budget(request, budget_units=budget_units)
+        return web.json_response(result)
+    except GatewayError as exc:
+        logger.warning("transcription request failed: %s", exc)
+        return web.json_response(
+            openai_error(exc.message, code=exc.code, error_type=exc.error_type),
+            status=_media_error_status(exc),
+        )
+    except Exception as exc:
+        logger.warning("transcription request failed: %s", exc)
+        return web.json_response(
+            openai_error(
+                "Upstream speech-to-text failed; retry shortly or contact the "
+                "gateway operator with the request_id for triage.",
+                code="transcription_error",
                 error_type="provider_error",
             ),
             status=502,

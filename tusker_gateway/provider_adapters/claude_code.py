@@ -121,6 +121,7 @@ def _quota_error_indicated(*parts: bytes | str) -> bool:
     ).lower()
     return any(phrase in text for phrase in (
         "session limit", "usage limit", "usage_limit", "limit reached",
+        "weekly limit", "hit your", "extra usage",
         "subscription limit", "quota", "out of credits", "rate limit",
         "too many requests",
     ))

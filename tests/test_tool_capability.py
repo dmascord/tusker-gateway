@@ -156,7 +156,27 @@ async def test_composite_probe_allows_reasoning_budget_for_multimodal_models():
         provider="ollama-cloud", model="glm-5.3-flash",
     )
     assert result["status"] == "passed"
-    assert session.payload["max_tokens"] == 2048
+    # Reasoning models need room for chain-of-thought before the tool call.
+    assert session.payload["max_tokens"] == 16384
+
+
+@pytest.mark.asyncio
+async def test_composite_probe_max_tokens_is_configurable(monkeypatch):
+    """The probe output cap is operator-tunable, defaulting to 16k.
+
+    A 2048 cap made synthetic/hf:Qwen/Qwen3.8-27B exhaust its output budget on
+    reasoning and produce a false ``unavailable`` verdict (2026-11-22).
+    """
+    from tusker_gateway.tool_qualification import _composite_probe_max_tokens
+
+    monkeypatch.delenv("TUSKER_COMPOSITE_QUALIFICATION_MAX_TOKENS", raising=False)
+    assert _composite_probe_max_tokens() == 16384
+    monkeypatch.setenv("TUSKER_COMPOSITE_QUALIFICATION_MAX_TOKENS", "8192")
+    assert _composite_probe_max_tokens() == 8192
+    monkeypatch.setenv("TUSKER_COMPOSITE_QUALIFICATION_MAX_TOKENS", "bogus")
+    assert _composite_probe_max_tokens() == 16384
+    monkeypatch.setenv("TUSKER_COMPOSITE_QUALIFICATION_MAX_TOKENS", "64")
+    assert _composite_probe_max_tokens() == 1024
 
 
 @pytest.mark.asyncio

@@ -41,6 +41,10 @@ logger = logging.getLogger(__name__)
 _CHARS_PER_TOKEN = 3.2
 _MESSAGE_OVERHEAD_TOKENS = 8
 _DEFAULT_IMAGE_TOKENS = 1600
+# Voice-control messages are short, but an audio content part still consumes a
+# real slice of the upstream context window. Conservative per-part estimate,
+# tunable by operators; audio payloads are never decoded just for accounting.
+_DEFAULT_AUDIO_TOKENS = 1000
 _DEFAULT_MIN_OUTPUT_TOKENS = 4096
 _DEFAULT_SAFETY_TOKENS = 256
 _MAX_TOKENS_KEYS = ("max_tokens", "max_completion_tokens")
@@ -484,20 +488,25 @@ _REASONING_FIELDS = ("reasoning_content", "reasoning", "reasoning_details", "thi
 _TEXT_PART_KEYS = ("text", "thinking", "reasoning", "reasoning_content", "content")
 
 
-def _content_size(content: Any) -> tuple[int, int]:
-    """Return (chars, images) for OpenAI-format message content."""
+def _content_size(content: Any) -> tuple[int, int, int]:
+    """Return (chars, images, audio_parts) for OpenAI-format message content."""
     if isinstance(content, str):
-        return len(content), 0
+        return len(content), 0, 0
     if not isinstance(content, list):
-        return 0, 0
+        return 0, 0, 0
     chars = 0
     images = 0
+    audio_parts = 0
     for part in content:
         if not isinstance(part, dict):
             chars += len(str(part))
             continue
-        if part.get("type") in {"image_url", "input_image", "image"}:
+        part_type = str(part.get("type") or "").strip().lower()
+        if part_type in {"image_url", "input_image", "image"}:
             images += 1
+            continue
+        if part_type in {"audio_url", "input_audio", "audio"}:
+            audio_parts += 1
             continue
         # Count text from any plausible text-bearing key, including reasoning /
         # thinking parts that some providers embed inside the content array.
@@ -511,24 +520,26 @@ def _content_size(content: Any) -> tuple[int, int]:
             # silently dropped from the estimate.
             if part.get("type") not in {"text", "input_text", "output_text"}:
                 chars += len(json.dumps(part, default=str))
-    return chars, images
+    return chars, images, audio_parts
 
 
 def estimate_prompt_tokens(
     messages: Any,
     tools: list[dict[str, Any]] | None = None,
 ) -> int:
-    """Estimate prompt tokens including tool schemas, tool calls and images."""
+    """Estimate prompt tokens including tools, images and audio content parts."""
     chars = 0
     images = 0
+    audio_parts = 0
     tokens = 0
     for message in messages if isinstance(messages, list) else []:
         if not isinstance(message, dict):
             continue
         tokens += _MESSAGE_OVERHEAD_TOKENS
-        message_chars, message_images = _content_size(message.get("content"))
+        message_chars, message_images, message_audio = _content_size(message.get("content"))
         chars += message_chars
         images += message_images
+        audio_parts += message_audio
         # Reasoning / thinking channels replayed from prior turns.
         for field in _REASONING_FIELDS:
             value = message.get(field)
@@ -551,7 +562,13 @@ def estimate_prompt_tokens(
     if tools:
         chars += len(json.dumps(tools, default=str))
     image_tokens = _env_int("TUSKER_IMAGE_TOKEN_ESTIMATE", _DEFAULT_IMAGE_TOKENS)
-    return tokens + int(chars / _CHARS_PER_TOKEN) + images * image_tokens
+    audio_tokens = _env_int("TUSKER_AUDIO_TOKEN_ESTIMATE", _DEFAULT_AUDIO_TOKENS)
+    return (
+        tokens
+        + int(chars / _CHARS_PER_TOKEN)
+        + images * image_tokens
+        + audio_parts * audio_tokens
+    )
 
 
 def required_context_tokens(prompt_estimate: int) -> int:
