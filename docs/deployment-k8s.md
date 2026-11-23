@@ -40,6 +40,10 @@ them, waits for all three rollouts, verifies each running pod's imageID, and
 annotates each Deployment with the build identity. It also prints (or, with
 `TUSKER_PIN_MANIFEST=1`, writes) the pin for all three tracked manifests.
 Workers were previously left on stale digests by gateway-only deploys.
+The worker YAML files are multi-document (Deployment + Service), so rendering
+goes through `pin-manifest.py --render` rather than `kubectl set image --local`,
+which rejects a document without a pod template. `k8s/verify-provenance.sh`
+checks all three tracked/live/pod chains.
 
 `TUSKER_COMMIT` must be the explicit full source SHA. The image embeds it;
 the deployments do not override it with an environment value.
