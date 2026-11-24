@@ -6,9 +6,9 @@ metadata:
   labels:
     app: tusker-gateway
   annotations:
-    tusker.net.au/commit: ad206c37a59595d94fbdd9755a2adc41bebd842a
-    tusker.net.au/image-tag: swarm-alpine-ad206c37a59595d94fbdd9755a2adc41bebd842a
-    tusker.net.au/image-digest: sha256:9cc86b5d1454489db54c0bf694d732a0dc8877a397e7df89ca003b6ceed7dbe3
+    tusker.net.au/commit: 52eb988045cf5ed2b3f8b066449f8a2830a2eea0
+    tusker.net.au/image-tag: swarm-alpine-52eb988045cf5ed2b3f8b066449f8a2830a2eea0
+    tusker.net.au/image-digest: sha256:e29e757d20a875778e598dec06ae58839783e75d2561d0bce93deb4459bcb0e2
 spec:
   replicas: 1
   selector:
@@ -34,7 +34,7 @@ spec:
       terminationGracePeriodSeconds: 90
       containers:
       - name: tusker-gateway
-        image: registry.tusker.net.au:5000/tusker-gateway@sha256:9cc86b5d1454489db54c0bf694d732a0dc8877a397e7df89ca003b6ceed7dbe3
+        image: registry.tusker.net.au:5000/tusker-gateway@sha256:e29e757d20a875778e598dec06ae58839783e75d2561d0bce93deb4459bcb0e2
         imagePullPolicy: Always
         envFrom:
         - secretRef:
@@ -303,8 +303,13 @@ spec:
               name: tusker-env-vault
               key: TUSKER_REDACTION_KEY
               optional: true
-        # outage blocks the request rather than silently dropping the event.
-        # The log path is on the writable tusker-home RWX PVC.
+        # Audit chain appends go to the shared state database. The JSONL path
+        # is retained only as the migration source for historical records;
+        # the RWX/NFS flock path caused the 2026-11-24 incident.
+        - name: TUSKER_AUDIT_BACKEND
+          value: database
+        - name: TUSKER_AUDIT_RETENTION_DAYS
+          value: '90'
         - name: TUSKER_AUDIT_LOG_PATH
           value: /home/tusker/.hermes/audit.jsonl
         - name: TUSKER_AUDIT_HMAC_KEY
@@ -825,6 +830,9 @@ spec:
             memory: 3Gi
             ephemeral-storage: 4Gi
       volumes:
+      # All mutable gateway state is in PostgreSQL (including the audit
+      # chain). The pod only needs these home paths to exist for legacy
+      # default paths; pod-local storage removes the last NFS dependency so
+      # RollingUpdate surge pods no longer share a filesystem.
       - name: tusker-home
-        persistentVolumeClaim:
-          claimName: tusker-home-rwx
+        emptyDir: {}

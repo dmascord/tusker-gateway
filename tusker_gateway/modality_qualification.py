@@ -48,20 +48,25 @@ logger = logging.getLogger(__name__)
 
 # 128x128 PNG: providers like DashScope reject 1x1 probes with an
 # "image length and width" 400, which would falsely mark vision-capable
-# models as unsupported. Keep it small (318 bytes) but above minimum-size
+# models as unsupported. Keep it small (268 bytes) but above minimum-size
 # checks, and keep it a *decodable* PNG: strict decoders (the Go image/png
 # behind Ollama's OpenAI shim) reject a truncated file with "Failed to load
 # image or audio file", which records a false capability negative.
+# Layout: three horizontal stripes — red (rows 0-42), green (43-85, the
+# literal middle stripe the composite image+tools probe asks about), blue
+# (86-127). The fixture previously held a 2x2 quadrant grid with no stripe
+# at all, so the required "middle stripe" observation could not be made and
+# honest vision models were scored unsupported (deepseek-v4.1-flash:1017,
+# 2026-11-24).
 # test_probe_image_data_url_is_a_decodable_png guards this constant.
 _TINY_IMAGE_DATA_URL = (
     "data:image/png;base64,"
-    "iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAIAAABMXPacAAABBUlEQVR42u3RMQ0A"
-    "IAwAMJTsRgmaEIYIREwEEpiNJU3qoCMjWoudrQ0BAgQIECBAgAABAgQIECBAgAAB"
-    "AgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQI"
-    "ECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECCgAuKs1t6drQkQ"
-    "IECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECA"
-    "AAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAEC"
-    "BAgQIECAAAHlAxK4JSlML2M2AAAAAElFTkSuQmCC"
+    "iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAIAAABMXPacAAAA00lEQVR42u3R"
+    "QQ0AMAgAMZQgZ5ombHIQMw28CEmTU3CNytRgYQEAAAIAQAAACAAAAQAgAAAE"
+    "AIAAABAAAAIAQAAACAAAAQAgAAAEAIAAABAAAAIAQAAACAAAAdgFkO9oMAAA"
+    "AAgAAAEAIAAABACAAAAQAAACAEAAAAgAAAEAIAAABACAAAAQAAACAEAAAAgA"
+    "AAEAIAAABGAbwC0NBgAAAAEAIAAABACAAAAQAAACAEAAAAgAAAEAIAAABACA"
+    "AAAQAAACAEAAAAgAAAEAIAAABACAmn1VQGaEYV1X7wAAAABJRU5ErkJggg=="
 )
 _TINY_WAV_BASE64 = "UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAAA"
 _MODALITY_TO_CAPABILITY = {

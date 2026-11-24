@@ -55,7 +55,7 @@ from http import HTTPStatus
 from typing import Any
 from urllib.parse import urlsplit
 
-from aiohttp import web
+from aiohttp import ClientSession, ClientTimeout, web
 
 from tusker_gateway.config_store import ConfigConflictError, ConfigUnavailableError
 from tusker_gateway.errors import AuthorizationError, BadRequestError, GatewayError, NotFoundError
@@ -245,9 +245,44 @@ _login_limiter = _LoginRateLimiter()
 
 
 
+def _claude_worker_url() -> str:
+    """Return the Claude worker base URL used by the remote CLI adapter."""
+    return (
+        os.environ.get("TUSKER_CLAUDE_WORKER_URL")
+        or os.environ.get("TUSKER_CLI_WORKER_URL")
+        or ""
+    ).strip().rstrip("/")
+
+
 async def admin_claude_auth_status(request: web.Request) -> web.Response:
-    """GET /admin/claude/auth — safe, allowlisted Claude CLI login status."""
+    """GET /admin/claude/auth — safe, allowlisted Claude CLI login status.
+
+    The credential lives in the Claude worker's runtime home, not the gateway
+    pod's, so ask the worker when one is configured. Local status is only a
+    fallback for in-process / test mode.
+    """
     from tusker_gateway.provider_adapters.claude_code import claude_auth_status
+
+    worker_url = _claude_worker_url()
+    if worker_url:
+        try:
+            timeout = ClientTimeout(total=8)
+            async with ClientSession(timeout=timeout) as session:
+                async with session.get(f"{worker_url}/worker/claude/auth") as resp:
+                    if resp.status == 200:
+                        payload = await resp.json(content_type=None)
+                        if isinstance(payload, dict):
+                            return web.json_response(
+                                {
+                                    **payload,
+                                    "source": "worker",
+                                    "login_command": "k8s/claude-code-login.sh",
+                                }
+                            )
+        except Exception as exc:  # noqa: BLE001 - degrade to local status
+            logging.getLogger(__name__).warning(
+                "claude auth status from worker failed: %s", exc.__class__.__name__
+            )
 
     status = await claude_auth_status()
     return web.json_response({**status, "login_command": "k8s/claude-code-login.sh"})

@@ -88,7 +88,11 @@ class RemoteCLIAdapter:
                 try:
                     async for line in resp.content:
                         if line:
-                            yield line.decode("utf-8", errors="replace")
+                            # aiohttp yields bytes per line, and the gateway's
+                            # stream loop / response capture operate on bytes.
+                            # Decoding here made every CLI stream raise a
+                            # TypeError once turn capture was enabled.
+                            yield line if isinstance(line, bytes) else line.encode("utf-8", errors="replace")
                 except Exception as exc:  # noqa: BLE001
                     # Worker connection dropped mid-stream; surface as a
                     # ProviderError so the gateway can render a verdict.

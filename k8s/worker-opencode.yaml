@@ -6,9 +6,9 @@ metadata:
   labels:
     app: tusker-opencode-worker
   annotations:
-    tusker.net.au/commit: ad206c37a59595d94fbdd9755a2adc41bebd842a
-    tusker.net.au/image-tag: swarm-alpine-ad206c37a59595d94fbdd9755a2adc41bebd842a
-    tusker.net.au/image-digest: sha256:9cc86b5d1454489db54c0bf694d732a0dc8877a397e7df89ca003b6ceed7dbe3
+    tusker.net.au/commit: 52eb988045cf5ed2b3f8b066449f8a2830a2eea0
+    tusker.net.au/image-tag: swarm-alpine-52eb988045cf5ed2b3f8b066449f8a2830a2eea0
+    tusker.net.au/image-digest: sha256:e29e757d20a875778e598dec06ae58839783e75d2561d0bce93deb4459bcb0e2
 spec:
   replicas: 1
   selector:
@@ -26,7 +26,7 @@ spec:
         fsGroupChangePolicy: OnRootMismatch
       containers:
       - name: tusker-opencode-worker
-        image: registry.tusker.net.au:5000/tusker-gateway@sha256:9cc86b5d1454489db54c0bf694d732a0dc8877a397e7df89ca003b6ceed7dbe3
+        image: registry.tusker.net.au:5000/tusker-gateway@sha256:e29e757d20a875778e598dec06ae58839783e75d2561d0bce93deb4459bcb0e2
         imagePullPolicy: Always
         command: ["tini", "--", "python", "-m", "tusker_gateway.worker"]
         envFrom:
@@ -89,9 +89,10 @@ spec:
           timeoutSeconds: 3
           failureThreshold: 6
       volumes:
+      # CLI homes are pod-local: the live .claude.json is already outside the
+      # mount, and the share only held backups/plugin caches. No NFS needed.
       - name: tusker-home
-        persistentVolumeClaim:
-          claimName: tusker-home-rwx
+        emptyDir: {}
 ---
 apiVersion: v1
 kind: Service

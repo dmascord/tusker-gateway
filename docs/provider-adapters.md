@@ -114,14 +114,20 @@ tokens itself, or log/store OAuth credentials.
 
 An operator can start the standard interactive Claude subscription login from
 an operator-controlled terminal with `k8s/claude-code-login.sh`. It runs
-`claude auth login --claudeai` in the gateway container, where the mounted
-Claude runtime home persists the credential. Complete any browser or one-time
-code step only in that terminal; never put credentials or login codes in a
-chat request. The helper prints only an allowlisted status after login.
+`claude auth login --claudeai` in the **Claude worker** container (the pod that
+actually consumes the credential), copies the resulting
+`.claude/.credentials.json` into the `claude-cli-credentials` Secret, and rolls
+the worker so the init container re-seeds every pod. Complete any browser or
+one-time code step only in that terminal; never put credentials or login codes
+in a chat request. The helper prints only an allowlisted status after login.
+Tokens are never echoed; the local copy is removed by a shell trap.
 
 `GET /admin/claude/auth` reports only `authenticated`, `login_required`, or
 `unknown` (and a small allowlist of auth-method labels), protected by the
-existing admin access controls. Claude Code remains responsible for refresh
+existing admin access controls. When `TUSKER_CLAUDE_WORKER_URL` is set it calls
+`GET /worker/claude/auth` on the worker — the pod that actually holds the
+credential — and includes `"source": "worker"` in the response; otherwise it
+falls back to local status for in-process development and tests. Claude Code remains responsible for refresh
 where supported and may request a fresh login when the current credential
 cannot be renewed. The gateway does not promise unattended refresh for every
 account type. If an actual request receives an explicit auth-expiry failure,

@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 
 import pytest
+from tusker_gateway.audit import AuditWriteError
 from tusker_gateway.budget import BudgetDecision
 import tusker_gateway.sse
 from tusker_gateway.errors import (
@@ -154,6 +155,27 @@ def test_public_stream_error_explains_empty_pool_as_availability_not_provider_fa
     assert "no eligible model" in message
     assert "req_b673132700f2562e" in message
     assert "Upstream provider error" not in message
+
+
+def test_public_stream_error_names_audit_failure_as_gateway_fault():
+    """A fail-closed audit write is a local control failure, not an upstream one.
+
+    2026-11-24: NFS flock EIO on the shared audit volume surfaced to callers as
+    "Upstream provider error: required audit persistence failed"
+    (req_9e48dfe2c9155c3a), sending operators to chase provider health.
+    """
+    message, code = _public_stream_error(
+        AuditWriteError("required audit persistence failed"),
+        request_id="req_9e48dfe2c9155c3a",
+        provider="apim",
+        model="gpt-5.6-luna",
+    )
+
+    assert code == "audit_unavailable"
+    assert "could not persist the required audit record" in message
+    assert "req_9e48dfe2c9155c3a" in message
+    assert "Upstream provider error" not in message
+    assert "required audit persistence failed" not in message
 
 
 def test_public_stream_error_correlates_capacity_failure():
@@ -3701,6 +3723,62 @@ class _FakeUpstreamHttp:
     async def request(self, method, url, **kwargs):
         self.calls.append({"method": method, "url": url, **kwargs})
         return self._responses.pop(0)
+
+
+@pytest.mark.asyncio
+async def test_remote_cli_adapter_yields_bytes(monkeypatch):
+    """RemoteCLIAdapter must yield bytes like every other stream adapter.
+
+    It used to decode each line to str. The gateway's prefetch bytearray and
+    response capture then raised ``TypeError`` whenever turn capture was
+    enabled (2026-11-24), killing every CLI-worker stream.
+    """
+    from tusker_gateway.provider_adapters.remote_cli import RemoteCLIAdapter
+
+    lines = [b'data: {"choices":[]}\n\n', b"data: [DONE]\n\n"]
+    expected = list(lines)
+
+    class _Content:
+        def __aiter__(self):
+            async def gen():
+                for line in expected:
+                    yield line
+            return gen()
+
+    class _Resp:
+        status = 200
+        content = _Content()
+
+        async def release(self):
+            return None
+
+    class _Session:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, *_args, **_kwargs):
+            return _Resp()
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(
+        "tusker_gateway.provider_adapters.remote_cli.aiohttp.ClientSession", _Session
+    )
+    adapter = RemoteCLIAdapter("claude-code-cli", "http://worker.test")
+    stream = await adapter.chat(
+        provider="claude-code-cli", model="sonnet", messages=[], stream=True
+    )
+    chunks = [chunk async for chunk in stream]
+
+    assert chunks == lines
+    assert all(isinstance(chunk, bytes) for chunk in chunks)
 
 
 @pytest.mark.asyncio

@@ -14,6 +14,28 @@ from tusker_gateway import worker as worker_module
 
 
 @pytest.mark.asyncio
+async def test_worker_claude_auth_route_returns_sanitized_status(monkeypatch):
+    """The worker exposes its own Claude login status for the admin endpoint."""
+    from tusker_gateway.provider_adapters import claude_code
+
+    async def fake_status():
+        return {"status": "authenticated", "auth_method": "claude.ai"}
+
+    monkeypatch.setattr(claude_code, "claude_auth_status", fake_status)
+    client = TestClient(TestServer(worker_module.create_app()))
+    await client.start_server()
+    try:
+        resp = await client.get("/worker/claude/auth")
+        assert resp.status == 200
+        assert await resp.json() == {
+            "status": "authenticated",
+            "auth_method": "claude.ai",
+        }
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
 async def test_worker_stream_failure_emits_parseable_sse_frames(monkeypatch):
     class _FailingAdapter:
         async def chat(self, **_kwargs):

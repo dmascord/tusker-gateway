@@ -143,7 +143,7 @@ async def test_composite_probe_rejects_forced_call_without_image_evidence():
         provider="openrouter", model="text-only",
     )
     assert result["status"] == "unsupported"
-    assert result["failure_class"] == "non_strict_tool_contract"
+    assert result["failure_class"] == "image_evidence_mismatch"
 
 @pytest.mark.asyncio
 async def test_composite_probe_allows_reasoning_budget_for_multimodal_models():

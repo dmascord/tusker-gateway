@@ -78,6 +78,33 @@ async def test_write_sync_persistent_oserror_still_fails_closed(
         logger.write_sync({"sequence": 0})
 
 
+async def test_write_sync_backoff_gives_transient_eio_time_to_clear(
+    tmp_path, monkeypatch
+):
+    """The sync path must space its retries; 4 instant attempts all hit the same EIO.
+
+    Tool-approval audit events run in a synchronous validator where the async
+    backoff is unreachable. Without a short sleep the whole retry budget was
+    consumed in one millisecond, so a sub-100ms shared-volume blip still failed
+    the caller closed (2026-11-24).
+    """
+    path = tmp_path / "audit.jsonl"
+    logger = AuditLogger(_config(path))
+    sleeps: list[float] = []
+    monkeypatch.setattr("tusker_gateway.audit.time.sleep", sleeps.append)
+
+    def always_fail(_event):
+        raise OSError(5, "Input/output error")
+
+    monkeypatch.setattr(logger, "_append", always_fail)
+
+    with pytest.raises(AuditWriteError):
+        logger.write_sync({"sequence": 0})
+
+    assert len(sleeps) == 3
+    assert sleeps == pytest.approx([0.02, 0.04, 0.08])
+
+
 async def test_transient_oserror_is_retried_instead_of_failing_closed(
     tmp_path, monkeypatch
 ):

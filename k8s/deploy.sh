@@ -127,7 +127,9 @@ for target in "${TARGETS[@]}"; do
     RENDERED_BY_TARGET["${target}"]="${rendered}"
 done
 
-kubectl -n "${NAMESPACE}" apply -f k8s/pvc-rwx.yaml
+# No RWX/NFS PVC: all pods use pod-local storage and the state DB is the
+# shared authority. tusker-home-rwx was retired after the audit migration;
+# see docs/nfs-retirement.md.
 kubectl -n "${NAMESPACE}" apply -f k8s/pvc.yaml
 kubectl -n "${NAMESPACE}" apply -f k8s/config.yaml
 for target in "${TARGETS[@]}"; do

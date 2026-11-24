@@ -57,25 +57,62 @@ def _summary(path: Path) -> tuple[bool, int, Counter[str], dict[str, int]]:
     return valid, total, counts, policy
 
 
+def _db_summary(config: AuditConfig) -> tuple[bool, int, Counter[str], dict[str, int]]:
+    """Summarize and verify the database-backed audit chain."""
+    from tusker_gateway.storage import shared_database
+
+    counts: Counter[str] = Counter()
+    policy: Counter[str] = Counter()
+    db = shared_database(
+        config.database_path, timeout=10.0, fallback_policy="critical"
+    )
+    with db.connection() as conn:
+        if not conn.degraded:
+            for event_type, count in conn.execute(
+                "SELECT event_type, COUNT(*) FROM audit_events GROUP BY event_type"
+            ).fetchall():
+                counts[str(event_type or "unknown")] += int(count)
+    valid, total = AuditLogger.verify_db(config)
+    return valid, total, counts, policy
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("path", nargs="?", default=os.environ.get("TUSKER_AUDIT_LOG_PATH", ""))
     parser.add_argument("--json", action="store_true", dest="as_json")
+    parser.add_argument(
+        "--database", action="store_true",
+        help="verify the database-backed audit chain instead of a JSONL file",
+    )
     return parser
 
 
 def main(argv: Iterable[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    if not args.path:
-        print("audit path is required", flush=True)
-        return 2
-    path = Path(args.path)
-    valid, total, counts, policy = _summary(path)
-    result = {"path": str(path), "valid": valid, "records": total, "event_counts": dict(counts), "policy_outcomes": dict(policy)}
+    if args.database:
+        config = AuditConfig(
+            backend="database",
+            database_path=os.environ.get("TUSKER_AUDIT_DATABASE_PATH", ""),
+            hmac_key=os.environ.get("TUSKER_AUDIT_HMAC_KEY", ""),
+        )
+        valid, total, counts, policy = _db_summary(config)
+        result = {
+            "backend": "database", "valid": valid, "records": total,
+            "event_counts": dict(counts), "policy_outcomes": dict(policy),
+        }
+    else:
+        if not args.path:
+            print("audit path is required", flush=True)
+            return 2
+        path = Path(args.path)
+        valid, total, counts, policy = _summary(path)
+        result = {"path": str(path), "valid": valid, "records": total, "event_counts": dict(counts), "policy_outcomes": dict(policy)}
     if args.as_json:
         print(json.dumps(result, sort_keys=True))
     else:
-        print(f"audit_file={path}")
+        print(f"audit_backend={result.get('backend', 'file')}")
+        if result.get("path"):
+            print(f"audit_file={result['path']}")
         print(f"valid={valid} records={total}")
         for name, count in counts.most_common():
             print(f"event.{name}={count}")
