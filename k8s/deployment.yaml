@@ -10,7 +10,10 @@ metadata:
     tusker.net.au/image-tag: swarm-alpine-c38a06c53505e5f9b86bf5d70d7062e4a8bf9bad
     tusker.net.au/image-digest: sha256:2ed14a62ef8dea57a68a3f7bc5a8c3b607476eaa97f772aec6c63a1af910dc7b
 spec:
-  replicas: 1
+  # Two replicas are safe now that the Codex refresh sequence holds a
+  # PostgreSQL advisory lock (see oauth_refresh_lock.py) and all state is in
+  # PostgreSQL. maxSurge/maxUnavailable below keep rollouts hitless.
+  replicas: 2
   selector:
     matchLabels:
       app: tusker-gateway
@@ -18,7 +21,8 @@ spec:
     type: RollingUpdate
     rollingUpdate:
       # Zero-downtime: maxSurge 1 + maxUnavailable 0 keeps the old pod
-      # serving until the new pod is Ready. Requires shared RWX volume.
+      # serving until the new pod is Ready. Mutable state is in PostgreSQL;
+      # tusker-home is pod-local, so surge pods share no filesystem.
       maxSurge: 1
       maxUnavailable: 0
   template:

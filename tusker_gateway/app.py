@@ -126,6 +126,7 @@ def create_app() -> web.Application:
             app["config_generation"] = 0
             app["config"]["_persist_credentials"] = getattr(store, "persist_credentials", None)
             app["config"]["_load_oauth_credentials"] = getattr(store, "load_oauth_credentials", None)
+            app["config"]["_oauth_refresh_lock"] = getattr(store, "oauth_refresh_lock", None)
             app["config_runtime"] = ConfigRuntime(app)
         except Exception as exc:
             log.warning("config store init failed (legacy config will be used): %s", exc)

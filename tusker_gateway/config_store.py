@@ -26,7 +26,8 @@ import os
 import secrets
 import threading
 import time
-from typing import Any, Callable
+from contextlib import contextmanager
+from typing import Any, Callable, Iterator
 
 from tusker_gateway.config import PoolConfig, ProviderConfig, expand_env_placeholders
 from tusker_gateway.identity import CallerIdentity, IdentityConfig, fingerprint_api_key
@@ -1278,6 +1279,13 @@ class ConfigStore:
         if not self._managed:
             return None
         return self._cas_persist_credentials
+
+    @property
+    def oauth_refresh_lock(self) -> Callable[[int], Any] | None:
+        """Return the advisory-lock context manager, or None when inert."""
+        if not self._managed:
+            return None
+        return self.oauth_refresh_advisory_lock
 
     def load_oauth_credentials(self, provider: str) -> list[dict[str, Any]] | None:
         """Return the stored credential list for ``provider``, or None.

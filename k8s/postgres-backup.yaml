@@ -1,0 +1,115 @@
+# Nightly logical backup of the gateway state store.
+#
+# tusker-gateway-postgres is a single-replica Deployment on a 10 GiB Longhorn
+# PVC and holds the DB-backed config store, the integrity-chained audit log,
+# encrypted OAuth credentials, quality/capability data and turn captures. A lost
+# volume loses the live configuration and every rotated token, not just request
+# history. See docs/resilience-performance-assessment.md.
+#
+# The dump goes to its own PVC so a runaway capture table cannot fill the
+# database volume and take the writer down with it.
+#
+# Restore procedure (run from a shell with postgres client tools):
+#   kubectl -n hermes scale deploy/tusker-gateway --replicas=0
+#   kubectl -n hermes exec -i deploy/tusker-gateway-postgres -- \
+#     psql -U tusker_gateway -d tusker_gateway < /backups/<dump>.sql
+#   kubectl -n hermes scale deploy/tusker-gateway --replicas=2
+# Verify with `k8s/verify-provenance.sh` and a `/health` request afterwards.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: tusker-gateway-postgres-backup
+  namespace: hermes
+  labels:
+    app: tusker-gateway-postgres
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: tusker-gateway-postgres-backup
+  namespace: hermes
+  labels:
+    app: tusker-gateway-postgres
+spec:
+  # Daily at 03:17 UTC — off the CLI-drift check (Mondays ~06:17) and off the
+  # top of the hour so it does not compete with other scheduled workloads.
+  schedule: "17 3 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  # Retry twice with a short backoff: a transient pg_dump failure (paused
+  # Postgres, volume temporarily unavailable) should not lose the day's dump.
+  backoffLimit: 2
+  jobTemplate:
+    spec:
+      # Two attempts at 45 minutes each, plus container starts.
+      activeDeadlineSeconds: 3600
+      template:
+        metadata:
+          labels:
+            app: tusker-gateway-postgres-backup
+        spec:
+          restartPolicy: OnFailure
+          securityContext:
+            fsGroup: 999
+          containers:
+            - name: pg-dump
+              # Matches the server major version so pg_dump output is always
+              # restorable into the running instance.
+              image: postgres:16-alpine
+              command:
+                - sh
+                - -ec
+                - |
+                  set -eu
+                  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+                  out="/backups/tusker_gateway-${stamp}.sql.gz"
+                  tmp="${out}.partial"
+                  echo "dumping to ${out}"
+                  # --no-owner/--no-privileges keeps the dump restorable into a
+                  # freshly created cluster whose role set may differ.
+                  pg_dump \
+                    --host=tusker-gateway-postgres \
+                    --username=tusker_gateway \
+                    --dbname=tusker_gateway \
+                    --no-owner --no-privileges \
+                    | gzip -9 > "${tmp}"
+                  # Only publish a dump that is non-trivial and complete: a
+                  # truncated gzip fails this decompression check, so the
+                  # newest *published* file is always readable.
+                  test "$(stat -c %s "${tmp}")" -gt 1024
+                  gzip -t "${tmp}"
+                  mv "${tmp}" "${out}"
+                  echo "wrote ${out} ($(stat -c %s "${out}") bytes)"
+                  # Retain the newest 7 dumps; delete older ones by name.
+                  ls -1t /backups/tusker_gateway-*.sql.gz 2>/dev/null \
+                    | tail -n +8 \
+                    | xargs -r rm -f
+                  ls -1t /backups/tusker_gateway-*.sql.gz | head -10
+              env:
+                - name: PGPASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: tusker-gateway-postgres-auth
+                      key: POSTGRES_PASSWORD
+              volumeMounts:
+                - name: backups
+                  mountPath: /backups
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 128Mi
+                limits:
+                  memory: 512Mi
+                  ephemeral-storage: 1Gi
+          volumes:
+            - name: backups
+              persistentVolumeClaim:
+                claimName: tusker-gateway-postgres-backup

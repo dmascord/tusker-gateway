@@ -140,6 +140,50 @@ spec:
           labels:
             severity: warning
 
+        # The gateway's config store, audit chain, OAuth credentials and
+        # quality data all live in this single Postgres instance. No exporter
+        # is deployed, so these rules use kube-state-metrics / kubelet volume
+        # metrics plus the backup CronJob's own status.
+        - alert: TuskerGatewayPostgresNoReadyPod
+          annotations:
+            description: No tusker-gateway-postgres pod is Ready for more than 2 minutes; config reload, OAuth rotation and audit writes will fail closed.
+            summary: Gateway Postgres has no ready pod
+          expr: kube_pod_status_ready{namespace="hermes",pod=~"tusker-gateway-postgres-.*",condition="true"} == 0
+          for: 2m
+          labels:
+            severity: critical
+        - alert: TuskerGatewayPostgresRestartStorm
+          annotations:
+            description: tusker-gateway-postgres restarted at least twice in 15 minutes; check the PVC and logs before it loses the state volume.
+            summary: Gateway Postgres is crash-looping
+          expr: increase(kube_pod_container_status_restarts_total{namespace="hermes",pod=~"tusker-gateway-postgres-.*",container="postgres"}[15m]) >= 2
+          labels:
+            severity: critical
+        - alert: TuskerGatewayPostgresVolumeAlmostFull
+          annotations:
+            description: The gateway Postgres PVC has less than 20% free; turn_captures can grow ~800 MB/day and a full volume stops every write.
+            summary: Gateway Postgres volume almost full
+          expr: kubelet_volume_stats_available_bytes{namespace="hermes",persistentvolumeclaim="tusker-gateway-postgres-data"} / kubelet_volume_stats_capacity_bytes{namespace="hermes",persistentvolumeclaim="tusker-gateway-postgres-data"} < 0.2
+          for: 15m
+          labels:
+            severity: warning
+        - alert: TuskerGatewayBackupStalled
+          annotations:
+            description: The nightly gateway Postgres dump has not succeeded in 26 hours; the state store has no current backup.
+            summary: Gateway Postgres backup is stale
+          expr: time() - kube_cronjob_status_last_successful_time{namespace="hermes",cronjob="tusker-gateway-postgres-backup"} > 93600
+          for: 10m
+          labels:
+            severity: warning
+        - alert: TuskerGatewayBackupNeverRan
+          annotations:
+            description: No successful gateway Postgres backup has ever been recorded; check the CronJob and its PVC.
+            summary: Gateway Postgres backup has never succeeded
+          expr: absent(kube_cronjob_status_last_successful_time{namespace="hermes",cronjob="tusker-gateway-postgres-backup"})
+          for: 30m
+          labels:
+            severity: critical
+
         - alert: PrometheusStorageAlmostFull
           annotations:
             description: Prometheus TSDB PVC has less than 15% free space; ingestion may stop before retention compaction catches up.
