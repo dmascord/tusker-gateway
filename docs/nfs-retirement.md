@@ -27,6 +27,18 @@ historical records and are marked deprecated.
   outside the old mount. The share held only `.claude.json` backups, plugin
   caches, sessions and project dirs — all reproducible CLI state.
 
+  **Exception — Claude Code CLI OAuth login.** The CLI keeps its login in
+  `/home/tusker/.claude/.credentials.json` (`claudeAiOauth` access + refresh
+  tokens), which *was* on the share. After the first NFS removal the worker
+  reported `loggedIn: false` and claude-code-cli requests failed. The file was
+  recovered from the retained Longhorn volume (Retain policy left the PV
+  intact even after the PVC was deleted), stored as the `claude-cli-credentials`
+  Secret, and is now seeded into the worker's writable emptyDir by an init
+  container on every pod start. `claude auth status --json` now reports
+  `loggedIn: true` (`claude.ai`, pro, refresh token valid to 2026-12-18).
+  The init container must remain ordered **after** `containers` in the
+  manifest because `k8s/pin-manifest.py` rewrites only the first image line.
+
 ## Historical audit evidence
 
 Before retiring the PVC, the 776 MB JSONL log was copied to the retained RWO
@@ -56,3 +68,8 @@ PostgreSQL; see `docs/audit-database.md`.
 - `verify_audit --database --json` reported `valid=true` with records
   accumulating from live traffic.
 - No audit errors in the gateway logs after the rollout.
+- `claude auth status --json` in the worker reports `loggedIn: true`.
+- A live `claude-code-cli/sonnet` request returns the real upstream condition
+  (`claude_code_cli_quota`) rather than a `TypeError`. The stream parser fix
+  (`RemoteCLIAdapter` yields bytes, not str) is covered by
+  `tests/test_chat.py::test_remote_cli_adapter_yields_bytes`.
