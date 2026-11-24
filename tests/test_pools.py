@@ -16,7 +16,12 @@ from tusker_gateway.model_capability import (
     PRIVACY_ZDR_PROBE_VERSION,
     STRUCTURED_OUTPUT_PROBE_VERSION,
 )
-from tusker_gateway.pools import ModelSpec, PoolManager, is_general_chat_model
+from tusker_gateway.pools import (
+    COMPOSITE_IMAGE_TOOLS_PROBE_VERSION,
+    ModelSpec,
+    PoolManager,
+    is_general_chat_model,
+)
 from tusker_gateway.quality import QualityDB
 from tusker_gateway.tool_capability import ToolCapabilityLevel
 
@@ -641,7 +646,7 @@ def test_composite_evidence_does_not_become_input_modality(tmp_path):
         capability="input_image_tools",
         status="passed",
         source="composite_probe",
-        probe_version="image-tool-contract-v2",
+        probe_version=COMPOSITE_IMAGE_TOOLS_PROBE_VERSION,
     )
     modalities, _ = manager._model_capabilities(
         manager.models["privacy"][0], {}, None
@@ -694,7 +699,7 @@ def test_image_tools_selection_requires_composite_probe(tmp_path):
         capability="input_image_tools",
         status="unsupported",
         source="composite_probe",
-        probe_version="image-tool-contract-v2",
+        probe_version=COMPOSITE_IMAGE_TOOLS_PROBE_VERSION,
     )
     manager._model_capability_db.record(
         provider="synthetic",
@@ -702,7 +707,7 @@ def test_image_tools_selection_requires_composite_probe(tmp_path):
         capability="input_image_tools",
         status="passed",
         source="composite_probe",
-        probe_version="image-tool-contract-v2",
+        probe_version=COMPOSITE_IMAGE_TOOLS_PROBE_VERSION,
     )
 
     assert manager.select(
@@ -794,7 +799,7 @@ def test_composite_image_tools_evidence_policy(
             capability="input_image_tools",
             status=status,
             source="composite_probe",
-            probe_version="image-tool-contract-v2",
+            probe_version=COMPOSITE_IMAGE_TOOLS_PROBE_VERSION,
         )
 
     selected = manager.select(
@@ -826,6 +831,44 @@ def test_composite_evidence_from_older_probe_version_is_not_authoritative(tmp_pa
         requires_image_tools=True,
     ) == ("synthetic", "vision-tools")
 
+
+
+def test_composite_evidence_from_impossible_fixture_version_is_not_authoritative(
+    tmp_path,
+):
+    """``image-tool-contract-v2`` verdicts must not read as a capability denial.
+
+    v2 probed against a fixture with no middle stripe while requiring the
+    model to report one, so its ``unsupported`` verdicts recorded a fixture
+    defect rather than a capability limit (ollama-cloud/deepseek-v4.1-flash:1017,
+    2026-11-24). v3 replaced the fixture. A curated route keeps its historical
+    eligibility under v2 evidence, while a v3 ``unsupported`` remains a
+    definitive denial; auto-discovered routes stay withheld either way until
+    they are re-probed.
+    """
+    for version, expected in (
+        ("image-tool-contract-v2", ("synthetic", "vision-tools")),
+        ("image-tool-contract-v3", None),
+    ):
+        manager = _composite_evidence_manager(tmp_path, auto_discovered=False)
+        manager._model_capability_db.record(
+            provider="synthetic",
+            model="vision-tools",
+            capability="input_image_tools",
+            status="unsupported",
+            source="composite_probe",
+            probe_version=version,
+        )
+
+        assert (
+            manager.select(
+                "code",
+                required_input_modalities={"image"},
+                requires_tools=True,
+                requires_image_tools=True,
+            )
+            == expected
+        ), version
 
 def test_text_tools_selection_does_not_require_composite_probe(tmp_path):
     manager = PoolManager(

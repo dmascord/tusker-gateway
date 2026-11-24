@@ -193,7 +193,10 @@ For each request to `hermes-code`/`hermes-privacy`/etc:
 
 For an image-bearing request that also supplies tools, selection requires the
 model's latest `input_image_tools` capability record to be `passed` with probe
-version `image-tool-contract-v2`. Image-only and text-tool qualification are
+version `image-tool-contract-v3` (v3 fixed the probe fixture: the previous
+image held a 2x2 quadrant grid with no middle stripe, so the required colour
+observation was impossible and honest vision models scored `unsupported`).
+Image-only and text-tool qualification are
 not combined implicitly: a route that passes only one half is excluded before
 the upstream call. The same requirement is applied on ordinary selection,
 fallback attempts, recovery probes, and session-sticky re-selection.

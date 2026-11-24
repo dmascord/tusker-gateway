@@ -45,6 +45,7 @@ Read in order when picking up the repo:
 | `docs/incidents/2026-11-23-all-rate-limited-failover.md` | Uniform rate-limit exhaustion now returns 429 with Retry-After instead of a generic 502. |
 | `docs/incidents/2026-11-23-claude-code-cli-sse-escape.md` | Worker error frames used literal backslash-n; claude-code-cli failures surfaced as a TypeError. |
 | `docs/incidents/2026-11-24-audit-flock-eio.md` | NFS flock EIO on the shared audit log failed requests closed and mislabelled them as upstream errors; share-manager restart + accurate message + sync retry backoff. |
+| `docs/incidents/2026-11-24-composite-probe-fixture.md` | Composite image+tools probe required a middle-stripe colour the fixture never contained (2x2 quadrants), so honest vision models scored `unsupported`; striped fixture + `image-tool-contract-v3`. |
 | `TODO.md` | Active cross-session work items. |
 
 

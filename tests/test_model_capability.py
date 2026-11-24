@@ -242,6 +242,54 @@ def test_probe_image_data_url_is_a_decodable_png():
     assert len(zlib.decompress(idat)) == height * (1 + width * 3)
 
 
+def test_probe_image_middle_stripe_matches_composite_probe_answer():
+    """The image+tools probe asks for a colour the fixture must actually show.
+
+    The composite probe requires the model to report the colour of the
+    image's *middle stripe* and only accepts ``IMAGE_PROBE_COLOR``. The
+    fixture used to be a 2x2 quadrant grid with no stripe at all, so a
+    vision-capable model could only pass by guessing; an honest model
+    answered "this image has no middle stripe — any value I supplied would
+    be invented rather than observed" and was recorded ``unsupported``
+    (ollama-cloud/deepseek-v4.1-flash:1017, 2026-11-24). This guards the
+    fixture the probe actually sends.
+    """
+    from tusker_gateway.tool_qualification import IMAGE_PROBE_COLOR
+
+    payload = _messages_for_modality("image")[0]["content"][1]["image_url"]["url"]
+    prefix = "data:image/png;base64,"
+    raw = base64.b64decode(payload[len(prefix):], validate=True)
+
+    offset = 8
+    idat = b""
+    while offset + 12 <= len(raw):
+        (length,) = struct.unpack(">I", raw[offset : offset + 4])
+        kind = raw[offset + 4 : offset + 8]
+        if kind == b"IDAT":
+            idat += raw[offset + 8 : offset + 8 + length]
+        offset += 12 + length
+    width, height = struct.unpack(">II", raw[16:24])
+    filtered = zlib.decompress(idat)
+    stride = 1 + width * 3
+    # Every row of the fixture uses filter type 0 (None), so the scanline
+    # bytes are literal RGB triples.
+    row_filters = {filtered[y * stride] for y in range(height)}
+    assert row_filters == {0}, "fixture must use unfiltered rows"
+
+    def pixel(x: int, y: int) -> tuple[int, int, int]:
+        start = y * stride + 1 + x * 3
+        return tuple(filtered[start : start + 3])
+
+    named = {"red": (220, 30, 30), "green": (30, 180, 70), "blue": (30, 120, 220)}
+    assert IMAGE_PROBE_COLOR in named
+    # The middle row is the stripe the probe names, so it must be the
+    # accepted colour; the rows above and below must differ from it so a
+    # model cannot pass by reporting one colour for the whole image.
+    assert pixel(width // 2, height // 2) == named[IMAGE_PROBE_COLOR]
+    assert pixel(width // 2, 0) != named[IMAGE_PROBE_COLOR]
+    assert pixel(width // 2, height - 1) != named[IMAGE_PROBE_COLOR]
+
+
 def test_successful_media_capability_records_are_provider_model_scoped(tmp_path):
     db = ModelCapabilityDB(str(tmp_path / "model-capability.db"))
 

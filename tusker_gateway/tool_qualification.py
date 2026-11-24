@@ -39,7 +39,7 @@ from tusker_gateway.tool_capability import (
 )
 logger = logging.getLogger(__name__)
 
-COMPOSITE_CAPABILITY_PROBE_VERSION = "image-tool-contract-v2"
+COMPOSITE_CAPABILITY_PROBE_VERSION = "image-tool-contract-v3"
 COMPOSITE_CAPABILITY = "input_image_tools"
 _COMPOSITE_PROBE_RETRY_DELAY_SECS = 2.0
 _COMPOSITE_PROBE_LOCK: asyncio.Lock | None = None
@@ -434,17 +434,21 @@ def _result_from_stream(
         )
 
     structured = call_count > 0
-    valid_tool_contract = (
+    # The structural half of the contract: exactly one call to the probe
+    # tool, machine-parseable arguments, and a tool_calls terminal. This is
+    # what "strict" means; the image-derived argument is a separate check.
+    contract_shape_ok = (
         status_code == 200
         and call_count == 1
         and function_name == PROBE_TOOL_NAME
         and arguments_valid
-        and arguments_match
         and finish_reason == "tool_calls"
     )
-    strict = (
-        valid_tool_contract
-        and not "".join(text_parts).strip()
+    has_prose = bool("".join(text_parts).strip())
+    valid_tool_contract = contract_shape_ok and arguments_match
+    strict = valid_tool_contract and not has_prose
+    image_derived = bool(
+        expected_arguments and "middle_stripe_color" in expected_arguments
     )
     if strict:
         level = ToolCapabilityLevel.STRICT_STRUCTURED_STREAM
@@ -457,6 +461,15 @@ def _result_from_stream(
         level = ToolCapabilityLevel.STRUCTURED_STREAM
         status = "passed"
         failure_class = "unexpected_text"
+    elif contract_shape_ok and image_derived and not arguments_match:
+        # The model honoured the tool contract but reported a different
+        # colour than the fixture shows. That is a wrong or invented
+        # observation, not a malformed contract; naming it
+        # ``non_strict_tool_contract`` misdescribed the evidence and made a
+        # blind guess indistinguishable from two tool calls or a bad name.
+        level = ToolCapabilityLevel.STRUCTURED_STREAM
+        status = "failed"
+        failure_class = "image_evidence_mismatch"
     elif structured:
         level = ToolCapabilityLevel.STRUCTURED_STREAM
         status = "failed"
