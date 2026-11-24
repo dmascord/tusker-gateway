@@ -1,4 +1,12 @@
-"""Append-only, integrity-chained audit events for gateway requests."""
+"""Append-only, integrity-chained audit events for gateway requests.
+
+The default backend appends to the shared state database (PostgreSQL in
+production, SQLite for local development and tests). Each append locks a
+singleton chain-state row, so ordering and the hash chain stay correct across
+processes without any NFS advisory locking. The historical JSONL file backend
+is retained for migration and offline tooling; both backends emit the same
+record shape and honour the same fail-closed contract.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -16,6 +24,7 @@ from typing import Any, Mapping
 from aiohttp import web
 
 from tusker_gateway.observability import get_access_log_context
+from tusker_gateway.storage import StorageUnavailableError, shared_database
 
 logger = logging.getLogger(__name__)
 
@@ -24,8 +33,8 @@ _MAX_AUDIT_TEXT_CHARS = 2_048
 _MAX_AUDIT_COLLECTION_ITEMS = 32
 _MAX_AUDIT_RECORD_BYTES = 64 * 1024
 _MAX_LEGACY_RECORD_BYTES = 1024 * 1024
-# A shared (NFS/RWX) audit volume can transiently reject an append while
-# another writer's advisory lock is reaped; bounded retry keeps the
+# A shared (NFS/RWX) audit volume could transiently reject an append while
+# another writer's advisory lock was reaped. Bounded retry keeps the
 # fail-closed contract from turning that into a client-visible 503.
 _APPEND_RETRY_ATTEMPTS = 4
 _APPEND_RETRY_BACKOFF_SECS = 0.02
@@ -34,10 +43,11 @@ _APPEND_RETRY_BACKOFF_SECS = 0.02
 # shared-volume EIO would otherwise fail the request closed on the first
 # transient blip.
 _SYNC_APPEND_RETRY_ATTEMPTS = 4
-# A synchronous validator cannot await the async retry backoff. Bound a short
-# escalating sleep here so a transient shared-volume lock error (NFS flock EIO)
-# has time to clear instead of burning every attempt in the same millisecond.
 _SYNC_APPEND_RETRY_BACKOFF_SECS = 0.02
+_PRUNE_INTERVAL_SECS = 300.0
+
+_AUDIT_TABLE = "audit_events"
+_CHAIN_TABLE = "audit_chain_state"
 
 try:  # pragma: no cover - Linux in production; fallback keeps local portability.
     import fcntl
@@ -52,16 +62,33 @@ class AuditConfig:
     fail_closed: bool = False
     fsync: bool = True
     exclude_paths: tuple[str, ...] = ("/health", "/ready", "/metrics")
+    # "database" (production default from env) or "file" (legacy/offline).
+    backend: str = "file"
+    # Logical storage target. In postgres mode this resolves to the shared DSN;
+    # in sqlite mode it is a local file (":memory:" for tests).
+    database_path: str = ""
+    retention_days: int = 90
 
     @property
     def enabled(self) -> bool:
-        return bool(self.path)
+        return self.backend == "database" or bool(self.path)
+
+    @property
+    def database_enabled(self) -> bool:
+        return self.backend == "database"
 
 
 def _bool_env(value: str, *, default: bool) -> bool:
     if not value:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _default_database_path() -> str:
+    home = Path("/home/tusker/.hermes")
+    if home.exists():
+        return str(home / "audit.db")
+    return "/tmp/tusker-audit.db"
 
 
 def load_audit_config_from_env(env: Mapping[str, str] | None = None) -> AuditConfig:
@@ -71,12 +98,24 @@ def load_audit_config_from_env(env: Mapping[str, str] | None = None) -> AuditCon
         for item in env.get("TUSKER_AUDIT_EXCLUDE_PATHS", "/health,/ready,/metrics").split(",")
         if item.strip()
     )
+    backend = str(env.get("TUSKER_AUDIT_BACKEND", "database") or "database").strip().lower()
+    if backend not in {"file", "database"}:
+        logger.warning("unknown audit backend %r; using database", backend)
+        backend = "database"
+    try:
+        retention_days = max(1, int(str(env.get("TUSKER_AUDIT_RETENTION_DAYS", "90"))))
+    except (TypeError, ValueError):
+        retention_days = 90
     return AuditConfig(
         path=env.get("TUSKER_AUDIT_LOG_PATH", "").strip(),
         hmac_key=env.get("TUSKER_AUDIT_HMAC_KEY", ""),
         fail_closed=_bool_env(env.get("TUSKER_AUDIT_FAIL_CLOSED", ""), default=False),
         fsync=_bool_env(env.get("TUSKER_AUDIT_FSYNC", ""), default=True),
         exclude_paths=excluded,
+        backend=backend,
+        database_path=str(env.get("TUSKER_AUDIT_DATABASE_PATH", "") or "").strip()
+        or _default_database_path(),
+        retention_days=retention_days,
     )
 
 
@@ -85,15 +124,34 @@ class AuditWriteError(RuntimeError):
 
 
 class AuditLogger:
-    """Write JSONL audit records whose hashes form an append-only chain."""
+    """Write integrity-chained audit events to the state DB or a JSONL file."""
 
     def __init__(self, config: AuditConfig):
         self.config = config
-        # Serialize appends inside this process. ``flock`` still guards
-        # cross-process writers, but on the RWX/NFS audit volume a burst of
-        # concurrent requests otherwise piles up in ``to_thread`` workers
-        # where a transient NFS error surfaces as a client-visible 503.
+        # Serialize file appends inside this process. ``flock`` still guards
+        # cross-process writers, but on an RWX/NFS volume a burst of concurrent
+        # requests otherwise piles up in ``to_thread`` workers where a
+        # transient NFS error surfaces as a client-visible 503.
         self._write_lock = asyncio.Lock()
+        self._db: Any = None
+        self._last_prune = 0.0
+        if config.database_enabled:
+            policy = "critical" if config.fail_closed else "advisory"
+            self._db = shared_database(
+                config.database_path or _default_database_path(),
+                timeout=10.0,
+                fallback_policy=policy,
+            )
+            try:
+                self._ensure_db()
+            except Exception as exc:  # pragma: no cover - startup resilience
+                # Do not latch the failure: the pool reconnects per connection,
+                # so a later write may succeed once the database recovers.
+                logger.warning("audit database schema check failed: %s", exc.__class__.__name__)
+
+    # ------------------------------------------------------------------
+    # Shared chain helpers
+    # ------------------------------------------------------------------
 
     def _digest(self, previous_hash: str, canonical_event: bytes) -> str:
         message = previous_hash.encode("ascii") + b"." + canonical_event
@@ -128,6 +186,31 @@ class AuditLogger:
             ]
         return cls._bounded_value(str(value), depth=depth)
 
+    def _canonical_payload(self, event: Mapping[str, Any]) -> dict[str, Any]:
+        payload = {
+            str(key)[:128]: self._bounded_value(value)
+            for key, value in list(event.items())[:_MAX_AUDIT_COLLECTION_ITEMS]
+        }
+        payload.setdefault("timestamp", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+        payload.setdefault(
+            "policy_version",
+            os.environ.get("TUSKER_POLICY_VERSION")
+            or os.environ.get("TUSKER_COMMIT")
+            or "unknown",
+        )
+        payload["chain_version"] = 2 if self.config.hmac_key else 1
+        payload["chain_mode"] = "hmac" if self.config.hmac_key else "sha256"
+        return payload
+
+    def _canonical_bytes(self, payload: Mapping[str, Any]) -> bytes:
+        return json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+
+    # ------------------------------------------------------------------
+    # File backend (legacy / migration source)
+    # ------------------------------------------------------------------
+
     @staticmethod
     def _previous_hash(handle) -> str:
         handle.seek(0, os.SEEK_END)
@@ -157,7 +240,7 @@ class AuditLogger:
             raise AuditWriteError("audit log contains an invalid chain record")
         return candidate
 
-    def _append(self, event: Mapping[str, Any]) -> dict[str, Any]:
+    def _append_file(self, event: Mapping[str, Any]) -> dict[str, Any]:
         path = Path(self.config.path)
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a+b") as handle:
@@ -169,23 +252,9 @@ class AuditLogger:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
             try:
                 previous_hash = self._previous_hash(handle)
-                payload = {
-                    str(key)[:128]: self._bounded_value(value)
-                    for key, value in list(event.items())[:_MAX_AUDIT_COLLECTION_ITEMS]
-                }
-                payload.setdefault("timestamp", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
-                payload.setdefault(
-                    "policy_version",
-                    os.environ.get("TUSKER_POLICY_VERSION")
-                    or os.environ.get("TUSKER_COMMIT")
-                    or "unknown",
-                )
+                payload = self._canonical_payload(event)
                 payload["previous_hash"] = previous_hash
-                payload["chain_version"] = 2 if self.config.hmac_key else 1
-                payload["chain_mode"] = "hmac" if self.config.hmac_key else "sha256"
-                canonical = json.dumps(
-                    payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-                ).encode("utf-8")
+                canonical = self._canonical_bytes(payload)
                 if len(canonical) > _MAX_AUDIT_RECORD_BYTES:
                     raise AuditWriteError("audit event exceeds the maximum record size")
                 payload["hash"] = self._digest(previous_hash, canonical)
@@ -204,6 +273,218 @@ class AuditLogger:
                 if fcntl is not None:
                     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
+    # ------------------------------------------------------------------
+    # Database backend
+    # ------------------------------------------------------------------
+
+    def _ensure_db(self) -> None:
+        assert self._db is not None
+        with self._db.connection() as conn:
+            if conn.degraded:
+                return
+            conn.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {_CHAIN_TABLE} (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    head_hash TEXT NOT NULL,
+                    head_sequence BIGINT NOT NULL,
+                    tail_sequence BIGINT,
+                    tail_hash TEXT
+                )
+                """
+            )
+            conn.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {_AUDIT_TABLE} (
+                    sequence BIGINT PRIMARY KEY,
+                    event_id TEXT UNIQUE,
+                    event_type TEXT,
+                    request_id TEXT,
+                    timestamp TEXT,
+                    chain_version INTEGER NOT NULL,
+                    chain_mode TEXT NOT NULL,
+                    previous_hash TEXT NOT NULL,
+                    hash TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_audit_events_request "
+                f"ON {_AUDIT_TABLE} (request_id)"
+            )
+            conn.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_audit_events_created "
+                f"ON {_AUDIT_TABLE} (created_at)"
+            )
+            conn.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_audit_events_type "
+                f"ON {_AUDIT_TABLE} (event_type)"
+            )
+            cursor = conn.execute(
+                f"SELECT head_hash FROM {_CHAIN_TABLE} WHERE id = 1"
+            )
+            if cursor.fetchone() is None:
+                conn.execute(
+                    f"INSERT INTO {_CHAIN_TABLE} (id, head_hash, head_sequence) "
+                    f"VALUES (1, ?, 0)",
+                    (_GENESIS_HASH,),
+                )
+
+    def _append_db(self, event: Mapping[str, Any]) -> dict[str, Any] | None:
+        assert self._db is not None
+        with self._db.connection() as conn:
+            if conn.degraded:
+                # Advisory mode: a state-store outage must not fail the caller.
+                return None
+            # Lock the singleton row so concurrent writers cannot observe the
+            # same head. PostgreSQL honours FOR UPDATE; SQLite serializes the
+            # whole short transaction via BEGIN IMMEDIATE.
+            lock = " FOR UPDATE" if conn.is_postgres else ""
+            cursor = conn.execute(
+                f"SELECT head_hash, head_sequence FROM {_CHAIN_TABLE} "
+                f"WHERE id = 1{lock}"
+            )
+            row = cursor.fetchone()
+            if row is None:
+                raise OSError("audit chain state is missing")
+            previous_hash = str(row[0])
+            sequence = int(row[1]) + 1
+
+            payload = self._canonical_payload(event)
+            payload["previous_hash"] = previous_hash
+            canonical = self._canonical_bytes(payload)
+            if len(canonical) > _MAX_AUDIT_RECORD_BYTES:
+                raise AuditWriteError("audit event exceeds the maximum record size")
+            digest = self._digest(previous_hash, canonical)
+            payload["hash"] = digest
+            serialized = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+            if len(serialized.encode("utf-8")) > _MAX_AUDIT_RECORD_BYTES:
+                raise AuditWriteError("audit event exceeds the maximum record size")
+
+            conn.execute(
+                f"INSERT INTO {_AUDIT_TABLE} "
+                f"(sequence, event_id, event_type, request_id, timestamp, "
+                f" chain_version, chain_mode, previous_hash, hash, payload, created_at) "
+                f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    sequence,
+                    payload.get("event_id"),
+                    payload.get("event_type"),
+                    payload.get("request_id"),
+                    payload.get("timestamp"),
+                    int(payload["chain_version"]),
+                    str(payload["chain_mode"]),
+                    previous_hash,
+                    digest,
+                    serialized,
+                    time.time(),
+                ),
+            )
+            conn.execute(
+                f"UPDATE {_CHAIN_TABLE} SET head_hash = ?, head_sequence = ? "
+                f"WHERE id = 1",
+                (digest, sequence),
+            )
+        result = dict(payload)
+        result["sequence"] = sequence
+        return result
+
+    def prune(self) -> int:
+        """Delete events older than the retention window, preserving the chain anchor."""
+        if self._db is None:
+            return 0
+        cutoff = time.time() - self.config.retention_days * 86_400
+        with self._db.connection() as conn:
+            if conn.degraded:
+                return 0
+            row = conn.execute(
+                f"SELECT MIN(sequence) FROM {_AUDIT_TABLE} WHERE created_at >= ?",
+                (cutoff,),
+            ).fetchone()
+            keep_from = int(row[0]) if row and row[0] is not None else None
+            if keep_from is None:
+                return 0
+            anchor = conn.execute(
+                f"SELECT hash FROM {_AUDIT_TABLE} WHERE sequence < ? "
+                f"ORDER BY sequence DESC LIMIT 1",
+                (keep_from,),
+            ).fetchone()
+            anchor_hash = str(anchor[0]) if anchor else _GENESIS_HASH
+            cursor = conn.execute(
+                f"DELETE FROM {_AUDIT_TABLE} WHERE sequence < ?", (keep_from,)
+            )
+            deleted = int(getattr(cursor, "rowcount", 0) or 0)
+            # tail_sequence is the last *pruned* sequence so verify starts at
+            # tail_sequence + 1, i.e. the first retained row.
+            conn.execute(
+                f"UPDATE {_CHAIN_TABLE} SET tail_sequence = ?, tail_hash = ? WHERE id = 1",
+                (keep_from - 1, anchor_hash),
+            )
+            return deleted
+
+    @classmethod
+    def verify_db(
+        cls,
+        config: AuditConfig,
+        *,
+        database_path: str = "",
+    ) -> tuple[bool, int]:
+        """Verify every hash link in the database chain; return (valid, count)."""
+        db = shared_database(
+            database_path or config.database_path or _default_database_path(),
+            timeout=10.0,
+            fallback_policy="critical",
+        )
+        verifier = cls(config)
+        previous = _GENESIS_HASH
+        count = 0
+        with db.connection() as conn:
+            if conn.degraded:
+                return False, 0
+            row = conn.execute(
+                f"SELECT tail_hash, tail_sequence FROM {_CHAIN_TABLE} WHERE id = 1"
+            ).fetchone()
+            start_sequence = 0
+            if row is not None and row[0]:
+                previous = str(row[0])
+                start_sequence = int(row[1]) + 1
+            cursor = conn.execute(
+                f"SELECT sequence, previous_hash, hash, payload FROM {_AUDIT_TABLE} "
+                f"WHERE sequence >= ? ORDER BY sequence",
+                (start_sequence,),
+            )
+            for _sequence, claimed_previous, claimed_hash, payload_text in cursor:
+                if str(claimed_previous) != previous:
+                    return False, count
+                record = json.loads(str(payload_text))
+                record.pop("hash", None)
+                canonical = json.dumps(
+                    record, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+                ).encode("utf-8")
+                mode = record.get("chain_mode", "sha256")
+                if mode == "hmac":
+                    digest = verifier._digest(previous, canonical)
+                else:
+                    digest = hashlib.sha256(
+                        previous.encode("ascii") + b"." + canonical
+                    ).hexdigest()
+                if not hmac.compare_digest(str(claimed_hash), digest):
+                    return False, count
+                previous = str(claimed_hash)
+                count += 1
+        return True, count
+
+    # ------------------------------------------------------------------
+    # Common write API
+    # ------------------------------------------------------------------
+
+    def _append(self, event: Mapping[str, Any]) -> dict[str, Any] | None:
+        if self._db is not None:
+            return self._append_db(event)
+        return self._append_file(event)
+
     async def write(self, event: Mapping[str, Any]) -> dict[str, Any] | None:
         if not self.config.enabled:
             return None
@@ -212,9 +493,10 @@ class AuditLogger:
             try:
                 async with self._write_lock:
                     return await asyncio.to_thread(self._append, event)
-            except OSError as exc:
+            except (OSError, StorageUnavailableError) as exc:
                 # A shared/NFS-backed audit volume can reject an append while
-                # another writer's lock is being reaped. Retry with backoff
+                # another writer's lock is being reaped; a state-store
+                # connection can also fail transiently. Retry with backoff
                 # instead of failing the caller closed.
                 last_error = exc
                 logger.warning(
@@ -243,8 +525,8 @@ class AuditLogger:
 
         Tool approval interception can occur inside a synchronous response
         validator, including while an async stream is being assembled.  This
-        small adapter preserves the same chained format and failure policy
-        without scheduling a task that could outlive the request.
+        adapter preserves the same chained format and failure policy without
+        scheduling a task that could outlive the request.
         """
         if not self.config.enabled:
             return None
@@ -252,9 +534,7 @@ class AuditLogger:
         for attempt in range(_SYNC_APPEND_RETRY_ATTEMPTS):
             try:
                 return self._append(event)
-            except OSError as exc:
-                # Mirror the async path: a shared/NFS-backed audit volume can
-                # transiently reject an append; retry before failing closed.
+            except (OSError, StorageUnavailableError) as exc:
                 last_error = exc
                 logger.warning(
                     "audit sync append retry %d/%d after %s",
@@ -268,6 +548,10 @@ class AuditLogger:
         if self.config.fail_closed and last_error is not None:
             raise AuditWriteError("required audit persistence failed") from last_error
         return None
+
+    # ------------------------------------------------------------------
+    # Verification / tooling
+    # ------------------------------------------------------------------
 
     @classmethod
     def verify_file(cls, config: AuditConfig) -> tuple[bool, int]:

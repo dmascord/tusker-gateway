@@ -534,6 +534,7 @@ def status_handler(request: web.Request) -> web.Response:
         "identity_profiles": len(getattr(identity_config, "identities", {})),
         "identity_required": bool(getattr(identity_config, "required", False)),
         "audit_enabled": bool(getattr(audit_config, "enabled", False)),
+        "audit_backend": str(getattr(audit_config, "backend", "file")),
         "audit_integrity": (
             "hmac-sha256"
             if getattr(audit_config, "hmac_key", "")

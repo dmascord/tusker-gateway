@@ -77,8 +77,8 @@ isolated the fault to the NFS lock rather than capacity or permissions.
   `sha256:cc8ea30ae4370195d3070e21ff8c3e04065975e161fecd8434893619322d295c`;
   `k8s/verify-provenance.sh` OK across all three workloads.
 
-### Follow-up worth considering
+### Follow-up — implemented
 
-The audit log is ~740 MB on an RWX volume whose lock path has now proven
-fragile. Rotation/compaction and an evaluation of whether `flock` is the right
-cross-process lock over this NFS mount were not part of this fix.
+The shared-file lock path has since been removed entirely: audit events now
+append to the shared PostgreSQL state store with a serialized row lock. See
+`docs/audit-database.md` for the design, migration tool, and retention policy.

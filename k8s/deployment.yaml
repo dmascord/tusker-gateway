@@ -303,8 +303,13 @@ spec:
               name: tusker-env-vault
               key: TUSKER_REDACTION_KEY
               optional: true
-        # outage blocks the request rather than silently dropping the event.
-        # The log path is on the writable tusker-home RWX PVC.
+        # Audit chain appends go to the shared state database. The JSONL path
+        # is retained only as the migration source for historical records;
+        # the RWX/NFS flock path caused the 2026-11-24 incident.
+        - name: TUSKER_AUDIT_BACKEND
+          value: database
+        - name: TUSKER_AUDIT_RETENTION_DAYS
+          value: '90'
         - name: TUSKER_AUDIT_LOG_PATH
           value: /home/tusker/.hermes/audit.jsonl
         - name: TUSKER_AUDIT_HMAC_KEY
