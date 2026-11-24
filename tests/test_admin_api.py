@@ -327,6 +327,57 @@ async def test_admin_diagnostics_aggregates_subsystems():
 
 
 @pytest.mark.asyncio
+async def test_claude_auth_admin_route_reads_worker_when_configured(monkeypatch):
+    """The credential lives in the worker, so admin status must ask the worker."""
+    import tusker_gateway.admin as admin_module
+
+    monkeypatch.setenv("TUSKER_CLAUDE_WORKER_URL", "http://worker.test")
+
+    class _Resp:
+        status = 200
+
+        async def json(self, content_type=None):
+            return {"status": "authenticated", "auth_method": "claude.ai"}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class _Session:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def get(self, url):
+            assert url == "http://worker.test/worker/claude/auth"
+            return _Resp()
+
+    monkeypatch.setattr(admin_module, "ClientSession", _Session)
+    app = _admin_app("sk-admin-test", identities=_admin_identities())
+    client = await _client(app)
+    try:
+        resp = await client.get(
+            "/admin/claude/auth", headers={"Authorization": "Bearer sk-admin-test"}
+        )
+        assert resp.status == 200
+        assert await resp.json() == {
+            "status": "authenticated",
+            "auth_method": "claude.ai",
+            "source": "worker",
+            "login_command": "k8s/claude-code-login.sh",
+        }
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
 async def test_claude_auth_admin_route_returns_only_sanitized_status(monkeypatch):
     from tusker_gateway.provider_adapters import claude_code
 

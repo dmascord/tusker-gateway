@@ -24,6 +24,13 @@ async def health(request: web.Request) -> web.Response:
     return web.json_response({"status": "ok", "mode": "worker"})
 
 
+async def claude_auth(request: web.Request) -> web.Response:
+    """Sanitized Claude CLI login status from this worker's runtime home."""
+    from tusker_gateway.provider_adapters.claude_code import claude_auth_status
+
+    return web.json_response(await claude_auth_status())
+
+
 async def chat(request: web.Request) -> web.Response:
     try:
         body = await request.json()
@@ -91,6 +98,7 @@ async def chat(request: web.Request) -> web.Response:
 def create_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/health", health)
+    app.router.add_get("/worker/claude/auth", claude_auth)
     app.router.add_post("/worker/chat", chat)
     return app
 
