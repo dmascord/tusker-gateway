@@ -6,9 +6,9 @@ metadata:
   labels:
     app: tusker-opencode-worker
   annotations:
-    tusker.net.au/commit: 4911c6e37a53108926a6ef1ff9ca08d262a82320
-    tusker.net.au/image-tag: swarm-alpine-4911c6e37a53108926a6ef1ff9ca08d262a82320
-    tusker.net.au/image-digest: sha256:f2bf5b72c49aa4a6b7b269465f269976b0c7873847f7871f722ea8a7b892dd83
+    tusker.net.au/commit: 52eb988045cf5ed2b3f8b066449f8a2830a2eea0
+    tusker.net.au/image-tag: swarm-alpine-52eb988045cf5ed2b3f8b066449f8a2830a2eea0
+    tusker.net.au/image-digest: sha256:e29e757d20a875778e598dec06ae58839783e75d2561d0bce93deb4459bcb0e2
 spec:
   replicas: 1
   selector:
@@ -26,7 +26,7 @@ spec:
         fsGroupChangePolicy: OnRootMismatch
       containers:
       - name: tusker-opencode-worker
-        image: registry.tusker.net.au:5000/tusker-gateway@sha256:f2bf5b72c49aa4a6b7b269465f269976b0c7873847f7871f722ea8a7b892dd83
+        image: registry.tusker.net.au:5000/tusker-gateway@sha256:e29e757d20a875778e598dec06ae58839783e75d2561d0bce93deb4459bcb0e2
         imagePullPolicy: Always
         command: ["tini", "--", "python", "-m", "tusker_gateway.worker"]
         envFrom:

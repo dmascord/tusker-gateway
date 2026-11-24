@@ -124,11 +124,10 @@ Tokens are never echoed; the local copy is removed by a shell trap.
 
 `GET /admin/claude/auth` reports only `authenticated`, `login_required`, or
 `unknown` (and a small allowlist of auth-method labels), protected by the
-existing admin access controls. It runs `claude auth status` **inside the
-gateway pod**, which no longer has a Claude credential after the NFS removal,
-so it currently reports `login_required` even when the worker is logged in.
-Trust the worker check in the login helper or `kubectl exec … -c
-tusker-claude-worker -- claude auth status --json` instead. Claude Code remains responsible for refresh
+existing admin access controls. When `TUSKER_CLAUDE_WORKER_URL` is set it calls
+`GET /worker/claude/auth` on the worker — the pod that actually holds the
+credential — and includes `"source": "worker"` in the response; otherwise it
+falls back to local status for in-process development and tests. Claude Code remains responsible for refresh
 where supported and may request a fresh login when the current credential
 cannot be renewed. The gateway does not promise unattended refresh for every
 account type. If an actual request receives an explicit auth-expiry failure,
