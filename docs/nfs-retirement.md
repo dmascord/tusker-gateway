@@ -38,6 +38,9 @@ historical records and are marked deprecated.
   `loggedIn: true` (`claude.ai`, pro, refresh token valid to 2026-12-18).
   The init container must remain ordered **after** `containers` in the
   manifest because `k8s/pin-manifest.py` rewrites only the first image line.
+  `k8s/claude-code-login.sh` now runs the login in the worker, mirrors the new
+  credential into this Secret, and rolls the worker so it takes effect. The
+  repo's Codex rotation tools do **not** touch this Secret.
 
 ## Historical audit evidence
 
