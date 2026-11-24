@@ -1,5 +1,44 @@
 # Project TODOs
 
+## Postgres backup, retention and gateway HA (2026-11-25)
+
+Evidence and measurements in `docs/resilience-performance-assessment.md`.
+Four items, in the order they should be done.
+
+1. **Back up `tusker-gateway-postgres` and alert on it.** It is a Deployment
+   with `replicas: 1` on a 10 GiB Longhorn PVC, and it now holds the config
+   store, audit chain, encrypted OAuth credentials, quality/capability data and
+   turn captures. There is no backup job and no Postgres alert rule. Add a
+   nightly `pg_dump` CronJob to a separate volume with retention and a restore
+   check; add `pg_up`, connection-count, disk-usage and backup-staleness
+   alerts to `k8s/prometheus-rules.yaml`. Document and periodically exercise
+   the restore procedure.
+2. **Schedule the two retention prunes.** Live `turn_captures` is 722 MB in
+   4,385 rows (92% of the database, ~780 KB average request body), and its TTL
+   prune runs only inside `capture()` — expired rows survive a traffic lull.
+   `AuditLogger.prune()` (`audit.py:394`) has no caller at all, so the
+   documented 90-day audit window is not applied. Call both from the existing
+   maintenance loop daily; add tests proving expired rows are removed with no
+   new capture and that the audit chain anchor stays verifiable after pruning.
+3. **Make gateway HA safe, then raise replicas.** The gateway is stateless
+   (Postgres + `emptyDir`) and already uses `maxSurge: 1/maxUnavailable: 0`,
+   but `replicas: 1`. The blocker is Codex OAuth refresh: the DB CAS runs
+   *after* the upstream refresh, so two replicas can consume the same
+   single-use refresh token and one gets a permanent `refresh_token_reused`
+   cooldown. Add a Postgres advisory lock around adopt-refresh-persist, test
+   two rotators sharing one DB, then set replicas to 2 and verify a rolling
+   restart plus a Codex refresh under load.
+4. **Remove the duplicate prompt estimate (cleanup).** `_context_advisory_headers`
+   recomputes the estimate already computed at `endpoints.py:5247` — 0.61 ms
+   per request on a 760k-token prompt. Thread `prompt_estimate=` into
+   `context_advisory_headers` at the chat response sites; fold this into item
+   2 or 3 rather than deploying on its own.
+
+Explicitly **not** pending (verified 2026-11-25): `QualityDB.rank()` N+1 was
+fixed in PR #72 (0.21 ms for 360 candidates); prompt estimation is 0.61 ms;
+request latency is model-dominated (p50 ≈ 5 s); Postgres uses 13/100
+connections and 9% of its volume; gateway logs and alerts are healthy.
+
 ## Quality-ranking selection bottleneck (2026-11-20)
 
 Bounded local profiling found `QualityDB.rank()` dominates selection after the
