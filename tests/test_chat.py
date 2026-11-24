@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 
 import pytest
+from tusker_gateway.audit import AuditWriteError
 from tusker_gateway.budget import BudgetDecision
 import tusker_gateway.sse
 from tusker_gateway.errors import (
@@ -154,6 +155,27 @@ def test_public_stream_error_explains_empty_pool_as_availability_not_provider_fa
     assert "no eligible model" in message
     assert "req_b673132700f2562e" in message
     assert "Upstream provider error" not in message
+
+
+def test_public_stream_error_names_audit_failure_as_gateway_fault():
+    """A fail-closed audit write is a local control failure, not an upstream one.
+
+    2026-11-24: NFS flock EIO on the shared audit volume surfaced to callers as
+    "Upstream provider error: required audit persistence failed"
+    (req_9e48dfe2c9155c3a), sending operators to chase provider health.
+    """
+    message, code = _public_stream_error(
+        AuditWriteError("required audit persistence failed"),
+        request_id="req_9e48dfe2c9155c3a",
+        provider="apim",
+        model="gpt-5.6-luna",
+    )
+
+    assert code == "audit_unavailable"
+    assert "could not persist the required audit record" in message
+    assert "req_9e48dfe2c9155c3a" in message
+    assert "Upstream provider error" not in message
+    assert "required audit persistence failed" not in message
 
 
 def test_public_stream_error_correlates_capacity_failure():

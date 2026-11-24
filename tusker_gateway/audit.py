@@ -34,6 +34,10 @@ _APPEND_RETRY_BACKOFF_SECS = 0.02
 # shared-volume EIO would otherwise fail the request closed on the first
 # transient blip.
 _SYNC_APPEND_RETRY_ATTEMPTS = 4
+# A synchronous validator cannot await the async retry backoff. Bound a short
+# escalating sleep here so a transient shared-volume lock error (NFS flock EIO)
+# has time to clear instead of burning every attempt in the same millisecond.
+_SYNC_APPEND_RETRY_BACKOFF_SECS = 0.02
 
 try:  # pragma: no cover - Linux in production; fallback keeps local portability.
     import fcntl
@@ -258,6 +262,8 @@ class AuditLogger:
                     _SYNC_APPEND_RETRY_ATTEMPTS,
                     exc.__class__.__name__,
                 )
+                if attempt + 1 < _SYNC_APPEND_RETRY_ATTEMPTS:
+                    time.sleep(_SYNC_APPEND_RETRY_BACKOFF_SECS * (2**attempt))
         logger.error("audit write failed: %s", last_error.__class__.__name__)
         if self.config.fail_closed and last_error is not None:
             raise AuditWriteError("required audit persistence failed") from last_error

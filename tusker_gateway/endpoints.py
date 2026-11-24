@@ -17,6 +17,7 @@ from aiohttp import ClientError, ClientPayloadError, web
 from aiohttp.http_exceptions import TransferEncodingError
 from aiohttp.web_exceptions import HTTPRequestEntityTooLarge
 from tusker_gateway.redaction import _BufferedRestorer
+from tusker_gateway.audit import AuditWriteError
 
 from tusker_gateway.cache import ResponseCache, make_cache_key, make_caller_scope
 from tusker_gateway.budget import BudgetTracker
@@ -4906,6 +4907,19 @@ def _public_stream_error(
             f"another model. Request ID: {request_id}."
         )
         code = "no_healthy_models"
+    elif isinstance(exc, AuditWriteError):
+        # Fail-closed audit persistence is a local control-plane failure, not
+        # an upstream provider fault. Naming it accurately keeps operators from
+        # chasing provider health while the audit volume is the real problem
+        # (2026-11-24: NFS flock EIO on the shared RWX audit log was surfaced
+        # to callers as "Upstream provider error: required audit persistence
+        # failed").
+        message = (
+            "The gateway could not persist the required audit record for this "
+            "request. Retry shortly or contact the gateway operator with the "
+            f"request ID: {request_id}."
+        )
+        code = "audit_unavailable"
     elif isinstance(exc, BadRequestError):
         # Gateway-authored rejection (validation, routing, payload size). The
         # wording is the gateway's own, so keep it verbatim and only add
