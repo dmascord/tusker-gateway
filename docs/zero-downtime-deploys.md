@@ -52,16 +52,14 @@ See "History" for the failed August 2026 attempts that delayed this.
 
 ## Audience note on replicas and file state
 
-The deployment currently stays at `replicas: 1`. The database-backed
-stores are safe for rolling multi-pod writes because PostgreSQL is the
-shared authority. The audit trail is still an integrity-chained JSONL
-file at `/home/tusker/.hermes/audit.jsonl` on the RWX volume, so sustained
-active-active operation requires validating its cross-node append locking
-or moving audit events into PostgreSQL. This is the remaining reason not
-to increase steady-state replicas as part of an ordinary rollout.
+The deployment currently stays at `replicas: 1`. All mutable state —
+including the integrity-chained audit log — is now in PostgreSQL, so
+rolling multi-pod writes are safe. As of 2026-11-24 the RWX/NFS volume has
+been retired entirely: every pod uses `emptyDir` for home paths and the
+state DB is the only shared authority (see `docs/nfs-retirement.md`).
+Increasing steady-state replicas no longer has a storage blocker.
 
-SQLite-on-RWX is no longer the production state design; SQLite is retained
-for local/test fallback behavior only.
+SQLite is retained for local/test fallback behavior only.
 
 ## Validation evidence (2026-09-07)
 
