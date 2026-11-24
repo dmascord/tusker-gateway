@@ -82,9 +82,10 @@ spec:
           timeoutSeconds: 3
           failureThreshold: 6
       volumes:
+      # CLI homes are pod-local: the live .claude.json is already outside the
+      # mount, and the share only held backups/plugin caches. No NFS needed.
       - name: tusker-home
-        persistentVolumeClaim:
-          claimName: tusker-home-rwx
+        emptyDir: {}
 ---
 apiVersion: v1
 kind: Service

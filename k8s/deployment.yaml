@@ -830,6 +830,9 @@ spec:
             memory: 3Gi
             ephemeral-storage: 4Gi
       volumes:
+      # All mutable gateway state is in PostgreSQL (including the audit
+      # chain). The pod only needs these home paths to exist for legacy
+      # default paths; pod-local storage removes the last NFS dependency so
+      # RollingUpdate surge pods no longer share a filesystem.
       - name: tusker-home
-        persistentVolumeClaim:
-          claimName: tusker-home-rwx
+        emptyDir: {}
