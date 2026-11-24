@@ -64,7 +64,7 @@ async def test_large_bash_tool_turn_is_preserved_end_to_end(
 
     async def fake_chat(
         _client, provider, model, messages, *, stream, tools, tool_choice, extra_body,
-        conversation_id, metrics_registry, request_id, pool,
+        conversation_id, metrics_registry, request_id, pool, **_kwargs,
     ):
         forwarded.update(
             provider=provider,
@@ -246,7 +246,7 @@ async def test_unusable_tool_turns_fail_over_before_client_output(
 
     async def fake_chat(
         _client, provider, model, messages, *, stream, tools, tool_choice, extra_body,
-        conversation_id, metrics_registry, request_id, pool,
+        conversation_id, metrics_registry, request_id, pool, **_kwargs,
     ):
         handled.append((provider, model))
 
@@ -373,7 +373,7 @@ async def test_reasoning_only_length_turn_never_reaches_the_client_as_length(
 
     async def fake_chat(
         _client, provider, model, messages, *, stream, tools, tool_choice, extra_body,
-        conversation_id, metrics_registry, request_id, pool,
+        conversation_id, metrics_registry, request_id, pool, **_kwargs,
     ):
         handled.append((provider, model))
         budgets.append(dict(extra_body or {}))
@@ -447,7 +447,7 @@ async def _post_stream(client, app, *, provider: str, model: str, frames, tools=
 
     async def fake_chat(
         _client, provider, model, messages, *, stream, tools, tool_choice, extra_body,
-        conversation_id, metrics_registry, request_id, pool,
+        conversation_id, metrics_registry, request_id, pool, **_kwargs,
     ):
         handled.append((provider, model))
 

@@ -126,8 +126,13 @@ def test_compress_text_records_skipped_short():
 
 
 def test_compress_text_records_skipped_too_large():
+    """Blocks beyond the cap are skipped and counted, not silently scanned."""
+    from tusker_gateway.rtk import _MAX_BLOCK_BYTES
+
     metrics = _registry()
-    big = "diff --git a/x.py b/x.py\n@@ ...\n" * 5000  # ~150 KB
+    big = "diff --git a/x.py b/x.py\n@@ ...\n" * (
+        _MAX_BLOCK_BYTES // 30 + 2
+    )
     out = compress_text(big, metrics=metrics)
     assert out == big  # unchanged
     assert metrics.rtk_calls.get({"outcome": "skipped_too_large"}) == 1

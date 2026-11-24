@@ -303,10 +303,40 @@ def test_prose_unchanged():
     assert out == PROSE_SAMPLE
 
 
-def test_very_large_block_unchanged():
-    """Blocks > 64 KB are not compressed (likely docs/system prompts)."""
-    big = "diff --git a/x.py b/x.py\n" * 5000  # ~150 KB
-    assert compress_text(big) == big
+def test_very_large_tool_output_is_compressed():
+    """Blocks above the old 64 KB cap are compressed.
+
+    Only ``role == "tool"`` content reaches ``compress_text``, so the cap was
+    never protecting system prompts. It skipped exactly the outputs worth
+    compressing: a 270 KB ``git diff`` used to pass through untouched.
+    The cap still bounds pathological payloads (see ``_MAX_BLOCK_BYTES``).
+    """
+    lines = ["diff --git a/x.py b/x.py"]
+    for i in range(3000):
+        lines.extend(
+            [
+                "--- a/x.py",
+                "+++ b/x.py",
+                f"@@ -{i},1 +{i},1 @@",
+                f"-old line {i}",
+                f"+new line {i}",
+            ]
+        )
+    big = "\n".join(lines) + "\n"
+    assert len(big) > 64 * 1024
+    out = compress_text(big)
+    assert len(out) < len(big)
+
+
+def test_pathological_block_still_skipped():
+    """The cap still bounds absurd payloads so we never scan unbounded text."""
+    from tusker_gateway.rtk import _MAX_BLOCK_BYTES
+
+    huge = "diff --git a/x.py b/x.py\n@@ -1,1 +1,1 @@\n-a\n+b\n" * (
+        _MAX_BLOCK_BYTES // 30 + 2
+    )
+    assert len(huge) > _MAX_BLOCK_BYTES
+    assert compress_text(huge) is huge
 
 
 def test_minimum_savings_threshold():

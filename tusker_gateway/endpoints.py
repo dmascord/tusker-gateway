@@ -83,6 +83,7 @@ from tusker_gateway.context_limits import (
     fit_output_budget,
     required_context_tokens,
 )
+from tusker_gateway.context_advisory import context_advisory_headers
 from tusker_gateway.inband_thinking import InbandThinkingTracker, has_visible_text
 from tusker_gateway.max_tokens import apply_max_tokens_floor
 from tusker_gateway.native_question import (
@@ -3916,6 +3917,42 @@ def _conversation_log_id(value: str | None) -> str:
         return "none"
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
 
+def _rtk_opt_out(request: Any) -> bool:
+    """Honor the documented ``X-Rtk-Token-Saver: off`` per-request opt-out.
+
+    ``request`` may be a SimpleNamespace in tests, so the header lookup must
+    tolerate a missing ``headers`` attribute.
+    """
+    try:
+        headers = getattr(request, "headers", None)
+        if not headers:
+            return True
+        return str(headers.get("X-Rtk-Token-Saver", "")).strip().lower() != "off"
+    except Exception:  # noqa: BLE001 - a header must never break a turn
+        return True
+
+
+def _context_advisory_headers(
+    body: Any,
+    tools: Any,
+    provider: str | None,
+    model: str | None,
+) -> dict[str, str]:
+    """Advisory prompt/context numbers for a response. Never raises."""
+    try:
+        messages = (body or {}).get("messages") if isinstance(body, dict) else None
+        return context_advisory_headers(
+            messages,
+            tools,
+            provider=provider,
+            model=model,
+            model_hint=(body or {}).get("model") if isinstance(body, dict) else None,
+        )
+    except Exception:  # noqa: BLE001 - an advisory must never fail a turn
+        logger.debug("context advisory headers failed", exc_info=True)
+        return {}
+
+
 
 def _estimated_tokens(messages: list[dict[str, Any]]) -> int:
     """Rough prompt-token estimate for budget pre-flight.
@@ -5276,6 +5313,7 @@ async def _call_with_pool_fallback(
                     metrics_registry=metrics_registry,
                     request_id=request_id,
                     pool=pool_name,
+                    rtk_compress=_rtk_opt_out(request),
                 )
                 if hasattr(result, "__aiter__"):
                     result = _attempt_touch_iterator(result, activity)
@@ -5782,6 +5820,7 @@ async def _call_with_pool_fallback(
                     metrics_registry=metrics_registry,
                     request_id=request_id,
                     pool=pool_name,
+                    rtk_compress=_rtk_opt_out(request),
                 )
                 if hasattr(result, "__aiter__"):
                     result = _attempt_touch_iterator(result, activity)
@@ -7709,7 +7748,12 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                         if _tok is not None and isinstance(hit, dict):
                             from tusker_gateway.redaction import restore_response
                             hit = restore_response(hit, _tok)
-                        return web.json_response(hit)
+                        return web.json_response(
+                            hit,
+                            headers=_context_advisory_headers(
+                                body, tools, provider, target_model
+                            ),
+                        )
                 set_access_log_context(request, cache_status="miss")
 
             # Semantic cache lookup (after exact-match miss).
@@ -7760,7 +7804,12 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                     if _tok is not None and isinstance(sem_hit, dict):
                         from tusker_gateway.redaction import restore_response
                         sem_hit = restore_response(sem_hit, _tok)
-                    return web.json_response(sem_hit)
+                    return web.json_response(
+                        sem_hit,
+                        headers=_context_advisory_headers(
+                            body, tools, provider, target_model
+                        ),
+                    )
                 set_access_log_context(request, cache_status="miss")
 
             # A previously approved high-impact tool call is replayed directly
@@ -7811,6 +7860,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                         "Connection": "keep-alive",
                         "X-Request-ID": request_id,
                         "X-Accel-Buffering": "no",
+                        **_context_advisory_headers(body, tools, provider, target_model),
                     },
                 )
                 await stream_resp.prepare(request)
@@ -8349,7 +8399,12 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                             },
                             n,
                         )
-            return web.json_response(result)
+            return web.json_response(
+                result,
+                headers=_context_advisory_headers(
+                    body, tools, provider, target_model
+                ),
+            )
         except BadRequestError as exc:
             status = exc.code or "bad_request"
             if stream_resp is not None and stream_stop is not None and stream_hb_task is not None:
@@ -8895,7 +8950,10 @@ async def _responses_handler_impl(request: web.Request) -> web.Response | web.St
                 _chat_result_to_responses(
                     result,
                     body.get("model") or config["model_name"],
-                )
+                ),
+                headers=_context_advisory_headers(
+                    chat_body, chat_body.get("tools"), provider, target_model
+                ),
             )
         # This compatibility endpoint has no lossless JSON representation for
         # a Chat SSE iterator. Fail explicitly rather than returning an empty

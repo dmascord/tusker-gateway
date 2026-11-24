@@ -103,6 +103,23 @@ def _anthropic_block_to_openai(block: Any) -> dict[str, Any] | None:
             code="unsupported_image_source",
         )
 
+    # Anthropic ``document`` blocks (PDF/text sources) have no equivalent in
+    # the OpenAI Chat Completions shape this gateway forwards upstream, and
+    # the image below does not carry a document parser. Stringifying the block
+    # used to ship the whole base64 payload as prose: a 1.5 MB PDF became
+    # ~468k estimated prompt tokens of unparseable text, which either blew the
+    # context window or was silently meaningless to a non-Anthropic upstream.
+    # Fail closed with an actionable error instead of spending the caller's
+    # budget on bytes no model can read.
+    if block_type == "document":
+        raise BadRequestError(
+            "Anthropic document blocks are not supported by this gateway: "
+            "the OpenAI Chat Completions request shape has no document part "
+            "and no upstream route parses PDFs. Extract the document to text "
+            "client-side and send it as a text block.",
+            code="unsupported_document_block",
+        )
+
     # Anthropic has more content block types than the canonical OpenAI chat
     # shape. Keep unsupported blocks inspectable as text instead of silently
     # deleting them from the conversation.
