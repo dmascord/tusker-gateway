@@ -1451,6 +1451,13 @@ async def _normalize_stream(
     async def diagnostic_raw_stream() -> AsyncIterator[bytes]:
         try:
             async for upstream_chunk in raw_stream:
+                # RemoteCLIAdapter yields already-decoded str lines while HTTP
+                # adapters yield bytes. The stream loop below and the response
+                # capture both operate on bytes; normalizing here keeps a CLI
+                # worker chunk from raising a TypeError in bytearray.extend
+                # when turn capture is enabled.
+                if isinstance(upstream_chunk, str):
+                    upstream_chunk = upstream_chunk.encode("utf-8", errors="replace")
                 stream_diag["chunks"] += 1
                 stream_diag["upstream_bytes"] += len(upstream_chunk)
                 append_response_capture(raw_capture, upstream_chunk)

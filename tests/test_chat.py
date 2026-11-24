@@ -3726,6 +3726,62 @@ class _FakeUpstreamHttp:
 
 
 @pytest.mark.asyncio
+async def test_remote_cli_adapter_yields_bytes(monkeypatch):
+    """RemoteCLIAdapter must yield bytes like every other stream adapter.
+
+    It used to decode each line to str. The gateway's prefetch bytearray and
+    response capture then raised ``TypeError`` whenever turn capture was
+    enabled (2026-11-24), killing every CLI-worker stream.
+    """
+    from tusker_gateway.provider_adapters.remote_cli import RemoteCLIAdapter
+
+    lines = [b'data: {"choices":[]}\n\n', b"data: [DONE]\n\n"]
+    expected = list(lines)
+
+    class _Content:
+        def __aiter__(self):
+            async def gen():
+                for line in expected:
+                    yield line
+            return gen()
+
+    class _Resp:
+        status = 200
+        content = _Content()
+
+        async def release(self):
+            return None
+
+    class _Session:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, *_args, **_kwargs):
+            return _Resp()
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(
+        "tusker_gateway.provider_adapters.remote_cli.aiohttp.ClientSession", _Session
+    )
+    adapter = RemoteCLIAdapter("claude-code-cli", "http://worker.test")
+    stream = await adapter.chat(
+        provider="claude-code-cli", model="sonnet", messages=[], stream=True
+    )
+    chunks = [chunk async for chunk in stream]
+
+    assert chunks == lines
+    assert all(isinstance(chunk, bytes) for chunk in chunks)
+
+
+@pytest.mark.asyncio
 async def test_chat_stream_rejected_turn_capture_records_provider_bytes(
     app, client, tmp_path, monkeypatch,
 ):

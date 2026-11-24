@@ -2889,6 +2889,12 @@ class PassthroughClient:
                     break
                 if not chunk:
                     continue
+                # RemoteCLIAdapter yields decoded str lines; HTTP adapters
+                # yield bytes. The prefetch buffer is a bytearray, so a str
+                # chunk would raise "expected iterable of integers" and kill
+                # every CLI-worker stream when turn capture is on.
+                if isinstance(chunk, str):
+                    chunk = chunk.encode("utf-8", errors="replace")
                 prefetched.append(chunk)
                 prefetched_bytes += len(chunk)
                 pending.extend(chunk)
