@@ -1,43 +1,34 @@
 # Project TODOs
 
-## Postgres backup, retention and gateway HA (2026-11-25)
+## Postgres backup, retention and gateway HA (2026-11-25) — DONE
 
-Evidence and measurements in `docs/resilience-performance-assessment.md`.
-Four items, in the order they should be done.
+All four items were implemented in the PR following
+`docs/resilience-performance-assessment.md`. Evidence and original measured
+findings remain in that document; the implementation is summarised here.
 
-1. **Back up `tusker-gateway-postgres` and alert on it.** It is a Deployment
-   with `replicas: 1` on a 10 GiB Longhorn PVC, and it now holds the config
-   store, audit chain, encrypted OAuth credentials, quality/capability data and
-   turn captures. There is no backup job and no Postgres alert rule. Add a
-   nightly `pg_dump` CronJob to a separate volume with retention and a restore
-   check; add `pg_up`, connection-count, disk-usage and backup-staleness
-   alerts to `k8s/prometheus-rules.yaml`. Document and periodically exercise
-   the restore procedure.
-2. **Schedule the two retention prunes.** Live `turn_captures` is 722 MB in
-   4,385 rows (92% of the database, ~780 KB average request body), and its TTL
-   prune runs only inside `capture()` — expired rows survive a traffic lull.
-   `AuditLogger.prune()` (`audit.py:394`) has no caller at all, so the
-   documented 90-day audit window is not applied. Call both from the existing
-   maintenance loop daily; add tests proving expired rows are removed with no
-   new capture and that the audit chain anchor stays verifiable after pruning.
-3. **Make gateway HA safe, then raise replicas.** The gateway is stateless
-   (Postgres + `emptyDir`) and already uses `maxSurge: 1/maxUnavailable: 0`,
-   but `replicas: 1`. The blocker is Codex OAuth refresh: the DB CAS runs
-   *after* the upstream refresh, so two replicas can consume the same
-   single-use refresh token and one gets a permanent `refresh_token_reused`
-   cooldown. Add a Postgres advisory lock around adopt-refresh-persist, test
-   two rotators sharing one DB, then set replicas to 2 and verify a rolling
-   restart plus a Codex refresh under load.
-4. **Remove the duplicate prompt estimate (cleanup).** `_context_advisory_headers`
-   recomputes the estimate already computed at `endpoints.py:5247` — 0.61 ms
-   per request on a 760k-token prompt. Thread `prompt_estimate=` into
-   `context_advisory_headers` at the chat response sites; fold this into item
-   2 or 3 rather than deploying on its own.
+1. **Backup + alerts.** `k8s/postgres-backup.yaml` adds a nightly 03:17 UTC
+   `pg_dump` CronJob to a separate 10 GiB Longhorn PVC, with gzip integrity
+   checks, 7-dump retention and a restore procedure in the manifest comments.
+   `k8s/prometheus-rules.yaml` adds five alerts: no ready Postgres pod, restart
+   storm, volume >80% full, backup stale >26 h, backup never succeeded. No
+   Postgres exporter exists, so the rules use kube-state-metrics / kubelet
+   volume metrics and the CronJob's own status.
+2. **Retention.** `tusker_gateway/retention.py` runs both `TurnCaptureStore.prune()`
+   and `AuditLogger.prune()`; the existing maintenance loop calls it on its
+   daily cadence via `asyncio.to_thread`. Expired captures are now removed
+   even with no new traffic, and the 90-day audit window is applied.
+3. **Safe HA.** `tusker_gateway/oauth_refresh_lock.py` derives a stable key per
+   credential; `ConfigStore.oauth_refresh_advisory_lock()` holds a bounded
+   (30 s) session-level `pg_try_advisory_lock` across adopt → refresh → CAS
+   persist. Fail-open with a process-local fallback if coordination is
+   unavailable. `k8s/deployment.yaml` now runs `replicas: 2`.
+4. **Duplicate estimate removed.** The chat and Responses handlers compute
+   one `estimate_prompt_tokens` per request and pass it to the advisory
+   headers; no second serialization at response time.
 
-Explicitly **not** pending (verified 2026-11-25): `QualityDB.rank()` N+1 was
-fixed in PR #72 (0.21 ms for 360 candidates); prompt estimation is 0.61 ms;
-request latency is model-dominated (p50 ≈ 5 s); Postgres uses 13/100
-connections and 9% of its volume; gateway logs and alerts are healthy.
+Regression coverage: `tests/test_resilience_followups.py` (12 tests; 6 fail
+against the unfixed tree). Offline suite green. Live verification performed
+after deploy is recorded in `docs/resilience-performance-assessment.md`.
 
 ## Quality-ranking selection bottleneck (2026-11-20)
 

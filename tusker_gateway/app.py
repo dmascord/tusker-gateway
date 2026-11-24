@@ -264,6 +264,7 @@ def create_app() -> web.Application:
                 provider=provider,
                 persist_credentials=config.get("_persist_credentials"),
                 load_credentials=config.get("_load_oauth_credentials"),
+                refresh_lock=config.get("_oauth_refresh_lock"),
                 model_exclusion_store=model_exclusion_store,
             )
     codex_rotator = credential_rotators.get("openai-codex")
@@ -274,6 +275,7 @@ def create_app() -> web.Application:
             provider="openai-codex",
             persist_credentials=config.get("_persist_credentials"),
             load_credentials=config.get("_load_oauth_credentials"),
+            refresh_lock=config.get("_oauth_refresh_lock"),
             model_exclusion_store=model_exclusion_store,
         )
     credential_rotators["openai-codex"] = codex_rotator

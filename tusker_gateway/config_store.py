@@ -36,6 +36,8 @@ from tusker_gateway.storage import Database, shared_database
 
 logger = logging.getLogger(__name__)
 
+_ADVISORY_LOCK_WAIT_SECS = 30.0
+
 _ENCRYPTION_KEY_VARS = ("TUSKER_KEY_ENCRYPTION_KEY", "ENCRYPTION_KEY")
 class ConfigUnavailableError(Exception):
     """Raised when the DB-backed config store cannot be reached."""
@@ -1315,6 +1317,51 @@ class ConfigStore:
                 "oauth credential store read failed provider=%s", name, exc_info=True
             )
             return None
+
+    @contextmanager
+    def oauth_refresh_advisory_lock(self, key: int) -> Iterator[None]:
+        """Hold a session-level PostgreSQL advisory lock across a refresh.
+
+        The lock lives on a dedicated connection so it survives the OAuth HTTP
+        round trip and the following CAS write. Unlock always runs in ``finally``.
+        SQLite (tests, single-process deployments) uses a process-local mutex:
+        there is no second process to coordinate with.
+        """
+        db = self._db_connect()
+        if not db.is_postgres:
+            with threading.Lock():
+                yield
+            return
+
+        # Bound the wait: a wedged peer replica must not hang this request
+        # forever. On timeout the caller falls back to the in-process lock
+        # (RefreshLock), so auth keeps working even if coordination fails.
+        deadline = time.monotonic() + _ADVISORY_LOCK_WAIT_SECS
+        with db.connection() as conn:
+            acquired = False
+            while True:
+                row = conn.execute(
+                    "SELECT pg_try_advisory_lock(?)", (int(key),)
+                ).fetchone()
+                if row and row[0]:
+                    acquired = True
+                    break
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.05)
+            if not acquired:
+                raise TimeoutError(
+                    f"oauth advisory lock wait exceeded {_ADVISORY_LOCK_WAIT_SECS:.0f}s"
+                )
+            try:
+                yield
+            finally:
+                try:
+                    conn.execute("SELECT pg_advisory_unlock(?)", (int(key),))
+                except Exception:  # noqa: BLE001 - connection may be gone
+                    logger.warning(
+                        "oauth advisory unlock failed key=%d", key, exc_info=True
+                    )
 
     def _cas_persist_credentials(
         self, provider: str, expected: dict[str, Any], replacement: dict[str, Any]

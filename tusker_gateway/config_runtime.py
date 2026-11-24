@@ -241,6 +241,7 @@ class ConfigRuntime:
         # the store.
         new_cfg["_persist_credentials"] = getattr(store, "persist_credentials", None)
         new_cfg["_load_oauth_credentials"] = getattr(store, "load_oauth_credentials", None)
+        new_cfg["_oauth_refresh_lock"] = getattr(store, "oauth_refresh_lock", None)
         # Validate: build the new pool manager off-loop visible state first.
         # A failure here aborts the apply before anything is published.
         from tusker_gateway.pools import PoolManager

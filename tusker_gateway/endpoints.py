@@ -7764,7 +7764,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                         return web.json_response(
                             hit,
                             headers=_context_advisory_headers(
-                                body, tools, provider, target_model
+                                body, tools, provider, target_model, request_prompt_estimate
                             ),
                         )
                 set_access_log_context(request, cache_status="miss")
@@ -7820,7 +7820,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                     return web.json_response(
                         sem_hit,
                         headers=_context_advisory_headers(
-                            body, tools, provider, target_model
+                            body, tools, provider, target_model, request_prompt_estimate
                         ),
                     )
                 set_access_log_context(request, cache_status="miss")
@@ -7873,7 +7873,9 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                         "Connection": "keep-alive",
                         "X-Request-ID": request_id,
                         "X-Accel-Buffering": "no",
-                        **_context_advisory_headers(body, tools, provider, target_model),
+                        **_context_advisory_headers(
+                            body, tools, provider, target_model, request_prompt_estimate
+                        ),
                     },
                 )
                 await stream_resp.prepare(request)
@@ -8415,7 +8417,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
             return web.json_response(
                 result,
                 headers=_context_advisory_headers(
-                    body, tools, provider, target_model
+                    body, tools, provider, target_model, request_prompt_estimate
                 ),
             )
         except BadRequestError as exc:
@@ -8971,7 +8973,7 @@ async def _responses_handler_impl(request: web.Request) -> web.Response | web.St
                     body.get("model") or config["model_name"],
                 ),
                 headers=_context_advisory_headers(
-                    chat_body, chat_body.get("tools"), provider, target_model
+                    chat_body, chat_body.get("tools"), provider, target_model, responses_prompt_estimate
                 ),
             )
         # This compatibility endpoint has no lossless JSON representation for
