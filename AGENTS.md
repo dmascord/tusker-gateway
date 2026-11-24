@@ -39,6 +39,8 @@ Read in order when picking up the repo:
 | `docs/incidents/2026-11-23-worker-pod-verification.md` | opencode worker verified end-to-end; kilo worker stale/unused, kilo models work over direct HTTP. |
 | `docs/incidents/2026-11-23-kilo-qualification.md` | 15/17 kilo models in code pool; 10 tool-qualified, 5 genuine upstream failures; 2 audio models correctly excluded. |
 | `docs/audio-routing.md` | OpenAI-compatible audio endpoints, provider selection, chat audio input and capability evidence. |
+| `docs/context-efficiency.md` | Context-pressure advisory headers, Anthropic document-block rejection, RTK compression honesty and the evidence behind each decision. |
+| `docs/local-cli-context-notes.md` | What OMP and OpenCode already do for context/token efficiency, and the local config gaps the gateway cannot fill. |
 | `docs/audit-database.md` | PostgreSQL-backed integrity-chained audit log: schema, locking, retention, migration and verification. |
 | `docs/nfs-retirement.md` | RWX/NFS volume retired: pod-local emptyDir, historical audit archive, verification. |
 | `docs/incidents/2026-11-23-audio-routing.md` | Restored accidentally-removed TTS route; added STT and audio token accounting; verified live. |

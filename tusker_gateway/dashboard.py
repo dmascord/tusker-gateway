@@ -28,6 +28,7 @@ from tusker_gateway.cooldown import global_tracker
 from tusker_gateway.pools import PoolManager
 from tusker_gateway.quality import QualityDB
 from tusker_gateway.rate_limit import RateLimiter
+from tusker_gateway.metrics import MetricsRegistry
 
 
 PAGE = """<!DOCTYPE html>
@@ -237,11 +238,21 @@ async def dashboard_cooldowns(request: web.Request) -> web.Response:
 
 
 async def dashboard_quota(request: web.Request) -> web.Response:
+    metrics: MetricsRegistry | None = request.app.get("metrics")
     cache: ResponseCache | None = request.app.get("cache")
     sem_cache = request.app.get("semantic_cache")
-    budget: BudgetTracker | None = request.app.get("budget")
-    ratelimit: RateLimiter | None = request.app.get("ratelimit")
     out = []
+    if metrics is not None:
+        prompt = metrics.tokens_total.sum_where(direction="prompt")
+        completion = metrics.tokens_total.sum_where(direction="completion")
+        total = prompt + completion
+        prompt_label = f"{prompt:,.0f}" if total else "0"
+        completion_label = f"{completion:,.0f}" if total else "0"
+        out.append(
+            "<div><span class='meta'>tokens (billed, upstream-reported)</span>"
+            f"<div class='num'>{total:,.0f}</div>"
+            f"<span class='meta'>{prompt_label} prompt · {completion_label} completion</span></div>"
+        )
     if cache is not None:
         s = cache.stats_snapshot()
         out.append(

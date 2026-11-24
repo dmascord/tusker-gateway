@@ -16,7 +16,17 @@ result. Falls back to a generic dedup filter if no specific filter matches.
 
 Disabled by default. Enable via ``TUSKER_RTK_ENABLED=true``. The
 ``X-Rtk-Token-Saver: off`` request header lets clients opt out
-per-request (matches 9router's ``X-9Router-Token-Saver`` pattern).
+per-request (matches 9router's ``X-9Router-Token-Saver`` pattern); the
+header is read on ``/v1/chat/completions`` and ``/v1/messages``.
+
+**What the counters measure.** ``rtk_bytes_saved`` counts removed output
+*bytes*, not billed tokens and not money. Independent benchmarks of RTK-style
+compression (Quesma, 2026-09: 1,740 attempts, ~$1,500; JetBrains
+SkillsBench) found removed output bytes did not translate into lower billed
+cost, because terminal output is a small share of a frontier model's input
+and a compression that costs an extra turn loses money. Treat these counters
+as "did the filters fire, and by how much", and read billed impact from
+``tusker_tokens_total``. See ``docs/context-efficiency.md``.
 
 Usage::
 
@@ -208,7 +218,9 @@ def _cargo_test_apply(text: str) -> str:
                 failed = int(m.group(1))
             continue
         if stripped.startswith("test ") and ("FAILED" in stripped or "panic" in stripped.lower()):
-            failures.append(stripped.split(" ... ")[0])
+            # Keep the panic message; only the "... <name>" duplication and
+            # the repeated "test result:" summary are noise.
+            failures.append(stripped)
         elif "FAILED" in stripped and "failures:" not in stripped:
             failures.append(stripped)
     out: list[str] = []
@@ -249,10 +261,20 @@ def _pytest_apply(text: str) -> str:
             if m:
                 passed = int(m.group(1))
             continue
-        if stripped.startswith("FAILED "):
-            failed.append(stripped.split(" - ")[0])
-        elif "FAILED" in stripped and "::" in stripped:
-            failed.append(stripped.split(" ")[0])
+        if stripped.startswith("FAILED ") or (
+            "FAILED" in stripped and "::" in stripped
+        ):
+            # Keep the whole line, including the trailing "- <reason>". The
+            # assertion reason is what the model needs to fix the test; the
+            # earlier behaviour stripped it and forced a second pytest run
+            # (independent benchmark: compression costing a turn loses money).
+            failed.append(stripped)
+        elif stripped.startswith("> ") and "assert" in stripped:
+            # The source line pytest points at inside the FAILURES section.
+            failed.append(stripped)
+        elif stripped.startswith("E "):
+            # pytest's assertion explanation line.
+            failed.append(stripped)
     out: list[str] = []
     if summary:
         out.append(summary)
@@ -410,10 +432,12 @@ _FILTERS: tuple[tuple[str, MatchFn, FilterFn], ...] = (
     DEDUP,
 )
 
-# Cap on individual content blocks to compress. Larger blocks are
-# unlikely to be tool output (they're system prompts or documents) and
-# compressing them risks losing important context.
-_MAX_BLOCK_BYTES = 64 * 1024
+# Cap on individual content blocks to compress. Only ``role == "tool"``
+# content reaches ``compress_text`` (see ``compress_tool_results``), so this
+# bounds pathological payloads rather than protecting system prompts. The
+# earlier 64 KiB value skipped exactly the outputs worth compressing: a
+# 270 KB ``git diff`` passed through untouched.
+_MAX_BLOCK_BYTES = 512 * 1024
 # If the filter output isn't at least this much shorter, skip it.
 _MIN_SAVINGS_RATIO = 0.10
 

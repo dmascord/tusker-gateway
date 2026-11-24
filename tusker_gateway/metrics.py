@@ -29,6 +29,7 @@ Metric catalogue:
     tusker_guardrail_blocks_total{kind}                        counter
     tusker_shadow_shape_mismatch_total{profile,surface}        counter
     tusker_pool_candidates{pool,state}                         gauge
+    tusker_rtk_blocks_total{filter,outcome}                   counter
     tusker_rtk_bytes_saved_total                               counter
     tusker_rtk_calls_total{outcome}                           counter
 
@@ -69,6 +70,28 @@ class Counter:
 
     def get(self, labels: dict[str, str] | None = None) -> float:
         return self._values.get(self._key(labels), 0.0)
+
+    def sum_where(self, **labels: str) -> float:
+        """Sum every series whose labels include the given exact matches.
+
+        ``get`` requires a complete label tuple, so it cannot answer "all
+        prompt tokens across every pool/provider/model". Partial selection is
+        what dashboards need; an empty match sums the whole counter.
+        """
+        if not labels:
+            with self._lock:
+                return sum(self._values.values())
+        positions = {
+            self.label_names.index(name): value
+            for name, value in labels.items()
+            if name in self.label_names
+        }
+        total = 0.0
+        with self._lock:
+            for key, value in self._values.items():
+                if all(key[idx] == want for idx, want in positions.items()):
+                    total += value
+        return total
 
     def _key(self, labels: dict[str, str] | None) -> tuple[str, ...]:
         if not self.label_names:
@@ -312,11 +335,16 @@ class MetricsRegistry:
         )
         # tusker_rtk_bytes_saved_total
         #   Sum of (input_bytes - output_bytes) across all compress_text
-        #   calls that actually produced savings. Plot as a rate to see
-        #   real-world savings over time.
+        #   calls that actually produced savings.
+        #   NOT a cost or token saving: it counts removed UTF-8 bytes of tool
+        #   output, and independent benchmarks of RTK-style compression
+        #   (Quesma, 2026-09; JetBrains SkillsBench) found removed output
+        #   bytes did not translate into lower billed cost. Treat this as a
+        #   shape metric ("did the filters fire, and by how much"), not as
+        #   savings. Billed impact must come from tusker_tokens_total.
         self.rtk_bytes_saved = Counter(
             "tusker_rtk_bytes_saved_total",
-            "Total input bytes removed by RTK compression",
+            "Tool-output bytes removed by RTK compression (NOT billed-token savings)",
         )
         # tusker_rtk_calls_total{outcome}
         #   outcome = "compressed" | "no_match" | "skipped_short"

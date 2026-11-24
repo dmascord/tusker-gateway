@@ -31,6 +31,7 @@ from tusker_gateway import translators
 from tusker_gateway.budget import BudgetTracker
 from tusker_gateway.circuit_breaker import CircuitBreaker, BreakerDecision
 from tusker_gateway.config import provider_route_is_disabled
+from tusker_gateway.context_advisory import context_advisory_headers
 from tusker_gateway.errors import (
     BadRequestError,
     NoHealthyModelsError,
@@ -275,6 +276,35 @@ def _sse_heartbeat_secs() -> float:
     return float(os.environ.get("TUSKER_SSE_HEARTBEAT_SECS", "15"))
 
 
+def _rtk_opt_out(request: Any) -> bool:
+    """Honor the documented ``X-Rtk-Token-Saver: off`` per-request opt-out."""
+    try:
+        return request.headers.get("X-Rtk-Token-Saver", "").strip().lower() != "off"
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _advisory_headers(
+    body: dict[str, Any] | None,
+    provider: str | None,
+    model: str | None,
+) -> dict[str, str]:
+    """Anthropic-route context advisory. Never raises."""
+    try:
+        messages = (body or {}).get("messages")
+        tools = (body or {}).get("tools") if isinstance(body, dict) else None
+        return context_advisory_headers(
+            messages,
+            tools if isinstance(tools, list) else None,
+            provider=provider,
+            model=model,
+            model_hint=(body or {}).get("model") if isinstance(body, dict) else None,
+        )
+    except Exception:  # noqa: BLE001 - advisory must never fail a turn
+        logger.debug("anthropic context advisory failed", exc_info=True)
+        return {}
+
+
 def _estimated_tokens(messages: list[dict[str, Any]]) -> int:
     """Rough prompt-token estimate for budget pre-flight."""
     chars = sum(len(str(m.get("content", ""))) for m in messages)
@@ -412,7 +442,8 @@ async def _call_with_pool_fallback_anthropic(
                                               if request is not None
                                               else None
                                           ),
-                                          pool=pool_name)
+                                          pool=pool_name,
+                                          rtk_compress=_rtk_opt_out(request))
                 if isinstance(result, dict):
                     result = normalize_response_tool_calls(
                         result,
@@ -502,7 +533,8 @@ async def _call_with_pool_fallback_anthropic(
                                       stream=bool(body.get("stream")), tools=tools,
                                       tool_choice=body.get("tool_choice"),
                                       extra_body=_build_extra_body(body) or None,
-                                      conversation_id=conversation_id)
+                                      conversation_id=conversation_id,
+                                      rtk_compress=_rtk_opt_out(request))
             if isinstance(result, dict):
                 result = normalize_response_tool_calls(
                     result,
@@ -773,6 +805,7 @@ async def anthropic_messages_handler(request: web.Request) -> web.Response | web
                         "Connection": "keep-alive",
                         "X-Request-ID": request.get("_request_id", ""),
                         "X-Accel-Buffering": "no",
+                        **_advisory_headers(openai_body, provider, target_model),
                     },
                 )
                 await stream_resp.prepare(request)
@@ -877,7 +910,10 @@ async def anthropic_messages_handler(request: web.Request) -> web.Response | web
                     n = int(usage.get(key) or 0)
                     if n:
                         metrics.tokens_total.inc({"pool": pool_name, "provider": provider, "model": target_model, "direction": direction}, n)
-            return web.json_response(anthropic_resp)
+            return web.json_response(
+                anthropic_resp,
+                headers=_advisory_headers(openai_body, provider, target_model),
+            )
 
         except BadRequestError as exc:
             status = exc.code or "bad_request"
