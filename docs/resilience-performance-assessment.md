@@ -172,3 +172,24 @@ it does not warrant its own deploy.
 - A billed-token A/B showing RTK changes cost materially: the counters in
   `tusker_rtk_bytes_saved_total` are bytes, not tokens — see
   `docs/context-efficiency.md`.
+
+## Implementation record (2026-11-25)
+
+All four proposed items were implemented in the PR following this assessment.
+`TODO.md` marks the work complete; the mapping from finding to change is:
+
+| Finding above | Change |
+|---|---|
+| Postgres unbacked, no alerts | `k8s/postgres-backup.yaml` (nightly `pg_dump` to a separate PVC, gzip integrity check, 7-dump retention, restore procedure in comments); five Postgres/backup alerts added to `k8s/prometheus-rules.yaml`. |
+| `turn_captures` prune only on write; audit prune never called | `tusker_gateway/retention.py` + daily call from the maintenance loop. |
+| Codex refresh race across replicas | `tusker_gateway/oauth_refresh_lock.py` + `ConfigStore.oauth_refresh_advisory_lock()` (bounded 30 s `pg_try_advisory_lock`, fail-open with process-local fallback) around adopt → refresh → CAS persist. |
+| `replicas: 1` | `k8s/deployment.yaml` now sets `replicas: 2`; the stale RWX rollout comment was corrected. |
+| Duplicate prompt estimate | Chat and Responses handlers compute one estimate per request and pass `prompt_estimate=` to the advisory headers. |
+
+Verification: `tests/test_resilience_followups.py` (12 tests, 6 of which fail
+against the unfixed tree), full offline suite, ruff, `py_compile`, YAML parse.
+Live verification after deploy is recorded in the deployment handoff below.
+
+### Live verification after deploy
+
+(to be filled in after the rollout)

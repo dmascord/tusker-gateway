@@ -1006,6 +1006,7 @@ class CodexTokenRotator:
         provider: str = "openai-codex",
         persist_credentials: Any | None = None,
         load_credentials: Any | None = None,
+        refresh_lock: Any | None = None,
         refresh_enabled: bool = True,
         secrets_authoritative: bool = False,
         model_exclusion_store: Any | None = None,
@@ -1022,6 +1023,13 @@ class CodexTokenRotator:
         # credential another process already rotated, instead of replaying a
         # refresh token that was consumed upstream (refresh_token_reused).
         self._load_credentials = load_credentials
+        # ``refresh_lock(key)`` is a cross-process context manager supplied by
+        # the DB config store. It serializes adopt -> refresh -> persist across
+        # gateway replicas so two pods cannot consume the same single-use
+        # refresh token. None falls back to the in-process lock only.
+        from tusker_gateway.oauth_refresh_lock import RefreshLock
+
+        self._refresh_lock = RefreshLock(acquire=refresh_lock)
         # ``refresh_enabled=False`` marks a read-only rotator (standalone
         # qualification jobs): never call the OAuth token endpoint, so the
         # shared refresh tokens cannot be consumed by a process that cannot
@@ -1479,112 +1487,121 @@ class CodexTokenRotator:
 
                 canary_skip = self._canary_skip_rotation(cred)
                 retry_at = self._refresh_failed_until.get(idx, 0.0)
-                if self._is_near_expiry(cred):
-                    # Store adoption runs for every near-expiry entry, before
-                    # any skip policy: it is the only way this process picks up
-                    # a rotation another process already made, and the skip
-                    # policies below only forbid the OAuth round-trip.
-                    adopted_fresh = False
-                    adopted = await self._maybe_adopt_from_store(idx)
-                    if adopted:
-                        cred = self._creds[idx]
-                        token = _creds_access_token(cred)
-                        if token and not self._is_expired(cred):
-                            # Store already holds a newer credential — use it
-                            # directly instead of the OAuth round-trip. Falling
-                            # through to the refresh block below would burn the
-                            # shared single-use refresh token even though the
-                            # adopted access token is valid
-                            # (refresh_token_reused).
-                            self._refresh_failed_until.pop(idx, None)
-                            adopted_fresh = True
-                        else:
-                            # Adoption gave us a row but its access token is
-                            # already past expiry; fall through and let the
-                            # refresh attempt below re-rotate it.
-                            token = None
+                # Cross-process critical section: adoption, the OAuth round
+                # trip and the CAS persist must be atomic across replicas,
+                # or two pods consume the same single-use refresh token
+                # (refresh_token_reused -> 24h permanent cooldown).
+                lock_identity = (
+                    _creds_refresh_token(cred)
+                    or str(cred.get("account_user_id") or cred.get("account_id") or idx)
+                )
+                async with self._refresh_lock.guard(self._provider, str(lock_identity)):
+                    if self._is_near_expiry(cred):
+                        # Store adoption runs for every near-expiry entry, before
+                        # any skip policy: it is the only way this process picks up
+                        # a rotation another process already made, and the skip
+                        # policies below only forbid the OAuth round-trip.
+                        adopted_fresh = False
+                        adopted = await self._maybe_adopt_from_store(idx)
+                        if adopted:
+                            cred = self._creds[idx]
+                            token = _creds_access_token(cred)
+                            if token and not self._is_expired(cred):
+                                # Store already holds a newer credential — use it
+                                # directly instead of the OAuth round-trip. Falling
+                                # through to the refresh block below would burn the
+                                # shared single-use refresh token even though the
+                                # adopted access token is valid
+                                # (refresh_token_reused).
+                                self._refresh_failed_until.pop(idx, None)
+                                adopted_fresh = True
+                            else:
+                                # Adoption gave us a row but its access token is
+                                # already past expiry; fall through and let the
+                                # refresh attempt below re-rotate it.
+                                token = None
 
-                    if canary_skip:
-                        # Canary policy: never rotate a refresh token that
-                        # production also holds. A still-valid access token
-                        # remains usable; a dead one is skipped.
-                        if not adopted_fresh and self._is_expired(cred):
-                            logger.warning(
-                                "oauth refresh skipped by canary policy provider=%s "
-                                "credential_index=%d/%d refresh_token_held_by_prod=true",
-                                self._provider,
-                                idx + 1,
-                                count,
-                            )
-                            continue
-                    elif not self._refresh_enabled:
-                        if not adopted_fresh and self._is_expired(cred):
-                            logger.warning(
-                                "oauth refresh disabled and access token expired "
-                                "provider=%s credential_index=%d/%d fingerprint=%s pod=%s",
-                                self._provider,
-                                idx + 1,
-                                count,
-                                self.fingerprint(cred.get("refresh_token")),
-                                self._process_identity(),
-                            )
-                            continue
-                    elif not adopted_fresh and retry_at <= now:
-                        # A still-cooling entry (up to 24h after a permanent
-                        # OAuth error) must not consume the shared refresh token
-                        # again; it waits for adoption above to recover it.
-                        # Refresh under our own authority: this process owns
-                        # the rotated result and persists it.
-                        pre_refresh = dict(cred)
-                        logger.info(
-                            "oauth refresh starting provider=%s credential_index=%d/%d "
-                            "refresh_fp=%s access_expires_in_s=%.0f pod=%s",
-                            self._provider,
-                            idx + 1,
-                            count,
-                            self.fingerprint(pre_refresh.get("refresh_token")),
-                            _creds_expires_at(pre_refresh) - time.time(),
-                            self._process_identity(),
-                        )
-                        try:
-                            refreshed = await self._refresh_one(cred)
-                        except Exception as exc:
-                            self._refresh_failed_until[idx] = time.time() + (
-                                self._permanent_refresh_cooldown_seconds()
-                                if self._is_permanent_refresh_error(exc)
-                                else self._refresh_failure_cooldown_seconds()
-                            )
-                            self._log_refresh_failure(idx, exc)
-                        else:
-                            self._creds[idx] = refreshed
-                            self._refresh_failed_until.pop(idx, None)
-                            targets_label = await self._persist(pre_refresh, refreshed)
-                            token = _creds_access_token(refreshed)
-                            committed = any(
-                                part.endswith("committed")
-                                for part in targets_label.split("+")
-                            )
+                        if canary_skip:
+                            # Canary policy: never rotate a refresh token that
+                            # production also holds. A still-valid access token
+                            # remains usable; a dead one is skipped.
+                            if not adopted_fresh and self._is_expired(cred):
+                                logger.warning(
+                                    "oauth refresh skipped by canary policy provider=%s "
+                                    "credential_index=%d/%d refresh_token_held_by_prod=true",
+                                    self._provider,
+                                    idx + 1,
+                                    count,
+                                )
+                                continue
+                        elif not self._refresh_enabled:
+                            if not adopted_fresh and self._is_expired(cred):
+                                logger.warning(
+                                    "oauth refresh disabled and access token expired "
+                                    "provider=%s credential_index=%d/%d fingerprint=%s pod=%s",
+                                    self._provider,
+                                    idx + 1,
+                                    count,
+                                    self.fingerprint(cred.get("refresh_token")),
+                                    self._process_identity(),
+                                )
+                                continue
+                        elif not adopted_fresh and retry_at <= now:
+                            # A still-cooling entry (up to 24h after a permanent
+                            # OAuth error) must not consume the shared refresh token
+                            # again; it waits for adoption above to recover it.
+                            # Refresh under our own authority: this process owns
+                            # the rotated result and persists it.
+                            pre_refresh = dict(cred)
                             logger.info(
-                                "oauth refresh succeeded provider=%s credential_index=%d/%d "
-                                "expires_in_s=%.0f refresh_token_rotated=%s persistence=%s "
-                                "targets=%s refresh_fp=%s->%s pod=%s",
+                                "oauth refresh starting provider=%s credential_index=%d/%d "
+                                "refresh_fp=%s access_expires_in_s=%.0f pod=%s",
                                 self._provider,
                                 idx + 1,
                                 count,
-                                max(0.0, _creds_expires_at(refreshed) - time.time()),
-                                _creds_refresh_token(pre_refresh)
-                                != _creds_refresh_token(refreshed),
-                                "committed" if committed else "not_committed",
-                                targets_label,
-                                self.fingerprint(_creds_refresh_token(pre_refresh)),
-                                self.fingerprint(_creds_refresh_token(refreshed)),
+                                self.fingerprint(pre_refresh.get("refresh_token")),
+                                _creds_expires_at(pre_refresh) - time.time(),
                                 self._process_identity(),
                             )
-                    if token and self._is_expired(cred):
-                        # Never forward a dead bearer: the refresh was skipped
-                        # by policy or cooldown and the store had nothing newer.
-                        continue
-                elif self._is_expired(cred):
+                            try:
+                                refreshed = await self._refresh_one(cred)
+                            except Exception as exc:
+                                self._refresh_failed_until[idx] = time.time() + (
+                                    self._permanent_refresh_cooldown_seconds()
+                                    if self._is_permanent_refresh_error(exc)
+                                    else self._refresh_failure_cooldown_seconds()
+                                )
+                                self._log_refresh_failure(idx, exc)
+                            else:
+                                self._creds[idx] = refreshed
+                                self._refresh_failed_until.pop(idx, None)
+                                targets_label = await self._persist(pre_refresh, refreshed)
+                                token = _creds_access_token(refreshed)
+                                committed = any(
+                                    part.endswith("committed")
+                                    for part in targets_label.split("+")
+                                )
+                                logger.info(
+                                    "oauth refresh succeeded provider=%s credential_index=%d/%d "
+                                    "expires_in_s=%.0f refresh_token_rotated=%s persistence=%s "
+                                    "targets=%s refresh_fp=%s->%s pod=%s",
+                                    self._provider,
+                                    idx + 1,
+                                    count,
+                                    max(0.0, _creds_expires_at(refreshed) - time.time()),
+                                    _creds_refresh_token(pre_refresh)
+                                    != _creds_refresh_token(refreshed),
+                                    "committed" if committed else "not_committed",
+                                    targets_label,
+                                    self.fingerprint(_creds_refresh_token(pre_refresh)),
+                                    self.fingerprint(_creds_refresh_token(refreshed)),
+                                    self._process_identity(),
+                                )
+                        if token and self._is_expired(cred):
+                            # Never forward a dead bearer: the refresh was skipped
+                            # by policy or cooldown and the store had nothing newer.
+                            continue
+                if self._is_expired(cred):
                     # Not near expiry yet expired (clock skew) and no recovery
                     # path applied: skip rather than send a known-dead token.
                     continue

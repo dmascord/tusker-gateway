@@ -1000,10 +1000,16 @@ async def qualification_maintenance_loop(
         if prune_enabled and prune_next_due_at is not None and now_mono >= prune_next_due_at:
             try:
                 from tusker_gateway.quality import QualityDB
+                from tusker_gateway.retention import run_retention_prune
 
                 quality_cfg = load_config()
                 removed = QualityDB(quality_cfg["quality_db_path"]).prune_events()
                 logger.info("quality event prune removed=%d", removed)
+                # Turn captures and audit events document retention windows
+                # that were previously applied only on write (or never).
+                # Run them on this same daily cadence, off the event loop.
+                retention = await asyncio.to_thread(run_retention_prune)
+                logger.info("retention prune result=%s", retention)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
