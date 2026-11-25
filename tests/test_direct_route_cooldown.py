@@ -106,6 +106,34 @@ async def test_direct_route_respects_provider_wide_cooldown(app, client):
 
 
 @pytest.mark.asyncio
+async def test_gce_direct_route_in_cooldown_keeps_503_and_window(app, client):
+    """Enterprise Copilot is a provider-wide 429 provider.
+
+    The local cooldown gate must reuse the 503 surface (not a client 429)
+    and carry the enforced window in Retry-After rather than a fixed 5s
+    that would invite an immediate retry into a quarantined route.
+    """
+    global_tracker().cooldown("github-copilot-enterprise", "gpt-5.6-luna", 7200)
+
+    with patch(
+        "tusker_gateway.endpoints.PassthroughClient.chat",
+        new_callable=AsyncMock,
+    ) as mock_chat:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "github-copilot-enterprise/gpt-5.6-luna",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+            headers=HEADERS_AUTH,
+        )
+
+    assert response.status == 503
+    assert int(response.headers["Retry-After"]) > 3000
+    mock_chat.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_expired_cooldown_does_not_block_direct_route(app, client):
     """An elapsed cooldown must not keep the route blocked."""
     tracker = global_tracker()
