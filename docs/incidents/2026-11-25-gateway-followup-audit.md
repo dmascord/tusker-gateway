@@ -120,13 +120,20 @@ and `...::test_retention_loop_prunes_without_qualification_enabled`.
 
 `k8s/prometheus-values.yaml` carried `grafana.adminPassword:
 "tusker-grafana"`, and the live `monitoring/monitoring-grafana-admin` Secret
-still uses that value. Grafana is reachable through the public ingress at
+used that value. Grafana is reachable through the public ingress at
 `https://ai.tusker.net.au/grafana`, so the credential was published.
 
 Fix: the values file now points the chart at the existing Secret
-(`grafana.admin.existingSecret`) and carries no credential. **The live
-Secret's password must be rotated** — that is a cluster change and was not
-performed as part of this release.
+(`grafana.admin.existingSecret`) and carries no credential. The live
+password was rotated during the deploy to a random value held only in the
+`monitoring-grafana-admin` Secret, verified in-cluster: the committed
+`admin:tusker-grafana` pair now returns 401 and the rotated credential
+returns 200. Changing the Secret alone is **not** enough — Grafana stores
+the admin password in its own database, so the credential must be reset
+with `grafana cli admin reset-admin-password` and the Secret synced to the
+same value. The live Deployment's strategy was also corrected to
+`Recreate` (the values specify it; the cluster had drifted to
+`RollingUpdate`, which deadlocks on the RWO Grafana PVC).
 
 ## Open, latent
 
