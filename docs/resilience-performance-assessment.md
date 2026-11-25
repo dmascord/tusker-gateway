@@ -192,8 +192,10 @@ Live verification after deploy is recorded in the deployment handoff below.
 
 ### Live verification after deploy (2026-11-25)
 
-Deployed as `b891e74f8d2a618164077cf74aec5bb285499ccd`, image
-`registry.tusker.net.au:5000/tusker-gateway@sha256:2104be59b7ff0054146f2c228ae046aff300f595d8e655f10bdc473704f6be0a`.
+Deployed in two steps: `b891e74f…` (image `sha256:2104be59…`) for the feature
+set, then `62acb03fec55d02d8330a022855f2226ce1c44e6` (image
+`sha256:89a1529c4faecea2b8543642876f7767cc9e803a820087b657ba9878b6a16f50`)
+for the three defects that first deploy exposed.
 
 | Check | Result |
 |---|---|
@@ -224,4 +226,21 @@ shipped broken:
    `app: tusker-gateway-postgres-backup` was added to the policy (manifest and
    live).
 
-Both fixes are in `k8s/gateway-postgres.yaml` and the gateway source.
+Both fixes are in `k8s/gateway-postgres.yaml` and the gateway source. A third
+defect — the missing `tusker-gateway-postgres-config` ConfigMap, which left the
+state pod in `Init:0/1` and turned fail-closed audit writes into a 503 for
+every caller — is recorded in
+`docs/incidents/2026-11-25-postgres-configmap-audit-503.md`; `k8s/deploy.sh`
+now applies that ConfigMap.
+
+### Final live state (2026-11-25, after the fixes)
+
+| Check | Result |
+|---|---|
+| Running image | `sha256:89a1529c…` on the gateway and both workers. |
+| Gateway pods | 2 replicas, `1/1 Running`, 0 restarts. |
+| Postgres | `1/1 Running`, 0 restarts. |
+| Advisory lock | **Zero** `advisory lock unavailable` errors since the rollout, and `pg_try_advisory_lock` + `pg_advisory_unlock` both confirmed executing in the live image. |
+| Audit errors | Zero `audit_unavailable` / `audit write exhausted` since the rollout. |
+| Smoke | `{"ok": true, "http_status": 200}`. |
+| Provenance | `k8s/verify-provenance.sh` → OK across manifest, Deployment, pods and `/health`. |
