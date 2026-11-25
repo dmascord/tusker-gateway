@@ -190,6 +190,38 @@ Verification: `tests/test_resilience_followups.py` (12 tests, 6 of which fail
 against the unfixed tree), full offline suite, ruff, `py_compile`, YAML parse.
 Live verification after deploy is recorded in the deployment handoff below.
 
-### Live verification after deploy
+### Live verification after deploy (2026-11-25)
 
-(to be filled in after the rollout)
+Deployed as `b891e74f8d2a618164077cf74aec5bb285499ccd`, image
+`registry.tusker.net.au:5000/tusker-gateway@sha256:2104be59b7ff0054146f2c228ae046aff300f595d8e655f10bdc473704f6be0a`.
+
+| Check | Result |
+|---|---|
+| Gateway replicas | 2 pods, both `1/1 Running`, 0 restarts, both report commit `b891e74f` in `/health`. |
+| Workers | `tusker-claude-worker` and `tusker-opencode-worker` both `1/1 Running` on the new digest. |
+| Provenance | `k8s/verify-provenance.sh` → **OK: all tracked manifests, live Deployments, running pods and /health agree** (with 2 replicas). |
+| Retention module | `run_retention_prune` importable and callable in both replicas. |
+| Lock key | Stable per credential and namespaced (`0x5455534B` = "TUSK") in both replicas. |
+| Backup CronJob | `k8s/postgres-backup.yaml` applied: PVC `Bound` (10 GiB), CronJob `17 3 * * *`, `concurrencyPolicy: Forbid`. |
+| Backup execution | Manual run from the CronJob: **Complete 1/1 in 6m11s**, wrote a **505 MB** dump; gzip integrity check passed. |
+| Alerts | 11 gateway alerts live, including the 5 new Postgres/backup ones. The live-only `tusker-kilo-worker` group was preserved (the manifest does not contain it). |
+
+**Two defects found and fixed during live verification** — both would have
+shipped broken:
+
+1. **The advisory lock never engaged.** `ConfigStore.oauth_refresh_advisory_lock`
+   was a sync `@contextmanager` but the caller used `async with`, raising
+   `TypeError: '_GeneratorContextManager' object does not support the
+   asynchronous context manager protocol`. The fail-open path swallowed it
+   (auth kept working via the process-local lock), so the cross-process
+   protection was silently absent — HA would not have been safe. Caught in the
+   live startup log. Fixed by making it an `@asynccontextmanager`; the
+   regression test `test_refresh_lock_guard_works_with_the_real_store_callback`
+   fails against the sync version.
+2. **The backup could not reach Postgres.** The namespace has
+   `default-deny-ingress`, and `allow-tusker-gateway-postgres` only listed the
+   gateway and state-migration pods. The dump hung with a 0-byte file until
+   `app: tusker-gateway-postgres-backup` was added to the policy (manifest and
+   live).
+
+Both fixes are in `k8s/gateway-postgres.yaml` and the gateway source.

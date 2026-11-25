@@ -26,9 +26,22 @@ findings remain in that document; the implementation is summarised here.
    one `estimate_prompt_tokens` per request and pass it to the advisory
    headers; no second serialization at response time.
 
-Regression coverage: `tests/test_resilience_followups.py` (12 tests; 6 fail
-against the unfixed tree). Offline suite green. Live verification performed
-after deploy is recorded in `docs/resilience-performance-assessment.md`.
+Regression coverage: `tests/test_resilience_followups.py` (14 tests; 6 fail
+against the unfixed tree). Offline suite green. Live verification is recorded in
+`docs/resilience-performance-assessment.md`.
+
+**Two defects were found during live verification and fixed before the
+follow-up release:**
+
+- The advisory lock was a sync `@contextmanager` used with `async with`, so it
+  raised `TypeError` and the fail-open path swallowed it — the cross-process
+  protection was silently absent. It is now an `@asynccontextmanager`, and
+  `test_refresh_lock_guard_works_with_the_real_store_callback` fails against
+  the sync version.
+- The backup pod could not reach Postgres: the namespace has
+  `default-deny-ingress` and `allow-tusker-gateway-postgres` did not list the
+  backup pod. The dump hung at 0 bytes until the pod label was added to the
+  policy in `k8s/gateway-postgres.yaml`.
 
 ## Quality-ranking selection bottleneck (2026-11-20)
 

@@ -26,8 +26,9 @@ import os
 import secrets
 import threading
 import time
-from contextlib import contextmanager
-from typing import Any, Callable, Iterator
+import asyncio
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator, Callable
 
 from tusker_gateway.config import PoolConfig, ProviderConfig, expand_env_placeholders
 from tusker_gateway.identity import CallerIdentity, IdentityConfig, fingerprint_api_key
@@ -1318,12 +1319,19 @@ class ConfigStore:
             )
             return None
 
-    @contextmanager
-    def oauth_refresh_advisory_lock(self, key: int) -> Iterator[None]:
+    @asynccontextmanager
+    async def oauth_refresh_advisory_lock(self, key: int) -> AsyncIterator[None]:
         """Hold a session-level PostgreSQL advisory lock across a refresh.
 
-        The lock lives on a dedicated connection so it survives the OAuth HTTP
-        round trip and the following CAS write. Unlock always runs in ``finally``.
+        Must be an *async* context manager: the caller holds it across the
+        OAuth HTTP round trip. A sync ``@contextmanager`` here raised
+        ``TypeError: '_GeneratorContextManager' object does not support the
+        asynchronous context manager protocol``, which the fail-open path
+        swallowed -- so the lock silently never engaged (observed live
+        2026-11-25 in the startup log).
+
+        The lock lives on a dedicated connection so it survives the round trip
+        and the following CAS write. Unlock always runs in ``finally``.
         SQLite (tests, single-process deployments) uses a process-local mutex:
         there is no second process to coordinate with.
         """
@@ -1340,15 +1348,17 @@ class ConfigStore:
         with db.connection() as conn:
             acquired = False
             while True:
-                row = conn.execute(
-                    "SELECT pg_try_advisory_lock(?)", (int(key),)
-                ).fetchone()
+                row = await asyncio.to_thread(
+                    lambda: conn.execute(
+                        "SELECT pg_try_advisory_lock(?)", (int(key),)
+                    ).fetchone()
+                )
                 if row and row[0]:
                     acquired = True
                     break
                 if time.monotonic() >= deadline:
                     break
-                time.sleep(0.05)
+                await asyncio.sleep(0.05)
             if not acquired:
                 raise TimeoutError(
                     f"oauth advisory lock wait exceeded {_ADVISORY_LOCK_WAIT_SECS:.0f}s"
@@ -1357,7 +1367,11 @@ class ConfigStore:
                 yield
             finally:
                 try:
-                    conn.execute("SELECT pg_advisory_unlock(?)", (int(key),))
+                    await asyncio.to_thread(
+                        lambda: conn.execute(
+                            "SELECT pg_advisory_unlock(?)", (int(key),)
+                        )
+                    )
                 except Exception:  # noqa: BLE001 - connection may be gone
                     logger.warning(
                         "oauth advisory unlock failed key=%d", key, exc_info=True

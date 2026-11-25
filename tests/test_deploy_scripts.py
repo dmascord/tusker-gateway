@@ -33,6 +33,18 @@ def test_deploy_script_covers_all_three_workloads():
     assert 'annotate deployment/"${target}"' in deploy
 
 
+def test_deploy_script_applies_postgres_configmap():
+    """Fail-closed audit writes depend on the Postgres ConfigMap being present.
+
+    k8s/gateway-postgres.yaml mounts tusker-gateway-postgres-config; if the
+    ConfigMap is missing the state pod never starts and every request fails
+    closed with 503 audit_unavailable. See docs/incidents/2026-11-25-postgres-configmap-audit-503.md.
+    """
+    deploy = _script("deploy.sh")
+    assert "k8s/postgres-config.yaml" in deploy
+    assert 'apply -f k8s/postgres-config.yaml' in deploy
+
+
 def test_provenance_check_covers_all_three_workloads():
     verify = _script("verify-provenance.sh")
     for name in ("tusker-gateway", "tusker-opencode-worker", "tusker-claude-worker"):

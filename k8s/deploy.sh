@@ -132,6 +132,11 @@ done
 # see docs/nfs-retirement.md.
 kubectl -n "${NAMESPACE}" apply -f k8s/pvc.yaml
 kubectl -n "${NAMESPACE}" apply -f k8s/config.yaml
+# Postgres mounts this ConfigMap at /etc/postgresql/override via
+# k8s/gateway-postgres.yaml. Without it the state pod stays in PodInitializing,
+# and fail-closed audit writes then return 503 audit_unavailable to callers
+# (2026-11-25 incident). Keep it in the standard deploy path.
+kubectl -n "${NAMESPACE}" apply -f k8s/postgres-config.yaml
 for target in "${TARGETS[@]}"; do
     kubectl -n "${NAMESPACE}" apply -f "${RENDERED_BY_TARGET[${target}]}"
 done

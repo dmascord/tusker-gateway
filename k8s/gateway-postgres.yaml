@@ -158,6 +158,10 @@ spec:
     - podSelector:
         matchLabels:
           app: tusker-gateway-state-migration
+    # The nightly pg_dump job reads the database from its own pod.
+    - podSelector:
+        matchLabels:
+          app: tusker-gateway-postgres-backup
     ports:
     - protocol: TCP
       port: 5432

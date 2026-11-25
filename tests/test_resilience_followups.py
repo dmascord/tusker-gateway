@@ -225,15 +225,21 @@ class _FakeDB:
         return _ctx()
 
 
-def test_config_store_advisory_lock_uses_pg_functions():
-    """The lock must use pg_advisory_lock/unlock, not a plain CAS."""
+@pytest.mark.asyncio
+async def test_config_store_advisory_lock_uses_pg_functions():
+    """The lock must use pg advisory functions and be an ASYNC context manager.
+
+    A sync ``@contextmanager`` here raises TypeError inside ``async with``;
+    the fail-open path swallows it, so the lock silently never engages. That
+    shipped once (2026-11-25) and this test pins the async contract.
+    """
     from tusker_gateway.config_store import ConfigStore
 
     conn = _FakeConnection()
     store = ConfigStore(database=":memory:")
     store._db = _FakeDB(conn)
 
-    with store.oauth_refresh_advisory_lock(12345):
+    async with store.oauth_refresh_advisory_lock(12345):
         pass
 
     assert any("pg_try_advisory_lock" in c for c in conn.calls)
@@ -241,9 +247,59 @@ def test_config_store_advisory_lock_uses_pg_functions():
     # Unlock runs even when the guarded block raises.
     conn.calls.clear()
     with pytest.raises(ValueError):
-        with store.oauth_refresh_advisory_lock(12345):
+        async with store.oauth_refresh_advisory_lock(12345):
             raise ValueError("refresh failed")
     assert any("pg_advisory_unlock" in c for c in conn.calls)
+
+
+@pytest.mark.asyncio
+async def test_refresh_lock_guard_uses_the_async_store_callback():
+    """RefreshLock.guard must await the store's async context manager."""
+    from tusker_gateway.oauth_refresh_lock import RefreshLock
+
+    entered = []
+
+    class _AsyncLock:
+        async def __aenter__(self):
+            entered.append("in")
+            return self
+
+        async def __aexit__(self, *exc):
+            entered.append("out")
+            return False
+
+    lock = RefreshLock(acquire=lambda key: _AsyncLock())
+    async with lock.guard("openai-codex", "seat-a"):
+        assert entered == ["in"]
+    assert entered == ["in", "out"]
+
+
+@pytest.mark.asyncio
+async def test_refresh_lock_guard_works_with_the_real_store_callback():
+    """The guard must work with ConfigStore's real lock, not just a fake.
+
+    Regression: the store's lock was a sync ``@contextmanager`` while the
+    guard used ``async with``. The TypeError was swallowed by the fail-open
+    path, so the cross-process lock silently never engaged in production
+    (seen in the live startup log on 2026-11-25).
+    """
+    from tusker_gateway.config_store import ConfigStore
+    from tusker_gateway.oauth_refresh_lock import RefreshLock
+
+    conn = _FakeConnection()
+    store = ConfigStore(database=":memory:")
+    store._db = _FakeDB(conn)
+
+    lock = RefreshLock(acquire=store.oauth_refresh_advisory_lock)
+    async with lock.guard("openai-codex", "seat-a"):
+        pass
+
+    assert any("pg_try_advisory_lock" in c for c in conn.calls), (
+        "the advisory lock was never acquired"
+    )
+    assert any("pg_advisory_unlock" in c for c in conn.calls), (
+        "the advisory lock was never released"
+    )
 
 
 # ---------------------------------------------------------------------------
