@@ -41,7 +41,7 @@ Read in order when picking up the repo:
 | `docs/audio-routing.md` | OpenAI-compatible audio endpoints, provider selection, chat audio input and capability evidence. |
 | `docs/context-efficiency.md` | Context-pressure advisory headers, Anthropic document-block rejection, RTK compression honesty and the evidence behind each decision. |
 | `docs/local-cli-context-notes.md` | What OMP and OpenCode already do for context/token efficiency, and the local config gaps the gateway cannot fill. |
-| `docs/resilience-performance-assessment.md` | Measured resilience/performance gaps: Postgres backup and retention, unscheduled prunes, safe gateway HA, and what is already fixed. |
+| `docs/resilience-performance-assessment.md` | Measured resilience/performance gaps: Postgres backup and retention, unscheduled prunes, safe gateway HA, and what is already fixed. Includes the live verification of the resilience release. |
 | `docs/audit-database.md` | PostgreSQL-backed integrity-chained audit log: schema, locking, retention, migration and verification. |
 | `docs/nfs-retirement.md` | RWX/NFS volume retired: pod-local emptyDir, historical audit archive, verification. |
 | `docs/incidents/2026-11-23-audio-routing.md` | Restored accidentally-removed TTS route; added STT and audio token accounting; verified live. |
