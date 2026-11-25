@@ -119,7 +119,10 @@ from tusker_gateway.sse import (
     sse_heartbeat_loop,
 )
 from tusker_gateway.tracing import Tracer
-from tusker_gateway.tool_formats import tool_diagnostics_enabled
+from tusker_gateway.tool_formats import (
+    tool_diagnostics_enabled,
+    validate_request_tool_arguments,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -7173,6 +7176,10 @@ def _validate_chat_body(body: Any) -> dict[str, Any]:
                     role=role,
                     context=f"messages[{index}]",
                 )
+    # A malformed tool call anywhere in the history makes the whole request
+    # unserviceable upstream. Reject before pool selection so failover cannot
+    # spend every candidate on a payload no provider will accept.
+    validate_request_tool_arguments(messages)
     if "tools" in body:
         tools = body["tools"]
         if not isinstance(tools, list):
