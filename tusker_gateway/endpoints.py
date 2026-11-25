@@ -4761,13 +4761,22 @@ def _public_provider_failure_response(
     """
     if isinstance(exc, RateLimitError):
         if not _provider_rate_limit_is_external(exc):
-            try:
-                retry_after = max(
-                    1,
-                    int(float(os.environ.get("TUSKER_PROVIDER_RETRY_AFTER_SECS", "5"))),
-                )
-            except (TypeError, ValueError):
-                retry_after = 5
+            # An explicit upstream window (or the gateway's own cooldown
+            # window) is authoritative: answering a fixed 5s told clients
+            # to retry into a route the gateway was still quarantining.
+            header_value = _provider_retry_after_header(
+                getattr(exc, "headers", None) or None
+            )
+            if header_value is not None:
+                retry_after = _retry_after_seconds_for_exc(exc)
+            else:
+                try:
+                    retry_after = max(
+                        1,
+                        int(float(os.environ.get("TUSKER_PROVIDER_RETRY_AFTER_SECS", "5"))),
+                    )
+                except (TypeError, ValueError):
+                    retry_after = 5
             suffix = f" Request ID: {request_id}." if request_id else ""
             return web.json_response(
                 openai_error(
@@ -5219,6 +5228,30 @@ def _allows_qualification_breaker_probe(request: web.Request | None) -> bool:
     return getattr(request, "remote", None) in {"127.0.0.1", "::1"}
 
 
+_QUALIFICATION_PROBE_HEADERS = (
+    "X-Tusker-Tool-Qualification",
+    "X-Tusker-Modality-Qualification",
+    "X-Tusker-Structured-Qualification",
+)
+
+
+def _is_loopback_qualification_probe(request: web.Request | None) -> bool:
+    """Whether the request came from a maintenance probe in this pod.
+
+    The three qualification runners mark their requests with their own
+    header. All of them are exempt from the direct-route cooldown gate,
+    because re-probing a quarantined route is exactly what they exist to
+    decide — and the runners already skip quarantined routes themselves
+    unless the operator asked for an explicit recovery probe.
+    """
+    headers = getattr(request, "headers", None) if request is not None else None
+    if not headers:
+        return False
+    if not any(headers.get(name) for name in _QUALIFICATION_PROBE_HEADERS):
+        return False
+    return getattr(request, "remote", None) in {"127.0.0.1", "::1"}
+
+
 async def _call_with_pool_fallback(
     config: dict[str, Any],
     body: dict[str, Any],
@@ -5294,6 +5327,34 @@ async def _call_with_pool_fallback(
                 f"circuit open for {provider}/{model}: {decision.reason}",
                 code="circuit_open",
             )
+
+        # Explicit provider/model routes bypass pool selection, so enforce
+        # the same cooldown gate here before dispatching upstream. Maintenance
+        # probes remain an explicit recovery check and are handled by their
+        # own qualification filters.
+        if not _is_loopback_qualification_probe(request):
+            from tusker_gateway.cooldown import global_tracker
+
+            cooldown_remaining = global_tracker().remaining_cooldown_seconds(
+                provider, model
+            )
+            if cooldown_remaining > 0:
+                if request is not None:
+                    set_access_log_context(
+                        request,
+                        failure_class="provider_cooldown",
+                        error_detail=(
+                            f"{provider}/{model} is in cooldown for "
+                            f"{int(round(cooldown_remaining))}s"
+                        ),
+                    )
+                cooldown_error = RateLimitError(
+                    f"provider route {provider}/{model} is in cooldown",
+                    code="rate_limit_exceeded",
+                    headers={"Retry-After": str(max(1, int(round(cooldown_remaining))))},
+                )
+                cooldown_error.provider = provider
+                raise cooldown_error
         try:
             result = None
             activity = _AttemptActivity()

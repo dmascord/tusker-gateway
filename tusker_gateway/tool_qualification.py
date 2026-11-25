@@ -933,6 +933,11 @@ async def run_image_tool_qualification(
     if not api_key:
         raise RuntimeError("API_KEYS must contain the gateway caller key")
     quality_path = config.get("quality_db_path", "data/quality.db")
+    cooldown_store = None
+    if quality_path != ":memory:":
+        from tusker_gateway.persistent_cooldown import PersistentCooldownStore
+
+        cooldown_store = PersistentCooldownStore(Path(quality_path).parent / "cooldowns.db")
     capability_db = ModelCapabilityDB(
         config.get("model_capability_db_path") or default_model_capability_db_path(quality_path)
     )
@@ -961,6 +966,22 @@ async def run_image_tool_qualification(
                 if str(provider).strip() and str(model).strip()
             }
         )
+        # Never probe a route the gateway already quarantined: the probe
+        # reaches the gateway through its public boundary, so an unknown
+        # route would otherwise be re-tested against a dead upstream and
+        # counted as another provider failure.
+        unquarantined = [
+            pair
+            for pair in pairs
+            if not _route_is_quarantined(pair[0], pair[1], cooldown_store)
+        ]
+        skipped_quarantine = len(pairs) - len(unquarantined)
+        if skipped_quarantine:
+            logger.info(
+                "composite qualification skipped_quarantined=%d",
+                skipped_quarantine,
+            )
+        pairs = unquarantined
         if max_age_secs is not None:
             now = time.time()
             due = [

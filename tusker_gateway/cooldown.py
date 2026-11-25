@@ -285,6 +285,35 @@ class CooldownTracker:
         logger.debug('cooldown check %s/%s: clear', provider, model)
         return False
 
+    def remaining_cooldown_seconds(self, provider: str, model: str) -> float:
+        """Return the seconds left on the active cooldown for a route.
+
+        Zero means the route is eligible. The longest applicable window
+        wins: a model-scoped cooldown, a provider-wide cooldown, a
+        shared-capacity quarantine, and the global circuit can all cover
+        the same route, and the caller needs the window it must wait out.
+        """
+        remaining = 0.0
+        cooldown = self._cooldowns.get((provider, model))
+        if cooldown is not None and cooldown.is_active():
+            remaining = max(remaining, cooldown.remaining())
+        provider_cooldown = self._provider_default.get(provider)
+        if provider_cooldown is not None and provider_cooldown.is_active():
+            remaining = max(remaining, provider_cooldown.remaining())
+        if self._global is not None and self._global.is_active():
+            remaining = max(remaining, self._global.remaining())
+        try:
+            from tusker_gateway.provider_usage import capacity_group_for_route
+
+            group = capacity_group_for_route(provider, model)
+        except Exception:
+            group = None
+        if group:
+            group_cooldown = self._group_cooldowns.get(group)
+            if group_cooldown is not None and group_cooldown.is_active():
+                remaining = max(remaining, group_cooldown.remaining())
+        return remaining
+
     def snapshot(self) -> dict[str, Any]:
         """Return active cooldowns with bounded, secret-free diagnostics."""
         model_entries = []
