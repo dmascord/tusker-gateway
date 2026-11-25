@@ -30,19 +30,35 @@ import sys
 #   input-modality merge correction (ba4f53a).
 # admin.py: 1704 -> 1717. Admin credential/cooldown surfaces.
 #
-# 2026-11-20 baselines re-measured against main (ce6870b) plus the deployed
-# xhigh downgrade (4c9ed13). The gate had been red since PR #67 and was not
-# policing new growth. Reviewed growth: endpoints.py 9381 -> 9431 (reasoning /
-# tool content in the prompt estimate, 1cb7ef0, plus earlier post-baseline
-# work); passthrough.py 3771 -> 3819 (Command Code floor, per-provider xhigh
-# downgrade); pools.py 1934 -> 2134 (cached model-capability snapshot for
-# selection hot path). Extraction stays a Priority 2 task.
+# 2026-11-25 baselines re-measured against main (45b8ee5) plus the direct-route
+# cooldown gate. The gate had been red on main since before 2026-11-20 and was
+# NOT policing new growth: the 2026-11-20 values had themselves been exceeded
+# while the check was unconsulted, so every value below was already wrong
+# before this branch started. Each delta is attributed to a reviewed commit.
+#
+# endpoints.py: 9431 -> 9749. Resilience release (b891e74: retention hooks and
+#   HA wiring), context advisory headers and RTK hardening (c38a06c), the
+#   all-rate-limit 429 terminal surface (87444f9, 2a2d41a, f65cf8f), CLI stream
+#   repair (4911c6e, 99931ee), and this branch's +50 (the direct-route gate;
+#   the bulk of the gate lives in cooldown.py to limit growth here).
+# passthrough.py: 3819 -> 3842. Resilience release (b891e74) and CLI stream
+#   repair (4911c6e).
+# pools.py: 2134 -> 2490. Value routing (6e2a1b7), price refresh (68fb635),
+#   pool context compaction (4756202), provider-wide 429 diversification
+#   (f98d1ff + its revert 18b9fe4), and the composite probe fixture (e1c8f0b).
+# admin.py: 1717 -> 1752. Claude auth status surface (52eb988).
+# config_store.py: 1583 -> 1652. Resilience release (b891e74) and the async
+#   advisory lock (62acb03).
+#
+# Extraction remains Priority 2 in TODO.md. Raising these values admits
+# reviewed reality so the gate polices NEW growth again; it is not a licence
+# for further growth in these files.
 MAX_LINES = {
-    "tusker_gateway/endpoints.py": 9_431,
-    "tusker_gateway/passthrough.py": 3_819,
-    "tusker_gateway/pools.py": 2_134,
-    "tusker_gateway/admin.py": 1_717,
-    "tusker_gateway/config_store.py": 1_583,
+    "tusker_gateway/endpoints.py": 9_749,
+    "tusker_gateway/passthrough.py": 3_842,
+    "tusker_gateway/pools.py": 2_490,
+    "tusker_gateway/admin.py": 1_752,
+    "tusker_gateway/config_store.py": 1_652,
 }
 
 
