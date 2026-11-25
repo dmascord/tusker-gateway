@@ -285,6 +285,35 @@ class CooldownTracker:
         logger.debug('cooldown check %s/%s: clear', provider, model)
         return False
 
+    def remaining_cooldown_seconds(self, provider: str, model: str) -> float:
+        """Return the seconds left on the active cooldown for a route.
+
+        Zero means the route is eligible. The longest applicable window
+        wins: a model-scoped cooldown, a provider-wide cooldown, a
+        shared-capacity quarantine, and the global circuit can all cover
+        the same route, and the caller needs the window it must wait out.
+        """
+        remaining = 0.0
+        cooldown = self._cooldowns.get((provider, model))
+        if cooldown is not None and cooldown.is_active():
+            remaining = max(remaining, cooldown.remaining())
+        provider_cooldown = self._provider_default.get(provider)
+        if provider_cooldown is not None and provider_cooldown.is_active():
+            remaining = max(remaining, provider_cooldown.remaining())
+        if self._global is not None and self._global.is_active():
+            remaining = max(remaining, self._global.remaining())
+        try:
+            from tusker_gateway.provider_usage import capacity_group_for_route
+
+            group = capacity_group_for_route(provider, model)
+        except Exception:
+            group = None
+        if group:
+            group_cooldown = self._group_cooldowns.get(group)
+            if group_cooldown is not None and group_cooldown.is_active():
+                remaining = max(remaining, group_cooldown.remaining())
+        return remaining
+
     def snapshot(self) -> dict[str, Any]:
         """Return active cooldowns with bounded, secret-free diagnostics."""
         model_entries = []
@@ -334,6 +363,30 @@ class CooldownTracker:
         self._cooldowns.pop((provider, model), None)
         logger.debug('cooldown cleared %s/%s', provider, model)
         # Don't clear provider-default; keep it for batch eviction
+
+
+def cooldown_gate_error(provider: str, model: str) -> Any | None:
+    """Return a 429 error when a route is still in cooldown, else None.
+
+    Explicit provider/model routes bypass pool selection, so they need the
+    same cooldown check the pool selector applies. Returning the error
+    (rather than a bool) keeps the enforced window attached to it, so the
+    caller can answer with the same ``Retry-After`` the gateway honours.
+    """
+    from tusker_gateway.errors import RateLimitError
+
+    remaining = global_tracker().remaining_cooldown_seconds(provider, model)
+    if remaining <= 0:
+        return None
+    error = RateLimitError(
+        f"provider route {provider}/{model} is in cooldown",
+        code="rate_limit_exceeded",
+        headers={"Retry-After": str(max(1, int(round(remaining))))},
+    )
+    # Carry the provider so the shared 429 surfaces treat this like the
+    # upstream rate limit it replaces.
+    error.provider = provider
+    return error
 
 
 def _strip_urls(body: str) -> str:
