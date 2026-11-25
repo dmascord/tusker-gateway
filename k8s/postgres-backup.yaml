@@ -44,12 +44,11 @@ spec:
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 3
   failedJobsHistoryLimit: 3
-  # Retry twice with a short backoff: a transient pg_dump failure (paused
-  # Postgres, volume temporarily unavailable) should not lose the day's dump.
-  backoffLimit: 2
   jobTemplate:
     spec:
-      # Two attempts at 45 minutes each, plus container starts.
+      # Retry twice: a transient pg_dump failure (paused Postgres, volume
+      # temporarily unavailable) should not lose the day's dump.
+      backoffLimit: 2
       activeDeadlineSeconds: 3600
       template:
         metadata:
