@@ -539,6 +539,47 @@ def test_composite_runner_retries_its_own_rate_limit(monkeypatch, tmp_path):
     assert record.status == "passed"
 
 
+def test_composite_runner_skips_quarantined_routes(monkeypatch, tmp_path):
+    """A quarantined route must not be probed again.
+
+    The composite probe reaches the gateway through its public boundary, so
+    re-probing a route the gateway already quarantined re-tested a dead
+    upstream and counted another provider failure against it. The tool,
+    modality, and structured runners already skipped quarantined routes.
+    """
+    db, run = _composite_runner(monkeypatch, tmp_path)
+    from tusker_gateway.persistent_cooldown import PersistentCooldownStore
+
+    store = PersistentCooldownStore(db_path=tmp_path / "cooldowns.db")
+    store.record("ollama-cloud", "cooled", 3600.0)
+
+    probed: list[tuple[str, str]] = []
+
+    async def fake_probe(*args, **kwargs):
+        probed.append((kwargs["provider"], kwargs["model"]))
+        return {
+            "provider": kwargs["provider"],
+            "model": kwargs["model"],
+            "status": "passed",
+            "http_status": 200,
+        }
+
+    monkeypatch.setattr(
+        "tusker_gateway.tool_qualification.probe_image_tool_model", fake_probe
+    )
+
+    results = asyncio.run(
+        run(
+            base_url="http://gateway.test",
+            model_pairs={("ollama-cloud", "cooled"), ("openai-codex", "healthy")},
+            max_age_secs=1.0,
+        )
+    )
+
+    assert probed == [("openai-codex", "healthy")]
+    assert [item["model"] for item in results] == ["healthy"]
+
+
 def test_non_opencode_probe_omits_session_header():
     session = _ProbeSession()
 
