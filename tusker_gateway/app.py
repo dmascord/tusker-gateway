@@ -76,6 +76,7 @@ from tusker_gateway.metrics import MetricsRegistry
 from tusker_gateway.oauth_refresh_lock import bind_metrics_registry
 from tusker_gateway.rate_limit import RateLimiter, load_rate_limit_config_from_env
 from tusker_gateway.observability import attach_request_id_middleware, AccessLog
+from tusker_gateway.provider_health import provider_health_handler
 from tusker_gateway.tracing import Tracer, load_tracer_config_from_env
 from tusker_gateway.providers.capabilities import (
     CapabilitiesRegistry,
@@ -687,6 +688,7 @@ def create_app() -> web.Application:
     app.router.add_post("/v1/audio/speech", tts_handler)
     app.router.add_post("/v1/audio/transcriptions", transcription_handler)
     app.router.add_get("/v1/models", models_handler)
+    app.router.add_get("/v1/provider-health", provider_health_handler)
     app.router.add_post("/v1/chat/completions", chat_completions_handler)
     app.router.add_post("/v1/responses", responses_handler)
     app.router.add_post("/v1/messages", anthropic_messages_handler)
