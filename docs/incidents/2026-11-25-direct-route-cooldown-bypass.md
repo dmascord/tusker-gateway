@@ -90,11 +90,16 @@ cooldown:
 - `CooldownTracker.remaining_cooldown_seconds()` (`cooldown.py`): returns the
   longest applicable window for a route — model-scoped, provider-wide,
   shared-capacity group, or global circuit.
+- `cooldown_gate_error()` (`cooldown.py`): returns a `RateLimitError`
+  carrying the enforced window when a route is still in cooldown, else
+  `None`. Keeping it next to the tracker it reads keeps the oversized
+  `endpoints.py` from growing further.
 - Direct-route gate (`endpoints.py`, `_call_with_pool_fallback`): when the
-  route is in cooldown, fail locally with HTTP 429 and the enforced window
-  in `Retry-After` instead of dispatching upstream. The error carries the
+  route is in cooldown, fail locally with the enforced window in
+  `Retry-After` instead of dispatching upstream. The error carries the
   provider so the shared 429 surfaces treat it like the upstream rate
-  limit it replaces.
+  limit it replaces, which means Enterprise Copilot still answers 503
+  rather than exposing a provider quota as a client 429.
 - Loopback qualification probes are exempt
   (`_is_loopback_qualification_probe`), because re-probing a quarantined
   route is what the runners exist to decide. The exemption requires a
@@ -110,7 +115,7 @@ cooldown:
 
 ### Verification
 
-`tests/test_direct_route_cooldown.py` (9 tests) and
+`tests/test_direct_route_cooldown.py` (10 tests) and
 `tests/test_tool_capability.py::test_composite_runner_skips_quarantined_routes`.
 
 Both are discriminating: with the gate removed the direct-route tests
@@ -119,7 +124,7 @@ filter removed the cooled route is probed again.
 
 ```
 $ pytest tests/test_direct_route_cooldown.py -q
-9 passed
+10 passed
 
 $ pytest tests/ -q --ignore=tests/test_passthrough_providers.py
 ```
