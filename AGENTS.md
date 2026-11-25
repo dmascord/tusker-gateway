@@ -40,6 +40,7 @@ Read in order when picking up the repo:
 | `docs/incidents/2026-11-23-kilo-qualification.md` | 15/17 kilo models in code pool; 10 tool-qualified, 5 genuine upstream failures; 2 audio models correctly excluded. |
 | `docs/audio-routing.md` | OpenAI-compatible audio endpoints, provider selection, chat audio input and capability evidence. |
 | `docs/context-efficiency.md` | Context-pressure advisory headers, Anthropic document-block rejection, RTK compression honesty and the evidence behind each decision. |
+| `docs/provider-health.md` | `GET /v1/provider-health` — router-level pool health for clients, the OMP extension that renders it, and the usage-row contract notes. |
 | `docs/local-cli-context-notes.md` | What OMP and OpenCode already do for context/token efficiency, and the local config gaps the gateway cannot fill. |
 | `docs/resilience-performance-assessment.md` | Measured resilience/performance gaps: Postgres backup and retention, unscheduled prunes, safe gateway HA, and what is already fixed. Includes the live verification of the resilience release. |
 | `docs/audit-database.md` | PostgreSQL-backed integrity-chained audit log: schema, locking, retention, migration and verification. |
