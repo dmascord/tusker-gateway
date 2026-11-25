@@ -34,19 +34,22 @@ The commands below use the `visor` alias for brevity when direct access works. O
 ## 2. Build and deploy
 
 The convenience script builds and pushes the image, renders the intended digest
-into temporary manifests for **all three workloads that run this image** —
-`tusker-gateway`, `tusker-opencode-worker` and `tusker-claude-worker` — applies
-them, waits for all three rollouts, verifies each running pod's imageID, and
-annotates each Deployment with the build identity. It also prints (or, with
-`TUSKER_PIN_MANIFEST=1`, writes) the pin for all three tracked manifests.
-Workers were previously left on stale digests by gateway-only deploys.
-The worker YAML files are multi-document (Deployment + Service), so rendering
-goes through `pin-manifest.py --render` rather than `kubectl set image --local`,
+into temporary manifests for all three image workloads — `tusker-gateway`,
+`tusker-opencode-worker` and `tusker-claude-worker` — and manages the gateway
+state plane before rolling them. It applies `postgres-config.yaml`,
+`gateway-postgres.yaml`, and the Longhorn `postgres-snapshot-job.yaml`, waits
+for Postgres to become Ready, then applies and rolls all three image workloads.
+The snapshot manifest is cluster-scoped under `longhorn-system`; it is not
+passed the `hermes` namespace flag.
+
+Workers were previously left on stale digests by gateway-only deploys. The
+worker YAML files are multi-document (Deployment + Service), so rendering goes
+through `pin-manifest.py --render` rather than `kubectl set image --local`,
 which rejects a document without a pod template. `k8s/verify-provenance.sh`
 checks all three tracked/live/pod chains.
 
-`TUSKER_COMMIT` must be the explicit full source SHA. The image embeds it;
-the deployments do not override it with an environment value.
+`TUSKER_COMMIT` must be the explicit full source SHA. The image embeds it; the
+deployments do not override it with an environment value.
 
 ```bash
 if ssh -o BatchMode=yes visor true 2>/dev/null; then
@@ -54,8 +57,9 @@ if ssh -o BatchMode=yes visor true 2>/dev/null; then
 else
   ssh -p 8022 tusker@tusker.duckdns.org "cd /srv/opencode/tusker-ai-gateway-build-$REV && TUSKER_COMMIT=$REV ./k8s/deploy.sh $REV"
 fi
-rm -r "$EXPORT"
+  rm -r "$EXPORT"
 ```
+
 
 Do not run concurrent deployments to the same gateway. Applying deployment or
 config manifests requires operator authorization. The script verifies the

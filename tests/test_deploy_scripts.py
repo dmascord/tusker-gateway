@@ -45,6 +45,13 @@ def test_deploy_script_applies_postgres_configmap():
     assert 'apply -f k8s/postgres-config.yaml' in deploy
 
 
+def test_deploy_script_manages_postgres_and_snapshot_protection():
+    """A fresh deploy must reproduce the state plane and its RPO policy."""
+    deploy = _script("deploy.sh")
+    assert 'apply -f k8s/gateway-postgres.yaml' in deploy
+    assert 'apply -f k8s/postgres-snapshot-job.yaml' in deploy
+    assert 'rollout status deployment/tusker-gateway-postgres' in deploy
+
 def test_provenance_check_covers_all_three_workloads():
     verify = _script("verify-provenance.sh")
     for name in ("tusker-gateway", "tusker-opencode-worker", "tusker-claude-worker"):

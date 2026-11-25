@@ -137,6 +137,13 @@ kubectl -n "${NAMESPACE}" apply -f k8s/config.yaml
 # and fail-closed audit writes then return 503 audit_unavailable to callers
 # (2026-11-25 incident). Keep it in the standard deploy path.
 kubectl -n "${NAMESPACE}" apply -f k8s/postgres-config.yaml
+# Postgres is part of the gateway's managed state plane. Apply its Service,
+# PVC and Deployment before rolling the gateway, then wait for it below.
+kubectl -n "${NAMESPACE}" apply -f k8s/gateway-postgres.yaml
+# Longhorn resources are cluster-scoped by namespace and must not inherit the
+# hermes namespace flag. This makes the documented 15-minute RPO reproducible.
+kubectl apply -f k8s/postgres-snapshot-job.yaml
+kubectl -n "${NAMESPACE}" rollout status deployment/tusker-gateway-postgres --timeout=300s
 for target in "${TARGETS[@]}"; do
     kubectl -n "${NAMESPACE}" apply -f "${RENDERED_BY_TARGET[${target}]}"
 done
