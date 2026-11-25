@@ -415,8 +415,12 @@ class ConfigRuntime:
         load_cb = getattr(store, "load_oauth_credentials", None)
         auth_file = new_cfg.get("auth_file")
         persist_cb = getattr(store, "persist_credentials", None)
+        # A rotator created after a config reload must use the same
+        # cross-process advisory lock as the startup path. Without it the
+        # rotator falls back to a process-local lock and the two gateway
+        # replicas can consume the same single-use refresh token.
+        refresh_lock_cb = getattr(store, "oauth_refresh_lock", None)
         creds_authoritative = bool(new_cfg.get("config_db_credentials_authoritative"))
-
         # Media handlers snapshot provider URLs/keys at construction; the
         # fingerprint check inside _rebuild_media_handlers decides whether
         # a rebuild is needed.
@@ -445,6 +449,7 @@ class ConfigRuntime:
                     provider=provider,
                     persist_credentials=persist_cb,
                     load_credentials=load_cb,
+                    refresh_lock=refresh_lock_cb,
                     secrets_authoritative=creds_authoritative,
                 )
                 session = self._app.get("http_session")

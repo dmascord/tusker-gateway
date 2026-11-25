@@ -1000,16 +1000,10 @@ async def qualification_maintenance_loop(
         if prune_enabled and prune_next_due_at is not None and now_mono >= prune_next_due_at:
             try:
                 from tusker_gateway.quality import QualityDB
-                from tusker_gateway.retention import run_retention_prune
 
                 quality_cfg = load_config()
                 removed = QualityDB(quality_cfg["quality_db_path"]).prune_events()
                 logger.info("quality event prune removed=%d", removed)
-                # Turn captures and audit events document retention windows
-                # that were previously applied only on write (or never).
-                # Run them on this same daily cadence, off the event loop.
-                retention = await asyncio.to_thread(run_retention_prune)
-                logger.info("retention prune result=%s", retention)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -1037,3 +1031,52 @@ async def qualification_maintenance_loop(
                 )
             finally:
                 privacy_next_due_at = time.monotonic() + privacy_interval_secs
+
+
+async def retention_maintenance_loop(stop_event: asyncio.Event) -> None:
+    """Prune expired turn captures and audit events on a daily cadence.
+
+    Retention is a state-hygiene guarantee, not a qualification probe, so it
+    must not share the qualification scheduler's switches: a deployment with
+    qualification maintenance disabled (or an operator turning the unrelated
+    quality-event pruning off) still has to honour the documented 7-day
+    capture window and 90-day audit window.
+    """
+    from tusker_gateway.retention import run_retention_prune
+
+    interval_secs = _env_float(
+        "TUSKER_RETENTION_PRUNE_INTERVAL_SECS",
+        86_400.0,
+        minimum=60.0,
+    )
+    initial_delay_secs = _env_float(
+        "TUSKER_RETENTION_PRUNE_INITIAL_DELAY_SECS",
+        300.0,
+        minimum=0.0,
+    )
+    next_due_at = time.monotonic() + initial_delay_secs
+    logger.info(
+        "retention maintenance started interval=%.0fs initial_delay=%.0fs",
+        interval_secs,
+        initial_delay_secs,
+    )
+    while not stop_event.is_set():
+        delay = max(0.0, next_due_at - time.monotonic())
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=delay)
+            break
+        except asyncio.TimeoutError:
+            pass
+        except asyncio.CancelledError:
+            raise
+        try:
+            removed = await asyncio.to_thread(run_retention_prune)
+            logger.info("retention prune result=%s", removed)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "retention prune failed error_class=%s",
+                type(exc).__name__,
+            )
+        next_due_at = time.monotonic() + interval_secs

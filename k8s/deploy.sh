@@ -140,6 +140,10 @@ kubectl -n "${NAMESPACE}" apply -f k8s/postgres-config.yaml
 # Postgres is part of the gateway's managed state plane. Apply its Service,
 # PVC and Deployment before rolling the gateway, then wait for it below.
 kubectl -n "${NAMESPACE}" apply -f k8s/gateway-postgres.yaml
+# The nightly logical dump is the state store's only backup that is not a
+# volume snapshot: it survives a corrupted volume. Without it in the deploy
+# path a fresh cluster ends up with Longhorn snapshots but no pg_dump.
+kubectl -n "${NAMESPACE}" apply -f k8s/postgres-backup.yaml
 # Longhorn resources are cluster-scoped by namespace and must not inherit the
 # hermes namespace flag. This makes the documented 15-minute RPO reproducible.
 kubectl apply -f k8s/postgres-snapshot-job.yaml

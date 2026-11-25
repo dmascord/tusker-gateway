@@ -52,6 +52,7 @@ Read in order when picking up the repo:
 | `docs/incidents/2026-11-24-composite-probe-fixture.md` | Composite image+tools probe required a middle-stripe colour the fixture never contained (2x2 quadrants), so honest vision models scored `unsupported`; striped fixture + `image-tool-contract-v3`. |
 | `docs/incidents/2026-11-25-postgres-configmap-audit-503.md` | Missing `tusker-gateway-postgres-config` ConfigMap kept Postgres in `Init:0/1`; fail-closed audit writes returned 503 `audit_unavailable`; deploy.sh now applies the ConfigMap. |
 | `docs/incidents/2026-11-25-direct-route-cooldown-bypass.md` | Explicit `provider/model` routes bypassed pool selection and therefore the cooldown filter, so quarantined routes were still dispatched upstream; composite probe runner had no quarantine filter at all. |
+| `docs/incidents/2026-11-25-gateway-followup-audit.md` | Post-resilience audit: logical backup missing from the deploy path, truncated dumps published as success, Anthropic cooldown bypass, reload-rebuilt rotators losing the refresh lock, provider-health missing capacity quarantines, retention gated behind unrelated switches, committed Grafana password. |
 | `TODO.md` | Active cross-session work items. |
 
 

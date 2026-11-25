@@ -113,7 +113,17 @@ prometheus:
 
 grafana:
   enabled: true
-  adminPassword: "tusker-grafana"
+  # The admin credential is NEVER stored here. It lives in the
+  # monitoring/monitoring-grafana-admin Secret, created out-of-band with a
+  # random password:
+  #   kubectl -n monitoring create secret generic monitoring-grafana-admin \
+  #     --from-literal=admin-user=admin \
+  #     --from-literal=admin-password="$(openssl rand -base64 24)"
+  # A committed adminPassword is a published credential for a service that
+  # is reachable from the public ingress, so the chart is pointed at the
+  # Secret instead. Rotate the password before the next `helm upgrade`.
+  admin:
+    existingSecret: monitoring-grafana-admin
   grafana.ini:
     server:
       protocol: http
