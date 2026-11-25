@@ -68,6 +68,10 @@ spec:
                 - -ec
                 - |
                   set -eu
+                  # pipefail matters: without it the pipeline status is gzip's,
+                  # so a pg_dump that dies halfway still publishes a valid
+                  # (but truncated) gzip file and the CronJob reports success.
+                  set -o pipefail
                   stamp="$(date -u +%Y%m%dT%H%M%SZ)"
                   out="/backups/tusker_gateway-${stamp}.sql.gz"
                   tmp="${out}.partial"
@@ -91,7 +95,7 @@ spec:
                   ls -1t /backups/tusker_gateway-*.sql.gz 2>/dev/null \
                     | tail -n +8 \
                     | xargs -r rm -f
-                  ls -1t /backups/tusker_gateway-*.sql.gz | head -10
+                  ls -1t /backups/tusker_gateway-*.sql.gz 2>/dev/null | head -10 || true
               env:
                 - name: PGPASSWORD
                   valueFrom:

@@ -39,7 +39,33 @@ logger = logging.getLogger(__name__)
 
 _ADVISORY_LOCK_WAIT_SECS = 30.0
 
+# One process-wide mutex per advisory-lock key for the SQLite (non-Postgres)
+# path. A per-call ``threading.Lock()`` provides no mutual exclusion at all,
+# because each caller gets a distinct object.
+_SQLITE_REFRESH_LOCKS: dict[int, tuple[Any, asyncio.Lock]] = {}
+_SQLITE_REFRESH_LOCKS_GUARD = threading.Lock()
+
+
+def _sqlite_refresh_lock(key: int) -> asyncio.Lock:
+    """Return the process-wide mutex guarding ``key``.
+
+    asyncio locks are bound to the loop that created them, so a lock left
+    behind by a previous loop (tests, a restarted task) is replaced rather
+    than reused.
+    """
+    loop = asyncio.get_running_loop()
+    with _SQLITE_REFRESH_LOCKS_GUARD:
+        entry = _SQLITE_REFRESH_LOCKS.get(key)
+        if entry is None or entry[0] is not loop:
+            lock = asyncio.Lock()
+            _SQLITE_REFRESH_LOCKS[key] = (loop, lock)
+            return lock
+        return entry[1]
+
+
 _ENCRYPTION_KEY_VARS = ("TUSKER_KEY_ENCRYPTION_KEY", "ENCRYPTION_KEY")
+
+
 class ConfigUnavailableError(Exception):
     """Raised when the DB-backed config store cannot be reached."""
 
@@ -1337,7 +1363,11 @@ class ConfigStore:
         """
         db = self._db_connect()
         if not db.is_postgres:
-            with threading.Lock():
+            # A per-call ``threading.Lock()`` never contends, so two rotators
+            # sharing one SQLite store both entered the refresh critical
+            # section and could consume the same single-use refresh token.
+            # Hold one process-wide mutex per credential key instead.
+            async with _sqlite_refresh_lock(key):
                 yield
             return
 

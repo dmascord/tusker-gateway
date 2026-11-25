@@ -30,24 +30,29 @@ from aiohttp import web
 from tusker_gateway import translators
 from tusker_gateway.budget import BudgetTracker
 from tusker_gateway.circuit_breaker import CircuitBreaker, BreakerDecision
+from tusker_gateway.cooldown import cooldown_gate_error
 from tusker_gateway.config import provider_route_is_disabled
 from tusker_gateway.context_advisory import context_advisory_headers
 from tusker_gateway.errors import (
     BadRequestError,
     NoHealthyModelsError,
     ProviderRouteDisabledError,
+    RateLimitError,
 )
 from tusker_gateway.endpoints import (
     _PreparedStream,
     _build_extra_body,
     _close_async_iterator,
     _complete_chat_result_stream,
+    _is_loopback_qualification_probe,
     _json_request_body,
     _normalize_stream,
     _prepare_stream_result,
+    _provider_rate_limit_is_external,
     _quarantine_tool_response_failure,
     _request_conversation_id,
     _required_input_modalities,
+    _retry_after_seconds_for_exc,
     _tool_choice_requires_call,
     _validate_tool_choice_request,
 )
@@ -528,6 +533,19 @@ async def _call_with_pool_fallback_anthropic(
                 f"circuit open for {route.provider}/{route.model}: {decision.reason}",
                 code="circuit_open",
             )
+        # Explicit provider/model routes bypass pool selection, so they need
+        # the same cooldown gate the OpenAI chat path applies. Without it a
+        # quarantined route kept receiving Anthropic traffic.
+        if not _is_loopback_qualification_probe(request):
+            cooldown_error = cooldown_gate_error(route.provider, route.model)
+            if cooldown_error is not None:
+                if request is not None:
+                    set_access_log_context(
+                        request,
+                        failure_class="provider_cooldown",
+                        error_detail=f"{route.provider}/{route.model} is in cooldown",
+                    )
+                raise cooldown_error
         try:
             result = await client.chat(route.provider, route.model, body["messages"],
                                       stream=bool(body.get("stream")), tools=tools,
@@ -931,6 +949,42 @@ async def anthropic_messages_handler(request: web.Request) -> web.Response | web
                 _anthropic_error(exc.message, type=exc.error_type),
                 status=exc.status,
                 headers=getattr(exc, "headers", None),
+            )
+        except RateLimitError as exc:
+            # A route in cooldown (or an upstream 429) must reach the client
+            # with the gateway's own enforced window, not a generic 502, so
+            # the caller backs off instead of retrying into the quarantine.
+            status = "rate_limited"
+            _emit(status)
+            if budget_recorded and budget is not None and api_key and body is not None:
+                await asyncio.to_thread(budget.refund, api_key, pool_name, budget_charged)
+                budget_recorded = False
+            retry_after = _retry_after_seconds_for_exc(exc)
+            if not _provider_rate_limit_is_external(exc):
+                return web.json_response(
+                    _anthropic_error(
+                        "Upstream provider capacity is unavailable; retry shortly.",
+                        type="server_error",
+                    ),
+                    status=503,
+                    headers={"Retry-After": str(retry_after)},
+                )
+            if stream_resp is not None:
+                await _stop_stream_heartbeat()
+                try:
+                    await stream_resp.write(
+                        f"event: error\ndata: {json.dumps(_anthropic_error('Upstream provider rate limit exceeded.', type='rate_limit_error'), ensure_ascii=False)}\n\n".encode()
+                    )
+                except (ConnectionResetError, ConnectionError, BrokenPipeError):
+                    pass
+                return stream_resp
+            return web.json_response(
+                _anthropic_error(
+                    "Upstream provider rate limit exceeded; retry after the upstream quota window resets.",
+                    type="rate_limit_error",
+                ),
+                status=429,
+                headers={"Retry-After": str(retry_after)},
             )
         except Exception as exc:
             logger.warning("anthropic request failed: %s", exc)

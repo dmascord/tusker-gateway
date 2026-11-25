@@ -37,10 +37,16 @@ The convenience script builds and pushes the image, renders the intended digest
 into temporary manifests for all three image workloads — `tusker-gateway`,
 `tusker-opencode-worker` and `tusker-claude-worker` — and manages the gateway
 state plane before rolling them. It applies `postgres-config.yaml`,
-`gateway-postgres.yaml`, and the Longhorn `postgres-snapshot-job.yaml`, waits
-for Postgres to become Ready, then applies and rolls all three image workloads.
-The snapshot manifest is cluster-scoped under `longhorn-system`; it is not
-passed the `hermes` namespace flag.
+`gateway-postgres.yaml`, `postgres-backup.yaml`, and the Longhorn
+`postgres-snapshot-job.yaml`, waits for Postgres to become Ready, then
+applies and rolls all three image workloads. The snapshot manifest is
+cluster-scoped under `longhorn-system`; it is not passed the `hermes`
+namespace flag.
+
+`postgres-backup.yaml` carries the nightly logical `pg_dump` to its own PVC.
+It is in the deploy path because it is the only backup of the state store
+that survives a corrupted volume: the Longhorn snapshot job is volume-level.
+A deploy that skipped it would leave a cluster with snapshots and no dump.
 
 Workers were previously left on stale digests by gateway-only deploys. The
 worker YAML files are multi-document (Deployment + Service), so rendering goes
@@ -79,8 +85,9 @@ fi
 ### Provenance: digest pinning and drift checks
 
 Every deploy pins the image by digest, not by tag: `kubectl set image` renders
-`repo@sha256:...` into the temporary manifest, and both Deployments are annotated
-with `tusker.net.au/commit`, `tusker.net.au/image-tag` and
+`repo@sha256:...` into the temporary manifest, and all three Deployments
+(`tusker-gateway`, `tusker-opencode-worker`, `tusker-claude-worker`) are
+annotated with `tusker.net.au/commit`, `tusker.net.au/image-tag` and
 `tusker.net.au/image-digest`. A tag is mutable, so a re-push of the same tag makes
 a restarted pod run a different binary while `/health` still reports the same
 commit. `k8s/deploy.sh` refuses to overwrite a tag that already exists in the
@@ -305,6 +312,11 @@ token throughput, success rate, latency, and filter variables.
 
 The login username and password are stored in the Kubernetes Secret
 `monitoring/monitoring-grafana-admin`; do not commit or print the password.
+`k8s/prometheus-values.yaml` points the chart at that Secret
+(`grafana.admin.existingSecret`) and carries no credential of its own — a
+committed `adminPassword` would publish the credential for a service that is
+reachable from the public ingress. Rotate the Secret's password (and update
+the Secret) before the next `helm upgrade` if it was ever committed.
 Retrieve it securely when required:
 
 ```bash

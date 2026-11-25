@@ -515,6 +515,15 @@ def create_app() -> web.Application:
                 name="qualification-maintenance",
             )
             startup_log.info("qualification maintenance task started")
+        # Retention pruning is a state-hygiene guarantee and must run even
+        # when qualification maintenance is disabled.
+        from tusker_gateway.maintenance import retention_maintenance_loop
+
+        app["retention_task"] = asyncio.create_task(
+            retention_maintenance_loop(stop_event),
+            name="retention-maintenance",
+        )
+        startup_log.info("retention maintenance task started")
         media_qualification_enabled = os.environ.get(
             "TUSKER_MEDIA_QUALIFICATION_ENABLED", "0"
         ).strip().lower()
@@ -571,6 +580,7 @@ def create_app() -> web.Application:
             "qualification_task",
             "media_qualification_task",
             "llm_stats_task",
+            "retention_task",
         ):
             task = app.get(task_name)
             if task is None:

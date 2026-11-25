@@ -1,7 +1,11 @@
 # Zero-downtime deploys
 
-Status: **shipped** (2026-09-07). The gateway runs `RollingUpdate`
-with `maxSurge: 1, maxUnavailable: 0` on a shared RWX volume.
+Status: **shipped** (2026-09-07), **storage retired** (2026-11-24). The
+gateway runs `RollingUpdate` with `maxSurge: 1, maxUnavailable: 0`. The
+shared RWX volume described below is **no longer part of the deployment**:
+every pod uses `emptyDir` and PostgreSQL is the only shared authority (see
+"Audience note on replicas and file state" below and
+`docs/nfs-retirement.md`). The manifests are retained as deprecated history.
 See "History" for the failed August 2026 attempts that delayed this.
 
 ## What shipped
@@ -12,10 +16,12 @@ See "History" for the failed August 2026 attempts that delayed this.
    share to pods via its internal NFS server, so from the pod it
    looks like an NFS mount — but the provisioner is Longhorn's
    own driver, not an external nfs-client CSI driver.
+   **Deprecated:** the gateway no longer mounts a shared filesystem.
 
 2. **`tusker-home-rwx` PVC** (`k8s/pvc-rwx.yaml`) — ReadWriteMany,
    `dataSource`-cloned from the live RWO `tusker-home` volume so no
-   state was lost or re-seeded.
+   state was lost or re-seeded. **Deprecated:** replaced by pod-local
+   `emptyDir` volumes.
 
 3. **Deployment strategy** (`k8s/deployment.yaml`):
 
