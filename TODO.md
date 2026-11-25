@@ -1,5 +1,34 @@
 # Project TODOs
 
+
+## Gateway follow-up audit (2026-11-25) — DONE
+
+Eight defects from the post-resilience audit were fixed in PR #92 and
+released as `5594394` (image
+`sha256:5e9fe801f300d8f457717de2e5e095e700f8cbe0e55cd3c68f1bb1b69bd285c5`):
+the logical backup manifest is in the deploy path, the backup CronJob fails
+closed, `/v1/messages` honours the direct-route cooldown gate, reload-built
+rotators get the cross-process refresh lock, the SQLite advisory lock is
+shared, `/v1/provider-health` reports capacity quarantines, retention
+pruning has its own scheduler, and the committed Grafana password was
+removed and rotated. Evidence:
+`docs/incidents/2026-11-25-gateway-followup-audit.md`.
+
+## Circuit-breaker counter atomicity — OPEN (latent)
+
+`CircuitBreaker.record_failure()` / `record_success()` read the row,
+compute the new counters in Python and write them back in a second
+statement, so two concurrent failures can both read the same value and both
+write the same increment: the second failure is lost and a breaker with a
+threshold of 3 stays closed. The half-open multi-probe accounting has the
+same shape and contradicts the module documentation ("if all admitted
+probes succeed, full traffic resumes; if any fails, the breaker reopens").
+
+**Blast radius: latent.** `TUSKER_CIRCUIT_ENABLED=false` in production, so
+the breaker is inert today. The fix needs an atomic
+`UPDATE ... SET counter = counter + 1` (or a per-route lock) plus a
+decision on the probe accounting, which is larger than a patch.
+
 ## Postgres backup, retention and gateway HA (2026-11-25) — DONE
 
 All four items were implemented in the PR following
