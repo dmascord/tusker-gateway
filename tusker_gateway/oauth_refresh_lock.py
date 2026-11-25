@@ -30,7 +30,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
-import os
 import threading
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Callable
@@ -40,6 +39,20 @@ logger = logging.getLogger(__name__)
 _LOCK_NAMESPACE = 0x5455534B  # "TUSK" - keeps keys disjoint from other apps
 _locks: dict[int, asyncio.Lock] = {}
 _locks_guard = threading.Lock()
+_metrics_registry: Any | None = None
+
+
+def bind_metrics_registry(registry: Any | None) -> None:
+    """Bind the metrics registry used for fail-open lock events."""
+    global _metrics_registry
+    _metrics_registry = registry
+
+
+def _count_unavailable(provider: str) -> None:
+    registry = _metrics_registry
+    counter = getattr(registry, "oauth_refresh_lock_unavailable", None)
+    if counter is not None:
+        counter.inc({"provider": provider})
 
 
 def _lock_key(provider: str, identity: str) -> int:
@@ -52,32 +65,46 @@ class RefreshLock:
     """Wrap a DB handle with a cross-process credential-refresh lock."""
 
     def __init__(self, *, acquire: Callable[[str], Any] | None = None) -> None:
-        # ``acquire`` is an optional callback returning a context manager that
-        # owns an advisory lock for a string key. It is supplied by the DB
-        # store so this module does not import config_store (which would
-        # create a cycle through config_runtime).
+        # ``acquire`` returns the store context manager. Keeping this callback
+        # injected avoids importing config_store and creating a cycle.
         self._acquire = acquire
 
     @asynccontextmanager
     async def guard(self, provider: str, identity: str) -> AsyncIterator[None]:
+        """Hold the lock; fail open only when acquisition itself fails."""
         key = _lock_key(provider, identity)
         if self._acquire is None:
             async with self._local_lock(key):
                 yield
             return
 
+        lock_cm = self._acquire(key)
         try:
-            async with self._acquire(key):
-                yield
+            await lock_cm.__aenter__()
         except Exception:  # noqa: BLE001 - fail open, never block auth
+            # __aenter__ may have acquired a session-level advisory lock before
+            # failing. Always invoke __aexit__ so it cannot leak to the pool.
+            try:
+                await lock_cm.__aexit__(None, None, None)
+            except Exception:  # noqa: BLE001 - cleanup cannot block auth
+                logger.debug("failed OAuth lock cleanup", exc_info=True)
             logger.warning(
                 "oauth refresh advisory lock unavailable provider=%s identity_fp=%s",
                 provider,
                 identity[:12],
                 exc_info=True,
             )
+            _count_unavailable(provider)
             async with self._local_lock(key):
                 yield
+            return
+
+        # Do not catch exceptions from the guarded body: a failed refresh must
+        # reach cooldown classification unchanged.
+        try:
+            yield
+        finally:
+            await lock_cm.__aexit__(None, None, None)
 
     @staticmethod
     @asynccontextmanager
@@ -88,10 +115,4 @@ class RefreshLock:
             yield
 
 
-def load_refresh_lock_from_env() -> bool:
-    """Whether cross-process refresh locking is enabled (default on)."""
-    raw = os.environ.get("TUSKER_OAUTH_REFRESH_LOCK", "1").strip().lower()
-    return raw not in {"0", "false", "no", "off"}
-
-
-__all__ = ["RefreshLock", "load_refresh_lock_from_env"]
+__all__ = ["RefreshLock", "bind_metrics_registry"]

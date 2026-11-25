@@ -39,10 +39,16 @@ unclean-recovery cycles.
   `terminationGracePeriodSeconds` elapses. K8s SIGTERM hits, postgres
   flushes WAL, the volume detaches cleanly.
 * `k8s/postgres-snapshot-job.yaml` — Longhorn `RecurringJob` snapshots the
-  postgres PVC every 15 minutes (96 retained = 24h of RPO). Supplements
-  the cluster-wide daily-snapshot job.
+  postgres PVC every 15 minutes (96 retained = 24h of history). It targets a
+  dedicated `gateway-postgres-snapshots` group; the PVC is labelled as the
+  group source in `k8s/gateway-postgres.yaml`. The cluster's `default` group
+  only matches volumes with no recurring-job labels, so the original
+  `groups: [default]` definition never targeted this volume.
 
-**RPO after Phase 1:** ≤15 minutes (snapshot interval).
+**RPO after Phase 1 (when the snapshot job is applied):** ≤15 minutes for a
+volume-level snapshot; the nightly logical dump in `k8s/postgres-backup.yaml`
+is a separate recovery path with a ~24 h RPO. Before that job was applied,
+live RPO was up to a week (one weekly Longhorn backup, `retain: 1`).
 
 ### Phase 2 — Hot-standby with streaming replication (not yet shipped)
 
@@ -113,7 +119,7 @@ After a node loss, volume flap, or pod crash:
 The cluster does not run any Postgres operator today. Adding one means
 CRDs, RBAC, and a namespace-scoped install per cluster — substantial
 up-front cost. Phase 1 closes the immediate reliability gap
-(RPO ≤15 min); Phase 2 is a self-contained addition without an operator.
+(RPO ≤15 min once the snapshot job is applied); Phase 2 is a self-contained addition without an operator.
 
 ## Why not Longhorn RWX + concurrent postgres?
 

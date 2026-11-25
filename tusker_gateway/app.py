@@ -73,6 +73,7 @@ from tusker_gateway.identity import (
     load_identity_config_from_env,
 )
 from tusker_gateway.metrics import MetricsRegistry
+from tusker_gateway.oauth_refresh_lock import bind_metrics_registry
 from tusker_gateway.rate_limit import RateLimiter, load_rate_limit_config_from_env
 from tusker_gateway.observability import attach_request_id_middleware, AccessLog
 from tusker_gateway.tracing import Tracer, load_tracer_config_from_env
@@ -140,6 +141,7 @@ def create_app() -> web.Application:
     metrics = MetricsRegistry()
     metrics.add_meta("version", "0.1.0")
     app["metrics"] = metrics
+    bind_metrics_registry(metrics)
 
     cache_cfg = load_cache_config_from_env()
     app["cache"] = ResponseCache(cache_cfg)

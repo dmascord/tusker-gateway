@@ -131,6 +131,69 @@ def _split_think_blocks(content: str) -> tuple[str, str | None]:
 # before the client-side tool validator sees it.
 
 
+def validate_request_tool_arguments(messages: Any) -> None:
+    """Reject malformed tool-call arguments in the client's message history.
+
+    Upstreams validate every tool call in the request, not just the newest
+    assistant turn. One ``arguments`` string that is not valid JSON makes the
+    whole request fail at every failover candidate: on 2026-11-25 two OMP turns
+    carried a bad escape in ``messages[718].tool_calls[0].function.arguments``
+    and burned six to nine attempts (~70 s) before surfacing a generic,
+    sanitized upstream 400. Fail at the public boundary with an actionable
+    400 instead of dispatching a request no candidate can accept.
+
+    This is deliberately narrower than provider-output validation: incomplete
+    arguments emitted *by a model* are useful to OMP's tool loop and are left
+    alone (see ``_validate_tool_call_arguments`` in endpoints.py). Only
+    client-supplied request history is checked here, and nothing is rewritten.
+
+    An empty/whitespace-only string is accepted as a no-argument call, which
+    clients commonly send for parameterless tools. An already-parsed object is
+    accepted too, so permissive clients do not break.
+    """
+    if not isinstance(messages, list):
+        return
+    for message_index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            continue
+        field = "tool_calls"
+        calls = message.get(field)
+        if calls is None:
+            function_call = message.get("function_call")
+            if isinstance(function_call, dict):
+                field = "function_call"
+                calls = [function_call]
+        if not isinstance(calls, list):
+            continue
+        for call_index, call in enumerate(calls):
+            if not isinstance(call, dict):
+                continue
+            function = call.get("function")
+            if not isinstance(function, dict):
+                function = call
+            arguments = function.get("arguments")
+            parsed: Any = {}
+            if isinstance(arguments, dict):
+                parsed = arguments
+            elif isinstance(arguments, str):
+                if arguments.strip():
+                    try:
+                        parsed = json.loads(arguments)
+                    except (json.JSONDecodeError, ValueError):
+                        parsed = None
+            else:
+                parsed = None
+            if isinstance(parsed, dict):
+                continue
+            name = function.get("name")
+            name_text = f" for tool '{name}'" if isinstance(name, str) and name else ""
+            raise BadRequestError(
+                f"messages[{message_index}].{field}[{call_index}].function.arguments"
+                f"{name_text} must be a JSON object string",
+                code="invalid_tool_call_arguments",
+            )
+
+
 def tool_diagnostics_enabled() -> bool:
     """Return whether safe tool-markup diagnostics are enabled."""
     return os.environ.get("TUSKER_TOOL_DIAGNOSTICS", "0").strip().lower() in {

@@ -302,6 +302,99 @@ async def test_refresh_lock_guard_works_with_the_real_store_callback():
     )
 
 
+@pytest.mark.asyncio
+async def test_guard_propagates_body_failure_without_rerunning_it():
+    """A failed refresh must reach the caller unchanged.
+
+    Regression: the fail-open ``except`` wrapped the guarded body too, so an
+    exception from the body re-entered the body via the local-lock fallback and
+    surfaced ``RuntimeError: generator didn't stop after athrow()``. Verified
+    in the deployed image on 2026-11-25.
+    """
+    from tusker_gateway.oauth_refresh_lock import RefreshLock
+
+    entered = 0
+
+    class _Lock:
+        async def __aenter__(self):
+            nonlocal entered
+            entered += 1
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    lock = RefreshLock(acquire=lambda key: _Lock())
+    with pytest.raises(RuntimeError, match="upstream refresh failed"):
+        async with lock.guard("openai-codex", "seat-b"):
+            raise RuntimeError("upstream refresh failed")
+    assert entered == 1
+
+
+@pytest.mark.asyncio
+async def test_guard_releases_lock_when_acquire_partially_succeeds():
+    """A lock acquired then failing before yield must be released.
+
+    Session-level advisory locks survive until explicitly unlocked. If the
+    store acquired then raised, the fail-open path left every other replica
+    blocked on that credential.
+    """
+    from tusker_gateway.oauth_refresh_lock import RefreshLock
+
+    state = {"acquired": False, "released": False}
+
+    class _Acquire:
+        async def __aenter__(self):
+            state["acquired"] = True
+            raise RuntimeError("db failed after acquiring")
+
+        async def __aexit__(self, *exc):
+            state["released"] = True
+            return False
+
+    lock = RefreshLock(acquire=lambda key: _Acquire())
+    async with lock.guard("openai-codex", "seat-c"):
+        pass
+
+    assert state["acquired"] is True
+    assert state["released"] is True, "partially acquired lock was leaked"
+
+
+@pytest.mark.asyncio
+async def test_guard_counts_fail_open_acquisitions():
+    """A fail-open must be visible in metrics, not only in a warning log."""
+    from tusker_gateway import oauth_refresh_lock as orl
+
+    class _Broken:
+        async def __aenter__(self):
+            raise RuntimeError("db down")
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class _Counter:
+        def __init__(self):
+            self.labels = []
+
+        def inc(self, labels):
+            self.labels.append(labels)
+
+    class _Registry:
+        def __init__(self):
+            self.oauth_refresh_lock_unavailable = _Counter()
+
+    registry = _Registry()
+    original = orl._metrics_registry
+    orl.bind_metrics_registry(registry)
+    try:
+        async with orl.RefreshLock(acquire=lambda key: _Broken()).guard("p", "id"):
+            pass
+    finally:
+        orl.bind_metrics_registry(original)
+
+    assert registry.oauth_refresh_lock_unavailable.labels == [{"provider": "p"}]
+
+
 # ---------------------------------------------------------------------------
 # 4. Backup and HA manifests
 # ---------------------------------------------------------------------------
@@ -324,6 +417,7 @@ def test_prometheus_rules_cover_postgres_and_backup():
         "TuskerGatewayPostgresVolumeAlmostFull",
         "TuskerGatewayBackupStalled",
         "TuskerGatewayBackupNeverRan",
+        "TuskerGatewayOAuthRefreshLockUnavailable",
     ):
         assert f"alert: {alert}" in rules
 
@@ -336,3 +430,33 @@ def test_gateway_deployment_runs_two_replicas():
     surge = manifest["spec"]["strategy"]["rollingUpdate"]
     assert surge["maxSurge"] == 1
     assert surge["maxUnavailable"] == 0
+
+
+def test_postgres_snapshot_job_targets_the_gateway_volume():
+    """The 15m snapshot job must actually select the gateway Postgres PVC.
+
+    Longhorn's `default` group is only implicit for volumes with no recurring
+    job labels. This PVC is explicitly in the backup group, so the original
+    `groups: [default]` job never snapshotted it (2026-11-25 investigation).
+    """
+    import yaml
+
+    job_docs = list(
+        yaml.safe_load_all((REPO / "k8s" / "postgres-snapshot-job.yaml").read_text())
+    )
+    job = next(d for d in job_docs if d and d.get("kind") == "RecurringJob")
+    group = job["spec"]["groups"][0]
+    assert group != "default"
+    assert job["spec"]["task"] == "snapshot"
+
+    pg_docs = list(
+        yaml.safe_load_all((REPO / "k8s" / "gateway-postgres.yaml").read_text())
+    )
+    pvc = next(
+        d for d in pg_docs
+        if d and d.get("kind") == "PersistentVolumeClaim"
+        and d["metadata"]["name"] == "tusker-gateway-postgres-data"
+    )
+    labels = pvc["metadata"]["labels"]
+    assert labels["recurring-job.longhorn.io/source"] == "enabled"
+    assert labels[f"recurring-job-group.longhorn.io/{group}"] == "enabled"

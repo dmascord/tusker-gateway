@@ -1,17 +1,17 @@
 # Longhorn recurring snapshot job for the gateway's PostgreSQL PVC.
 #
-# Captures a snapshot every 15 minutes (96/day), retained for 24 hours. The
-# daily-snapshot job in /Volumes/dev/dev/k8s/manifests/longhorn-system already
-# snapshots every volume daily; this adds a tighter RPO window for the
-# gateway's state store.
+# Captures a snapshot every 15 minutes (96 retained = 24 hours). This is a
+# volume-level point-in-time recovery option alongside the nightly logical
+# backup in postgres-backup.yaml.
 #
 # Apply once:
 #   kubectl apply -f k8s/postgres-snapshot-job.yaml
 #
-# Note: the gateway's PVC label is `app=tusker-gateway-postgres`. Longhorn
-# recurring-job groups are matched against PV labels. If the cluster is
-# configured to label Longhorn volumes differently, override the group with
-# the volume selector that matches in your environment.
+# Targeting: Longhorn matches a RecurringJob to volumes via groups on the
+# Volume CR. `groups: [default]` is only an implicit match for volumes with
+# NO recurring-job labels; this PVC is explicitly labelled for the cluster's
+# weekly backup, so that job would never select it. Use a dedicated group and
+# label the PVC as the label source so the setting survives volume rebuilds.
 apiVersion: longhorn.io/v1beta2
 kind: RecurringJob
 metadata:
@@ -25,11 +25,6 @@ spec:
   retain: 96
   concurrency: 1
   groups:
-  - default
+  - gateway-postgres-snapshots
   labels:
     app: tusker-gateway-postgres
-  parameters:
-    cron: "*/15 * * * *"
-    task: snapshot
-    retain: 96
-    concurrency: 1

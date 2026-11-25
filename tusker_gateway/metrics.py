@@ -31,6 +31,7 @@ Metric catalogue:
     tusker_pool_candidates{pool,state}                         gauge
     tusker_rtk_blocks_total{filter,outcome}                   counter
     tusker_rtk_bytes_saved_total                               counter
+    tusker_oauth_refresh_lock_unavailable_total{provider}         counter
     tusker_rtk_calls_total{outcome}                           counter
 
 We deliberately scope labels to keep cardinality bounded:
@@ -357,6 +358,15 @@ class MetricsRegistry:
             "RTK compress_text invocations by high-level outcome",
             ("outcome",),
         )
+        # A fail-open lock acquisition means the cross-process HA guarantee is
+        # degraded. Both the async-Lock defect and the body-exception defect
+        # were invisible to monitoring on 2026-11-25.
+        self.oauth_refresh_lock_unavailable = Counter(
+            "tusker_oauth_refresh_lock_unavailable_total",
+            "OAuth refresh advisory-lock acquisitions that failed and fell back "
+            "to a process-local lock",
+            ("provider",),
+        )
         self.pool_candidates = Gauge(
             "tusker_pool_candidates",
             "Current number of candidates per pool, partitioned by validity",
@@ -402,6 +412,7 @@ class MetricsRegistry:
             self.shadow_shape_mismatch_total,
             self.pool_candidates, self.cooldowns_active,
             self.rtk_blocks, self.rtk_bytes_saved, self.rtk_calls,
+            self.oauth_refresh_lock_unavailable,
         ):
             for line in m.render():
                 parts.append(line)
