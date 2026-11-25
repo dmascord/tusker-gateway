@@ -117,6 +117,14 @@ spec:
           for: 2m
           labels:
             severity: critical
+        - alert: TuskerGatewayOAuthRefreshLockUnavailable
+          annotations:
+            description: A gateway replica fell back to a process-local OAuth refresh lock for provider {{ $labels.provider }}; cross-process refresh coordination is degraded and concurrent replicas can consume the same single-use token.
+            summary: Gateway OAuth refresh lock is failing open
+          expr: increase(tusker_oauth_refresh_lock_unavailable_total{job="tusker-gateway"}[10m]) > 0
+          for: 5m
+          labels:
+            severity: warning
         - alert: TuskerGatewayRestartStorm
           annotations:
             description: The tusker-gateway pod has restarted {{ $value | humanize }} times in the last 15 minutes, indicating a crash loop (see OOMKilled alert).

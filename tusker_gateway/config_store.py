@@ -1344,28 +1344,35 @@ class ConfigStore:
         # Bound the wait: a wedged peer replica must not hang this request
         # forever. On timeout the caller falls back to the in-process lock
         # (RefreshLock), so auth keeps working even if coordination fails.
+        #
+        # Session-level advisory locks survive transaction boundaries. Keep
+        # release in an outer finally so a failure after acquisition but before
+        # yield cannot leak the lock to another replica.
+        acquired = False
+        conn = None
         deadline = time.monotonic() + _ADVISORY_LOCK_WAIT_SECS
-        with db.connection() as conn:
-            acquired = False
-            while True:
-                row = await asyncio.to_thread(
-                    lambda: conn.execute(
-                        "SELECT pg_try_advisory_lock(?)", (int(key),)
-                    ).fetchone()
-                )
-                if row and row[0]:
-                    acquired = True
-                    break
-                if time.monotonic() >= deadline:
-                    break
-                await asyncio.sleep(0.05)
-            if not acquired:
-                raise TimeoutError(
-                    f"oauth advisory lock wait exceeded {_ADVISORY_LOCK_WAIT_SECS:.0f}s"
-                )
-            try:
+        try:
+            with db.connection() as connection:
+                conn = connection
+                while True:
+                    row = await asyncio.to_thread(
+                        lambda: conn.execute(
+                            "SELECT pg_try_advisory_lock(?)", (int(key),)
+                        ).fetchone()
+                    )
+                    if row and row[0]:
+                        acquired = True
+                        break
+                    if time.monotonic() >= deadline:
+                        break
+                    await asyncio.sleep(0.05)
+                if not acquired:
+                    raise TimeoutError(
+                        f"oauth advisory lock wait exceeded {_ADVISORY_LOCK_WAIT_SECS:.0f}s"
+                    )
                 yield
-            finally:
+        finally:
+            if acquired and conn is not None:
                 try:
                     await asyncio.to_thread(
                         lambda: conn.execute(

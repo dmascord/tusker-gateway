@@ -23,6 +23,8 @@ metadata:
   namespace: hermes
   labels:
     app: tusker-gateway-postgres
+    recurring-job.longhorn.io/source: enabled
+    recurring-job-group.longhorn.io/gateway-postgres-snapshots: enabled
 spec:
   accessModes:
   - ReadWriteOnce
