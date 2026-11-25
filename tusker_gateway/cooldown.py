@@ -365,6 +365,30 @@ class CooldownTracker:
         # Don't clear provider-default; keep it for batch eviction
 
 
+def cooldown_gate_error(provider: str, model: str) -> Any | None:
+    """Return a 429 error when a route is still in cooldown, else None.
+
+    Explicit provider/model routes bypass pool selection, so they need the
+    same cooldown check the pool selector applies. Returning the error
+    (rather than a bool) keeps the enforced window attached to it, so the
+    caller can answer with the same ``Retry-After`` the gateway honours.
+    """
+    from tusker_gateway.errors import RateLimitError
+
+    remaining = global_tracker().remaining_cooldown_seconds(provider, model)
+    if remaining <= 0:
+        return None
+    error = RateLimitError(
+        f"provider route {provider}/{model} is in cooldown",
+        code="rate_limit_exceeded",
+        headers={"Retry-After": str(max(1, int(round(remaining))))},
+    )
+    # Carry the provider so the shared 429 surfaces treat this like the
+    # upstream rate limit it replaces.
+    error.provider = provider
+    return error
+
+
 def _strip_urls(body: str) -> str:
     """Remove URLs from an error body so hint matching is not corrupted.
 

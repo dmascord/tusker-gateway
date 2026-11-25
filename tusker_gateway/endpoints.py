@@ -5333,27 +5333,16 @@ async def _call_with_pool_fallback(
         # probes remain an explicit recovery check and are handled by their
         # own qualification filters.
         if not _is_loopback_qualification_probe(request):
-            from tusker_gateway.cooldown import global_tracker
+            from tusker_gateway.cooldown import cooldown_gate_error
 
-            cooldown_remaining = global_tracker().remaining_cooldown_seconds(
-                provider, model
-            )
-            if cooldown_remaining > 0:
+            cooldown_error = cooldown_gate_error(provider, model)
+            if cooldown_error is not None:
                 if request is not None:
                     set_access_log_context(
                         request,
                         failure_class="provider_cooldown",
-                        error_detail=(
-                            f"{provider}/{model} is in cooldown for "
-                            f"{int(round(cooldown_remaining))}s"
-                        ),
+                        error_detail=f"{provider}/{model} is in cooldown",
                     )
-                cooldown_error = RateLimitError(
-                    f"provider route {provider}/{model} is in cooldown",
-                    code="rate_limit_exceeded",
-                    headers={"Retry-After": str(max(1, int(round(cooldown_remaining))))},
-                )
-                cooldown_error.provider = provider
                 raise cooldown_error
         try:
             result = None
