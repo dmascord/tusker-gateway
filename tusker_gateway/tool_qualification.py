@@ -671,8 +671,7 @@ async def probe_model(
             {
                 "role": "user",
                 "content": (
-                    f"Call {PROBE_TOOL_NAME} exactly once with path {PROBE_PATH}. "
-                    "Do not call any other function."
+                    f"Call {PROBE_TOOL_NAME} exactly once with path {PROBE_PATH}."
                 ),
             },
         ],
