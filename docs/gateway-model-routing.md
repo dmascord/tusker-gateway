@@ -1146,7 +1146,10 @@ operator-curated entries.
 
 The deployment's static `hermes-code` baseline includes MiniMax M-series
 aliases plus Synthetic `syn:large:text`, `syn:small:text`,
-`syn:large:vision`, and `syn:small:vision`, plus Groq's current GPT-OSS 20B,
+`syn:large:vision`, and the pinned full ID
+`hf:thinkingmachines/Inkling-2-Mini` (formerly the `syn:small:vision` alias —
+pinned because the provider can re-point an alias without a config change),
+plus Groq's current GPT-OSS 20B,
 GPT-OSS 120B, and Qwen 3.6 27B routes, plus Arcee `trinity-mini`.
 MiniMax M2.x models are text-only;
 the current MiniMax M3 API supports image input and tool use. The Synthetic
