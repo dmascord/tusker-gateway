@@ -6,9 +6,9 @@ metadata:
   labels:
     app: tusker-gateway
   annotations:
-    tusker.net.au/commit: 218a8e90b301f45a6da0664ed36ca5178966d914
-    tusker.net.au/image-tag: swarm-alpine-218a8e90b301f45a6da0664ed36ca5178966d914
-    tusker.net.au/image-digest: sha256:3e4a3540965da737e4cdc7d377ce4717bce893efe96bccb7179b8fff0701b0fe
+    tusker.net.au/commit: 00b70e22230fc40532fc2b170914e08681af8a7f
+    tusker.net.au/image-tag: swarm-alpine-00b70e22230fc40532fc2b170914e08681af8a7f
+    tusker.net.au/image-digest: sha256:bc34d2cc8d069196a328d667d79bc0be4f1cb5d49fa551c36c415aa18c5de1f7
 spec:
   # Two replicas are safe now that the Codex refresh sequence holds a
   # PostgreSQL advisory lock (see oauth_refresh_lock.py) and all state is in
@@ -38,7 +38,7 @@ spec:
       terminationGracePeriodSeconds: 90
       containers:
       - name: tusker-gateway
-        image: registry.tusker.net.au:5000/tusker-gateway@sha256:3e4a3540965da737e4cdc7d377ce4717bce893efe96bccb7179b8fff0701b0fe
+        image: registry.tusker.net.au:5000/tusker-gateway@sha256:bc34d2cc8d069196a328d667d79bc0be4f1cb5d49fa551c36c415aa18c5de1f7
         imagePullPolicy: Always
         envFrom:
         - secretRef:
