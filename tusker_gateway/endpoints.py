@@ -5345,7 +5345,7 @@ async def _call_with_pool_fallback(
             pool=pool_name or "passthrough",
         )
     if pool_name is None:
-        provider, model = _route_target(config, body)
+        provider, model = _route_target(config, body, request)
         if request is not None:
             set_access_log_context(
                 request,
@@ -7298,7 +7298,11 @@ def _direct_route_supports_modalities(
     return supported is None or required <= supported
 
 
-def _route_target(config: dict[str, Any], body: dict[str, Any]) -> tuple[str, str]:
+def _route_target(
+    config: dict[str, Any],
+    body: dict[str, Any],
+    request: web.Request | None = None,
+) -> tuple[str, str]:
     route = resolve_route(body.get("model"), body)
     if route.kind in {"pool", "code", "swarm"}:
         if route.kind == "swarm":
@@ -7323,7 +7327,13 @@ def _route_target(config: dict[str, Any], body: dict[str, Any]) -> tuple[str, st
     if route.kind == "passthrough" and route.provider and route.model:
         if provider_route_is_disabled(config, route.provider):
             raise ProviderRouteDisabledError(route.provider)
-        if model_is_blacklisted(config, route.provider, route.model):
+        # A qualification probe may test a denied route: deciding whether
+        # the route should come back is exactly what the runner exists to
+        # do, and the runner marks its requests with its private header
+        # from loopback only (same rule as the cooldown gate).
+        if model_is_blacklisted(config, route.provider, route.model) and not (
+            _allows_qualification_breaker_probe(request)
+        ):
             raise BadRequestError(
                 f"model route is blacklisted: {route.provider}/{route.model}",
                 code="model_blacklisted",
