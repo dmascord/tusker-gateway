@@ -79,4 +79,14 @@ were exhausted.
 The upstream catalog still advertises an unservable model. After this fix the
 first failure marks `opencode-cli/seaglass-alpha-free` permanently failed and
 auto-catalog prunes it on the next refresh, so callers no longer pay for the
-dead route. No production deploy was performed as part of this change.
+dead route.
+
+### Deployment
+
+Deployed from commit `5d2e3ff88706fff95864bf171c4331a1c89769d4`, image
+`registry.tusker.net.au:5000/tusker-gateway@sha256:99a07b67b93b30a40324e7c012f45803acd28b9916c05f6bcfdb3a8305465301`
+(tag `swarm-alpine-5d2e3ff88706fff95864bf171c4331a1c89769d4`). All three
+workloads (`tusker-gateway`, `tusker-opencode-worker`, `tusker-claude-worker`)
+rolled out and reported matching imageIDs; `/health` reported the same commit.
+`k8s/verify-provenance.sh` passed: tracked manifests, live Deployments, running
+pods and `/health` all agree. `k8s/smoke_production.sh` passed after rollout.
