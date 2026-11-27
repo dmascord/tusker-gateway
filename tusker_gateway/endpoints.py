@@ -1191,6 +1191,199 @@ def _emit_arg_tails(
         yield f"data: {json.dumps({**obj, 'choices': [{**choice, 'delta': {'role': 'assistant', 'tool_calls': calls}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n".encode()
 
 
+def _split_misindexed_argument_text(text: str) -> tuple[str, str]:
+    """Split orphan argument bytes into a leading prefix and a whole JSON call.
+
+    The 2026-11-27 ``syn:small:vision`` turn put the opening ``{"`` of one
+    call and the complete JSON of the next call under a single nameless index.
+    Prepending the whole buffer to the first call would therefore corrupt both:
+    return the part that prefixes an existing call and, when present, the
+    complete JSON object that belongs to a later call with empty arguments.
+    """
+    if not text:
+        return "", ""
+    decoder = json.JSONDecoder()
+    for offset, char in enumerate(text):
+        if char not in "{[":
+            continue
+        try:
+            value, end = decoder.raw_decode(text, offset)
+        except ValueError:
+            continue
+        if isinstance(value, (dict, list)) and not text[end:].strip():
+            return text[:offset], text[offset:end]
+    return text, ""
+
+
+def _repair_deferred_tool_frames(
+    frames: list[bytes],
+    *,
+    provider: str | None,
+    model: str | None,
+    request_id: str | None,
+) -> list[bytes]:
+    """Place orphaned argument deltas before the identified calls they belong to.
+
+    OpenCode assembles streamed tool calls by ``index``. When a provider emits
+    argument bytes under a nameless index (observed with ``syn:small:vision``
+    mapping to Inkling 2 Mini, 2026-11-27), the client sees a ``Tool  not
+    found`` call plus a body fragment that is not valid JSON, and every tool
+    turn fails. Tool frames are deferred until the terminal so they can be
+    rewritten here: orphan text moves to the front of the call whose arguments
+    are missing their opening, a second JSON object moves to the next call with
+    empty arguments, and the orphan delta itself is dropped.
+    """
+    if not frames:
+        return []
+
+    parsed: list[tuple[dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None]] = []
+    entries: dict[tuple[int, int], dict[str, Any]] = {}
+    for frame in frames:
+        stripped = frame.strip()
+        obj: dict[str, Any] | None = None
+        choice: dict[str, Any] | None = None
+        delta: dict[str, Any] | None = None
+        if stripped.startswith(b"data: ") and stripped[6:] != b"[DONE]":
+            try:
+                candidate = json.loads(stripped[6:])
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                candidate = None
+            if isinstance(candidate, dict):
+                obj = candidate
+                choices = candidate.get("choices")
+                if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+                    choice = choices[0]
+                    maybe_delta = choice.get("delta")
+                    if isinstance(maybe_delta, dict):
+                        delta = maybe_delta
+        parsed.append((obj, choice, delta))
+        if delta is None or choice is None:
+            continue
+        try:
+            choice_index = int(choice.get("index", 0) or 0)
+        except (TypeError, ValueError):
+            choice_index = 0
+        for raw in delta.get("tool_calls") or []:
+            if not isinstance(raw, dict):
+                continue
+            function = raw.get("function")
+            function = function if isinstance(function, dict) else {}
+            try:
+                call_index = int(raw.get("index", 0) or 0)
+            except (TypeError, ValueError):
+                call_index = 0
+            key = (choice_index, call_index)
+            entry = entries.setdefault(key, {"id": "", "name": "", "parts": []})
+            entry["id"] = entry["id"] or str(raw.get("id") or "")
+            entry["name"] = entry["name"] or str(function.get("name") or "")
+            arguments = function.get("arguments")
+            if isinstance(arguments, str) and arguments:
+                entry["parts"].append(arguments)
+
+    identified = [
+        key for key, entry in sorted(entries.items()) if entry["name"]
+    ]
+    orphaned = [
+        key for key, entry in sorted(entries.items())
+        if not entry["name"] and entry["parts"]
+    ]
+    repaired: list[str] = []
+    for key in orphaned:
+        entry = entries[key]
+        prefix, completion = _split_misindexed_argument_text("".join(entry["parts"]))
+        if prefix:
+            target = next(
+                (
+                    candidate for candidate in identified
+                    if candidate[0] == key[0]
+                    and not "".join(entries[candidate]["parts"]).lstrip().startswith(("{", "["))
+                ),
+                None,
+            )
+            if target is not None:
+                target_parts = entries[target]["parts"]
+                if target_parts:
+                    target_parts[0] = prefix + target_parts[0]
+                else:
+                    target_parts.append(prefix)
+                repaired.append(f"{key[1]}->{target[1]}:prefix")
+        if completion:
+            target = next(
+                (
+                    candidate for candidate in identified
+                    if candidate[0] == key[0]
+                    and candidate[1] > key[1]
+                    and not "".join(entries[candidate]["parts"])
+                ),
+                None,
+            )
+            if target is not None:
+                target_parts = entries[target]["parts"]
+                if target_parts:
+                    target_parts[0] = completion + target_parts[0]
+                else:
+                    target_parts.append(completion)
+                repaired.append(f"{key[1]}->{target[1]}:complete")
+
+    if repaired:
+        logger.info(
+            "repaired mis-indexed streamed tool arguments provider=%s model=%s "
+            "request_id=%s ranges=%s",
+            provider or "unknown",
+            model or "unknown",
+            request_id or "unknown",
+            ",".join(repaired),
+        )
+
+    dropped = set(orphaned)
+    remaining = {
+        key: list(entry["parts"])
+        for key, entry in entries.items()
+        if key not in dropped
+    }
+    output: list[bytes] = []
+    for frame, (obj, choice, delta) in zip(frames, parsed):
+        if obj is None or choice is None or delta is None:
+            output.append(frame)
+            continue
+        raw_calls = delta.get("tool_calls")
+        if not isinstance(raw_calls, list):
+            output.append(f"data: {json.dumps(obj, ensure_ascii=False)}\n\n".encode())
+            continue
+        kept: list[dict[str, Any]] = []
+        try:
+            choice_index = int(choice.get("index", 0) or 0)
+        except (TypeError, ValueError):
+            choice_index = 0
+        for raw in raw_calls:
+            if not isinstance(raw, dict):
+                kept.append(raw)
+                continue
+            try:
+                call_index = int(raw.get("index", 0) or 0)
+            except (TypeError, ValueError):
+                call_index = 0
+            key = (choice_index, call_index)
+            if key in dropped:
+                continue
+            function = dict(raw.get("function") or {})
+            parts = remaining.get(key) or []
+            arguments = parts.pop(0) if parts else ""
+            if arguments:
+                function["arguments"] = arguments
+            else:
+                function.pop("arguments", None)
+            kept.append({**raw, "function": function})
+        if kept:
+            delta["tool_calls"] = kept
+        else:
+            delta.pop("tool_calls", None)
+        if not delta and choice.get("finish_reason") is None:
+            continue
+        output.append(f"data: {json.dumps(obj, ensure_ascii=False)}\n\n".encode())
+    return output
+
+
 async def _normalize_stream(
     raw_stream: AsyncIterator[bytes],
     *,
@@ -1278,6 +1471,9 @@ async def _normalize_stream(
     native_index_owners: dict[tuple[int, int], str] = {}
     native_index_names: dict[tuple[int, int], str] = {}
     native_next_indices: dict[int, int] = {}
+    # Tool frames are held until the terminal so mis-indexed argument
+    # fragments can be moved to the call they belong to before client output.
+    deferred_tool_frames: list[bytes] = []
     synthetic_tool_call_sequence = 0
     last_tool_diagnostics_signature: tuple[Any, ...] | None = None
 
@@ -1718,8 +1914,14 @@ async def _normalize_stream(
             if isinstance(raw_tc, list):
                 delta["tool_calls"] = tc
             has_tools = isinstance(tc, list) and bool(tc)
+            deferred_tc = None
             if has_tools:
                 inband_thinking.note_other_content()
+                # Hold native tool deltas until the terminal: mis-indexed
+                # argument fragments can only be placed correctly once the
+                # whole call stream is visible.
+                deferred_tc = tc
+                delta.pop("tool_calls", None)
             if restorer is not None and isinstance(tc, list):
                 for call in tc:
                     if not isinstance(call, dict):
@@ -2078,12 +2280,24 @@ async def _normalize_stream(
                 if has_tools:
                     tools_only = {
                         "role": delta.get("role"),
-                        "tool_calls": tc,
+                        "tool_calls": deferred_tc,
                     }
-                    yield f"data: {json.dumps({**new_obj, 'choices': [{**new_choice, 'delta': tools_only, 'finish_reason': None}]}, ensure_ascii=False)}\n\n".encode()
+                    tools_frame = f"data: {json.dumps({**new_obj, 'choices': [{**new_choice, 'delta': tools_only, 'finish_reason': None}]}, ensure_ascii=False)}\n\n".encode()
+                    if tools_requested:
+                        deferred_tool_frames.append(tools_frame)
+                    else:
+                        yield tools_frame
                 for tool_frame in pending_tool_frames:
                     yield tool_frame
                 reason = "tool_calls" if saw_tool_call else fr
+                for repaired_frame in _repair_deferred_tool_frames(
+                    deferred_tool_frames,
+                    provider=provider,
+                    model=model,
+                    request_id=request_id,
+                ):
+                    yield repaired_frame
+                deferred_tool_frames.clear()
                 # Release any argument text held back by the token restorer
                 # (an unterminated `[TUSKER:` prefix) as a final arguments
                 # fragment before the finish frame. Clients concatenate
@@ -2118,6 +2332,13 @@ async def _normalize_stream(
                     or (upstream_finish_reason and obj.get("usage") is not None)
                 ):
                     yield f"data: {json.dumps(new_obj, ensure_ascii=False)}\n\n".encode()
+                if has_tools:
+                    tools_only = {"role": delta.get("role"), "tool_calls": deferred_tc}
+                    tools_frame = f"data: {json.dumps({**new_obj, 'choices': [{**new_choice, 'delta': tools_only, 'finish_reason': None}]}, ensure_ascii=False)}\n\n".encode()
+                    if tools_requested:
+                        deferred_tool_frames.append(tools_frame)
+                    else:
+                        yield tools_frame
                 for prose_frame in pending_prose_frames:
                     yield prose_frame
 
@@ -2186,6 +2407,14 @@ async def _normalize_stream(
             raise unusable_tool_error("reasoning_only_or_empty")
     if not tools_requested and not saw_tool_call and not inband_thinking.has_visible_text:
         raise empty_stream_error()
+    for repaired_frame in _repair_deferred_tool_frames(
+        deferred_tool_frames,
+        provider=provider,
+        model=model,
+        request_id=request_id,
+    ):
+        yield repaired_frame
+    deferred_tool_frames.clear()
     for tail_frame in _text_tail_frames():
         yield tail_frame
     for tail_frame in _emit_arg_tails(
