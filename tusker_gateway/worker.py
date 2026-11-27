@@ -61,15 +61,33 @@ async def chat(request: web.Request) -> web.Response:
             tool_choice=tool_choice,
         )
     except Exception as exc:  # noqa: BLE001 - surface as HTTP error
-        status = getattr(exc, "status", 502)
+        # CLI adapters carry the upstream verdict on ``upstream_status`` while
+        # ``status`` stays at the client-safe 502 (ProviderError). Reading only
+        # ``status`` flattened model retirements (410) and auth failures (401)
+        # into a generic 502, which the gateway proxy then labelled
+        # ``worker_error`` - so dead auto-discovered routes were never pruned.
+        status = getattr(exc, "upstream_status", None)
+        if status is None:
+            status = getattr(exc, "status", 502)
         try:
             status = int(status)
         except (TypeError, ValueError):
             status = 502
-        return web.json_response(
-            {"error": {"message": str(exc), "code": getattr(exc, "code", None)}},
-            status=status,
-        )
+        error = {
+            "message": str(exc),
+            "code": getattr(exc, "code", None),
+            "upstream_status": getattr(exc, "upstream_status", None),
+        }
+        # Rate-limit adapters put the retry window in body/headers. Forward
+        # them so the gateway can apply the published cooldown instead of the
+        # transient ladder.
+        body = getattr(exc, "body", None)
+        if isinstance(body, str) and body:
+            error["body"] = body[:2000]
+        headers = getattr(exc, "headers", None)
+        if isinstance(headers, dict):
+            error["headers"] = {str(k): str(v) for k, v in headers.items()}
+        return web.json_response({"error": error}, status=status)
 
     if hasattr(result, "__aiter__"):
         resp = web.StreamResponse(

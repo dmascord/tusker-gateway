@@ -90,6 +90,43 @@ is re-established:
 - `ollama-cloud/glm-5.3-flash`
 - `synthetic/hf:zai-org/GLM-5.3-Flash`
 - `xiaomi/mimo-v2.5-pro`
+`mlx-mac/inkling-2-mini*` was denied on 2026-11-27 while it was
+unqualified, and the entry was lifted the same day once the route passed
+all three privacy gates. The first measurement used the IQ4_NL GGUF build
+under llama.cpp, which measured 3-5x slower than the curated
+`mlx-mac/qwen3.8-27b` route (sequential text 35-59 s versus 10 s) and
+failed the behavioral tool-contract probe (`stream-tool-contract-v1`)
+after 175.9 s with zero tool calls. The native NVFP4 MLX build
+(`inkling-2-mini:26b-a5b-nvfp4`) reverses that: measured warm on the MLX
+Mac it answers a 300-token turn in 5.7 s and a tool turn in 5.6 s,
+against 16.4 s and 18.0 s for `qwen3.8-27b` and 6.8 s and 5.1 s for
+`shirdel-coder-9b-claude-fable-5`. It now serves the privacy pool as a
+curated static route.
+
+Two operational notes for the MLX Mac:
+
+- the Ollama `/v1` endpoint ignores a per-request `num_ctx`, so a
+  per-model context window requires a derived tag
+  (`PARAMETER num_ctx 131072` for `qwen3.8-27b:128k`). The server-wide
+  `OLLAMA_CONTEXT_LENGTH` stays at 262144;
+- the route needs the full Ollama build (the Homebrew bottle has no MLX
+  runtime and rejects the model with `this model requires MLX support`).
+
+#### Self-closing tool-call markup
+
+Inkling 2 Mini answers a tool request with the call in assistant content
+as a self-closing tag whose name is the tool name and whose attributes
+are the arguments:
+
+```
+<tusker_capability_probe path="/v1/canary/probe" />
+```
+
+`parse_text_tool_calls` in `tusker_gateway/tool_formats.py` parses that
+form, but only for tools the request actually asked for
+(`allowed_tool_names`). The scope is required: without it the shape is
+indistinguishable from ordinary HTML such as `<body class="x">`, which
+would otherwise be promoted to a spurious tool call.
 
 
 ### Ollama Cloud retirement policy

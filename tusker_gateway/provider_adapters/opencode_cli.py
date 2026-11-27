@@ -155,7 +155,10 @@ async def _run_cli_tool(
 # model itself is gone, identically on every request. Mapping these to a
 # retired-model error lets the gateway's permanent-failure marker prune the
 _MODEL_REJECTION_RE = re.compile(
-    r"has been deprecated|model is unavailable|invalid model reference",
+    # The CLI also emits `provider.no-route: Model unavailable: <slug>` for
+    # catalog entries that are advertised but not servable (2026-11-27,
+    # opencode/seaglass-alpha-free), without the word "is".
+    r"has been deprecated|model\s+(?:is\s+)?unavailable|invalid model reference",
     re.IGNORECASE,
 )
 # CLI outputs that signal a provider-side rate limit (HTTP 429). The cooldown

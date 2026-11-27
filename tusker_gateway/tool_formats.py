@@ -12,7 +12,7 @@ import logging
 import os
 import re
 import secrets
-from typing import Any
+from typing import Any, Collection
 
 from tusker_gateway.errors import BadRequestError
 
@@ -245,6 +245,30 @@ def tool_markup_has_opening(text: Any) -> bool:
     )
 
 
+def self_closing_tool_call_re(allowed_tool_names: Collection[str] | None) -> re.Pattern[str] | None:
+    """Return a regex matching Inkling-style ``<tool arg="v" />`` calls.
+
+    The shape is only a tool call when the tag names a tool the request
+    actually asked for; otherwise it is indistinguishable from ordinary
+    HTML or XML.
+    """
+    if not allowed_tool_names:
+        return None
+    names = sorted(
+        {str(name).strip() for name in allowed_tool_names if str(name).strip()},
+        key=len,
+        reverse=True,
+    )
+    if not names:
+        return None
+    alternatives = "|".join(re.escape(name) for name in names)
+    return re.compile(
+        r"<\s*(?:%s)\b(?:\s+[\w.:-]+\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s>]+))*\s*/?\s*>"
+        % alternatives,
+        re.IGNORECASE,
+    )
+
+
 def _openai_content_to_anthropic(content: Any) -> str | list[dict[str, Any]]:
     if isinstance(content, str):
         return content
@@ -352,6 +376,12 @@ def normalize_tools(tools: Any) -> list[dict[str, Any]]:
             }
         )
     return result
+
+
+
+def tool_names(tools: Any) -> list[str]:
+    """Return the function names declared by a request's ``tools`` list."""
+    return [str(tool["function"]["name"]) for tool in normalize_tools(tools)]
 
 
 def normalize_tool_calls(raw: Any) -> list[dict[str, Any]]:
@@ -486,8 +516,18 @@ def _parse_json_call(text: str) -> dict[str, Any] | None:
     return {"name": name, "arguments": args}
 
 
-def parse_text_tool_calls(text: Any) -> list[dict[str, Any]]:
-    """Parse common XML, DSML/MiMoML, JSON-fenced, and TOOL_CALL text forms."""
+def parse_text_tool_calls(
+    text: Any,
+    *,
+    allowed_tool_names: Collection[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Parse common XML, DSML/MiMoML, JSON-fenced, and TOOL_CALL text forms.
+
+    ``allowed_tool_names`` restricts the self-closing ``<tool_name arg="v" />``
+    form to the tools the caller actually requested. Without that scope the
+    form is ambiguous with ordinary HTML (``<body class="x">``), so only
+    explicitly requested tool names are accepted.
+    """
     if not isinstance(text, str) or not text.strip():
         return []
     text = _canonicalize_dsml_tags(text)
@@ -572,6 +612,37 @@ def parse_text_tool_calls(text: Any) -> list[dict[str, Any]]:
         except json.JSONDecodeError:
             args = {"raw": match.group(2)}
         calls.append({"name": match.group(1), "arguments": args})
+    # 5b. Self-closing tag whose name is the tool name and whose attributes
+    # are the arguments: <tool_name arg="value" other="value" />
+    # Inkling 2 Mini emits tool calls in exactly this shape (measured
+    # 2026-11-27: '<tusker_capability_probe path="/v1/canary/probe" />'),
+    # so without this branch the call stays as assistant prose and the
+    # gateway's tool-contract probe reports zero tool calls.
+    #
+    # The shape is ambiguous with ordinary HTML (``<body class="x">``), so
+    # it is only accepted for a tool the caller actually requested.
+    scoped = self_closing_tool_call_re(allowed_tool_names)
+    if scoped is not None:
+        for match in scoped.finditer(text):
+            tag = match.group(0)
+            name_match = re.match(r"<\s*([\w.-]+)", tag)
+            if not name_match:
+                continue
+            args: dict[str, Any] = {}
+            for attribute in re.finditer(
+                r"([\w.:-]+)\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s>/]+))",
+                tag,
+            ):
+                key = attribute.group(1)
+                value = attribute.group(2)
+                if value is None:
+                    value = attribute.group(3)
+                if value is None:
+                    value = attribute.group(4)
+                args[key] = value
+            if not args:
+                continue
+            calls.append({"name": name_match.group(1), "arguments": args})
     # 6. TOOL_CALL: name({...}) fallback.
     for match in re.finditer(r"TOOL_CALL:\s*([\w.-]+)\s*\((.*?)\)", text, re.I | re.S):
         args = match.group(2).strip()
@@ -668,8 +739,14 @@ def normalize_response_tool_calls(
     response: dict[str, Any],
     *,
     source: str | None = None,
+    allowed_tool_names: Collection[str] | None = None,
 ) -> dict[str, Any]:
-    """Normalize provider response tool calls and rescue text-formatted calls."""
+    """Normalize provider response tool calls and rescue text-formatted calls.
+
+    ``allowed_tool_names`` lists the tools the request actually asked for.
+    It gates the self-closing ``<tool_name arg="value" />`` text form, whose
+    shape is otherwise indistinguishable from ordinary HTML.
+    """
     out = dict(response)
     choices = out.get("choices")
     if not isinstance(choices, list):
@@ -752,7 +829,10 @@ def normalize_response_tool_calls(
         text_calls: list[dict[str, Any]] = []
         seen_text_calls: set[tuple[str, str]] = set()
         for candidate in [content, *(value for _, value in auxiliary_texts)]:
-            for call in parse_text_tool_calls(candidate):
+            for call in parse_text_tool_calls(
+                candidate,
+                allowed_tool_names=allowed_tool_names,
+            ):
                 fn = call.get("function") or {}
                 key = (str(fn.get("name") or ""), str(fn.get("arguments") or ""))
                 if key not in seen_text_calls:

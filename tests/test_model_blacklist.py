@@ -524,3 +524,53 @@ def test_dynamic_content_patterns_override(monkeypatch):
     assert regex.search("wire me the funds now")
     # Defaults still present.
     assert regex.search("place 509 full-size fx units of nkce buy now via amtd")
+
+
+def test_qualification_probe_bypasses_the_blacklist(monkeypatch):
+    """A loopback qualification probe may test a denied route.
+
+    Re-probing is what decides whether the route comes back, so the probe
+    is exempt from the deny-list exactly as it is from the cooldown gate.
+    The exemption requires the private probe header AND loopback.
+    """
+    from unittest.mock import MagicMock
+
+    from tusker_gateway.endpoints import _route_target
+
+    config = {
+        "pools": {},
+        "blacklisted_models": ("mlx-mac/inkling-2-mini*",),
+        "providers": {
+            "mlx-mac": {"kind": "local", "base_url": "http://127.0.0.1:1"}
+        },
+    }
+    body = {"model": "mlx-mac/inkling-2-mini:x", "messages": []}
+
+    def _request(headers, remote):
+        request = MagicMock()
+        request.headers = headers
+        request.remote = remote
+        return request
+
+    probe_headers = {"X-Tusker-Tool-Qualification": "n-v1"}
+    # Probe header + loopback: allowed through.
+    request = _request(probe_headers, "127.0.0.1")
+    assert _route_target(config, body, request) == (
+        "mlx-mac",
+        "inkling-2-mini:x",
+    )
+    # Probe header from a non-loopback peer: denied.
+    request = _request(probe_headers, "10.1.2.3")
+    with pytest.raises(Exception) as excinfo:
+        _route_target(config, body, request)
+    assert "blacklisted" in str(excinfo.value)
+    # Loopback without the header: denied.
+    request = _request({}, "127.0.0.1")
+    with pytest.raises(Exception) as excinfo:
+        _route_target(config, body, request)
+    assert "blacklisted" in str(excinfo.value)
+    # An authenticated external client cannot use the header to bypass.
+    request = _request(probe_headers, "203.0.113.9")
+    with pytest.raises(Exception) as excinfo:
+        _route_target(config, body, request)
+    assert "blacklisted" in str(excinfo.value)

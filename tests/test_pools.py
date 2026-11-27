@@ -2857,3 +2857,65 @@ def test_pool_filter_logs_payload_skip_event(caplog):
         assert len(records) == 1
         assert "payload_bytes=200000" in records[0].message
         assert "small-model" in records[0].message
+
+
+def test_context_safety_factor_filters_local_candidates_before_dispatch(
+    tmp_path, monkeypatch
+):
+    """A route whose widened requirement exceeds its window must be dropped.
+
+    The chars/token estimator under-counts code and JSON conversations
+    (measured 18-28% low on the MLX Mac's tokenizer, 2026-11-27). Without
+    the widening an oversized prompt is admitted onto the local route and
+    fails only after minutes of prefill, instead of failing over to a
+    long-context route immediately.
+    """
+    monkeypatch.setenv(
+        "TUSKER_CONTEXT_SAFETY_FACTOR_JSON",
+        json.dumps({"mlx-mac": 1.35}),
+    )
+    manager = PoolManager(
+        {
+            "pools": {
+                "test": PoolConfig(
+                    name="test",
+                    models=[
+                        {"provider": "mlx-mac", "model": "local-model"},
+                        {"provider": "remote", "model": "long-context"},
+                    ],
+                )
+            },
+            "providers": {
+                "mlx-mac": {"kind": "local", "zdr_ok": True},
+                "remote": {"kind": "bearer", "zdr_ok": True},
+            },
+            "quality_db_path": str(tmp_path / "quality.db"),
+            "provider_api_keys": {"mlx-mac": "k", "remote": "k"},
+        }
+    )
+    windows = {
+        ("mlx-mac", "local-model"): 262144,
+        ("remote", "long-context"): 1_048_576,
+    }
+    monkeypatch.setattr(
+        "tusker_gateway.pools.declared_context_window",
+        lambda provider, model: windows.get((provider, model)),
+    )
+    monkeypatch.setattr(
+        "tusker_gateway.pools.context_safety_factor",
+        lambda provider, model: 1.35 if provider == "mlx-mac" else 1.0,
+    )
+
+    from tusker_gateway.context_limits import required_context_tokens
+
+    # 194180 tokens of estimate: un-widened it fits the 262144 MLX window,
+    # but the 1.35 factor pushes the requirement past it, so the MLX route
+    # is rejected and the long-context remote route serves the request.
+    required = required_context_tokens(194_180)
+    assert required < 262144, "the raw estimate alone must still fit"
+    chosen = manager.select("test", context_tokens=required)
+    assert chosen == ("remote", "long-context")
+
+    # A small prompt still selects the local route.
+    chosen = manager.select("test", context_tokens=required_context_tokens(1_000))
+    assert chosen == ("mlx-mac", "local-model")

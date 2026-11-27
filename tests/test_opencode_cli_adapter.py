@@ -696,6 +696,19 @@ def test_cli_auth_diagnostics_map_to_provider_auth_error(diagnostics):
 
 
 @pytest.mark.parametrize("diagnostics", [
+    # `provider.no-route` omits "is" but still names the model deterministically.
+    b'{"type":"error","error":{"type":"provider.no-route",'
+    b'"message":"Model unavailable: opencode/seaglass-alpha-free"}}',
+    b"Upstream request failed: Model is unavailable.",
+    b"model unavailable: old-free",
+])
+def test_cli_catalog_but_unservable_model_maps_to_model_retired(diagnostics):
+    error = _cli_failure_error(diagnostics)
+    assert isinstance(error, ProviderModelRetiredError)
+    assert error.upstream_status == 410
+
+
+@pytest.mark.parametrize("diagnostics", [
     b"Error: invalid tool call arguments",
     b"model quota: 1.2M tokens/day remaining",
     b"step 14012 completed",
