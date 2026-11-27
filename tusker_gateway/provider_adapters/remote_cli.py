@@ -15,7 +15,60 @@ from typing import Any
 
 import aiohttp
 
-from tusker_gateway.errors import ProviderError, ProviderRouteDisabledError
+from tusker_gateway.errors import (
+    ProviderAuthError,
+    ProviderError,
+    ProviderModelRetiredError,
+    ProviderRouteDisabledError,
+    RateLimitError,
+)
+
+
+def _worker_error(status: int, body: str) -> Exception:
+    """Rebuild the adapter's error class from the worker's JSON error body.
+
+    The worker forwards ``code`` / ``upstream_status`` and retry metadata so
+    the gateway keeps classifying CLI failures after process isolation. A
+    generic ``worker_error`` loses the permanent-failure mark for a retired
+    model and the quota cooldown for an exhausted key, leaving dead
+    auto-discovered routes in rotation (req_6cf0e5a0d1d0bbd7).
+    """
+    message = f"worker error {status}: {body[:200]}"
+    code = "worker_error"
+    upstream_status: int | None = status
+    retry_body: str | None = None
+    headers: dict[str, str] = {}
+    try:
+        payload = json.loads(body)
+        error = payload.get("error") if isinstance(payload, dict) else None
+        if isinstance(error, dict):
+            if isinstance(error.get("code"), str) and error["code"]:
+                code = error["code"]
+            value = error.get("upstream_status")
+            if isinstance(value, int) and not isinstance(value, bool):
+                upstream_status = value
+            if isinstance(error.get("message"), str) and error["message"]:
+                message = error["message"]
+            if isinstance(error.get("body"), str):
+                retry_body = error["body"]
+            raw_headers = error.get("headers")
+            if isinstance(raw_headers, dict):
+                headers = {str(k): str(v) for k, v in raw_headers.items()}
+    except (TypeError, ValueError):
+        pass
+
+    if code == "rate_limit_exceeded":
+        return RateLimitError(
+            message, code=code, body=retry_body or body, headers=headers
+        )
+    if code == "model_retired":
+        return ProviderModelRetiredError(message, code=code)
+    if code == "provider_auth_failed":
+        return ProviderAuthError(message, code=code)
+    exc = ProviderError(message, code=code)
+    exc.upstream_status = upstream_status
+    exc.upstream_body = retry_body or body
+    return exc
 
 
 class RemoteCLIAdapter:
@@ -78,10 +131,7 @@ class RemoteCLIAdapter:
                 body = ""
             await resp.release()
             await session.close()
-            raise ProviderError(
-                f"worker error {resp.status}: {body[:200]}",
-                code="worker_error",
-            )
+            raise _worker_error(resp.status, body)
 
         if stream:
             async def _stream() -> AsyncIterator[str]:

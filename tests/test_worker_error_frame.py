@@ -11,6 +11,11 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from tusker_gateway import worker as worker_module
+from tusker_gateway.errors import (
+    ProviderModelRetiredError,
+    ProviderError,
+    RateLimitError,
+)
 
 
 @pytest.mark.asyncio
@@ -68,5 +73,101 @@ async def test_worker_stream_failure_emits_parseable_sse_frames(monkeypatch):
         assert len(frames) == 3  # partial frame, then error, then [DONE]
         assert b'"error"' in frames[-2]
         assert frames[-1] == b"data: [DONE]"
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_worker_preserves_upstream_status_and_code_for_retired_model(monkeypatch):
+    """A model rejected at inference must reach the gateway as a 410.
+
+    Otherwise the proxy labels it `worker_error` and auto-catalog never prunes
+    the dead route (2026-11-27, opencode/seaglass-alpha-free).
+    """
+    class _RetiringAdapter:
+        async def chat(self, **_kwargs):
+            raise ProviderModelRetiredError(
+                "OpenCode CLI rejected the model as deprecated or unavailable"
+            )
+
+    monkeypatch.setattr(
+        worker_module.provider_adapters, "get", lambda _name: _RetiringAdapter()
+    )
+    client = TestClient(TestServer(worker_module.create_app()))
+    await client.start_server()
+    try:
+        resp = await client.post(
+            "/worker/chat",
+            json={
+                "provider": "opencode-cli",
+                "model": "seaglass-alpha-free",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert resp.status == 410
+        body = await resp.json()
+        assert body["error"]["code"] == "model_retired"
+        assert body["error"]["upstream_status"] == 410
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_worker_forwards_rate_limit_retry_metadata(monkeypatch):
+    class _LimitedAdapter:
+        async def chat(self, **_kwargs):
+            raise RateLimitError(
+                "OpenCode CLI rate limit exceeded; retry shortly.",
+                body="Try again in 8 seconds.",
+                headers={"Retry-After": "8"},
+            )
+
+    monkeypatch.setattr(
+        worker_module.provider_adapters, "get", lambda _name: _LimitedAdapter()
+    )
+    client = TestClient(TestServer(worker_module.create_app()))
+    await client.start_server()
+    try:
+        resp = await client.post(
+            "/worker/chat",
+            json={
+                "provider": "opencode-cli",
+                "model": "big-pickle",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert resp.status == 429
+        error = (await resp.json())["error"]
+        assert error["code"] == "rate_limit_exceeded"
+        assert error["body"] == "Try again in 8 seconds."
+        assert error["headers"] == {"Retry-After": "8"}
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_worker_generic_error_stays_502(monkeypatch):
+    class _BrokenAdapter:
+        async def chat(self, **_kwargs):
+            raise ProviderError("OpenCode CLI request failed", code="opencode_cli_failed")
+
+    monkeypatch.setattr(
+        worker_module.provider_adapters, "get", lambda _name: _BrokenAdapter()
+    )
+    client = TestClient(TestServer(worker_module.create_app()))
+    await client.start_server()
+    try:
+        resp = await client.post(
+            "/worker/chat",
+            json={
+                "provider": "opencode-cli",
+                "model": "big-pickle",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert resp.status == 502
+        error = (await resp.json())["error"]
+        assert error["code"] == "opencode_cli_failed"
+        assert error["upstream_status"] is None
     finally:
         await client.close()
