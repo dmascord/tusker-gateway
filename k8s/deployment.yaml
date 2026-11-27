@@ -179,7 +179,7 @@ spec:
           # Both hardware routes use Ollama's OpenAI-compatible API on the LAN.
           # Ollama itself uses Apple MLX (Metal GPU) as its inference backend,
           # so no separate mlx_lm/mlx_vlm servers are needed on the Mac.
-          value: '{"local-llm":{"kind":"local","base_url":"http://10.0.0.39:11434","chat_path":"/v1/chat/completions","models_path":"/api/tags","embed_path":"/v1/embeddings","zdr_ok":true},"mlx-mac":{"kind":"local","base_url":"http://10.0.0.141:11434","chat_path":"/v1/chat/completions","models_path":"/api/tags","embed_path":"/v1/embeddings","zdr_ok":true},"groq":{"kind":"bearer","base_url":"https://api.groq.com/openai","chat_path":"/v1/chat/completions","zdr_ok":true},"workers-ai":{"kind":"bearer","base_url":"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai","chat_path":"/v1/chat/completions","zdr_ok":true},"alibaba":{"kind":"bearer","base_url":"https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode","chat_path":"/v1/chat/completions","zdr_ok":false},"apim":{"kind":"api_key","base_url":"https://mcoeapim.azure-api.net/foundry/openai/v1","chat_path":"/chat/completions","auth_env":"PROVIDER_APIM_API_KEY","api_key_header":"api-key","models_path":"/models","catalog_models":["gpt-5.6-luna","gpt-6-luna"],"zdr_ok":true}}'
+          value: '{"local-llm":{"kind":"local","base_url":"http://10.0.0.39:11434","chat_path":"/v1/chat/completions","models_path":"/api/tags","embed_path":"/v1/embeddings","zdr_ok":true},"mlx-mac":{"kind":"local","base_url":"http://10.0.0.141:11434","chat_path":"/v1/chat/completions","models_path":"/api/tags","embed_path":"/v1/embeddings","zdr_ok":true,"model_aliases":{"qwen3.8-27b":"qwen3.8-27b:128k"}},"groq":{"kind":"bearer","base_url":"https://api.groq.com/openai","chat_path":"/v1/chat/completions","zdr_ok":true},"workers-ai":{"kind":"bearer","base_url":"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai","chat_path":"/v1/chat/completions","zdr_ok":true},"alibaba":{"kind":"bearer","base_url":"https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode","chat_path":"/v1/chat/completions","zdr_ok":false},"apim":{"kind":"api_key","base_url":"https://mcoeapim.azure-api.net/foundry/openai/v1","chat_path":"/chat/completions","auth_env":"PROVIDER_APIM_API_KEY","api_key_header":"api-key","models_path":"/models","catalog_models":["gpt-5.6-luna","gpt-6-luna"],"zdr_ok":true}}'
         - name: TUSKER_AUTO_CATALOG_EXCLUDED_PROVIDERS
           value: nvidia
         # Do not poll provider catalogs that are intentionally unavailable or
@@ -210,7 +210,18 @@ spec:
           # upstream-retired or wrong-tier routes (2026-11-16 audit):
           # qwen3.6-plus and deepseek-v4-flash are not in the OpenCode Go
           # plan, groq's qwen3.6-27b 404s, xiaomi/mimo-v2.5 is retired.
-          value: ollama-cloud/minimax-m2.7,ollama-cloud/mistral-large-3:675b,ollama-cloud/nemotron-3-nano:30b,opencode-go/qwen3.6-plus,opencode-go/deepseek-v4-flash,groq/qwen/qwen3.6-27b,xiaomi/mimo-v2.5
+          #
+          # mlx-mac/inkling-2-mini is denied on 2026-11-27: it is
+          # auto-discovered from the Ollama catalog into the privacy pool
+          # and is held out until it is qualified there. The native NVFP4
+          # MLX build measured warm at 5.7 s for a 300-token text turn and
+          # 5.6 s for a tool turn versus 16.4 s and 18.0 s for
+          # qwen3.8-27b, so the denial is provisional, not a capability
+          # verdict. Its self-closing tool-call markup is parsed by
+          # tool_formats.parse_text_tool_calls. Lift this entry after the
+          # route passes tool, composite image+tools, and privacy ZDR
+          # qualification. See docs/gateway-model-routing.md.
+          value: ollama-cloud/minimax-m2.7,ollama-cloud/mistral-large-3:675b,ollama-cloud/nemotron-3-nano:30b,opencode-go/qwen3.6-plus,opencode-go/deepseek-v4-flash,groq/qwen/qwen3.6-27b,xiaomi/mimo-v2.5,mlx-mac/inkling-2-mini*
         - name: TUSKER_GREYLISTED_MODELS
           value: ''
         # Comma-separated provider/model globs allowed to emit direct
@@ -715,8 +726,28 @@ spec:
         # apim 128,000 fallback filtered long-context privacy requests out
         # (2026-11-22, req_4ae4a2134158c498). Keep this model-scoped: other APIM
         # models may have different windows.
+        #
+        # qwen3.8-27b is declared at 131072, not the server's 262144
+        # (2026-11-27): llama.cpp allocates the whole KV cache eagerly, so
+        # at 262144 the route holds 27.5 GB of VRAM and decodes 11.9 tok/s
+        # versus 22.2 GB and 16.6 tok/s at 131072. Measured prefill cost at
+        # large context (~55-68 tok/s at 200k tokens) makes a 200k+-token
+        # request exceed the 420 s attempt budget anyway, so admitting it
+        # only delayed the inevitable failover while monopolising the Mac.
+        # shirdel keeps 262144: its 7B weights leave headroom and its
+        # prefill is fast enough that large windows remain servable.
         - name: TUSKER_CONTEXT_WINDOW_OVERRIDES_JSON
-          value: '{"apim/gpt-5.6-luna": 1050000, "mlx-mac/ornith-1.5:35b": 262144, "mlx-mac/qwen3.8-27b": 262144, "mlx-mac/shirdel-coder-9b-claude-fable-5": 262144, "local-llm/qwopus-9b-coder-mtp": 8192}'
+          value: '{"apim/gpt-5.6-luna": 1050000, "mlx-mac/ornith-1.5:35b": 262144, "mlx-mac/qwen3.8-27b": 131072, "mlx-mac/shirdel-coder-9b-claude-fable-5": 262144, "local-llm/qwopus-9b-coder-mtp": 8192}'
+        # Prompt-token estimate widening, per provider or provider/model.
+        # The chars/token estimator divides by a flat 3.2, which measured
+        # 18% low on Inkling code and 28% low on Inkling JSON against the
+        # MLX Mac's own tokenizer (2026-11-27). On a local route an
+        # under-count is expensive: the oversized prompt is admitted, then
+        # the Mac spends minutes prefilling it (~55-68 tok/s at 200k
+        # tokens) before the request fails. 1.35 covers the observed
+        # under-count for code/JSON traffic on the local MLX backend.
+        - name: TUSKER_CONTEXT_SAFETY_FACTOR_JSON
+          value: '{"mlx-mac": 1.35}'
         # Per-provider streaming per-chunk idle budget overrides (seconds).
         # xiaomi/mimo large contexts regularly exceed the default 120s wall
         # clock — extend the per-chunk budget so streaming generation completes

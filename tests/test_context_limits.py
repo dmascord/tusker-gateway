@@ -8,6 +8,7 @@ import pytest
 
 from tusker_gateway import context_limits
 from tusker_gateway.context_limits import (
+    context_safety_factor,
     declared_context_window,
     estimate_prompt_tokens,
     fit_output_budget,
@@ -329,3 +330,36 @@ async def test_reasoning_only_stream_reason_reflects_finish_reason(finish_reason
         ):
             pass
     assert info.value.reason == expected
+
+
+def test_context_safety_factor_defaults_to_one(monkeypatch):
+    """Without configuration the admission estimate is unchanged."""
+    monkeypatch.delenv("TUSKER_CONTEXT_SAFETY_FACTOR_JSON", raising=False)
+    assert context_safety_factor("mlx-mac", "qwen3.8-27b") == 1.0
+
+
+def test_context_safety_factor_is_scoped_to_provider_and_model(monkeypatch):
+    monkeypatch.setenv(
+        "TUSKER_CONTEXT_SAFETY_FACTOR_JSON",
+        json.dumps({"mlx-mac": 1.35, "mlx-mac/qwen3.8-27b": 1.5}),
+    )
+    assert context_safety_factor("mlx-mac", "qwen3.8-27b") == 1.5
+    assert context_safety_factor("mlx-mac", "other-model") == 1.35
+    assert context_safety_factor("other-provider", "qwen3.8-27b") == 1.0
+
+
+def test_context_safety_factor_ignores_invalid_configuration(monkeypatch):
+    monkeypatch.setenv("TUSKER_CONTEXT_SAFETY_FACTOR_JSON", "not json")
+    assert context_safety_factor("mlx-mac", "qwen3.8-27b") == 1.0
+    monkeypatch.setenv("TUSKER_CONTEXT_SAFETY_FACTOR_JSON", json.dumps({"mlx-mac": 0.5}))
+    assert context_safety_factor("mlx-mac", "qwen3.8-27b") == 1.0
+
+
+def test_required_context_tokens_widens_by_the_safety_factor(monkeypatch):
+    """A measured under-count must widen the required window."""
+    base = required_context_tokens(100_000)
+    widened = required_context_tokens(100_000, safety_factor=1.35)
+    assert widened > base
+    # The safety margin applies to the prompt estimate, not to the fixed
+    # output floor and safety tokens.
+    assert widened - base == pytest.approx(35_000, abs=2)

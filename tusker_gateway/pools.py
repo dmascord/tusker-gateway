@@ -27,7 +27,7 @@ from tusker_gateway.config import (
     DEFAULT_PROVIDER_REGISTRY,
     PoolConfig,
 )
-from tusker_gateway.context_limits import declared_context_window
+from tusker_gateway.context_limits import context_safety_factor, declared_context_window
 from tusker_gateway.cooldown import CooldownTracker, global_tracker, is_permanently_failed
 from tusker_gateway.heavyweight import is_heavyweight
 from tusker_gateway.model_rankings import normalize_slug
@@ -1767,7 +1767,13 @@ class PoolManager:
                             if context_tokens > 0
                             else None
                         )
-                        if declared is not None and declared < context_tokens:
+                        sticky_required = context_tokens
+                        if context_tokens > 0:
+                            sticky_required = int(
+                                context_tokens
+                                * context_safety_factor(s.provider, s.model)
+                            )
+                        if declared is not None and declared < sticky_required:
                             # Context doesn't fit; clear stickiness
                             self._drop_stickiness(key)
                             break
@@ -1881,6 +1887,7 @@ class PoolManager:
         filtered_zdr_models: list[str] = []
         filtered_context_models: list[str] = []
         context_only_windows: list[int] = []
+        widest_required_context = 0
         filtered_payload_models: list[str] = []
         for s in specs:
             if self._model_is_blacklisted_fast(s.provider, s.model):
@@ -2014,10 +2021,26 @@ class PoolManager:
             # pool that is empty for privacy, capability, cooldown, or policy
             # reasons. The pool-wide window is only a default; route-specific
             # declarations preserve long-context candidates.
+            #
+            # The required window is widened per route
+            # (``context_safety_factor``) because the chars/token estimator
+            # under-counts code and JSON-heavy conversations (measured 18%
+            # low on Inkling code, 28% on Inkling JSON, 2026-11-27). Without
+            # the widening the gateway admits an oversized prompt onto a
+            # local route whose failure arrives only after minutes of
+            # prefill, instead of failing over to a long-context route
+            # immediately.
             window = declared_context_window(s.provider, s.model)
-            if context_tokens > 0 and window is not None and window < context_tokens:
+            required = context_tokens
+            if context_tokens > 0:
+                required = int(
+                    context_tokens * context_safety_factor(s.provider, s.model)
+                )
+            if required > 0 and window is not None and window < required:
                 filter_counts["context_window"] += 1
                 context_only_windows.append(window)
+                if required > widest_required_context:
+                    widest_required_context = required
                 if len(filtered_context_models) < 12:
                     filtered_context_models.append(f"{s.provider}/{s.model}:{window}")
                 continue
@@ -2123,7 +2146,12 @@ class PoolManager:
 
         if not candidates:
             if context_failure is not None and context_only_windows:
-                context_failure["required_context_tokens"] = int(context_tokens)
+                # Report the widened requirement the routes actually
+                # rejected against, so the client's compaction advice names
+                # the size that genuinely did not fit.
+                context_failure["required_context_tokens"] = max(
+                    int(context_tokens), widest_required_context
+                )
                 context_failure["max_context_window"] = max(context_only_windows)
             filters = ",".join(
                 f"{name}={count}"

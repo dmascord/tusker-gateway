@@ -45,6 +45,7 @@ from tusker_gateway.provider_usage import (
 from tusker_gateway.quality import QualityDB
 from tusker_gateway.sse import split_sse_frame, sse_data_payload
 from tusker_gateway.gemini_thought import default_cache as _gemini_cache
+from tusker_gateway.tool_formats import tool_names
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +110,44 @@ def _normalize_reasoning_effort(value: Any, provider: str | None = None) -> Any:
     if key == "xhigh" and (provider or "").strip().lower() not in _XHIGH_CAPABLE_PROVIDERS:
         return "high"
     return _OPENCODE_REASONING_EFFORT_ALIASES.get(key, value)
+
+
+# Providers whose chat template only accepts the classic roles. Ollama's
+# Go templates raise ``System message must be at the beginning of the
+# conversation`` (or an outright template exception) for ``developer``,
+# so the role is folded into ``system`` before dispatch. Measured
+# 2026-11-27: a developer-role turn returned HTTP 500 from mlx-mac while
+# the same content as ``system`` returned 200.
+_SYSTEM_ONLY_ROLE_PROVIDERS = frozenset(
+    {
+        "mlx-mac",
+        "local-llm",
+    }
+)
+
+
+def _fold_developer_role(messages: Any, provider: str | None) -> Any:
+    """Rewrite ``developer`` messages to ``system`` for providers that reject it.
+
+    OpenAI introduced ``developer`` as the replacement for ``system``;
+    many OpenAI-compatible backends (notably Ollama's Go chat templates)
+    still accept only ``system``. Folding keeps the instruction rather
+    than dropping it.
+    """
+    if (provider or "").strip().lower() not in _SYSTEM_ONLY_ROLE_PROVIDERS:
+        return messages
+    if not isinstance(messages, list):
+        return messages
+    folded: list[Any] = []
+    for message in messages:
+        if (
+            isinstance(message, dict)
+            and str(message.get("role", "")).strip().lower() == "developer"
+        ):
+            folded.append({**message, "role": "system"})
+        else:
+            folded.append(message)
+    return folded
 
 
 # Providers whose reasoning-model deployments reject the legacy
@@ -2780,6 +2819,7 @@ class PassthroughClient:
                 result = normalize_response_tool_calls(
                     result,
                     source=f"{provider}/{model}",
+                    allowed_tool_names=tool_names(tools),
                 )
                 if provider.lower() == "google":
                     # The normalized object still carries provider extensions;
@@ -3009,7 +3049,7 @@ class PassthroughClient:
             headers[_OPENCODE_SESSION_HEADER] = session_id
         body: dict[str, Any] = {
             "model": model,
-            "messages": messages,
+            "messages": _fold_developer_role(messages, provider),
             "stream": stream,
         }
         if tools:

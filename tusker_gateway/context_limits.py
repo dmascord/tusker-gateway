@@ -571,9 +571,64 @@ def estimate_prompt_tokens(
     )
 
 
-def required_context_tokens(prompt_estimate: int) -> int:
-    """Window size a candidate needs to answer a prompt of *prompt_estimate*."""
-    return prompt_estimate + min_output_tokens() + _DEFAULT_SAFETY_TOKENS
+def required_context_tokens(
+    prompt_estimate: int,
+    *,
+    safety_factor: float = 1.0,
+) -> int:
+    """Window size a candidate needs to answer a prompt of *prompt_estimate*.
+
+    ``safety_factor`` widens the estimate to cover the error in
+    ``estimate_prompt_tokens``. That estimator divides characters by a flat
+    3.2, which under-counts code and JSON-heavy conversations badly enough
+    to matter: measured against the MLX Mac's own tokenizer on 2026-11-27,
+    Inkling code was 2.63 chars/token and Inkling JSON 2.31, so the
+    estimate ran 18% and 28% low respectively. Admitting such a request
+    against the raw estimate sends the upstream a prompt larger than its
+    window, and on the MLX Mac the failure arrives after minutes of
+    prefill (~55-68 tok/s at 200k tokens).
+    """
+    widened = prompt_estimate * max(1.0, float(safety_factor))
+    return int(widened) + min_output_tokens() + _DEFAULT_SAFETY_TOKENS
+
+
+def _context_safety_factors() -> dict[str, float]:
+    """Parse ``TUSKER_CONTEXT_SAFETY_FACTOR_JSON`` (read per call for hot reload).
+
+    Keys are ``provider`` or ``provider/model``; values widen the prompt
+    estimate for that route. Operator-tunable so a measured estimate error
+    can be corrected without a code change.
+    """
+    raw = os.environ.get("TUSKER_CONTEXT_SAFETY_FACTOR_JSON", "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        logger.warning("ignoring TUSKER_CONTEXT_SAFETY_FACTOR_JSON: invalid JSON")
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    parsed: dict[str, float] = {}
+    for key, value in data.items():
+        try:
+            factor = float(value)
+        except (TypeError, ValueError):
+            continue
+        if factor > 1.0:
+            parsed[_route_key(str(key))] = factor
+    return parsed
+
+
+def context_safety_factor(provider: str, model: str) -> float:
+    """Return the admission widening applied to this route's prompt estimate."""
+    factors = _context_safety_factors()
+    if not factors:
+        return 1.0
+    exact = factors.get(_route_key(f"{provider}/{model}"))
+    if exact is not None:
+        return exact
+    return factors.get(_route_key(provider), 1.0)
 
 
 @dataclass(frozen=True)

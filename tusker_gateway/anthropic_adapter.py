@@ -71,7 +71,7 @@ from tusker_gateway.rate_limit import RateLimiter
 from tusker_gateway.routing import resolve_route
 from tusker_gateway.sse import sse_comment, sse_heartbeat_loop
 from tusker_gateway.storage import StorageUnavailableError
-from tusker_gateway.tool_formats import normalize_response_tool_calls
+from tusker_gateway.tool_formats import normalize_response_tool_calls, tool_names
 from tusker_gateway.tracing import Tracer
 
 logger = logging.getLogger(__name__)
@@ -453,6 +453,7 @@ async def _call_with_pool_fallback_anthropic(
                     result = normalize_response_tool_calls(
                         result,
                         source=f"{prov}/{mdl}",
+                        allowed_tool_names=tool_names(tools),
                     )
                 result = await _prepare_stream_result(
                     result,
@@ -502,6 +503,7 @@ async def _call_with_pool_fallback_anthropic(
                                 request.app.get("redaction_tokenizer")
                                 if request is not None else None
                             ),
+                            allowed_tool_names=tool_names(tools),
                         )
                     )
                     result = _AnthropicSSEStreamAdapter(
@@ -557,6 +559,7 @@ async def _call_with_pool_fallback_anthropic(
                 result = normalize_response_tool_calls(
                     result,
                     source=f"{route.provider}/{route.model}",
+                    allowed_tool_names=tool_names(tools),
                 )
             result = await _prepare_stream_result(
                 result,
@@ -594,6 +597,7 @@ async def _call_with_pool_fallback_anthropic(
                             request.app.get("redaction_tokenizer")
                             if request is not None else None
                         ),
+                        allowed_tool_names=tool_names(tools),
                     )
                 )
                 result = _AnthropicSSEStreamAdapter(

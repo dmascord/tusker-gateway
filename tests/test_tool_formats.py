@@ -312,3 +312,80 @@ def test_parse_text_tool_calls_returns_list_never_none():
     for text in ["", "plain text", "<tool_call></tool_call>", "no tool call here"]:
         result = parse_text_tool_calls(text)
         assert isinstance(result, list), f"got {type(result).__name__} for {text!r}"
+
+
+def test_self_closing_tool_call_is_parsed_for_requested_tools():
+    """Inkling 2 Mini emits tool calls as a self-closing named tag.
+
+    Measured 2026-11-27 against the MLX Mac: the model answered a
+    required-tool request with '<tusker_capability_probe path="/v1/canary/probe" />'
+    in assistant content, so the call never reached the client as a
+    structured tool call.
+    """
+    calls = parse_text_tool_calls(
+        '<tusker_capability_probe path="/v1/canary/probe" />',
+        allowed_tool_names=["tusker_capability_probe"],
+    )
+    assert len(calls) == 1
+    assert calls[0]["function"]["name"] == "tusker_capability_probe"
+    assert json.loads(calls[0]["function"]["arguments"]) == {
+        "path": "/v1/canary/probe"
+    }
+
+
+def test_self_closing_tool_call_ignores_unrequested_tags():
+    """The self-closing shape is indistinguishable from ordinary HTML.
+
+    Without a scope, '<body class="x">' would be read as a tool call, so
+    the form is only accepted for tools the request actually asked for.
+    """
+    assert parse_text_tool_calls('<body class="x">') == []
+    assert parse_text_tool_calls(
+        '<body class="x">',
+        allowed_tool_names=["tusker_capability_probe"],
+    ) == []
+    assert parse_text_tool_calls(
+        '<body class="x">',
+        allowed_tool_names=["body"],
+    ) != []
+
+
+def test_self_closing_tool_call_multiple_attributes():
+    calls = parse_text_tool_calls(
+        "<probe path='/x' mode='fast' />",
+        allowed_tool_names=["probe"],
+    )
+    assert len(calls) == 1
+    assert json.loads(calls[0]["function"]["arguments"]) == {
+        "path": "/x",
+        "mode": "fast",
+    }
+
+
+def test_normalize_response_tool_calls_scoped_to_requested_tools():
+    """A response's self-closing markup is only promoted for asked-for tools."""
+    response = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": '<read path="/etc/hosts" />',
+                },
+                "finish_reason": "stop",
+            }
+        ]
+    }
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": "read", "parameters": {"type": "object"}},
+        }
+    ]
+    normalized = normalize_response_tool_calls(
+        response,
+        allowed_tool_names=[t["function"]["name"] for t in tools],
+    )
+    calls = normalized["choices"][0]["message"]["tool_calls"]
+    assert len(calls) == 1
+    assert calls[0]["function"]["name"] == "read"
+    assert json.loads(calls[0]["function"]["arguments"]) == {"path": "/etc/hosts"}

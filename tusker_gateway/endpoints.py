@@ -11,7 +11,7 @@ import re
 import secrets
 import time
 import uuid
-from typing import Any, AsyncIterator, Iterator
+from typing import Any, AsyncIterator, Collection, Iterator
 
 from aiohttp import ClientError, ClientPayloadError, web
 from aiohttp.http_exceptions import TransferEncodingError
@@ -120,7 +120,9 @@ from tusker_gateway.sse import (
 )
 from tusker_gateway.tracing import Tracer
 from tusker_gateway.tool_formats import (
+    self_closing_tool_call_re,
     tool_diagnostics_enabled,
+    tool_names,
     validate_request_tool_arguments,
 )
 
@@ -396,7 +398,7 @@ class _ToolCallStripper:
     _MAX_PENDING_CHARS = 64 * 1024
     _MAX_PENDING_SECONDS = 30.0
 
-    def __init__(self) -> None:
+    def __init__(self, allowed_tool_names: Collection[str] | None = None) -> None:
         self._carry = ""
         # When an unclosed bare <function=...> block is observed we buffer it
         # here until </function> arrives (or flush() drops it). Buffering
@@ -412,6 +414,12 @@ class _ToolCallStripper:
         # ``(block, had_params)`` so the caller can decide whether each
         # block is well-formed.
         self._pending_blocks: list[tuple[str, bool]] = []
+        # Inkling 2 Mini emits tool calls as a self-closing tag whose name is
+        # the tool name and whose attributes are the arguments
+        # (measured 2026-11-27: '<tusker_capability_probe path="..." />').
+        # The shape is only a tool call when the tag names a requested tool,
+        # so the pattern is scoped to the request's tool names.
+        self._self_closing_tool_re = self_closing_tool_call_re(allowed_tool_names)
 
     def _guard_pending(self, block: str) -> str:
         if self._pending_started_at is None:
@@ -576,6 +584,18 @@ class _ToolCallStripper:
                 # shape when the block is promoted.
                 self._stash_block(block, True)
             text = text[m.end() :]
+
+        # Inkling-style self-closing tool calls: <tool_name arg="value" />.
+        # The pattern is already scoped to the requested tool names, so an
+        # ordinary HTML tag in the assistant prose is left untouched.
+        if self._self_closing_tool_re is not None:
+            while True:
+                m = self._self_closing_tool_re.search(text)
+                if not m:
+                    break
+                out.append(text[: m.start()])
+                self._stash_block(m.group(0), True)
+                text = text[m.end() :]
 
         # Strip orphan closing tags (`</parameter>`, `</function>`, etc.) that
         # arrive with no matching opener observed by the stripper. Models
@@ -1181,6 +1201,7 @@ async def _normalize_stream(
     require_tool_call: bool = False,
     detect_repeated_reasoning: bool = False,
     restorer: Any | None = None,
+    allowed_tool_names: Collection[str] | None = None,
 ) -> AsyncIterator[bytes]:
     """Sanitize and normalize a provider's OpenAI-compatible SSE stream.
 
@@ -1224,7 +1245,7 @@ async def _normalize_stream(
         "content_chars": 0,
         "tool_call_deltas": 0,
     }
-    tool_stripper = _ToolCallStripper()
+    tool_stripper = _ToolCallStripper(allowed_tool_names)
     # Per-tool-call argument restorer: streamed arguments may be tokenized
     # upstream and split across many deltas. OpenAI clients concatenate the
     # `arguments` fragments they receive, so each fragment is replaced with
@@ -1724,6 +1745,16 @@ async def _normalize_stream(
             raw_marker_types = tuple(
                 sorted({marker for _, value in raw_texts for marker in tool_markup_kinds(value)})
             )
+            # Inkling-style self-closing tool calls are only markup when the
+            # tag names a requested tool; the pattern is scoped accordingly.
+            if tool_stripper._self_closing_tool_re is not None:
+                if any(
+                    tool_stripper._self_closing_tool_re.search(value)
+                    for _, value in raw_texts
+                ):
+                    raw_marker_types = tuple(
+                        sorted(set(raw_marker_types) | {"self_closing_tool_call"})
+                    )
             if raw_marker_types:
                 saw_tool_markup = True
                 tool_markup_seen.update(raw_marker_types)
@@ -1805,7 +1836,10 @@ async def _normalize_stream(
             if not has_tools:
                 for _, raw_text in raw_texts:
                     direct_text_calls = (
-                        parse_text_tool_calls(raw_text)
+                        parse_text_tool_calls(
+                            raw_text,
+                            allowed_tool_names=allowed_tool_names,
+                        )
                         if re.search(
                             r"\bTOOL_CALL\s*:\s*[\w.-]+\s*\(",
                             raw_text,
@@ -1820,7 +1854,10 @@ async def _normalize_stream(
 
             for block, eligible in tool_stripper.drain_pending_blocks():
                 if eligible:
-                    parsed = parse_text_tool_calls(block)
+                    parsed = parse_text_tool_calls(
+                        block,
+                        allowed_tool_names=allowed_tool_names,
+                    )
                     text_calls_detected += len(parsed)
                     if parsed:
                         if not has_tools:
@@ -3545,6 +3582,7 @@ async def _prepare_stream_result(
         normalized = normalize_response_tool_calls(
             result,
             source=f"{provider}/{model}",
+            allowed_tool_names=tool_names(tools),
         )
         return _validate_complete_tool_response(
             normalized,
@@ -3577,6 +3615,7 @@ async def _prepare_stream_result(
         require_tool_call=require_tool_call,
         detect_repeated_reasoning=True,
         restorer=redaction_tokenizer,
+        allowed_tool_names=tool_names(tools),
     )
 
     async def _first_frame(
@@ -8006,6 +8045,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                 result = normalize_response_tool_calls(
                     result,
                     source=f"{provider}/{target_model}",
+                    allowed_tool_names=tool_names(tools),
                 )
 
             # Gateway-routed responses echo the alias; passthrough keeps upstream id.
@@ -8137,6 +8177,7 @@ async def chat_completions_handler(request: web.Request) -> web.Response | web.S
                                             body.get("tool_choice")
                                         ),
                                         restorer=request.app.get("redaction_tokenizer"),
+                                        allowed_tool_names=tool_names(tools),
                                     )
                                 )
                                 if response_alias is not None and response_alias != target_model:
@@ -8939,6 +8980,7 @@ async def _responses_handler_impl(request: web.Request) -> web.Response | web.St
                 result = normalize_response_tool_calls(
                     result,
                     source=f"responses/{body.get('model') or config['model_name']}",
+                    allowed_tool_names=tool_names(chat_body.get("tools")),
                 )
                 response_stream = _responses_stream_from_chat(
                     None,
@@ -8992,6 +9034,7 @@ async def _responses_handler_impl(request: web.Request) -> web.Response | web.St
             result = normalize_response_tool_calls(
                 result,
                 source=f"responses/{body.get('model') or config['model_name']}",
+                allowed_tool_names=tool_names(chat_body.get("tools")),
             )
             if (
                 cache is not None
