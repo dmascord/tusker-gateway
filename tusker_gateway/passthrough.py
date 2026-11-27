@@ -133,23 +133,41 @@ def _fold_developer_role(messages: Any, provider: str | None) -> Any:
     many OpenAI-compatible backends (notably Ollama's Go chat templates)
     still accept only ``system``. Folding keeps the instruction rather
     than dropping it.
+
+    Ollama's Go chat template also requires exactly one ``system`` message
+    at position 0: ``[user, developer]`` folds to ``[user, system]`` and
+    dies with ``System message must be at the beginning``, and
+    ``[system, system, user]`` is rejected too. Fold developer to system,
+    merge all system content into a single leading ``system`` message (the
+    first system/developer message's extra fields are retained), and keep
+    every non-system message in place.
     """
     if (provider or "").strip().lower() not in _SYSTEM_ONLY_ROLE_PROVIDERS:
         return messages
     if not isinstance(messages, list):
         return messages
-    folded: list[Any] = []
+    system_parts: list[str] = []
+    rest: list[Any] = []
+    first_system: dict[str, Any] | None = None
     for message in messages:
-        if (
-            isinstance(message, dict)
-            and str(message.get("role", "")).strip().lower() == "developer"
-        ):
-            folded.append({**message, "role": "system"})
+        if not isinstance(message, dict):
+            rest.append(message)
+            continue
+        role = str(message.get("role", "")).strip().lower()
+        if role in {"developer", "system"}:
+            system_parts.append(str(message.get("content", "")))
+            if first_system is None:
+                first_system = message
         else:
-            folded.append(message)
-    return folded
-
-
+            rest.append(message)
+    if not system_parts:
+        return messages
+    merged: dict[str, Any] = {"role": "system", "content": "\n".join(system_parts)}
+    if first_system is not None:
+        for key, value in first_system.items():
+            if key not in {"role", "content"}:
+                merged[key] = value
+    return [merged] + rest
 # Providers whose reasoning-model deployments reject the legacy
 # ``max_tokens`` chat-completions parameter and require the modern
 # ``max_completion_tokens`` name (Azure APIM / Azure OpenAI gpt-5.x).
