@@ -245,6 +245,11 @@ def test_syn_small_vision_is_not_heavyweight_slug():
     assert is_heavyweight_slug("syn:small:vision") is False
 
 
+def test_inkling_2_mini_full_id_is_not_heavyweight_slug():
+    """The pinned Synthetic full ID is the same small model — no heavy gate."""
+    assert is_heavyweight_slug("hf:thinkingmachines/Inkling-2-Mini") is False
+
+
 def test_tagged_variant_inherits_base_slug_classification():
     """Dated/tagged builds of a heavy model are heavy (deepseek-v4-pro:0813
     burned Ollama Cloud "extra high usage" quota through the cheap gate)."""
