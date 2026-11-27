@@ -171,8 +171,29 @@ exactly this reason; the behavioral probe now does too, tunable with
 
 - The MLX Mac serves three large models; weights alone total ~45 GB of
   48 GB. Loading several at once exhausts memory and swaps (observed
-  2 GB of swap on 2026-11-27). Keep at most two resident.
+  2.5 GB of swap on 2026-11-27).
 - `ollama list` on the Mac currently holds `inkling-2-mini:26b-a5b-nvfp4`,
-  `inkling-2-mini:mlx32k`, `qwen3.8-27b:128k` and the pre-existing tags.
+  `qwen3.8-27b:128k` and the pre-existing tags.
 - The Mac's Ollama was upgraded from 0.30.11 to 0.40.18 to run the Inkling
   model; the previous binary is at `/tmp/ollama-0.30.11.bak` on the Mac.
+
+### Ollama residency settings (2026-11-27)
+
+`/Library/LaunchDaemons/dev.tusker.ollama.plist` now sets three knobs so
+the daemon stops holding two large models at once:
+
+| Setting | Before | After | Reason |
+|---|---|---|---|
+| `OLLAMA_MAX_LOADED_MODELS` | `0` (unlimited) | `1` | Two large models co-resided (35.2 GB observed) and the Mac swapped (2.5 GB). One resident model means a second request replaces the first instead of co-residing. |
+| `OLLAMA_KEEP_ALIVE` | `5m` | `30m` | The model is evicted 5 minutes after the last request, so ordinary gaps between turns paid a full reload. |
+| `OLLAMA_NUM_PARALLEL` | `0` (auto) | `1` | The Mac serializes inference regardless: four concurrent requests produced a latency staircase (4.28 / 8.65 / 12.92 / 17.50 s), so parallel buffers would only add memory pressure. |
+
+Measured after the change: one model resident at 22.3 GB, switching
+models costs a 4.5 s reload rather than a swap, and warm latency is
+unchanged (Inkling 4.44 s, `qwen3.8-27b:128k` 14.16 s, shirdel 5.27 s).
+The gateway's admission limits are unchanged.
+
+The plist is backed up at
+`/Library/LaunchDaemons/dev.tusker.ollama.plist.bak-20261127`. Note that
+`launchctl bootout` + `bootstrap` failed on this host (I/O error); the
+service reloads with `sudo launchctl load -w`.
