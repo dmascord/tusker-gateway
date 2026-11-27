@@ -131,9 +131,41 @@ MLX runtime and rejects the model with `this model requires MLX support,
 but the MLX runtime is not available`. The GitHub release tarball
 (188 MB, versus the 22.8 MB bottle) carries the Metal kernels.
 
-Inkling stays on the deny-list until it is qualified in the privacy pool
-(tool contract, composite image+tools, privacy ZDR). See
+Inkling was denied on the operator deny-list while it was unqualified,
+and the entry was lifted the same day once it passed all three privacy
+gates: behavioral tool contract (`stream-tool-contract-v1`, level 4, one
+tool call, arguments valid and matching), composite image+tools
+(`image-tool-contract-v3`) and privacy ZDR (`privacy-zdr-v1`). It serves
+the privacy pool as a curated static route. See
 `docs/gateway-model-routing.md` for the deny-list policy.
+
+## 6. Two probe defects the qualification surfaced
+
+Qualifying Inkling exposed two defects in the gateway's own probe, both of
+which had produced false negatives for reasoning models.
+
+**The direct-route deny-list had no probe exemption.** A route on
+`TUSKER_BLACKLISTED_MODELS` could never be re-probed: the runner that
+decides whether the route should come back could not reach it. The
+cooldown gate already exempts these probes; the blacklist now does too,
+under the same rule (private probe header AND loopback remote, so an
+authenticated external client cannot use it to reach a denied route).
+
+**The probe's wording stalled Inkling's reasoning.** The user message
+ended with "Do not call any other function." Against Inkling 2 Mini that
+phrase deterministically sent the model into a reasoning loop: 66,730
+reasoning characters, `finish_reason: length`, zero tool calls at every
+token budget tested (192 through 16,384), 10/10 failures. The identical
+request without the suffix produced a clean `tool_calls` finish. The
+phrase added no contract — `tool_choice: "required"` already forbids
+extra calls — and it was the only difference between a passing and a
+failing request.
+
+Separately, the probe's 192-token output budget was too small for a
+reasoning model, which spends its budget on the preamble before emitting
+the call. The composite image+tools probe already defaulted to 16,384 for
+exactly this reason; the behavioral probe now does too, tunable with
+`TUSKER_TOOL_QUALIFICATION_MAX_TOKENS`.
 
 ## Operational notes
 
