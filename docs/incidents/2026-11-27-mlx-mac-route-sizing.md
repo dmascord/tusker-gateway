@@ -59,11 +59,16 @@ provider except `openai-codex` and `opencode-go`, per
 the gateway accepts the role but forwarded it verbatim, so Ollama's Go
 chat template raised an exception and the turn failed.
 
-**Fix.** `_fold_developer_role` in `tusker_gateway/passthrough.py` rewrites
+**Fix.** `_fold_developer_role` in `tusker_gateway/passthrough.py` folds
 `developer` messages to `system` for the providers whose templates reject
-it (`mlx-mac`, `local-llm`). The instruction is kept rather than dropped.
-Empty messages were already rejected at the gateway with a clean 400, so
-the upstream 400 was only reachable through a direct-route path.
+it (`mlx-mac`, `local-llm`), then merges all system messages into exactly
+one leading ``system`` message at position 0. Ollama's Go chat template
+rejects any ``system`` message that is not first — and rejects multiple
+leading systems too — so ``[user, developer]`` becomes ``[system, user]``
+and ``[system, system, user]`` becomes ``[system, user]``. The instruction
+is kept rather than dropped. Empty messages were already rejected at the
+gateway with a clean 400, so the upstream 400 was only reachable through a
+direct-route path.
 
 ## 3. Context windows: declared larger than the machine could serve
 
@@ -184,14 +189,31 @@ the daemon stops holding two large models at once:
 
 | Setting | Before | After | Reason |
 |---|---|---|---|
-| `OLLAMA_MAX_LOADED_MODELS` | `0` (unlimited) | `1` | Two large models co-resided (35.2 GB observed) and the Mac swapped (2.5 GB). One resident model means a second request replaces the first instead of co-residing. |
-| `OLLAMA_KEEP_ALIVE` | `5m` | `30m` | The model is evicted 5 minutes after the last request, so ordinary gaps between turns paid a full reload. |
+| `OLLAMA_MAX_LOADED_MODELS` | `0` (unlimited) | `1` | Two large models co-resided (35.2 GB observed). One resident model means a second request replaces the first instead of co-residing. |
+| `OLLAMA_KEEP_ALIVE` | `5m` | `30m` | A shorter window evicts the model sooner after the last request. Whether this avoids a reload on a real inter-turn gap was not measured; see the limits below. |
 | `OLLAMA_NUM_PARALLEL` | `0` (auto) | `1` | The Mac serializes inference regardless: four concurrent requests produced a latency staircase (4.28 / 8.65 / 12.92 / 17.50 s), so parallel buffers would only add memory pressure. |
 
-Measured after the change: one model resident at 22.3 GB, switching
-models costs a 4.5 s reload rather than a swap, and warm latency is
-unchanged (Inkling 4.44 s, `qwen3.8-27b:128k` 14.16 s, shirdel 5.27 s).
-The gateway's admission limits are unchanged.
+Measured after the change: one model resident at 22.3 GB (was 35.2 GB
+with Inkling and shirdel co-resident), switching models costs a 4.5 s
+reload, and warm latency is unchanged (Inkling 4.44 s,
+`qwen3.8-27b:128k` 14.16 s, shirdel 5.27 s). The gateway's admission
+limits are unchanged.
+
+### What this change does not establish
+
+- **Swap usage did not fall.** The Mac reported 2.5 GB of swap used
+  before the change and 2.5 GB after it. macOS does not reclaim swap
+  eagerly, so the figure does not show whether the Mac is still under
+  memory pressure; only a reboot and a fresh observation would separate
+  stale swap pages from active pressure.
+- **The keep-alive benefit is unmeasured.** The measurements above warm
+  each model before timing it, so they do not cross the eviction window.
+  Whether a 30-minute keep-alive avoids a reload on a real gap between
+  turns is not established by the data above.
+- **Sustained pressure was not tested.** One resident model fits; a
+  workload that keeps two large models hot would still be served one at
+  a time, with the other evicted on every switch (measured: a 4.5 s
+  reload). That switch cost is the real constraint, and it is unchanged.
 
 The plist is backed up at
 `/Library/LaunchDaemons/dev.tusker.ollama.plist.bak-20261127`. Note that
