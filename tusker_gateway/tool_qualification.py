@@ -104,6 +104,26 @@ def _composite_probe_max_tokens() -> int:
         return 16384
     return max(1024, value)
 
+
+def _behavioral_probe_max_tokens() -> int:
+    """Output budget for one behavioral tool-contract probe.
+
+    Inkling 2 Mini reasons before it emits the call. At the historical
+    192-token cap it spent the whole budget on ``reasoning`` and finished
+    with ``length`` and zero tool calls, so the probe recorded a false
+    ``unavailable`` for a route that satisfies the contract at a larger
+    budget (measured 2026-11-27: 0 calls at 192, a clean
+    ``finish_reason: tool_calls`` once the budget covers the reasoning
+    preamble). The same reasoning-model false negative is why
+    ``_composite_probe_max_tokens`` already defaults high.
+    """
+    try:
+        value = int(float(os.environ.get("TUSKER_TOOL_QUALIFICATION_MAX_TOKENS", "16384")))
+    except (TypeError, ValueError):
+        return 16384
+    return max(1024, value)
+
+
 PROBE_TOOL: dict[str, Any] = {
     "type": "function",
     "function": {
@@ -660,7 +680,7 @@ async def probe_model(
         "tool_choice": "required",
         "stream": True,
         "temperature": 0,
-        "max_tokens": 192,
+        "max_tokens": _behavioral_probe_max_tokens(),
     }
     # APIM's gpt-6-luna only accepts function tools when reasoning_effort is
     # none. Send a non-none value so the gateway's compatibility adapter is

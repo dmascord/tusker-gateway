@@ -1384,3 +1384,16 @@ def test_composite_probe_retries_stale_routes_fairly_across_providers(
         "github-copilot-enterprise",
         "ollama-cloud",
     }
+
+
+def test_behavioral_probe_budget_covers_reasoning_preamble():
+    """The behavioral probe must not cap out on a reasoning model's preamble.
+
+    Inkling 2 Mini reasons before emitting its tool call. At the historical
+    192-token cap it spent the whole budget on reasoning and finished with
+    ``length``, so the probe recorded a false ``unavailable`` for a route
+    that satisfies the contract at a larger budget.
+    """
+    from tusker_gateway.tool_qualification import _behavioral_probe_max_tokens
+
+    assert _behavioral_probe_max_tokens() >= 8192
