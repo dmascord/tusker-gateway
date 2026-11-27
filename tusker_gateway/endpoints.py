@@ -120,6 +120,7 @@ from tusker_gateway.sse import (
 )
 from tusker_gateway.tracing import Tracer
 from tusker_gateway.tool_formats import (
+    sanitize_poisoned_tool_history,
     self_closing_tool_call_re,
     tool_diagnostics_enabled,
     tool_names,
@@ -7398,6 +7399,17 @@ def _validate_chat_body(body: Any) -> dict[str, Any]:
     messages = body["messages"]
     if not isinstance(messages, list) or not messages:
         raise BadRequestError("messages must be a non-empty array", code="invalid_messages")
+    sanitized, dropped = sanitize_poisoned_tool_history(messages)
+    if dropped:
+        body["messages"] = sanitized
+        messages = sanitized
+        logger.info(
+            "sanitized poisoned tool-call history messages=%d dropped=%d",
+            len(messages),
+            dropped,
+        )
+        if not messages:
+            raise BadRequestError("messages must be a non-empty array", code="invalid_messages")
     for index, message in enumerate(messages):
         if not isinstance(message, dict) or message.get("role") not in {
             "system",
