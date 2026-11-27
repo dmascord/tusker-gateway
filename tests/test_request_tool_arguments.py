@@ -7,6 +7,8 @@ req_9bddd80866c784c1, req_7e1be45c37b89344).
 """
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from tusker_gateway.endpoints import _validate_chat_body
@@ -94,6 +96,80 @@ def test_does_not_inspect_provider_output_validation_path():
         provider="kilo",
         model="test",
         request_id="req_test",
+    )
+
+
+def _poisoned_call(call_id="call_broken"):
+    return {
+        "id": call_id,
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "arguments": {
+                "__parseError": "Unexpected token at position 0",
+                "__rawJson": 'command":"echo hi"}',
+            },
+        },
+    }
+
+
+def test_drops_poisoned_tool_calls_and_their_results():
+    """A resumed session's failed tool pairs must not reach the model.
+
+    OpenCode replays tool calls whose arguments are an ``__parseError``/
+    ``__rawJson`` object; the model copies that shape and loops on invalid
+    arguments (2026-11-27, sessions 01a219d1 / 01a21c0c).
+    """
+    good = _call('{"path": "/tmp/a"}')
+    body = {
+        "model": "hermes-code",
+        "messages": [
+            {"role": "user", "content": "resume"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [_poisoned_call(), {**good, "id": "call_good"}],
+            },
+            {"role": "tool", "tool_call_id": "call_broken", "content": "Tool  not found"},
+            {"role": "tool", "tool_call_id": "call_good", "content": "ok"},
+        ],
+    }
+    result = _validate_chat_body(body)
+    messages = result["messages"]
+    assert [m.get("role") for m in messages] == ["user", "assistant", "tool"]
+    assert [c["id"] for c in messages[1]["tool_calls"]] == ["call_good"]
+    assert messages[2]["tool_call_id"] == "call_good"
+    assert "__parseError" not in str(messages)
+
+
+def test_drops_whole_assistant_turn_when_every_call_is_poisoned():
+    body = {
+        "model": "hermes-code",
+        "messages": [
+            {"role": "user", "content": "resume"},
+            {"role": "assistant", "content": None, "tool_calls": [_poisoned_call()]},
+            {"role": "tool", "tool_call_id": "call_broken", "content": "Tool  not found"},
+        ],
+    }
+    messages = _validate_chat_body(body)["messages"]
+    assert [m.get("role") for m in messages] == ["user"]
+
+
+def test_drops_poisoned_arguments_serialized_as_a_string():
+    poisoned = _poisoned_call()
+    poisoned["function"]["arguments"] = json.dumps(poisoned["function"]["arguments"])
+    body = _body([poisoned])
+    messages = _validate_chat_body(body)["messages"]
+    assert [m.get("role") for m in messages] == ["user"]
+
+
+def test_keeps_a_tool_with_a_genuine_parseerror_argument_name():
+    """Only the pair of OpenCode failure markers identifies a poisoned call."""
+    call = _call('{"__parseError": "user supplied value"}')
+    body = _body([call])
+    messages = _validate_chat_body(body)["messages"]
+    assert messages[1]["tool_calls"][0]["function"]["arguments"] == (
+        '{"__parseError": "user supplied value"}'
     )
 
 

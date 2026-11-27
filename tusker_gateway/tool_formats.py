@@ -194,6 +194,105 @@ def validate_request_tool_arguments(messages: Any) -> None:
             )
 
 
+def sanitize_poisoned_tool_history(messages: Any) -> tuple[list[Any], int]:
+    """Drop failed tool-call pairs from client-supplied conversation history.
+
+    OpenCode records a tool call whose argument JSON could not be parsed as an
+    object carrying ``__parseError``/``__rawJson``. When a long session is
+    resumed those objects are replayed to the model, which copies the error
+    envelope instead of emitting usable arguments; the session then loops on
+    ``Tool call arguments are not valid JSON`` even when the provider stream
+    itself is healthy (observed 2026-11-27). A failed call and its tool result
+    contain no completed work, so both are removed before dispatch.
+
+    Only calls carrying *both* marker keys are dropped: a tool with a genuine
+    argument named ``__parseError`` is left untouched. Returns the (possibly
+    new) message list and the number of removed records for logging.
+    """
+    if not isinstance(messages, list):
+        return [], 0
+
+    def poisoned_call(call: Any) -> bool:
+        if not isinstance(call, dict):
+            return False
+        function = call.get("function")
+        function = function if isinstance(function, dict) else call
+        arguments = function.get("arguments")
+        if isinstance(arguments, dict):
+            return "__parseError" in arguments and "__rawJson" in arguments
+        if isinstance(arguments, str) and arguments.strip():
+            try:
+                parsed = json.loads(arguments)
+            except (json.JSONDecodeError, ValueError):
+                return False
+            return (
+                isinstance(parsed, dict)
+                and "__parseError" in parsed
+                and "__rawJson" in parsed
+            )
+        return False
+
+    dropped_ids: set[str] = set()
+    dropped = 0
+    kept_messages: list[Any] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            kept_messages.append(message)
+            continue
+        calls = message.get("tool_calls")
+        if isinstance(calls, list) and calls:
+            kept_calls = []
+            for call in calls:
+                if poisoned_call(call):
+                    dropped += 1
+                    call_id = call.get("id") or call.get("call_id")
+                    if isinstance(call_id, str) and call_id.strip():
+                        dropped_ids.add(call_id.strip())
+                else:
+                    kept_calls.append(call)
+            if kept_calls:
+                kept_messages.append({**message, "tool_calls": kept_calls})
+            else:
+                kept_messages.append({k: v for k, v in message.items() if k != "tool_calls"})
+            continue
+        function_call = message.get("function_call")
+        if poisoned_call(function_call):
+            dropped += 1
+            call_id = function_call.get("id") or function_call.get("call_id")
+            if isinstance(call_id, str) and call_id.strip():
+                dropped_ids.add(call_id.strip())
+            kept_messages.append({k: v for k, v in message.items() if k != "function_call"})
+            continue
+        kept_messages.append(message)
+
+    if dropped_ids:
+        without_results: list[Any] = []
+        for message in kept_messages:
+            if isinstance(message, dict) and message.get("role") == "tool":
+                tool_call_id = str(
+                    message.get("tool_call_id") or message.get("call_id") or ""
+                ).strip()
+                if tool_call_id in dropped_ids:
+                    dropped += 1
+                    continue
+            without_results.append(message)
+        kept_messages = without_results
+
+    # An assistant turn whose only output was failed tool calls is now empty;
+    # leave it out rather than forwarding a content-less message with no call.
+    final = [
+        message for message in kept_messages
+        if not (
+            isinstance(message, dict)
+            and message.get("role") == "assistant"
+            and not message.get("content")
+            and not message.get("tool_calls")
+            and message.get("function_call") is None
+        )
+    ]
+    return final, dropped
+
+
 def tool_diagnostics_enabled() -> bool:
     """Return whether safe tool-markup diagnostics are enabled."""
     return os.environ.get("TUSKER_TOOL_DIAGNOSTICS", "0").strip().lower() in {
