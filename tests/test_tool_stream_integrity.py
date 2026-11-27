@@ -170,6 +170,174 @@ async def test_large_bash_tool_turn_is_preserved_end_to_end(
     assert f"sha256={output_digest}" in history_diagnostics[0]
 
 
+def _tool_delta_frame(index: int, arguments: str, *, call_id=None, name=None) -> bytes:
+    """One OpenAI tool-call delta frame, with id/name only when supplied."""
+    function: dict = {"arguments": arguments}
+    if name is not None:
+        function["name"] = name
+    call: dict = {"index": index, "function": function}
+    if call_id is not None:
+        call["id"] = call_id
+        call["type"] = "function"
+    return _sse({"id": "chatcmpl-misindexed", "choices": [{
+        "index": 0,
+        "delta": {"tool_calls": [call]},
+        "finish_reason": None,
+    }]})
+
+
+def _misindexed_frames(fragments) -> list[bytes]:
+    """Wrap tool delta fragments in a complete streaming response."""
+    frames = [_sse({"id": "chatcmpl-misindexed", "choices": [{
+        "index": 0, "delta": {"role": "assistant"}, "finish_reason": None,
+    }]})]
+    frames.extend(
+        _tool_delta_frame(index, arguments, call_id=call_id, name=name)
+        for index, call_id, name, arguments in fragments
+    )
+    frames.append(_sse({"id": "chatcmpl-misindexed", "choices": [{
+        "index": 0, "delta": {}, "finish_reason": "tool_calls",
+    }]}))
+    frames.append(b"data: [DONE]\n\n")
+    return frames
+
+
+async def _post_misindexed_stream(client, app, fragments, *, caplog=None):
+    """Drive a simulated mis-indexed tool stream through the public handler."""
+    from unittest.mock import MagicMock
+
+    pool_manager = MagicMock()
+    pool_manager.fallback_pools.return_value = ()
+    pool_manager.select.side_effect = [("synthetic", "syn:small:vision")]
+    app["pool_manager"] = pool_manager
+
+    async def fake_chat(
+        _client, provider, model, messages, *, stream, tools, tool_choice, extra_body,
+        conversation_id, metrics_registry, request_id, pool, **_kwargs,
+    ):
+        async def upstream_stream():
+            for frame in _misindexed_frames(fragments):
+                yield frame
+        return upstream_stream()
+
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+            },
+        },
+    }]
+    with patch("tusker_gateway.endpoints.PassthroughClient.chat", new=fake_chat):
+        if caplog is not None:
+            with caplog.at_level(logging.INFO, logger="tusker_gateway.endpoints"):
+                response = await client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "hermes-code",
+                        "messages": [{"role": "user", "content": "check node health"}],
+                        "tools": tools,
+                        "stream": True,
+                    },
+                    headers=HEADERS_AUTH,
+                )
+                body = await response.read()
+        else:
+            response = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "hermes-code",
+                    "messages": [{"role": "user", "content": "check node health"}],
+                    "tools": tools,
+                    "stream": True,
+                },
+                headers=HEADERS_AUTH,
+            )
+            body = await response.read()
+    return response, body
+
+
+def _emitted_tool_calls(body: bytes) -> dict[int, str]:
+    """Assemble client-visible arguments by tool-call index."""
+    assembled: dict[int, str] = {}
+    for event in _read_sse_data(body):
+        for choice in event.get("choices", []):
+            for call in (choice.get("delta", {}) or {}).get("tool_calls", []):
+                index = int(call.get("index", 0))
+                assembled[index] = assembled.get(index, "") + (
+                    (call.get("function") or {}).get("arguments") or ""
+                )
+    return assembled
+
+
+@pytest.mark.asyncio
+async def test_misindexed_argument_prefix_is_moved_to_its_call(client, app, caplog):
+    """The leading `{"` emitted under a nameless index must reach the bash call.
+
+    This is the 2026-11-27 ``syn:small:vision`` shape that made OMP report
+    ``Tool  not found`` and ``arguments are not valid JSON`` on every turn.
+    """
+    call_id = "call_misindexed_prefix"
+    arguments = json.dumps(
+        {"command": "kubectl get nodes -o wide", "i": "Checking Kubernetes node health"},
+        ensure_ascii=False, separators=(",", ":"),
+    )
+    prefix, body = arguments[:2], arguments[2:]
+    fragments = [
+        (0, call_id, "bash", body[:15]),
+        (0, None, None, body[15:]),
+        (1, None, None, prefix[:1]),
+        (1, None, None, prefix[1:]),
+    ]
+
+    response, payload = await _post_misindexed_stream(client, app, fragments, caplog=caplog)
+
+    assert response.status == 200
+    assembled = _emitted_tool_calls(payload)
+    assert set(assembled) == {0}, assembled
+    assert assembled[0] == arguments
+    assert json.loads(assembled[0])["command"] == "kubectl get nodes -o wide"
+    assert b"Tool  not found" not in payload
+    assert b"call_stream_0_1" not in payload
+    repairs = [
+        record.getMessage() for record in caplog.records
+        if record.getMessage().startswith("repaired mis-indexed streamed tool arguments")
+    ]
+    assert repairs and "1->0:prefix" in repairs[0], repairs
+
+
+@pytest.mark.asyncio
+async def test_misindexed_second_call_json_is_routed_to_its_named_call(client, app):
+    """A whole second call carried under the nameless index reaches its own call.
+
+    The first ``syn:small:vision`` turn emitted the opening ``{"`` of call 0
+    and the complete JSON of call 1 under a single nameless index, with call 1
+    arriving later as a named call carrying empty arguments.
+    """
+    first = json.dumps({"command": "kubectl get nodes"}, separators=(",", ":"))
+    second = json.dumps({"command": "kubectl top nodes"}, separators=(",", ":"))
+    fragments = [
+        (0, "call_misindexed_first", "bash", first[2:20]),
+        (0, None, None, first[20:]),
+        (1, None, None, '{"'),
+        (1, None, None, second),
+        (2, "call_misindexed_second", "bash", ""),
+    ]
+
+    response, payload = await _post_misindexed_stream(client, app, fragments)
+
+    assert response.status == 200
+    assembled = _emitted_tool_calls(payload)
+    assert set(assembled) == {0, 2}, assembled
+    assert assembled[0] == first
+    assert assembled[2] == second
+    assert json.loads(assembled[0])["command"] == "kubectl get nodes"
+    assert json.loads(assembled[2])["command"] == "kubectl top nodes"
+    assert b"call_stream_0_1" not in payload
+
+
 def _leaked_opener_frames() -> list[bytes]:
     """Upstream bytes captured from the failing 2026-10-15 alibaba turn.
 
