@@ -135,4 +135,50 @@ async def test_upstream_request_uses_system_role_for_mlx_mac():
         ],
     )
     body = captured["body"]
-    assert [m["role"] for m in body["messages"]] == ["system", "user"]
+
+def test_developer_after_user_is_reordered_before_system():
+    """developer folded to system after user must be moved before user."""
+    messages = [
+        {"role": "user", "content": "hi"},
+        {"role": "developer", "content": "be terse"},
+    ]
+    folded = _fold_developer_role(messages, "mlx-mac")
+    assert [m["role"] for m in folded] == ["system", "user"]
+    assert folded[0]["content"] == "be terse"
+    assert folded[1]["content"] == "hi"
+
+def test_multiple_systems_are_merged_into_one_leading_system():
+    """Multiple system messages merge into a single leading system message."""
+    messages = [
+        {"role": "user", "content": "hi"},
+        {"role": "system", "content": "second system"},
+        {"role": "system", "content": "first system"},
+        {"role": "user", "content": "again"},
+    ]
+    folded = _fold_developer_role(messages, "mlx-mac")
+    assert [m["role"] for m in folded] == ["system", "user", "user"]
+    assert folded[0]["content"] == "second system\nfirst system"
+    assert folded[1]["content"] == "hi"
+    assert folded[2]["content"] == "again"
+
+
+def test_developer_and_system_are_merged_into_one_leading_system():
+    """developer folded to system merges with existing system messages."""
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "hi"},
+        {"role": "developer", "content": "be terse"},
+    ]
+    folded = _fold_developer_role(messages, "mlx-mac")
+    assert [m["role"] for m in folded] == ["system", "user"]
+    assert folded[0]["content"] == "sys\nbe terse"
+    assert folded[1]["content"] == "hi"
+
+
+def test_developer_is_not_reordered_for_other_providers():
+    """Non-system-only providers get no reordering or folding."""
+    messages = [
+        {"role": "user", "content": "hi"},
+        {"role": "developer", "content": "be terse"},
+    ]
+    assert _fold_developer_role(messages, "openai") == messages
